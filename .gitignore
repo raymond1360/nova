@@ -8,6 +8,7 @@ build/
 out/
 releases/
 apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
 
 # Local environment and secrets
 .env
@@ -30,4 +31,3 @@ logs/
 Thumbs.db
 .vscode/
 .idea/
-

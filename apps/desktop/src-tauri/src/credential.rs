@@ -50,11 +50,11 @@ mod windows_store {
     }
 
     fn decode_blob(bytes: &[u8]) -> NovaResult<String> {
-        if bytes.len() % 2 != 0 {
+        if !bytes.len().is_multiple_of(2) {
             return Err(NovaError::Credential("凭据数据格式异常".to_string()));
         }
         let units = bytes
-            .chunks_exact(2)
+            .chunks(2)
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect::<Vec<_>>();
         String::from_utf16(&units)

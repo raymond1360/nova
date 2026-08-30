@@ -2,6 +2,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{self, ApiProvider, StreamChunk};
+use crate::db::RequestLogEntry;
 use crate::error::{public_error, NovaError, NovaResult};
 use crate::models::{
     ChatMessage, Conversation, ModelInfo, ProviderSummary, SaveProviderRequest, SendChatRequest,
@@ -238,15 +239,15 @@ pub async fn send_chat_message(
                         "complete",
                         request_id.as_deref(),
                     );
-                    let _ = db.log_request(
-                        &provider_id,
-                        Some(&model_id),
-                        AllowedEndpoint::ChatCompletions.path(),
-                        Some(200),
-                        None,
-                        None,
-                        request_id.as_deref(),
-                    );
+                    let _ = db.log_request(RequestLogEntry {
+                        provider_id: &provider_id,
+                        model_id: Some(&model_id),
+                        endpoint: AllowedEndpoint::ChatCompletions.path(),
+                        status_code: Some(200),
+                        error_code: None,
+                        message: None,
+                        request_id: request_id.as_deref(),
+                    });
                 }
                 let _ = app.emit(
                     "chat://done",
@@ -258,29 +259,23 @@ pub async fn send_chat_message(
                 );
             }
             Err(detail) => {
-                let status = if detail.code.as_deref() == Some("user_canceled")
-                    || detail.code.as_deref() == Some("sse_incomplete")
-                {
-                    "interrupted"
-                } else {
-                    "error"
-                };
-                let public_message = redact_sensitive_text(&detail.message);
+                let status = stream_error_status(&detail);
+                let public_message = stream_error_message(&detail);
                 if let Ok(db) = db_for_finish.lock() {
                     let _ = db.update_message_status(
                         &assistant_id_for_stream,
                         status,
                         detail.request_id.as_deref(),
                     );
-                    let _ = db.log_request(
-                        &provider_id,
-                        Some(&model_id),
-                        AllowedEndpoint::ChatCompletions.path(),
-                        detail.status,
-                        detail.code.as_deref(),
-                        Some(&public_message),
-                        detail.request_id.as_deref(),
-                    );
+                    let _ = db.log_request(RequestLogEntry {
+                        provider_id: &provider_id,
+                        model_id: Some(&model_id),
+                        endpoint: AllowedEndpoint::ChatCompletions.path(),
+                        status_code: detail.status,
+                        error_code: detail.code.as_deref(),
+                        message: Some(&public_message),
+                        request_id: detail.request_id.as_deref(),
+                    });
                 }
                 let _ = app.emit(
                     "chat://error",
@@ -297,6 +292,25 @@ pub async fn send_chat_message(
     Ok(SendChatResult {
         assistant_message_id,
     })
+}
+
+fn stream_error_status(detail: &api::ApiErrorDetail) -> &'static str {
+    if detail.received_delta
+        || detail.code.as_deref() == Some("user_canceled")
+        || detail.code.as_deref() == Some("sse_incomplete")
+    {
+        "interrupted"
+    } else {
+        "error"
+    }
+}
+
+fn stream_error_message(detail: &api::ApiErrorDetail) -> String {
+    if detail.received_delta && detail.code.as_deref() != Some("user_canceled") {
+        "回答中断，可重新生成".to_string()
+    } else {
+        redact_sensitive_text(&detail.message)
+    }
 }
 
 #[tauri::command]
@@ -334,4 +348,33 @@ where
         .lock()
         .map_err(|_| "本地数据库锁定失败".to_string())?;
     action(&db).map_err(public_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn detail(code: Option<&str>, message: &str, received_delta: bool) -> api::ApiErrorDetail {
+        api::ApiErrorDetail {
+            status: None,
+            code: code.map(str::to_string),
+            message: message.to_string(),
+            request_id: None,
+            received_delta,
+        }
+    }
+
+    #[test]
+    fn partial_stream_errors_map_to_interrupted_message() {
+        let error = detail(Some("sse_parse_error"), "bad json", true);
+        assert_eq!(stream_error_status(&error), "interrupted");
+        assert_eq!(stream_error_message(&error), "回答中断，可重新生成");
+    }
+
+    #[test]
+    fn user_cancel_maps_to_interrupted_without_retry_hint() {
+        let error = detail(Some("user_canceled"), "生成已停止，已保留收到的内容", true);
+        assert_eq!(stream_error_status(&error), "interrupted");
+        assert_eq!(stream_error_message(&error), "生成已停止，已保留收到的内容");
+    }
 }

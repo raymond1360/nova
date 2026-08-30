@@ -11,6 +11,16 @@ pub struct Database {
     conn: Connection,
 }
 
+pub struct RequestLogEntry<'a> {
+    pub provider_id: &'a str,
+    pub model_id: Option<&'a str>,
+    pub endpoint: &'a str,
+    pub status_code: Option<u16>,
+    pub error_code: Option<&'a str>,
+    pub message: Option<&'a str>,
+    pub request_id: Option<&'a str>,
+}
+
 impl Database {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         Ok(Self {
@@ -269,27 +279,18 @@ impl Database {
         Ok(())
     }
 
-    pub fn log_request(
-        &self,
-        provider_id: &str,
-        model_id: Option<&str>,
-        endpoint: &str,
-        status_code: Option<u16>,
-        error_code: Option<&str>,
-        message: Option<&str>,
-        request_id: Option<&str>,
-    ) -> rusqlite::Result<()> {
+    pub fn log_request(&self, entry: RequestLogEntry<'_>) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO request_logs (id, provider_id, model_id, endpoint, status_code, error_code, message, request_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 Uuid::new_v4().to_string(),
-                provider_id,
-                model_id,
-                endpoint,
-                status_code.map(i64::from),
-                error_code,
-                message,
-                request_id,
+                entry.provider_id,
+                entry.model_id,
+                entry.endpoint,
+                entry.status_code.map(i64::from),
+                entry.error_code,
+                entry.message,
+                entry.request_id,
                 now()
             ],
         )?;
@@ -395,5 +396,32 @@ mod tests {
             .unwrap();
         assert!(provider.has_key);
         assert_ne!(provider.masked_key.unwrap(), fake_key);
+    }
+
+    #[test]
+    fn interrupted_partial_stream_preserves_single_partial_content() {
+        let db = Database::memory().unwrap();
+        db.migrate().unwrap();
+        let conversation = db.create_conversation("sdkmax", Some("gpt-test")).unwrap();
+        let assistant = db
+            .create_message(
+                &conversation.id,
+                "assistant",
+                "",
+                "sdkmax",
+                "gpt-test",
+                "streaming",
+            )
+            .unwrap();
+
+        db.append_message_delta(&assistant.id, "partial", None)
+            .unwrap();
+        db.update_message_status(&assistant.id, "interrupted", None)
+            .unwrap();
+
+        let messages = db.list_messages(&conversation.id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "partial");
+        assert_eq!(messages[0].status, "interrupted");
     }
 }

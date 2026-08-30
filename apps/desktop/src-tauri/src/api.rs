@@ -21,6 +21,7 @@ pub struct ApiErrorDetail {
     pub code: Option<String>,
     pub message: String,
     pub request_id: Option<String>,
+    pub received_delta: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +34,20 @@ pub struct StreamChunk {
 pub enum StreamEvent {
     Delta(String),
     Done,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseParseError {
+    message: String,
+    events: Vec<StreamEvent>,
+}
+
+impl SseParseError {
+    fn emitted_delta(&self) -> bool {
+        self.events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Delta(_)))
+    }
 }
 
 pub async fn fetch_models(
@@ -123,7 +138,7 @@ where
                 if attempts == 1
                     && detail.status.is_none()
                     && !cancel.is_cancelled()
-                    && detail.code.as_deref() != Some("stream_started") =>
+                    && !detail.received_delta =>
             {
                 continue;
             }
@@ -155,6 +170,7 @@ where
             code: None,
             message: map_network_error(error).public_message(),
             request_id: None,
+            received_delta: false,
         })?;
     let request_id = response_request_id(response.headers());
     if !response.status().is_success() {
@@ -165,32 +181,54 @@ where
     let mut stream = response.bytes_stream();
     let mut saw_done = false;
     let mut saw_delta = false;
-    while let Some(item) = stream.next().await {
-        if cancel.is_cancelled() {
-            return Err(ApiErrorDetail {
-                status: None,
-                code: Some("user_canceled".to_string()),
-                message: "生成已停止，已保留收到的内容".to_string(),
-                request_id,
-            });
-        }
+    loop {
+        let item = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Err(ApiErrorDetail {
+                    status: None,
+                    code: Some("user_canceled".to_string()),
+                    message: "生成已停止，已保留收到的内容".to_string(),
+                    request_id,
+                    received_delta: saw_delta,
+                });
+            }
+            item = stream.next() => item,
+        };
+        let Some(item) = item else {
+            break;
+        };
         let bytes = item.map_err(|error| ApiErrorDetail {
             status: None,
-            code: if saw_delta {
-                Some("stream_started".to_string())
-            } else {
-                None
-            },
+            code: None,
             message: map_network_error(error).public_message(),
             request_id: request_id.clone(),
+            received_delta: saw_delta,
         })?;
         let text = String::from_utf8_lossy(&bytes);
-        for event in parser.push(&text).map_err(|message| ApiErrorDetail {
-            status: None,
-            code: Some("sse_parse_error".to_string()),
-            message,
-            request_id: request_id.clone(),
-        })? {
+        let events = match parser.push(&text) {
+            Ok(events) => events,
+            Err(error) => {
+                let emitted_delta = error.emitted_delta();
+                for event in error.events {
+                    if let StreamEvent::Delta(delta) = event {
+                        saw_delta = true;
+                        on_chunk(StreamChunk {
+                            delta,
+                            request_id: request_id.clone(),
+                        });
+                    }
+                }
+                return Err(ApiErrorDetail {
+                    status: None,
+                    code: Some("sse_parse_error".to_string()),
+                    message: error.message,
+                    request_id: request_id.clone(),
+                    received_delta: saw_delta || emitted_delta,
+                });
+            }
+        };
+        for event in events {
             match event {
                 StreamEvent::Delta(delta) => {
                     saw_delta = true;
@@ -213,8 +251,9 @@ where
         return Err(ApiErrorDetail {
             status: None,
             code: Some("sse_incomplete".to_string()),
-            message: "流式响应中断，已保留收到的内容".to_string(),
+            message: "回答中断，可重新生成".to_string(),
             request_id,
+            received_delta: saw_delta,
         });
     }
     Ok(request_id)
@@ -226,7 +265,7 @@ pub struct SseParser {
 }
 
 impl SseParser {
-    pub fn push(&mut self, chunk: &str) -> Result<Vec<StreamEvent>, String> {
+    pub fn push(&mut self, chunk: &str) -> Result<Vec<StreamEvent>, SseParseError> {
         self.buffer.push_str(chunk);
         let normalized = self.buffer.replace("\r\n", "\n");
         let mut parts = normalized
@@ -249,7 +288,10 @@ impl SseParser {
                 continue;
             }
             let value: serde_json::Value =
-                serde_json::from_str(&data).map_err(|_| "SSE data 不是有效 JSON".to_string())?;
+                serde_json::from_str(&data).map_err(|_| SseParseError {
+                    message: "SSE data 不是有效 JSON".to_string(),
+                    events: events.clone(),
+                })?;
             if let Some(delta) = value
                 .pointer("/choices/0/delta/content")
                 .and_then(serde_json::Value::as_str)
@@ -329,6 +371,7 @@ async fn map_api_error(response: reqwest::Response, request_id: Option<String>) 
         code: code.clone(),
         message: classify_error(status, code.as_deref(), raw_message),
         request_id: request_id.map(|id| mask_request_id(&id)),
+        received_delta: false,
     }
 }
 
@@ -379,6 +422,7 @@ fn to_api_detail(error: NovaError) -> ApiErrorDetail {
         code: None,
         message: error.public_message(),
         request_id: None,
+        received_delta: false,
     }
 }
 
@@ -396,7 +440,126 @@ struct ModelItem {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
     use super::*;
+
+    enum MockResponse {
+        CloseImmediately,
+        Body(String),
+        HeadersThenSleep(Duration),
+    }
+
+    struct MockServer {
+        base_url: String,
+        requests: Arc<AtomicUsize>,
+    }
+
+    fn chat_message(content: &str) -> ChatMessage {
+        ChatMessage {
+            id: "user-1".to_string(),
+            conversation_id: "conversation-1".to_string(),
+            role: "user".to_string(),
+            content: content.to_string(),
+            provider_id: "sdkmax".to_string(),
+            model_id: "gpt-test".to_string(),
+            status: "complete".to_string(),
+            request_id: None,
+            created_at: "2026-08-30T00:00:00Z".to_string(),
+        }
+    }
+
+    fn sse_delta(text: &str) -> String {
+        format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n")
+    }
+
+    fn start_mock_server(responses: Vec<MockResponse>) -> MockServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let responses = Arc::new(Mutex::new(responses));
+        let request_counter = requests.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                drain_headers(&mut stream);
+                request_counter.fetch_add(1, Ordering::SeqCst);
+                let response = responses.lock().unwrap().remove(0);
+                match response {
+                    MockResponse::CloseImmediately => {}
+                    MockResponse::Body(body) => write_sse_response(&mut stream, &body),
+                    MockResponse::HeadersThenSleep(delay) => {
+                        write_headers(&mut stream);
+                        thread::sleep(delay);
+                    }
+                }
+                if responses.lock().unwrap().is_empty() {
+                    break;
+                }
+            }
+        });
+        MockServer {
+            base_url: format!("http://{}", addr),
+            requests,
+        }
+    }
+
+    fn drain_headers(stream: &mut TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut buffer = [0_u8; 1024];
+        let mut collected = Vec::new();
+        while !collected.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            collected.extend_from_slice(&buffer[..read]);
+        }
+    }
+
+    fn write_headers(stream: &mut TcpStream) {
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn write_sse_response(stream: &mut TcpStream, body: &str) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.flush().unwrap();
+    }
+
+    async fn run_stream(
+        server: &MockServer,
+        chunks: Arc<Mutex<Vec<String>>>,
+    ) -> Result<Option<String>, ApiErrorDetail> {
+        stream_chat(
+            reqwest::Client::new(),
+            ApiProvider {
+                base_url: server.base_url.clone(),
+                api_key: "test-key".to_string(),
+            },
+            "gpt-test".to_string(),
+            vec![chat_message("hello")],
+            CancellationToken::new(),
+            move |chunk| chunks.lock().unwrap().push(chunk.delta),
+        )
+        .await
+    }
 
     #[test]
     fn parses_openai_model_list() {
@@ -454,5 +617,90 @@ mod tests {
         .unwrap();
         assert_eq!(usage.name, "nova-desktop");
         assert_eq!(usage.total_available, 9.0);
+    }
+
+    #[tokio::test]
+    async fn streams_normal_delta_and_done() {
+        let body = format!("{}data: [DONE]\n\n", sse_delta("hello"));
+        let server = start_mock_server(vec![MockResponse::Body(body)]);
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let result = run_stream(&server, chunks.clone()).await.unwrap();
+        assert_eq!(result, None);
+        assert_eq!(*chunks.lock().unwrap(), vec!["hello".to_string()]);
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retries_once_when_temporary_failure_has_no_delta() {
+        let body = format!("{}data: [DONE]\n\n", sse_delta("retry-ok"));
+        let server = start_mock_server(vec![
+            MockResponse::CloseImmediately,
+            MockResponse::Body(body),
+        ]);
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let result = run_stream(&server, chunks.clone()).await.unwrap();
+        assert_eq!(result, None);
+        assert_eq!(*chunks.lock().unwrap(), vec!["retry-ok".to_string()]);
+        assert_eq!(server.requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_when_stream_breaks_after_delta() {
+        let body = sse_delta("partial");
+        let server = start_mock_server(vec![MockResponse::Body(body)]);
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let error = run_stream(&server, chunks.clone()).await.unwrap_err();
+        assert_eq!(error.code.as_deref(), Some("sse_incomplete"));
+        assert!(error.received_delta);
+        assert_eq!(error.message, "回答中断，可重新生成");
+        assert_eq!(*chunks.lock().unwrap(), vec!["partial".to_string()]);
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_sse_after_delta_does_not_retry() {
+        let body = format!("{}data: not-json\n\n", sse_delta("partial"));
+        let server = start_mock_server(vec![MockResponse::Body(body)]);
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let error = run_stream(&server, chunks.clone()).await.unwrap_err();
+        assert_eq!(error.code.as_deref(), Some("sse_parse_error"));
+        assert!(error.received_delta);
+        assert_eq!(*chunks.lock().unwrap(), vec!["partial".to_string()]);
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn blocking_stream_can_be_cancelled_immediately_and_does_not_retry() {
+        let server =
+            start_mock_server(vec![MockResponse::HeadersThenSleep(Duration::from_secs(5))]);
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let chunks_for_task = chunks.clone();
+        let base_url = server.base_url.clone();
+        let task = tokio::spawn(async move {
+            stream_chat(
+                reqwest::Client::new(),
+                ApiProvider {
+                    base_url,
+                    api_key: "test-key".to_string(),
+                },
+                "gpt-test".to_string(),
+                vec![chat_message("hello")],
+                cancel_for_task,
+                move |chunk| chunks_for_task.lock().unwrap().push(chunk.delta),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_millis(500), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code.as_deref(), Some("user_canceled"));
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+        assert!(chunks.lock().unwrap().is_empty());
     }
 }

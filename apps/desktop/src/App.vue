@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useNovaStore } from './stores/nova'
+import { applyStreamChunk, applyStreamError } from './chatEvents'
 import type { ChatMessage } from './types'
 
 const store = useNovaStore()
@@ -33,11 +34,7 @@ onMounted(async () => {
   unlistenChunk = await listen<{ message_id: string; content_delta: string; request_id?: string | null }>(
     'chat://chunk',
     (event) => {
-      const message = store.messages.find((item) => item.id === event.payload.message_id)
-      if (message) {
-        message.content += event.payload.content_delta
-        message.status = 'streaming'
-      }
+      applyStreamChunk(store.messages, event.payload)
       if (event.payload.request_id) {
         store.lastRequestId = event.payload.request_id
       }
@@ -54,6 +51,7 @@ onMounted(async () => {
     'chat://error',
     async (event) => {
       store.lastError = event.payload.message
+      applyStreamError(store.messages, event.payload)
       if (event.payload.request_id) store.lastRequestId = event.payload.request_id
       await store.finishSending()
     },

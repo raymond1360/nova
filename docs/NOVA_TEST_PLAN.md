@@ -33,3 +33,13 @@ Frontend:
 - Verify SQLite and logs contain no full key.
 
 Manual real SDKMAX calls require user confirmation and a key from Windows Credential Manager or environment, never from a committed `.env` file.
+
+## CSP Verification (Manual)
+
+- Run `npm run tauri -- build`, launch the resulting `apps\desktop\src-tauri\target\release\nova.exe`, and confirm the window renders with full styling (no blank/unstyled UI, which would indicate the production CSP in `tauri.conf.json` blocked a required resource).
+- Type a message containing `<script>alert(1)</script>` and confirm it renders as inert text (no dialog fires). This must not require a real SDKMAX API call — the check applies to how the message is rendered in the input/composer or as already-stored local content, not to a live chat completion.
+- No informational or authorization-related content should be required to perform this check.
+
+## Build/Commit Verification
+
+`scripts\verify-build.ps1` automates the four commands above (`npm test`, `npm run build`, `cargo test`, `npm run tauri -- build`) and binds their pass/fail result to the Git commit hash under test in `test-results\build-info.txt`. See `NOVA_DEVELOPMENT_WORKFLOW.md` for the commit-then-verify workflow. This does not replace the manual acceptance checks above (which need a running window and human observation); it only replaces manually re-running and eyeballing the four commands' exit codes.

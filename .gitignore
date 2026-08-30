@@ -26,6 +26,9 @@ logs/
 *.sqlite3
 *.db
 
+# Regenerable local build/test verification output (see scripts/verify-build.ps1)
+test-results/
+
 # Tooling
 .DS_Store
 Thumbs.db

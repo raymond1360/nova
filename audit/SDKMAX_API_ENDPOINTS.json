@@ -1,0 +1,603 @@
+{
+  "audit_date": "2026-08-30",
+  "scope": {
+    "sdkmax_project": "D:\\sdkmax\\new-api",
+    "nova_project": "D:\\nova",
+    "production_db_connected": false,
+    "production_api_modified": false,
+    "sdkmax_files_modified": false
+  },
+  "evidence": {
+    "api_router": "D:\\sdkmax\\new-api\\router\\api-router.go",
+    "relay_router": "D:\\sdkmax\\new-api\\router\\relay-router.go",
+    "user_controller": "D:\\sdkmax\\new-api\\controller\\user.go",
+    "token_controller": "D:\\sdkmax\\new-api\\controller\\token.go",
+    "model_controller": "D:\\sdkmax\\new-api\\controller\\model.go",
+    "auth_middleware": "D:\\sdkmax\\new-api\\middleware\\auth.go",
+    "distributor_middleware": "D:\\sdkmax\\new-api\\middleware\\distributor.go"
+  },
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/api/user/login",
+      "category": "auth",
+      "auth": "none; creates Cookie session",
+      "classification": "wrap_or_short_term_reuse",
+      "request_example": {
+        "username": "alice",
+        "password": "***REDACTED***"
+      },
+      "success_response_example": {
+        "success": true,
+        "message": "",
+        "data": {
+          "id": 123,
+          "username": "alice",
+          "display_name": "Alice",
+          "role": 1,
+          "status": 1,
+          "group": "default"
+        }
+      },
+      "twofa_response_example": {
+        "success": true,
+        "message": "require 2FA",
+        "data": {
+          "require_2fa": true
+        }
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:63",
+        "D:\\sdkmax\\new-api\\controller\\user.go:33",
+        "D:\\sdkmax\\new-api\\controller\\user.go:93"
+      ],
+      "notes": "Desktop should not store passwords; prefer Web login then Nova device-token exchange."
+    },
+    {
+      "method": "POST",
+      "path": "/api/user/login/2fa",
+      "category": "auth",
+      "auth": "pending Cookie session",
+      "classification": "wrap_or_short_term_reuse",
+      "request_example": {
+        "code": "***REDACTED***"
+      },
+      "success_response_example": {
+        "success": true,
+        "message": "",
+        "data": {
+          "id": 123,
+          "username": "alice",
+          "display_name": "Alice",
+          "role": 1,
+          "status": 1,
+          "group": "default"
+        }
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:64",
+        "D:\\sdkmax\\new-api\\controller\\twofa.go:382",
+        "D:\\sdkmax\\new-api\\controller\\twofa.go:467"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/oauth/state",
+      "category": "auth",
+      "auth": "Cookie session",
+      "classification": "wrap",
+      "response_example": {
+        "success": true,
+        "message": "",
+        "data": "***STATE_REDACTED***"
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:43",
+        "D:\\sdkmax\\new-api\\controller\\oauth.go:22"
+      ],
+      "notes": "State is stored in server-side/session cookie flow."
+    },
+    {
+      "method": "GET",
+      "path": "/api/oauth/:provider",
+      "category": "auth",
+      "auth": "OAuth state Cookie session",
+      "classification": "wrap",
+      "query_example": {
+        "code": "***REDACTED***",
+        "state": "***REDACTED***"
+      },
+      "success_response_example": {
+        "success": true,
+        "message": "",
+        "data": {
+          "id": 123,
+          "username": "alice",
+          "display_name": "Alice",
+          "role": 1,
+          "status": 1,
+          "group": "default"
+        }
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:52",
+        "D:\\sdkmax\\new-api\\controller\\oauth.go:43",
+        "D:\\sdkmax\\new-api\\oauth\\oidc.go:51"
+      ],
+      "notes": "OIDC uses authorization_code plus client_secret; no generic PKCE/device flow found for user login."
+    },
+    {
+      "method": "GET",
+      "path": "/api/user/self",
+      "category": "account",
+      "auth": "Cookie session or user access token + New-Api-User header",
+      "classification": "reuse",
+      "headers_example": {
+        "Cookie": "session=***REDACTED***",
+        "New-Api-User": "123"
+      },
+      "response_example": {
+        "success": true,
+        "message": "",
+        "data": {
+          "id": 123,
+          "username": "alice",
+          "display_name": "Alice",
+          "role": 1,
+          "status": 1,
+          "email": "a***@example.com",
+          "group": "default",
+          "quota": 500000,
+          "used_quota": 12000,
+          "request_count": 42
+        }
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:82",
+        "D:\\sdkmax\\new-api\\controller\\user.go:395",
+        "D:\\sdkmax\\new-api\\middleware\\auth.go:95"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/user/models",
+      "category": "models",
+      "auth": "Cookie session or user access token + New-Api-User header",
+      "classification": "reuse",
+      "response_example": {
+        "success": true,
+        "message": "",
+        "data": [
+          "gpt-4o-mini",
+          "claude-3-5-sonnet"
+        ]
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:83",
+        "D:\\sdkmax\\new-api\\controller\\user.go:531",
+        "D:\\sdkmax\\new-api\\model\\ability.go:147"
+      ],
+      "notes": "Account-visible models only; does not apply an individual API token's model_limits."
+    },
+    {
+      "method": "GET",
+      "path": "/api/user/self/groups",
+      "category": "account",
+      "auth": "Cookie session or user access token + New-Api-User header",
+      "classification": "reuse",
+      "response_example": {
+        "success": true,
+        "message": "",
+        "data": {
+          "default": {
+            "desc": "default group",
+            "ratio": 1
+          }
+        }
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:81",
+        "D:\\sdkmax\\new-api\\service\\group.go:10"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/user/logout",
+      "category": "auth",
+      "auth": "Cookie session",
+      "classification": "reuse",
+      "response_example": {
+        "success": true,
+        "message": ""
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:66",
+        "D:\\sdkmax\\new-api\\controller\\user.go:121"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/token/",
+      "category": "token",
+      "auth": "Cookie session or user access token + New-Api-User header",
+      "classification": "wrap",
+      "response_example": {
+        "success": true,
+        "data": {
+          "items": [
+            {
+              "id": 456,
+              "user_id": 123,
+              "key": "abcd**********wxyz",
+              "status": 1,
+              "name": "nova-desktop:win-7f3a2c91"
+            }
+          ],
+          "total": 1
+        }
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:279",
+        "D:\\sdkmax\\new-api\\controller\\token.go:34"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/token/search",
+      "category": "token",
+      "auth": "Cookie session or user access token + New-Api-User header",
+      "classification": "wrap",
+      "query_example": {
+        "keyword": "nova-desktop:win-7f3a2c91",
+        "token": ""
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:280",
+        "D:\\sdkmax\\new-api\\controller\\token.go:48"
+      ],
+      "notes": "Can reduce duplicate device-token creation but is not atomic."
+    },
+    {
+      "method": "GET",
+      "path": "/api/token/:id",
+      "category": "token",
+      "auth": "Cookie session or user access token + New-Api-User header",
+      "classification": "wrap",
+      "response_example": {
+        "success": true,
+        "data": {
+          "id": 456,
+          "key": "abcd**********wxyz",
+          "name": "nova-desktop:win-7f3a2c91"
+        }
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:281",
+        "D:\\sdkmax\\new-api\\controller\\token.go:65"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/token/",
+      "category": "token",
+      "auth": "Cookie session or user access token + New-Api-User header",
+      "classification": "wrap",
+      "request_example": {
+        "name": "nova-desktop:win-7f3a2c91",
+        "expired_time": -1,
+        "remain_quota": 0,
+        "unlimited_quota": true,
+        "model_limits_enabled": false,
+        "model_limits": "",
+        "allow_ips": "",
+        "group": "auto",
+        "cross_group_retry": true
+      },
+      "response_example": {
+        "success": true,
+        "message": "",
+        "data": {
+          "id": 456,
+          "user_id": 123,
+          "key": "abcd**********wxyz",
+          "status": 1,
+          "name": "nova-desktop:win-7f3a2c91"
+        }
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:282",
+        "D:\\sdkmax\\new-api\\controller\\token.go:167",
+        "D:\\sdkmax\\new-api\\controller\\token.go:208"
+      ],
+      "notes": "Existing endpoint returns masked key on create and allows user-controlled token properties."
+    },
+    {
+      "method": "PUT",
+      "path": "/api/token/",
+      "category": "token",
+      "auth": "Cookie session or user access token + New-Api-User header",
+      "classification": "wrap",
+      "request_example": {
+        "id": 456,
+        "name": "nova-desktop:win-7f3a2c91-renamed",
+        "status": 1,
+        "expired_time": -1,
+        "remain_quota": 0,
+        "unlimited_quota": true,
+        "model_limits_enabled": false,
+        "model_limits": "",
+        "group": "auto",
+        "cross_group_retry": true
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:283",
+        "D:\\sdkmax\\new-api\\controller\\token.go:249"
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/token/:id",
+      "category": "token",
+      "auth": "Cookie session or user access token + New-Api-User header",
+      "classification": "wrap",
+      "response_example": {
+        "success": true,
+        "message": ""
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:284",
+        "D:\\sdkmax\\new-api\\controller\\token.go:235"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/token/:id/key",
+      "category": "token",
+      "auth": "Cookie session or user access token + New-Api-User header",
+      "classification": "forbid_for_nova_direct",
+      "response_example": {
+        "success": true,
+        "data": {
+          "key": "sk-***REDACTED***"
+        }
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:282",
+        "D:\\sdkmax\\new-api\\controller\\token.go:80",
+        "D:\\sdkmax\\new-api\\model\\token.go:51"
+      ],
+      "notes": "Can repeatedly reveal a full token key; Nova should use a one-time server wrapper instead."
+    },
+    {
+      "method": "POST",
+      "path": "/api/token/batch/keys",
+      "category": "token",
+      "auth": "Cookie session or user access token + New-Api-User header",
+      "classification": "forbid_for_nova_direct",
+      "request_example": {
+        "ids": [
+          456
+        ]
+      },
+      "response_example": {
+        "success": true,
+        "data": {
+          "keys": {
+            "456": "sk-***REDACTED***"
+          }
+        }
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:286",
+        "D:\\sdkmax\\new-api\\controller\\token.go:337"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/usage/token/",
+      "category": "account",
+      "auth": "Bearer API Token; read-only token auth",
+      "classification": "reuse",
+      "headers_example": {
+        "Authorization": "Bearer sk-***REDACTED***"
+      },
+      "response_example": {
+        "code": true,
+        "message": "ok",
+        "data": {
+          "object": "token_usage",
+          "name": "nova-desktop:win-7f3a2c91",
+          "total_granted": 500000,
+          "total_used": 12000,
+          "total_available": 488000,
+          "unlimited_quota": false,
+          "model_limits": {},
+          "model_limits_enabled": false,
+          "expires_at": 0
+        }
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\controller\\token.go:118",
+        "D:\\sdkmax\\new-api\\middleware\\auth.go:210"
+      ],
+      "notes": "Read-only auth intentionally permits disabled/expired/exhausted token lookup but still rejects banned users."
+    },
+    {
+      "method": "GET",
+      "path": "/v1/models",
+      "category": "models",
+      "auth": "Bearer API Token",
+      "classification": "reuse",
+      "headers_example": {
+        "Authorization": "Bearer sk-***REDACTED***"
+      },
+      "response_example": {
+        "success": true,
+        "object": "list",
+        "data": [
+          {
+            "id": "gpt-4o-mini",
+            "object": "model",
+            "created": 1626777600,
+            "owned_by": "openai",
+            "supported_endpoint_types": [
+              "chat_completions"
+            ]
+          }
+        ]
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\relay-router.go:18",
+        "D:\\sdkmax\\new-api\\controller\\model.go:208",
+        "D:\\sdkmax\\new-api\\controller\\model.go:309"
+      ],
+      "notes": "Best source for token-effective callable models."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "category": "ai",
+      "auth": "Bearer API Token",
+      "classification": "reuse",
+      "request_example": {
+        "model": "gpt-4o-mini",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "stream": true
+      },
+      "stream_response_example": "data: {\"id\":\"chatcmpl_xxx\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\\n\\ndata: [DONE]\\n\\n",
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\relay-router.go:94",
+        "D:\\sdkmax\\new-api\\relay\\channel\\openai\\relay-openai.go:106",
+        "D:\\sdkmax\\new-api\\controller\\channel-test.go:619"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/responses",
+      "category": "ai",
+      "auth": "Bearer API Token",
+      "classification": "reuse",
+      "request_example": {
+        "model": "gpt-5-mini",
+        "input": "hello",
+        "stream": true
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\relay-router.go:99",
+        "D:\\sdkmax\\new-api\\relay\\responses_handler.go:23"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/responses/compact",
+      "category": "ai",
+      "auth": "Bearer API Token",
+      "classification": "reuse_when_model_requires",
+      "request_example": {
+        "model": "gpt-5-mini",
+        "input": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "previous_response_id": "resp_***REDACTED***"
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\relay-router.go:102",
+        "D:\\sdkmax\\new-api\\relay\\responses_handler.go:23"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/pricing",
+      "category": "pricing",
+      "auth": "header-nav module auth; may be public/user depending settings",
+      "classification": "reuse_for_display_only",
+      "response_shape": {
+        "success": true,
+        "data": "pricing[]",
+        "vendors": "vendor map/list",
+        "group_ratio": "map",
+        "usable_group": "map",
+        "supported_endpoint": "map",
+        "auto_groups": "string[]",
+        "pricing_version": "string"
+      },
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:25",
+        "D:\\sdkmax\\new-api\\controller\\pricing.go:36",
+        "D:\\sdkmax\\new-api\\controller\\pricing.go:67"
+      ],
+      "notes": "Pricing may differ from actual token-callable models."
+    },
+    {
+      "method": "ANY",
+      "path": "/api/channel/*",
+      "category": "admin",
+      "auth": "AdminAuth/RootAuth for sensitive routes",
+      "classification": "forbid_for_nova",
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:245",
+        "D:\\sdkmax\\new-api\\router\\api-router.go:252"
+      ],
+      "notes": "Contains channel management, upstream key retrieval, tests, routing maintenance."
+    },
+    {
+      "method": "ANY",
+      "path": "/api/option/*",
+      "category": "admin",
+      "auth": "RootAuth",
+      "classification": "forbid_for_nova",
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:182"
+      ]
+    },
+    {
+      "method": "ANY",
+      "path": "/api/models/*",
+      "category": "admin",
+      "auth": "AdminAuth",
+      "classification": "forbid_for_nova",
+      "evidence": [
+        "D:\\sdkmax\\new-api\\router\\api-router.go:332"
+      ]
+    }
+  ],
+  "recommended_new_endpoint": {
+    "method": "POST",
+    "path": "/api/nova/device-token",
+    "auth": "Cookie session + New-Api-User, or future PKCE desktop auth",
+    "classification": "recommended_mvp_addition",
+    "request_example": {
+      "device_id_hash": "sha256:***REDACTED***",
+      "device_name": "Lenovo Windows",
+      "platform": "windows",
+      "nova_version": "0.1.0"
+    },
+    "first_create_response_example": {
+      "success": true,
+      "data": {
+        "token_id": 456,
+        "token_name": "nova-desktop:7f3a2c91",
+        "api_key": "sk-***REDACTED***",
+        "created": true
+      }
+    },
+    "subsequent_response_example": {
+      "success": true,
+      "data": {
+        "token_id": 456,
+        "token_name": "nova-desktop:7f3a2c91",
+        "api_key": null,
+        "masked_key": "abcd**********wxyz",
+        "created": false
+      }
+    }
+  }
+}

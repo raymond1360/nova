@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+target/
+
+# Build outputs
+dist/
+build/
+out/
+releases/
+apps/desktop/src-tauri/target/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Logs and runtime state
+*.log
+logs/
+*.sqlite
+*.sqlite3
+*.db
+
+# Tooling
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+

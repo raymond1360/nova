@@ -30,6 +30,51 @@ current frontend has no code path that can issue a second
 a single global slot behaves identically to a per-request slot, because
 there is only ever at most one request to track.
 
+**This invariant previously had a gap and has since been closed at the
+frontend level (see "R1 fix" below); it is still enforced by the frontend
+alone, not by the Rust side.** `AppState.active_cancel` itself has **not**
+been changed and remains a single global slot — this section documents a
+UI-level guard that makes the existing single-stream assumption actually
+hold, not a change to the underlying architecture. Concurrent generation
+is still not supported and is not the goal of the fix described below.
+
+#### R1 fix: `sendMessage()` reentrancy guard (closed, frontend-only)
+
+`CLAUDE_REVIEW_NOVA_TECHNICAL_MVP_FINAL.md` (finding R1) found that
+`stores/nova.ts::sendMessage()` set `this.sending = true` **after**
+`await this.createConversation()` when starting the first message of a
+brand-new conversation. During that `await`, a second `sendMessage()` call
+(e.g. a double `Ctrl+Enter`, or a button click racing a keyboard shortcut)
+could also see `activeConversationId` as still empty, create a second
+conversation, and start a second `send_chat_message` — both streams would
+then fight over the single `active_cancel` slot, so "停止" could only ever
+stop the newer of the two.
+
+This has been fixed **entirely in `sendMessage()`**, by:
+
+1. Checking `if (this.sending) return` as the very first statement (before
+   any `await`, including `createConversation()`), so a second call made
+   while the first is still in its synchronous prologue is rejected
+   immediately.
+2. Setting `this.sending = true` immediately after that guard — still
+   before the first `await` — so the invariant holds even across the
+   `createConversation()` gap that caused the original bug.
+3. Only resetting `this.sending = false` inside `sendMessage()` itself when
+   `createConversation()` or the `send_chat_message` invoke call fails
+   (i.e. Rust never spawned a background stream, so no `chat://done` /
+   `chat://error` will ever arrive to release the flag via
+   `finishSending()`). Once the invoke call succeeds, `sendMessage()` does
+   not touch `sending` again — ownership passes to `finishSending()`
+   (triggered by the `chat://done`/`chat://error` listeners in `App.vue`),
+   exactly as before this fix.
+
+This closes the specific race described above. It does **not** change
+`active_cancel`, does **not** allow more than one stream to run at a time,
+and does **not** touch `stream_chat`/`stream_chat_once` in `api.rs`. The
+architectural debt below (multiple concurrent streams, multiple windows,
+background generation) is unaffected and still requires the `HashMap`
+redesign before any of those features can ship.
+
 ### When this must be fixed
 
 Before shipping any of the following, `active_cancel` must be redesigned:

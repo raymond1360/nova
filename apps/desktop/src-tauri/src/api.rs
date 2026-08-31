@@ -453,6 +453,20 @@ mod tests {
         CloseImmediately,
         Body(String),
         HeadersThenSleep(Duration),
+        /// Declares a `Content-Length` larger than the bytes actually
+        /// sent, then closes the connection. Unlike a clean close (which
+        /// the client sees as end-of-stream and `stream_chat_once` reports
+        /// as `sse_incomplete`), this makes the HTTP client detect a
+        /// genuine transport-level read error (body ended before the
+        /// promised length), exercising the `item.map_err(...)` branch in
+        /// `stream_chat_once` rather than the `!saw_done` branch.
+        TruncatedBody(String),
+        /// Sends headers and an initial delta payload immediately, then
+        /// stalls without closing the connection or sending `[DONE]`.
+        /// Used to test cancellation after some content has already
+        /// arrived, as opposed to `HeadersThenSleep` which stalls before
+        /// any content is sent at all.
+        DeltaThenSleep(String, Duration),
     }
 
     struct MockServer {
@@ -495,6 +509,15 @@ mod tests {
                     MockResponse::Body(body) => write_sse_response(&mut stream, &body),
                     MockResponse::HeadersThenSleep(delay) => {
                         write_headers(&mut stream);
+                        thread::sleep(delay);
+                    }
+                    MockResponse::TruncatedBody(body) => {
+                        write_truncated_sse_response(&mut stream, &body)
+                    }
+                    MockResponse::DeltaThenSleep(delta, delay) => {
+                        write_headers(&mut stream);
+                        stream.write_all(delta.as_bytes()).unwrap();
+                        stream.flush().unwrap();
                         thread::sleep(delay);
                     }
                 }
@@ -541,6 +564,24 @@ mod tests {
         );
         stream.write_all(response.as_bytes()).unwrap();
         stream.flush().unwrap();
+    }
+
+    fn write_truncated_sse_response(stream: &mut TcpStream, body: &str) {
+        // Promise far more bytes than we send, then shut the socket down.
+        // This is a deterministic, platform-independent way to force a
+        // genuine body-read I/O error (as opposed to relying on raw TCP
+        // RST timing, which is not reliably reproducible on Windows): the
+        // HTTP client knows from Content-Length that the body is
+        // incomplete and reports an error rather than treating the closed
+        // connection as a clean end-of-stream.
+        let promised_len = body.len() + 4096;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            promised_len, body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        let _ = stream.shutdown(std::net::Shutdown::Both);
     }
 
     async fn run_stream(
@@ -702,5 +743,78 @@ mod tests {
         assert_eq!(error.code.as_deref(), Some("user_canceled"));
         assert_eq!(server.requests.load(Ordering::SeqCst), 1);
         assert!(chunks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_io_error_after_delta_does_not_retry() {
+        // R3: a genuine transport-level read error (not a clean stream
+        // end) after at least one Delta has already been received must be
+        // treated the same as the sse_incomplete case tested above: no
+        // retry, content preserved, interrupted (not complete/error).
+        let body = sse_delta("partial");
+        let server = start_mock_server(vec![MockResponse::TruncatedBody(body)]);
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let error = run_stream(&server, chunks.clone()).await.unwrap_err();
+        assert_eq!(error.code, None);
+        assert!(error.status.is_none());
+        assert!(error.received_delta);
+        assert_eq!(*chunks.lock().unwrap(), vec!["partial".to_string()]);
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_after_receiving_delta_preserves_content_and_does_not_retry() {
+        // R4: cancelling after some content has already streamed in must
+        // not retry and must not lose or duplicate the content that was
+        // already delivered to on_chunk.
+        let server = start_mock_server(vec![MockResponse::DeltaThenSleep(
+            sse_delta("partial"),
+            Duration::from_secs(5),
+        )]);
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let chunks_for_task = chunks.clone();
+        let base_url = server.base_url.clone();
+        let task = tokio::spawn(async move {
+            stream_chat(
+                reqwest::Client::new(),
+                ApiProvider {
+                    base_url,
+                    api_key: "test-key".to_string(),
+                },
+                "gpt-test".to_string(),
+                vec![chat_message("hello")],
+                cancel_for_task,
+                move |chunk| chunks_for_task.lock().unwrap().push(chunk.delta),
+            )
+            .await
+        });
+
+        // Wait for the delta to actually arrive before cancelling, so the
+        // test genuinely exercises "cancel after partial content", not a
+        // race that might cancel before anything arrived.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !chunks.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("mock server should have delivered a delta within 2s");
+
+        cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_millis(500), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+
+        assert_eq!(error.code.as_deref(), Some("user_canceled"));
+        assert!(error.received_delta);
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(*chunks.lock().unwrap(), vec!["partial".to_string()]);
     }
 }

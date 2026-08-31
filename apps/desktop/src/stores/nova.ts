@@ -112,25 +112,57 @@ export const useNovaStore = defineStore('nova', {
       this.messages = await invoke<ChatMessage[]>('list_messages', { conversationId })
     },
     async sendMessage(content: string) {
+      // Reentrancy guard: a stream is already in flight (either actively
+      // streaming, or between invoke() and the backend emitting its first
+      // chat:// event). Silently no-op instead of starting a second
+      // request that would fight the first one over the single Rust-side
+      // active_cancel slot. This must be the very first thing this
+      // function does, before any `await`, so a second synchronous call
+      // (e.g. Ctrl+Enter fired twice) cannot slip in during the
+      // createConversation() gap below.
+      if (this.sending) {
+        return
+      }
       if (!this.selectedModelId) {
         throw new Error('请先选择模型')
-      }
-      if (!this.activeConversationId) {
-        await this.createConversation()
       }
       this.sending = true
       this.lastError = ''
       this.lastRequestId = ''
-      const result = await invoke<{ assistant_message_id: string }>('send_chat_message', {
-        request: {
-          conversation_id: this.activeConversationId,
-          provider_id: SDKMAX_PROVIDER_ID,
-          model_id: this.selectedModelId,
-          content,
-        },
-      })
+      let assistantMessageId: string
+      try {
+        if (!this.activeConversationId) {
+          await this.createConversation()
+        }
+        const result = await invoke<{ assistant_message_id: string }>('send_chat_message', {
+          request: {
+            conversation_id: this.activeConversationId,
+            provider_id: SDKMAX_PROVIDER_ID,
+            model_id: this.selectedModelId,
+            content,
+          },
+        })
+        assistantMessageId = result.assistant_message_id
+      } catch (error) {
+        // Nothing was started on the Rust side (create_conversation or
+        // send_chat_message itself rejected), so no chat://done or
+        // chat://error will ever arrive for this attempt. This function
+        // is the only owner of `sending` on this failure path — reset it
+        // here so the user can retry immediately. The error message is
+        // already redacted by the Rust command boundary before it ever
+        // reaches this catch block.
+        this.sending = false
+        this.lastError = String(error)
+        throw error
+      }
+      // From this point on, Rust has accepted the request and spawned the
+      // background stream task. Ownership of `sending` now belongs to
+      // finishSending() (invoked by the chat://done / chat://error
+      // listeners in App.vue) — do not reset it here even if this
+      // best-effort refresh fails, or a still-running stream would look
+      // finished and let a second send race with it.
       await this.loadMessages(this.activeConversationId!)
-      return result.assistant_message_id
+      return assistantMessageId
     },
     async stopGeneration() {
       await invoke('cancel_active_chat')

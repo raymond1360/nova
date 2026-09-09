@@ -15,15 +15,15 @@ Phase 1 remains blocked until Claude re-reviews the Stage 0 baseline and returns
 ## Finding Closure
 
 - B1: Resolved for re-review. Untracked material was classified, unrelated `.cloude` material was backed up and moved out of `D:\nova`, the duplicate root V3 spec was verified byte-identical by SHA256 before being moved out, and the accepted baseline documents were committed in `55e3cb92708a74423ad5235abf3d3a739d021859`.
-- M1: Resolved. `00_SCOPE.md` now explicitly states that v0.1.0-beta.1 does not include user-customized/free-form multi-agent workflow orchestration; only the fixed developer/reviewer/fix/re-review/user-acceptance loop is in scope.
-- M2: Resolved. `03_IMPLEMENTATION_MAP.md` now includes an independent "Release Candidate and Local End-to-End Verification" phase before Windows CI/release preparation.
-- M3: Resolved. `00_SCOPE.md` now includes protection of user uncommitted work before modification as a P0 requirement.
-- Minor CLI detection: Resolved in planning docs. `02_GAP_MATRIX.md` and `03_IMPLEMENTATION_MAP.md` now require explicit CLI states beyond `--version`.
-- Minor `active_cancel`: Resolved in audit docs. `01_BASELINE_AUDIT.md` now states that `active_cancel` remains a global single slot and is accepted only because concurrent execution is not supported in v0.1.0; TD-1 remains open.
+- M1: Resolved. `00_SCOPE09091050.md` now explicitly states that v0.1.0-beta.1 does not include user-customized/free-form multi-agent workflow orchestration; only the fixed developer/reviewer/fix/re-review/user-acceptance loop is in scope.
+- M2: Resolved. `03_IMPLEMENTATION_MAP09091050.md` now includes an independent "Release Candidate and Local End-to-End Verification" phase before Windows CI/release preparation.
+- M3: Resolved. `00_SCOPE09091050.md` now includes protection of user uncommitted work before modification as a P0 requirement.
+- Minor CLI detection: Resolved in planning docs. `02_GAP_MATRIX09091050.md` and `03_IMPLEMENTATION_MAP09091050.md` now require explicit CLI states beyond `--version`.
+- Minor `active_cancel`: Resolved in audit docs. `01_BASELINE_AUDIT09091050.md` now states that `active_cancel` remains a global single slot and is accepted only because concurrent execution is not supported in v0.1.0; TD-1 remains open.
 - Minor duplicate V3 spec: Resolved. The root duplicate matched the canonical product spec by SHA256 and was moved out after backup verification.
-- Minor rollback/milestone names: Resolved. `03_IMPLEMENTATION_MAP.md` now defines milestone names including `milestone/runtime-foundation`, `milestone/task-engine`, and `milestone/core-loop`.
-- Minor branch strategy: Resolved. `00_SCOPE.md` freezes Stage 0 on `feature/nova-technical-mvp`, forbids branch rewrite/switch/merge/rebase, and says any Phase 1 branch decision must start from the accepted Stage 0 baseline.
-- Minor remote risk: Recorded. `01_BASELINE_AUDIT.md` and this report record that no remote is configured.
+- Minor rollback/milestone names: Resolved. `03_IMPLEMENTATION_MAP09091050.md` now defines milestone names including `milestone/runtime-foundation`, `milestone/task-engine`, and `milestone/core-loop`.
+- Minor branch strategy: Resolved. `00_SCOPE09091050.md` freezes Stage 0 on `feature/nova-technical-mvp`, forbids branch rewrite/switch/merge/rebase, and says any Phase 1 branch decision must start from the accepted Stage 0 baseline.
+- Minor remote risk: Recorded. `01_BASELINE_AUDIT09091050.md` and this report record that no remote is configured.
 - Scope conflict old docs: Partially resolved. The two most directly conflicting historical product docs now have prominent historical-doc headers. Broader archival can be done later if desired.
 
 ## Backup Result
@@ -74,11 +74,11 @@ Accepted audit/review inputs committed:
 
 Stage 0 baseline/remediation docs committed:
 
-- `D:\nova\docs\release-v0.1.0\00_SCOPE.md`
-- `D:\nova\docs\release-v0.1.0\01_BASELINE_AUDIT.md`
-- `D:\nova\docs\release-v0.1.0\02_GAP_MATRIX.md`
-- `D:\nova\docs\release-v0.1.0\03_IMPLEMENTATION_MAP.md`
-- `D:\nova\docs\release-v0.1.0\STAGE0_REMEDIATION_REPORT.md`
+- `D:\nova\docs\release-v0.1.0\00_SCOPE09091050.md`
+- `D:\nova\docs\release-v0.1.0\01_BASELINE_AUDIT09091050.md`
+- `D:\nova\docs\release-v0.1.0\02_GAP_MATRIX09091050.md`
+- `D:\nova\docs\release-v0.1.0\03_IMPLEMENTATION_MAP09091050.md`
+- `D:\nova\docs\release-v0.1.0\STAGE0_REMEDIATION_REPORT09091050.md`
 
 Moved out of the repository after verified backup:
 
@@ -89,12 +89,12 @@ No unknown untracked material is intentionally left for the Stage 0 baseline aft
 
 ## Documents Corrected
 
-- `00_SCOPE.md`: added P0 user-work protection, fixed-loop non-goal, Stage 0 branch strategy, and remediation-era allowed operations.
-- `01_BASELINE_AUDIT.md`: clarified pre-remediation untracked state, documented `active_cancel`/TD-1 status, and recorded no-remote risk.
-- `02_GAP_MATRIX.md`: expanded CLI detection acceptance states beyond `--version`.
-- `03_IMPLEMENTATION_MAP.md`: added milestone names, expanded Phase 1 CLI tests, and inserted independent RC/local E2E verification before Windows release work.
-- Follow-up after Claude re-review: updated `01_BASELINE_AUDIT.md` so the old untracked-file blocker is explicitly marked as resolved Stage 0 baseline history, and tightened Phase 8 release-candidate verification in `03_IMPLEMENTATION_MAP.md` to require role-swapped workflow coverage, second-review-fails coverage, and fixed release-doc filenames.
-- Remaining follow-up after restart: tightened `03_IMPLEMENTATION_MAP.md` Phase 8 to explicitly cover user-rejection handling, GitHub manual installation guide verification, network-interruption handling, and the seven release document names required by the product plan.
+- `00_SCOPE09091050.md`: added P0 user-work protection, fixed-loop non-goal, Stage 0 branch strategy, and remediation-era allowed operations.
+- `01_BASELINE_AUDIT09091050.md`: clarified pre-remediation untracked state, documented `active_cancel`/TD-1 status, and recorded no-remote risk.
+- `02_GAP_MATRIX09091050.md`: expanded CLI detection acceptance states beyond `--version`.
+- `03_IMPLEMENTATION_MAP09091050.md`: added milestone names, expanded Phase 1 CLI tests, and inserted independent RC/local E2E verification before Windows release work.
+- Follow-up after Claude re-review: updated `01_BASELINE_AUDIT09091050.md` so the old untracked-file blocker is explicitly marked as resolved Stage 0 baseline history, and tightened Phase 8 release-candidate verification in `03_IMPLEMENTATION_MAP09091050.md` to require role-swapped workflow coverage, second-review-fails coverage, and fixed release-doc filenames.
+- Remaining follow-up after restart: tightened `03_IMPLEMENTATION_MAP09091050.md` Phase 8 to explicitly cover user-rejection handling, GitHub manual installation guide verification, network-interruption handling, and the seven release document names required by the product plan.
 - `docs\NOVA_PRD_MVP.md`: added historical-document notice pointing to current product baseline.
 - `docs\product\NOVA_V1_PRODUCT_DESIGN_PLAN.md`: added historical-document notice pointing to current product baseline.
 
@@ -111,7 +111,7 @@ No unknown untracked material is intentionally left for the Stage 0 baseline aft
 - Commit message: `chore: accept stage 0 remediation baseline`
 - Commit time: 2026-09-09 09:06:37 +0800
 - Post-baseline status at evidence time: clean working tree, empty staged diff, no untracked files.
-- Full post-baseline evidence is recorded in `D:\nova\docs\release-v0.1.0\STAGE0_BASELINE_COMMIT_EVIDENCE.md`.
+- Full post-baseline evidence is recorded in `D:\nova\docs\release-v0.1.0\STAGE0_BASELINE_COMMIT_EVIDENCE09091050.md`.
 
 ## Not Handled
 
@@ -126,11 +126,11 @@ No unknown untracked material is intentionally left for the Stage 0 baseline aft
 
 Claude should review at least:
 
-- `D:\nova\docs\release-v0.1.0\00_SCOPE.md`
-- `D:\nova\docs\release-v0.1.0\01_BASELINE_AUDIT.md`
-- `D:\nova\docs\release-v0.1.0\02_GAP_MATRIX.md`
-- `D:\nova\docs\release-v0.1.0\03_IMPLEMENTATION_MAP.md`
-- `D:\nova\docs\release-v0.1.0\STAGE0_REMEDIATION_REPORT.md`
+- `D:\nova\docs\release-v0.1.0\00_SCOPE09091050.md`
+- `D:\nova\docs\release-v0.1.0\01_BASELINE_AUDIT09091050.md`
+- `D:\nova\docs\release-v0.1.0\02_GAP_MATRIX09091050.md`
+- `D:\nova\docs\release-v0.1.0\03_IMPLEMENTATION_MAP09091050.md`
+- `D:\nova\docs\release-v0.1.0\STAGE0_REMEDIATION_REPORT09091050.md`
 - `D:\nova\docs\release-v0.1.0\CLAUDE_STAGE0_INDEPENDENT_REVIEW09090131.md`
 - `D:\nova\product\NOVA_V1_MVP_PRODUCT_DEVELOPMENT_SPEC_V3.md`
 - `D:\nova\product\NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md`

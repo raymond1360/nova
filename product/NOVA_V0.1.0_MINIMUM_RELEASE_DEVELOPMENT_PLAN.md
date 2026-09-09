@@ -181,10 +181,10 @@ Codex 必须先检查 `D:\nova` 当前分支、远程仓库、未提交修改、
 
 **交付物：**
 
-- `docs/release-v0.1.0/00_SCOPE.md`
-- `docs/release-v0.1.0/01_BASELINE_AUDIT.md`
-- `docs/release-v0.1.0/02_GAP_MATRIX.md`
-- `docs/release-v0.1.0/03_IMPLEMENTATION_MAP.md`
+- `docs/release-v0.1.0/00_SCOPE09091050.md`
+- `docs/release-v0.1.0/01_BASELINE_AUDIT09091050.md`
+- `docs/release-v0.1.0/02_GAP_MATRIX09091050.md`
+- `docs/release-v0.1.0/03_IMPLEMENTATION_MAP09091050.md`
 
 **Claude 审核门禁：** 审计是否遗漏、范围是否越界、测试和构建命令是否来自真实仓库。审计通过前不进入编码。
 
@@ -457,10 +457,10 @@ Codex 必须先检查 `D:\nova` 当前分支、远程仓库、未提交修改、
 - 输出中隐藏密钥、令牌和个人信息。
 
 请产出以下文档草案：
-- docs/release-v0.1.0/00_SCOPE.md
-- docs/release-v0.1.0/01_BASELINE_AUDIT.md
-- docs/release-v0.1.0/02_GAP_MATRIX.md
-- docs/release-v0.1.0/03_IMPLEMENTATION_MAP.md
+- docs/release-v0.1.0/00_SCOPE09091050.md
+- docs/release-v0.1.0/01_BASELINE_AUDIT09091050.md
+- docs/release-v0.1.0/02_GAP_MATRIX09091050.md
+- docs/release-v0.1.0/03_IMPLEMENTATION_MAP09091050.md
 
 内容必须包括：
 - 当前真实技术栈、目录结构、已经实现的功能；
@@ -489,10 +489,10 @@ Codex 必须先检查 `D:\nova` 当前分支、远程仓库、未提交修改、
 请阅读：
 - 仓库规则、README、构建和测试配置；
 - docs/product/ 下两份产品与开发计划；
-- docs/release-v0.1.0/00_SCOPE.md；
-- 01_BASELINE_AUDIT.md；
-- 02_GAP_MATRIX.md；
-- 03_IMPLEMENTATION_MAP.md；
+- docs/release-v0.1.0/00_SCOPE09091050.md；
+- 01_BASELINE_AUDIT09091050.md；
+- 02_GAP_MATRIX09091050.md；
+- 03_IMPLEMENTATION_MAP09091050.md；
 - 当前 git status 和必要的源代码/配置。
 
 请独立验证：

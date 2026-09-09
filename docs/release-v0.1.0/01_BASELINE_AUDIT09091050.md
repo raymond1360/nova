@@ -38,7 +38,7 @@ Untracked material includes:
 - `D:\nova\product\NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md`
 - `D:\nova\product\NOVA_V1_MVP_PRODUCT_DEVELOPMENT_SPEC_V3.md`
 
-Risk: formal development should not begin until the user decides whether these untracked files are intended inputs to preserve, files to commit, or files to move out of the repo. Stage 0 remediation classifies this material in `D:\nova\docs\release-v0.1.0\STAGE0_REMEDIATION_REPORT.md`.
+Risk: formal development should not begin until the user decides whether these untracked files are intended inputs to preserve, files to commit, or files to move out of the repo. Stage 0 remediation classifies this material in `D:\nova\docs\release-v0.1.0\STAGE0_REMEDIATION_REPORT09091050.md`.
 
 ## Repository Structure
 
@@ -249,7 +249,7 @@ Blocker:
 
 Resolved Stage 0 blocker:
 
-- Pre-remediation working tree contained 241 untracked files, including current product docs and audit reports. This was resolved by the Stage 0 remediation baseline: accepted product/audit documents were committed, unrelated third-party or duplicate material was backed up and moved out after verification, and the post-baseline working tree was recorded as clean in `D:\nova\docs\release-v0.1.0\STAGE0_BASELINE_COMMIT_EVIDENCE.md`.
+- Pre-remediation working tree contained 241 untracked files, including current product docs and audit reports. This was resolved by the Stage 0 remediation baseline: accepted product/audit documents were committed, unrelated third-party or duplicate material was backed up and moved out after verification, and the post-baseline working tree was recorded as clean in `D:\nova\docs\release-v0.1.0\STAGE0_BASELINE_COMMIT_EVIDENCE09091050.md`.
 
 Major:
 

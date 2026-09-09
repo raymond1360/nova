@@ -3,7 +3,7 @@
 审核人：Claude Code（独立只读审核）
 生成时间：2026-09-09
 仓库：`D:\nova`
-审核对象：Codex 产出的阶段0只读基线审计与范围冻结（`docs/release-v0.1.0/00_SCOPE.md`、`01_BASELINE_AUDIT.md`、`02_GAP_MATRIX.md`、`03_IMPLEMENTATION_MAP.md`）
+审核对象：Codex 产出的阶段0只读基线审计与范围冻结（`docs/release-v0.1.0/00_SCOPE09091050.md`、`01_BASELINE_AUDIT09091050.md`、`02_GAP_MATRIX09091050.md`、`03_IMPLEMENTATION_MAP09091050.md`）
 工作方式：全程只读。本报告未修改任何应用代码、配置、测试或既有审计文档；仅新增本文件。
 
 ---
@@ -20,10 +20,10 @@
 - `D:\nova\docs\product\NOVA_V1_PRODUCT_DESIGN_PLAN.md`（旧文档，供对照）
 
 阶段0审计文档（全文）：
-- `docs/release-v0.1.0/00_SCOPE.md`
-- `docs/release-v0.1.0/01_BASELINE_AUDIT.md`
-- `docs/release-v0.1.0/02_GAP_MATRIX.md`
-- `docs/release-v0.1.0/03_IMPLEMENTATION_MAP.md`
+- `docs/release-v0.1.0/00_SCOPE09091050.md`
+- `docs/release-v0.1.0/01_BASELINE_AUDIT09091050.md`
+- `docs/release-v0.1.0/02_GAP_MATRIX09091050.md`
+- `docs/release-v0.1.0/03_IMPLEMENTATION_MAP09091050.md`
 
 配置/规则类：
 - 根 `package.json`、`apps/desktop/package.json`、`apps/desktop/src-tauri/Cargo.toml`、`apps/desktop/src-tauri/tauri.conf.json`、`apps/desktop/src-tauri/capabilities/default.json`、`.gitignore`（master 与 HEAD 两版）
@@ -44,7 +44,7 @@ Git 元数据：`git status --porcelain=v2 --untracked-files=all`、`git log --a
 
 ## 三、Git与版本基线核对
 
-独立执行结果如下，与 `01_BASELINE_AUDIT.md` 声称的数值逐项比对：
+独立执行结果如下，与 `01_BASELINE_AUDIT09091050.md` 声称的数值逐项比对：
 
 | 项目 | Codex 审计声称 | 独立核实结果 | 结论 |
 |---|---|---|---|
@@ -62,14 +62,14 @@ Git 元数据：`git status --porcelain=v2 --untracked-files=all`、`git log --a
 
 ## 四、四份审计文档逐份结论
 
-### 4.1 `00_SCOPE.md`
+### 4.1 `00_SCOPE09091050.md`
 - 文档冲突优先级声明（仓库规则 > V3 > 最小上线计划 > 旧文档）与用户任务书要求的优先级完全一致，且核实仓库确实不存在 `AGENTS.md`/`CLAUDE.md`/`README.md`（`.cloude` 内的同名文件属于第三方 vendored 材料，不构成项目规则，判断合理）。
 - P0 范围、P1/延后范围、明确不做（Non-Goals）三部分与 `NOVA_V1_MVP_PRODUCT_DEVELOPMENT_SPEC_V3.md`、`NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md` 独立比对后，**未发现任何 P1/非目标功能被违规塞入 P0**（子任务逐条核对，见第五节）。
 - 但存在**欠缺范围（under-scoping）**问题：非目标清单遗漏 V3 明确禁止的"多 Agent 自由编排/用户自定义工作流"（Major，见 M1）；P0 清单未把"修改前保护用户已有工作"列为独立条目（Major，见 M3）。
 - "Stop/Risk Condition" 段落如实披露未跟踪文件问题，未淡化。
 - 结论：**基本准确，但范围冻结存在实质性遗漏，需修正后才能作为后续阶段的权威基线。**
 
-### 4.2 `01_BASELINE_AUDIT.md`
+### 4.2 `01_BASELINE_AUDIT09091050.md`
 - Git 基线部分：见第三节，核实无误。
 - 技术基线部分：Vue/Vite/TypeScript/Pinia/Vitest/Tauri/Rust/rusqlite/reqwest/tokio 版本描述与 `package.json`、`Cargo.toml` 实际内容逐一核对**完全一致**。
 - 代码证据引用（`api.rs:24/138/141/185`、`commands.rs:298/309/317`、`nova.ts:123/129`、`db.rs:38/120`、`lib.rs:46`、`security.rs:30`、`security.ts:8`、`validation.rs:6/16/35/45/67`、`tauri.conf.json:23/27`、`capabilities/default.json:6`）**共14项独立核对，全部与真实代码内容相符**，仅个别行号指向对象小节而非精确字段（如 `tauri.conf.json:27` 指向 `bundle` 对象起始括号而非 `active` 字段本体），不影响结论正确性。
@@ -80,14 +80,14 @@ Git 元数据：`git status --porcelain=v2 --untracked-files=all`、`git log --a
 - "Major Baseline Risks"分级基本合理，但漏了本审核新发现的两处 Major（见 M1、M2）。
 - 结论：**代码层面证据扎实、诚实、可复核，是本次四份文档中质量最高的一份**；历史问题闭环判断基本准确，仅有 F5 显式状态遗漏的完整性问题。
 
-### 4.3 `02_GAP_MATRIX.md`
+### 4.3 `02_GAP_MATRIX09091050.md`
 - 47行需求-状态矩阵覆盆盖了任务书列出的全部重点检查项（环境检测、三入口、需求确认、修改前保护、Codex开发、Claude只读审核、一次修复二次审核、角色互换、状态机、中断恢复、时间线、证据中心、Markdown报告、用户确认、中英文、Windows构建）。
 - 独立比对 V3 产品规格文档后，**未发现越权把 V1 明确禁止的功能（自动部署、私有仓库授权、无限返工、模型市场等）列入"应做"范围**——所有条目要么标注 Missing/Blocker 需要在后续阶段开发，要么明确是"P0应做但目前缺失"，没有一条属于产品文档非目标清单内容。
 - 分类基本准确区分了"Complete/Partial/Missing/Conflict/Unverified"五态，且 Complete 状态均限定在"现有 SDKMAX 聊天 MVP"范围内，未被误判为"V3 需求已完成"，判断严谨（例如"SSE/stream integrity"标注为"Complete for current chat MVP"而非笼统"Complete"，正确区分了现有能力与V3新需求的边界）。
 - 缺口：CLI 登录态检测（而非仅"是否安装"）未作为独立行列出，混在"Git/Codex/Claude CLI detection"一行内，存在被简化实现满足文字但达不到 V3 §14.2 登录/额度/权限/进程错误区分要求的风险。列为 Minor（m1）。
 - 结论：**矩阵内容真实、无越界、无遗漏历史 Blocker 级问题，风险分级（Blocker/Major/Minor）基本恰当**，仅登录态检测颗粒度可以更细。
 
-### 4.4 `03_IMPLEMENTATION_MAP.md`
+### 4.4 `03_IMPLEMENTATION_MAP09091050.md`
 - 声明"基于当前代码而非机械照抄产品计划"——核实属实：Phase 1-6 的"Likely affected files"均为仓库中真实存在的文件路径（已逐一核对存在性），且工作包划分（Runtime Foundation → Task State Machine → Local Project Core Loop → Timeline/Evidence → Create Product → GitHub Import → i18n → CI/Release）在语义上是把《最小上线版本指定开发计划》第6节的阶段0-8合理拆分/重排，并非机械复制中文原文，而是结合当前代码现状重新组织了阶段3与阶段5的实施顺序（先做本地项目闭环，再做模板创建和GitHub导入），这一调整有其工程合理性。
 - 每个 Phase 均标注 Local tests、Claude review gate、Git boundary（单一提交）、Rollback point、Prerequisites、Forbidden expansion，结构完整，符合"可独立开发、测试、提交、审核、回滚"的要求。
 - 发现结构性遗漏（Major，见 M2）：**产品计划第6节"阶段7：发布候选版、本地端到端验证"在本文档中没有对应的独立阶段**。该阶段要求的10项强制端到端场景（全新安装、模板创建闭环、保留未提交修改打开项目、GitHub导入不自动执行脚本、角色互换、首审失败-修复-复审通过、复审仍失败正确停止、执行中重启恢复、CLI缺失/未登录/网络中断/取消等异常路径）以及必须产出的6份发布文档（`04_TEST_PLAN_AND_RESULTS.md`、`05_CLAUDE_FINAL_REVIEW.md`、`06_RELEASE_CHECKLIST.md`、`07_ROLLBACK_PLAN.md`、`08_KNOWN_LIMITATIONS.md`、`CHANGELOG.md`、`PRIVACY.md`）在 Codex 的 Phase 8（"Windows Build, CI, and Release Preparation"）中均未被提及，Phase 8 只列出了 npm/Rust/Tauri 构建检查与安装包/SHA256验证，未覆盖端到端场景清单与文档清单。若不修正，后续团队有可能直接从 Phase 7（i18n）跳到 GitHub Actions 接入，漏掉强制的端到端回归与发布文档产出。
@@ -105,7 +105,7 @@ Git 元数据：`git status --porcelain=v2 --untracked-files=all`、`git log --a
 | 打开本地项目 | 覆盖（Gap Matrix + Phase 3） |
 | GitHub公开仓库导入 | 覆盖（Gap Matrix + Phase 6） |
 | 需求确认 | 覆盖，但"禁止影响的原有功能"字段未被点名（次要，未单列） |
-| 修改前保护 | Gap Matrix 中标注 Blocker，但未进入 00_SCOPE.md 的 P0 正式清单（M3） |
+| 修改前保护 | Gap Matrix 中标注 Blocker，但未进入 00_SCOPE09091050.md 的 P0 正式清单（M3） |
 | Codex开发 | 覆盖（Blocker，Phase 1&3） |
 | Claude只读审核 | 覆盖（Blocker，Phase 1&3，且明确"技术强制只读，非仅靠提示词"） |
 | 一次修复+二次审核 | 覆盖，且正确限定为"仅一次"，未被过度扩大为多轮 |
@@ -131,10 +131,10 @@ Git 元数据：`git status --porcelain=v2 --untracked-files=all`、`git log --a
 | F2 | Medium | 取消检查非抢占式，Stop 不能立即生效 | **已修复**，`api.rs:185` 起用 `tokio::select! { biased; ... }`，测试验证500ms内可取消 |
 | F3 | Medium | 生产环境 CSP 显式为 null | **已修复**，`tauri.conf.json:23-24` 已配置严格 CSP |
 | F4 | Low | 构建/测试产物未记录对应 commit | **已修复**，`scripts/verify-build.ps1` + `test-results/build-info.txt` |
-| F5 | Low（设计层面） | `active_cancel` 全局单槽位，若未来允许并发发送存在架构风险 | **仍未修复**，`lib.rs` 中架构未变，属有意存档为技术债（`NOVA_TECHNICAL_DEBT.md` TD-1），本身合理，但 `01_BASELINE_AUDIT.md` 未显式复述这一状态（m2） |
+| F5 | Low（设计层面） | `active_cancel` 全局单槽位，若未来允许并发发送存在架构风险 | **仍未修复**，`lib.rs` 中架构未变，属有意存档为技术债（`NOVA_TECHNICAL_DEBT.md` TD-1），本身合理，但 `01_BASELINE_AUDIT09091050.md` 未显式复述这一状态（m2） |
 | R1 | Low-Medium | 前端并发提交存在竞态窗口（`sending`标记设置晚于`await`） | **已修复**，`nova.ts:114-129` 已将守卫前移，`nova.test.ts` 有专门测试 |
 | R2-R5 | Low | 文档/测试补充类 | R3、R4 已修复（有专门测试）；R2、R5 非缺陷，属文档/风格性事项，未逐条复述但不影响结论 |
-| R6 | 非代码 | 真实 SDKMAX 手动联调未验证 | **仍未验证**，`01_BASELINE_AUDIT.md` 正确标注为外部人工验收环节，未被误判为已完成 |
+| R6 | 非代码 | 真实 SDKMAX 手动联调未验证 | **仍未验证**，`01_BASELINE_AUDIT09091050.md` 正确标注为外部人工验收环节，未被误判为已完成 |
 
 **未发现历史 Blocker 级问题被遗漏或被谎报为已修复。** 唯一 High 级问题（F1）修复证据链完整（代码+测试+当前HEAD可复现）。仅 F5 存在"应显式复述其未修复状态"的文档完整性瑕疵。
 
@@ -143,7 +143,7 @@ Git 元数据：`git status --porcelain=v2 --untracked-files=all`、`git log --a
 ### Blocker（进入阶段1前必须解决）
 
 **B1. 工作区存在大量未提交/未跟踪内容，阶段0审计文档本身也在其中，尚无任何决定或基线提交。**
-- 对应文件：整个 `D:\nova` 工作区；`docs/release-v0.1.0/00_SCOPE.md`（Stop/Risk Condition 段）、`01_BASELINE_AUDIT.md`（Git Baseline 段）、`03_IMPLEMENTATION_MAP.md`（Phase 1 Prerequisites）均已如实披露此问题。
+- 对应文件：整个 `D:\nova` 工作区；`docs/release-v0.1.0/00_SCOPE09091050.md`（Stop/Risk Condition 段）、`01_BASELINE_AUDIT09091050.md`（Git Baseline 段）、`03_IMPLEMENTATION_MAP09091050.md`（Phase 1 Prerequisites）均已如实披露此问题。
 - 真实证据：`git status --porcelain=v2 --untracked-files=all` 独立执行确认，未跟踪内容包括：`product/`、`docs/product/`、`docs/release-v0.1.0/`（本次审计的四份交付物）、两份历史 Claude 审核报告、根目录重复的 V3 spec、`nova-ui-design.html`、`docs/chatgpt.txt`、以及与项目无关的 `.cloude/` 第三方 vendored 目录（内含完整的 claude-code-main 仓库镜像和一个命名为"新建文件夹"的空目录）。
 - 影响：产品基线文档、审计交付物、历史审核证据均无 Git 版本保护，存在被误删、误改、丢失且无法追溯的风险；违反最小上线计划 §4.2"不允许在工作区有来源不明的未提交修改时开始批量开发"的强制规则；也违反 §10 第一工作日执行顺序第6步"Claude复审通过后，冻结v0.1.0范围并建立首个基线提交"尚未执行。
 - 修改要求：由用户对每一类未跟踪内容做出明确决定（保留并提交 / 移出仓库 / 删除），尤其 `.cloude/` 建议整体移出仓库（与项目无关）；决定后建立唯一的"接受基线"提交，且该提交范围应仅限文档与配置，不得混入应用代码变更。
@@ -151,45 +151,45 @@ Git 元数据：`git status --porcelain=v2 --untracked-files=all`、`git log --a
 
 ### Major（审计结论存在重要错误或遗漏，必须修正文档）
 
-**M1. `00_SCOPE.md` 的 Explicit Non-Goals 遗漏 V3 明确禁止的"自由多Agent编排/用户自定义工作流"。**
-- 对应文件：`docs/release-v0.1.0/00_SCOPE.md`（Explicit Non-Goals 段）
-- 真实证据：`NOVA_V1_MVP_PRODUCT_DEVELOPMENT_SPEC_V3.md` §4.2（"Nova V1不允许用户设计任意工作流"）、§5.3（"多Agent自由编排"列为V1禁止扩展项）；`00_SCOPE.md` 当前非目标清单11条中无对应表述。
+**M1. `00_SCOPE09091050.md` 的 Explicit Non-Goals 遗漏 V3 明确禁止的"自由多Agent编排/用户自定义工作流"。**
+- 对应文件：`docs/release-v0.1.0/00_SCOPE09091050.md`（Explicit Non-Goals 段）
+- 真实证据：`NOVA_V1_MVP_PRODUCT_DEVELOPMENT_SPEC_V3.md` §4.2（"Nova V1不允许用户设计任意工作流"）、§5.3（"多Agent自由编排"列为V1禁止扩展项）；`00_SCOPE09091050.md` 当前非目标清单11条中无对应表述。
 - 影响：这是 V3 明确命名的产品边界原则（"固定闭环优先"），而非普通功能项；若不显式登记，后续阶段可能在未违反文字条款的情况下引入自定义工作流/自由编排能力，造成范围蔓延。
 - 修改要求：在 Explicit Non-Goals 中新增一条，明确写出"不支持用户自定义/自由编排的多Agent工作流，仅支持固定的开发-审核闭环"。
 - 通过条件：Non-Goals 清单包含该条目，且与 V3 §4.2/§5.3 表述一致。
 
-**M2. `03_IMPLEMENTATION_MAP.md` 缺少对应产品计划"阶段7：发布候选版/本地端到端验证"的独立工作阶段。**
-- 对应文件：`docs/release-v0.1.0/03_IMPLEMENTATION_MAP.md`（Phase 7、Phase 8 之间）
-- 真实证据：`NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md` 第6节"阶段7"列出10项强制端到端场景与7份发布材料（`04_TEST_PLAN_AND_RESULTS.md`至`08_KNOWN_LIMITATIONS.md`、`CHANGELOG.md`、`PRIVACY.md`）；`03_IMPLEMENTATION_MAP.md` 的 Phase 8（"Windows Build, CI, and Release Preparation"）仅列 npm/Rust/Tauri 构建检查与安装包/SHA256验证，未提及上述场景或文档。
+**M2. `03_IMPLEMENTATION_MAP09091050.md` 缺少对应产品计划"阶段7：发布候选版/本地端到端验证"的独立工作阶段。**
+- 对应文件：`docs/release-v0.1.0/03_IMPLEMENTATION_MAP09091050.md`（Phase 7、Phase 8 之间）
+- 真实证据：`NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md` 第6节"阶段7"列出10项强制端到端场景与7份发布材料（`04_TEST_PLAN_AND_RESULTS.md`至`08_KNOWN_LIMITATIONS.md`、`CHANGELOG.md`、`PRIVACY.md`）；`03_IMPLEMENTATION_MAP09091050.md` 的 Phase 8（"Windows Build, CI, and Release Preparation"）仅列 npm/Rust/Tauri 构建检查与安装包/SHA256验证，未提及上述场景或文档。
 - 影响：若不修正，后续团队可能在完成 i18n（Phase 7 in Codex 编号）后直接进入 CI/发布接入（Phase 8），跳过强制的端到端回归测试与发布文档产出，违反发布阻断清单第10条（"Blocker或Major级Claude审核问题未关闭"关联的证据链缺失风险）。
 - 修改要求：在 Phase 7（i18n）与 Phase 8（CI/Release）之间新增一个独立阶段（或在 Phase 8 中显式并入并列出全部10项场景与7份文档要求），与产品计划阶段7一一对应。
-- 通过条件：`03_IMPLEMENTATION_MAP.md` 中存在可对应到产品计划阶段7全部10项场景与全部7份文档产出的阶段定义。
+- 通过条件：`03_IMPLEMENTATION_MAP09091050.md` 中存在可对应到产品计划阶段7全部10项场景与全部7份文档产出的阶段定义。
 
-**M3. `00_SCOPE.md` 的 P0 Scope 未把"修改前保护用户已有工作"列为独立条目。**
-- 对应文件：`docs/release-v0.1.0/00_SCOPE.md`（P0 Scope 段）；对照 `docs/release-v0.1.0/02_GAP_MATRIX.md` 中"Modification-before-protection/user work guard"一行（已标注 Blocker）
-- 真实证据：`NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md` §8 发布阻断清单明确"用户既有未提交修改被覆盖或丢失"可单独阻断发布；§4.2 明确禁止"在工作区有来源不明的未提交修改时开始批量开发"。该能力在 Gap Matrix 中已被识别为 Blocker，但未作为 P0 Scope 的独立一行出现在 00_SCOPE.md 中，只隐含在"打开本地项目"条目内。
-- 影响：00_SCOPE.md 是范围冻结的权威文档；若该项仅存在于 Gap Matrix 而不在 Scope Freeze 正式清单中，未来范围核对/验收时容易被忽略。
+**M3. `00_SCOPE09091050.md` 的 P0 Scope 未把"修改前保护用户已有工作"列为独立条目。**
+- 对应文件：`docs/release-v0.1.0/00_SCOPE09091050.md`（P0 Scope 段）；对照 `docs/release-v0.1.0/02_GAP_MATRIX09091050.md` 中"Modification-before-protection/user work guard"一行（已标注 Blocker）
+- 真实证据：`NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md` §8 发布阻断清单明确"用户既有未提交修改被覆盖或丢失"可单独阻断发布；§4.2 明确禁止"在工作区有来源不明的未提交修改时开始批量开发"。该能力在 Gap Matrix 中已被识别为 Blocker，但未作为 P0 Scope 的独立一行出现在 00_SCOPE09091050.md 中，只隐含在"打开本地项目"条目内。
+- 影响：00_SCOPE09091050.md 是范围冻结的权威文档；若该项仅存在于 Gap Matrix 而不在 Scope Freeze 正式清单中，未来范围核对/验收时容易被忽略。
 - 修改要求：在 P0 Scope 中新增独立一行，明确表述为"任务开始前检测并保护用户项目的未提交修改，脏工作区需用户确认后才可继续"。
 - 通过条件：P0 Scope 清单包含该独立条目。
 
 ### Minor（不阻止进入阶段1，但应登记修正）
 
-- **m1.** CLI 环境检测未把"已安装但未登录/额度异常/权限异常"作为独立能力点名（`00_SCOPE.md` P0 Scope、`02_GAP_MATRIX.md` "Git/Codex/Claude CLI detection"一行），仅笼统写"environment checks"。建议在 Phase 1 验收标准中显式列出登录态区分。
-- **m2.** `01_BASELINE_AUDIT.md`"Historical Claude Audit Status"未显式复述 F5（`active_cancel`全局单槽位）的"仍未修复，已存档为技术债"状态，也未逐条列出 Final 复审的 R2-R5。建议补一行明确状态，避免读者误以为首次审核问题已全部闭环。
+- **m1.** CLI 环境检测未把"已安装但未登录/额度异常/权限异常"作为独立能力点名（`00_SCOPE09091050.md` P0 Scope、`02_GAP_MATRIX09091050.md` "Git/Codex/Claude CLI detection"一行），仅笼统写"environment checks"。建议在 Phase 1 验收标准中显式列出登录态区分。
+- **m2.** `01_BASELINE_AUDIT09091050.md`"Historical Claude Audit Status"未显式复述 F5（`active_cancel`全局单槽位）的"仍未修复，已存档为技术债"状态，也未逐条列出 Final 复审的 R2-R5。建议补一行明确状态，避免读者误以为首次审核问题已全部闭环。
 - **m3.** 根目录存在与 `product\NOVA_V1_MVP_PRODUCT_DEVELOPMENT_SPEC_V3.md` 字节级相同的重复文件 `D:\nova\NOVA_V1_MVP_PRODUCT_DEVELOPMENT_SPEC_V3.md`，审计未提及需清理。建议在建立基线提交前删除根目录冗余副本，只保留 `product\` 下的规范位置。
-- **m4.** `03_IMPLEMENTATION_MAP.md` 各阶段 Rollback point 使用"回退该提交"代替产品计划规定的 `milestone/*` 标签命名（如 `milestone/runtime-foundation`），未说明为何偏离约定命名法。建议统一采用产品计划的里程碑标签命名，或显式说明简化理由。
+- **m4.** `03_IMPLEMENTATION_MAP09091050.md` 各阶段 Rollback point 使用"回退该提交"代替产品计划规定的 `milestone/*` 标签命名（如 `milestone/runtime-foundation`），未说明为何偏离约定命名法。建议统一采用产品计划的里程碑标签命名，或显式说明简化理由。
 - **m5.** 未记录阶段1及后续开发将沿用当前 `feature/nova-technical-mvp` 分支，还是依据产品计划 §5.2 新开 `feature/v0.1.0-mvp`。产品计划要求"若仓库已有分支规范，以现有规范为准"，但这一判断结论未被写入任何审计文档。建议在基线提交时一并写明分支策略决定。
 - **m6.** 仓库无任何 Git 远程仓库配置，全部历史仅存在本机，无异地备份。建议登记为运营风险，在阶段8接入 GitHub 远程前妥善处理。
 
 ### Suggestion（后续优化建议，不得扩大当前范围）
 
-- **s1.** 尽快按 `03_IMPLEMENTATION_MAP.md` 自身建议，把"接受的产品/审计文档"作为阶段1第一个提交的前置步骤单独提交，不与运行骨架代码提交混合。
+- **s1.** 尽快按 `03_IMPLEMENTATION_MAP09091050.md` 自身建议，把"接受的产品/审计文档"作为阶段1第一个提交的前置步骤单独提交，不与运行骨架代码提交混合。
 - **s2.** 将 `docs\NOVA_PRD_MVP.md`、`docs\product\NOVA_V1_PRODUCT_DESIGN_PLAN.md` 等与 V3 冲突的旧文档做归档标注（如移入 `docs/archive/`），避免未来被误当作当前范围引用。
 - **s3.** `.cloude\` 目录（含完整 claude-code-main 仓库镜像、zip 包、名为"新建文件夹"的空目录）与项目无关，建议整体移出仓库而非仅"接受为未跟踪噪音"。
 
 ## 八、阶段1建议边界
 
-在 Blocker B1 解决、Major M1-M3 修正后，阶段1应严格限定为 `03_IMPLEMENTATION_MAP.md` 中 Phase 1 的范围，本次审核确认该范围本身定义清楚、可独立提交回滚：
+在 Blocker B1 解决、Major M1-M3 修正后，阶段1应严格限定为 `03_IMPLEMENTATION_MAP09091050.md` 中 Phase 1 的范围，本次审核确认该范围本身定义清楚、可独立提交回滚：
 
 **可以保留的现有实现**（无需重做）：
 - Tauri 2 + Vue 3 + TypeScript + Rust + SQLite 应用骨架
@@ -206,9 +206,9 @@ Git 元数据：`git status --porcelain=v2 --untracked-files=all`、`git log --a
 
 **不应该重复开发的内容**：
 - 不应重新实现流式请求/取消/脱敏机制，Phase 1 的进程执行器应复用 `security.rs` 的脱敏模式与 `validation.rs` 的白名单校验模式，而非另起一套。
-- 不应在阶段1提前实现 Codex/Claude CLI 的任务级调用、GitHub 导入或项目创建模板（`03_IMPLEMENTATION_MAP.md` 已在"Forbidden expansion"中正确排除，本审核确认该边界合理，应严格执行）。
+- 不应在阶段1提前实现 Codex/Claude CLI 的任务级调用、GitHub 导入或项目创建模板（`03_IMPLEMENTATION_MAP09091050.md` 已在"Forbidden expansion"中正确排除，本审核确认该边界合理，应严格执行）。
 
-**阶段1准确的开发边界**（与 `03_IMPLEMENTATION_MAP.md` Phase 1 一致，本审核确认无需扩大或缩小）：
+**阶段1准确的开发边界**（与 `03_IMPLEMENTATION_MAP09091050.md` Phase 1 一致，本审核确认无需扩大或缩小）：
 - Git、Codex CLI、Claude Code CLI 可用性与登录态检测（须包含 m1 指出的登录/额度/权限状态区分，而不仅是"已安装"）。
 - 统一进程/命令执行边界：超时、取消、退出码、stdout/stderr分流、敏感信息脱敏、禁止字符串拼接命令。
 - 路径含空格/中文、命令注入尝试等安全测试。
@@ -225,15 +225,15 @@ Git 元数据：`git status --porcelain=v2 --untracked-files=all`、`git log --a
 ## 十、Codex文档修正清单（不通过时必须完成）
 
 1. 解决 B1：获得用户对全部未跟踪内容的明确决定，建立唯一的"接受基线"提交（仅含文档/配置，不含应用代码）。
-2. 修正 `00_SCOPE.md`：
+2. 修正 `00_SCOPE09091050.md`：
    - 在 Explicit Non-Goals 增加"不支持用户自定义/自由编排的多Agent工作流"（对应 M1）。
    - 在 P0 Scope 增加独立条目"任务开始前检测并保护用户项目未提交修改"（对应 M3）。
    - 补充说明阶段1及后续开发沿用的 Git 分支策略（对应 m5）。
-3. 修正 `03_IMPLEMENTATION_MAP.md`：
+3. 修正 `03_IMPLEMENTATION_MAP09091050.md`：
    - 新增或扩展一个阶段，完整对应产品计划阶段7的10项端到端场景与7份发布文档要求（对应 M2）。
    - 统一 Rollback point 命名为产品计划的 `milestone/*` 标签规范，或显式说明简化理由（对应 m4）。
-4. 修正 `01_BASELINE_AUDIT.md`："Historical Claude Audit Status"补充 F5 的"仍未修复，已存档为技术债 TD-1"显式状态（对应 m2）。
-5. 修正 `02_GAP_MATRIX.md`："Git/Codex/Claude CLI detection"一行细化登录/额度/权限状态检测要求，不仅是"是否安装"（对应 m1）。
+4. 修正 `01_BASELINE_AUDIT09091050.md`："Historical Claude Audit Status"补充 F5 的"仍未修复，已存档为技术债 TD-1"显式状态（对应 m2）。
+5. 修正 `02_GAP_MATRIX09091050.md`："Git/Codex/Claude CLI detection"一行细化登录/额度/权限状态检测要求，不仅是"是否安装"（对应 m1）。
 6. 清理根目录重复的 `NOVA_V1_MVP_PRODUCT_DEVELOPMENT_SPEC_V3.md`（对应 m3），并处理与项目无关的 `.cloude\` 目录（对应 s3）。
 
 以上6项全部完成并再次提交独立复审、确认无新增 Blocker/Major 后，方可进入阶段1。

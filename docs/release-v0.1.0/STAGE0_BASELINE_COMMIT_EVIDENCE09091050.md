@@ -18,12 +18,12 @@ Repository: `D:\nova`
 - `docs/NOVA_PRD_MVP.md`
 - `docs/chatgpt.txt`
 - `docs/product/NOVA_V1_PRODUCT_DESIGN_PLAN.md`
-- `docs/release-v0.1.0/00_SCOPE.md`
-- `docs/release-v0.1.0/01_BASELINE_AUDIT.md`
-- `docs/release-v0.1.0/02_GAP_MATRIX.md`
-- `docs/release-v0.1.0/03_IMPLEMENTATION_MAP.md`
+- `docs/release-v0.1.0/00_SCOPE09091050.md`
+- `docs/release-v0.1.0/01_BASELINE_AUDIT09091050.md`
+- `docs/release-v0.1.0/02_GAP_MATRIX09091050.md`
+- `docs/release-v0.1.0/03_IMPLEMENTATION_MAP09091050.md`
 - `docs/release-v0.1.0/CLAUDE_STAGE0_INDEPENDENT_REVIEW09090131.md`
-- `docs/release-v0.1.0/STAGE0_REMEDIATION_REPORT.md`
+- `docs/release-v0.1.0/STAGE0_REMEDIATION_REPORT09091050.md`
 - `nova-ui-design.html`
 - `product/NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md`
 - `product/NOVA_V1_MVP_PRODUCT_DEVELOPMENT_SPEC_V3.md`

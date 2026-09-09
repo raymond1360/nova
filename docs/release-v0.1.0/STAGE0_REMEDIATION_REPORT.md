@@ -4,6 +4,7 @@ Generated: 2026-09-09
 Repository: `D:\nova`
 Branch: `feature/nova-technical-mvp`
 Pre-remediation HEAD: `e1e967548621b78c2b9a78e2e08b43159c3040be`
+Stage 0 baseline commit: `55e3cb92708a74423ad5235abf3d3a739d021859`
 
 ## Conclusion
 
@@ -13,7 +14,7 @@ Phase 1 remains blocked until Claude re-reviews the Stage 0 baseline and returns
 
 ## Finding Closure
 
-- B1: Resolved for re-review. Untracked material was classified, unrelated `.cloude` material was backed up and moved out of `D:\nova`, the duplicate root V3 spec was verified byte-identical by SHA256 before being moved out, and accepted baseline documents are ready for a single Stage 0 commit.
+- B1: Resolved for re-review. Untracked material was classified, unrelated `.cloude` material was backed up and moved out of `D:\nova`, the duplicate root V3 spec was verified byte-identical by SHA256 before being moved out, and the accepted baseline documents were committed in `55e3cb92708a74423ad5235abf3d3a739d021859`.
 - M1: Resolved. `00_SCOPE.md` now explicitly states that v0.1.0-beta.1 does not include user-customized/free-form multi-agent workflow orchestration; only the fixed developer/reviewer/fix/re-review/user-acceptance loop is in scope.
 - M2: Resolved. `03_IMPLEMENTATION_MAP.md` now includes an independent "Release Candidate and Local End-to-End Verification" phase before Windows CI/release preparation.
 - M3: Resolved. `00_SCOPE.md` now includes protection of user uncommitted work before modification as a P0 requirement.
@@ -57,7 +58,7 @@ Restore method:
 
 ## Classification
 
-Accepted baseline/product inputs to commit:
+Accepted baseline/product inputs committed:
 
 - `D:\nova\product\NOVA_V1_MVP_PRODUCT_DEVELOPMENT_SPEC_V3.md`
 - `D:\nova\product\NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md`
@@ -65,13 +66,13 @@ Accepted baseline/product inputs to commit:
 - `D:\nova\docs\chatgpt.txt` as historical product discussion/input
 - `D:\nova\nova-ui-design.html` as historical UI/design resource
 
-Accepted audit/review inputs to commit:
+Accepted audit/review inputs committed:
 
 - `D:\nova\audit\CLAUDE_REVIEW_NOVA_TECHNICAL_MVP.md`
 - `D:\nova\audit\CLAUDE_REVIEW_NOVA_TECHNICAL_MVP_FINAL.md`
 - `D:\nova\docs\release-v0.1.0\CLAUDE_STAGE0_INDEPENDENT_REVIEW09090131.md`
 
-Stage 0 baseline/remediation docs to commit:
+Stage 0 baseline/remediation docs committed:
 
 - `D:\nova\docs\release-v0.1.0\00_SCOPE.md`
 - `D:\nova\docs\release-v0.1.0\01_BASELINE_AUDIT.md`
@@ -100,7 +101,15 @@ No unknown untracked material is intentionally left for the Stage 0 baseline aft
 - Branch remains `feature/nova-technical-mvp`.
 - No branch switch, rename, merge, rebase, reset, tag, push, pull, or remote change was performed.
 - `git remote -v` produced no configured remote.
-- Stage 0 remediation should be committed as one baseline commit on the current branch.
+- Stage 0 remediation was committed as baseline commit `55e3cb92708a74423ad5235abf3d3a739d021859` on the current branch.
+
+## Baseline Commit Evidence
+
+- Baseline commit: `55e3cb92708a74423ad5235abf3d3a739d021859`
+- Commit message: `chore: accept stage 0 remediation baseline`
+- Commit time: 2026-09-09 09:06:37 +0800
+- Post-baseline status at evidence time: clean working tree, empty staged diff, no untracked files.
+- Full post-baseline evidence is recorded in `D:\nova\docs\release-v0.1.0\STAGE0_BASELINE_COMMIT_EVIDENCE.md`.
 
 ## Not Handled
 

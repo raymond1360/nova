@@ -382,29 +382,31 @@ Local E2E scenarios:
 - Git installed and detected as ready.
 - Git missing or not found on PATH.
 - Codex CLI installed and runnable.
-- Codex CLI installed but not logged in, session invalid, quota-limited, permission-denied, start-failed, non-zero exit, timeout, user-cancelled, and unknown-error states.
+- Codex CLI installed but not logged in, session invalid, quota-limited, permission-denied, network-interrupted, start-failed, non-zero exit, timeout, user-cancelled, and unknown-error states.
 - Claude Code CLI installed and runnable.
-- Claude Code CLI installed but not logged in, session invalid, quota-limited, permission-denied, start-failed, non-zero exit, timeout, user-cancelled, and unknown-error states.
+- Claude Code CLI installed but not logged in, session invalid, quota-limited, permission-denied, network-interrupted, start-failed, non-zero exit, timeout, user-cancelled, and unknown-error states.
 - Open local project with a clean worktree.
 - Open local project with uncommitted user work and verify Nova blocks unsafe modification until the user confirms.
 - Create product beta in an empty target directory.
 - Reject create-product beta in a non-empty target directory.
-- Import a public GitHub repository into a new target directory without installing dependencies or running imported code.
+- Import a public GitHub repository into a new target directory, generate the manual installation guide from README/license/install docs, and verify Nova does not install dependencies or run repository scripts automatically.
 - Run the fixed workflow: requirement confirmation -> developer AI -> first review -> one fix pass -> second review -> user acceptance.
 - Run the role-swapped fixed workflow: requirement confirmation -> Claude Code developer -> Codex read-only reviewer -> one fix pass -> second review -> user acceptance.
 - Run the second-review-fails path and verify Nova stops for user decision instead of starting another automatic rework loop.
+- Reject the final result at user acceptance and verify Nova leaves the task not completed, requiring user decision or a new task.
 - Restart Nova during draft, development, review, fix, and user-acceptance states and verify recovery does not duplicate destructive actions.
 - Switch Simplified Chinese / English without losing task state, input, timeline, or scroll position.
 - Verify generated Markdown task documents and evidence records match the real Git status, diff, command exits, and test results.
 
 Release docs:
 
-- `RC_CHECKLIST.md`: release candidate checklist with scenario owner, pass/fail status, evidence path, and exact commit.
-- `RC_E2E_EVIDENCE.md`: local E2E evidence for every required scenario, including the default and role-swapped fixed workflows and the second-review-fails path.
-- `KNOWN_LIMITATIONS.md`: known limitations that do not contradict P0 scope.
-- `ROLLBACK_NOTES.md`: manual rollback notes.
-- `CHECKSUM_PLAN.md`: SHA256/checksum plan for installer artifacts.
-- `CLAUDE_RC_REVIEW_PACKET.md`: Claude review packet containing scope, gap matrix, implementation map, E2E evidence, release docs, and the exact candidate commit.
+- `04_TEST_PLAN_AND_RESULTS.md`: local E2E test plan and results for every required scenario, including the default and role-swapped fixed workflows, second-review-fails path, user-rejection path, GitHub manual-guide verification, and network-interruption handling.
+- `05_CLAUDE_FINAL_REVIEW.md`: final Claude review result for the release candidate, including scope, gap matrix, implementation map, E2E evidence, release docs, and the exact candidate commit.
+- `06_RELEASE_CHECKLIST.md`: release candidate checklist with scenario owner, pass/fail status, evidence path, and exact commit.
+- `07_ROLLBACK_PLAN.md`: manual rollback plan.
+- `08_KNOWN_LIMITATIONS.md`: known limitations that do not contradict P0 scope.
+- `CHANGELOG.md`: user-facing release notes for `v0.1.0-beta.1`.
+- `PRIVACY.md`: privacy statement covering local task data, logs, diagnostics, prompts, project source, and the absence of default telemetry upload.
 
 Claude review gate:
 
@@ -435,7 +437,7 @@ Forbidden expansion:
 
 Pass criteria:
 
-- Every local E2E scenario has recorded evidence, pass/fail status, and exact commit identifier, including role-swapped execution and second-review-fails handling.
+- Every local E2E scenario has recorded evidence, pass/fail status, and exact commit identifier, including role-swapped execution, second-review-fails handling, user-rejection handling, GitHub manual-guide generation, and network-interruption handling.
 - No Blocker/Major Claude findings remain open.
 - Known limitations are documented and do not contradict P0 scope.
 

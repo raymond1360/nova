@@ -391,17 +391,20 @@ Local E2E scenarios:
 - Reject create-product beta in a non-empty target directory.
 - Import a public GitHub repository into a new target directory without installing dependencies or running imported code.
 - Run the fixed workflow: requirement confirmation -> developer AI -> first review -> one fix pass -> second review -> user acceptance.
+- Run the role-swapped fixed workflow: requirement confirmation -> Claude Code developer -> Codex read-only reviewer -> one fix pass -> second review -> user acceptance.
+- Run the second-review-fails path and verify Nova stops for user decision instead of starting another automatic rework loop.
 - Restart Nova during draft, development, review, fix, and user-acceptance states and verify recovery does not duplicate destructive actions.
 - Switch Simplified Chinese / English without losing task state, input, timeline, or scroll position.
 - Verify generated Markdown task documents and evidence records match the real Git status, diff, command exits, and test results.
 
 Release docs:
 
-- Release candidate checklist.
-- Known limitations.
-- Manual rollback notes.
-- SHA256/checksum plan for installer artifacts.
-- Claude review packet containing scope, gap matrix, implementation map, E2E evidence, and the exact candidate commit.
+- `RC_CHECKLIST.md`: release candidate checklist with scenario owner, pass/fail status, evidence path, and exact commit.
+- `RC_E2E_EVIDENCE.md`: local E2E evidence for every required scenario, including the default and role-swapped fixed workflows and the second-review-fails path.
+- `KNOWN_LIMITATIONS.md`: known limitations that do not contradict P0 scope.
+- `ROLLBACK_NOTES.md`: manual rollback notes.
+- `CHECKSUM_PLAN.md`: SHA256/checksum plan for installer artifacts.
+- `CLAUDE_RC_REVIEW_PACKET.md`: Claude review packet containing scope, gap matrix, implementation map, E2E evidence, release docs, and the exact candidate commit.
 
 Claude review gate:
 
@@ -432,7 +435,7 @@ Forbidden expansion:
 
 Pass criteria:
 
-- Every local E2E scenario has recorded evidence, pass/fail status, and exact commit identifier.
+- Every local E2E scenario has recorded evidence, pass/fail status, and exact commit identifier, including role-swapped execution and second-review-fails handling.
 - No Blocker/Major Claude findings remain open.
 - Known limitations are documented and do not contradict P0 scope.
 

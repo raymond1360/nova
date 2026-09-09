@@ -245,8 +245,11 @@ Issue status:
 
 Blocker:
 
-- Working tree contains 241 untracked files, including current product docs and audit reports. The project baseline is not clean enough for formal development until user confirms how to handle them.
 - V3 core product workflow is not implemented; current app is an SDKMAX chat MVP.
+
+Resolved Stage 0 blocker:
+
+- Pre-remediation working tree contained 241 untracked files, including current product docs and audit reports. This was resolved by the Stage 0 remediation baseline: accepted product/audit documents were committed, unrelated third-party or duplicate material was backed up and moved out after verification, and the post-baseline working tree was recorded as clean in `D:\nova\docs\release-v0.1.0\STAGE0_BASELINE_COMMIT_EVIDENCE.md`.
 
 Major:
 

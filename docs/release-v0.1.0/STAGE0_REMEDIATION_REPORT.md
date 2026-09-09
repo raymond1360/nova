@@ -93,6 +93,7 @@ No unknown untracked material is intentionally left for the Stage 0 baseline aft
 - `01_BASELINE_AUDIT.md`: clarified pre-remediation untracked state, documented `active_cancel`/TD-1 status, and recorded no-remote risk.
 - `02_GAP_MATRIX.md`: expanded CLI detection acceptance states beyond `--version`.
 - `03_IMPLEMENTATION_MAP.md`: added milestone names, expanded Phase 1 CLI tests, and inserted independent RC/local E2E verification before Windows release work.
+- Follow-up after Claude re-review: updated `01_BASELINE_AUDIT.md` so the old untracked-file blocker is explicitly marked as resolved Stage 0 baseline history, and tightened Phase 8 release-candidate verification in `03_IMPLEMENTATION_MAP.md` to require role-swapped workflow coverage, second-review-fails coverage, and fixed release-doc filenames.
 - `docs\NOVA_PRD_MVP.md`: added historical-document notice pointing to current product baseline.
 - `docs\product\NOVA_V1_PRODUCT_DESIGN_PLAN.md`: added historical-document notice pointing to current product baseline.
 

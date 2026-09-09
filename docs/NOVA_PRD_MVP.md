@@ -1,5 +1,7 @@
 # Nova Technical MVP 0.1 PRD
 
+> Historical document only. This file describes the earlier SDKMAX API-key chat MVP and is not the current Nova v0.1.0-beta.1 product baseline. For current scope, use `D:\nova\product\NOVA_V1_MVP_PRODUCT_DEVELOPMENT_SPEC_V3.md` and `D:\nova\product\NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md`.
+
 ## Scope
 
 Nova 0.1 is a Windows x64 desktop MVP for SDKMAX API-Key based chat usage. It does not implement SDKMAX web login, automatic `nova-desktop` token creation, payment, admin features, or SDKMAX server changes.

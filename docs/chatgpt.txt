@@ -1,0 +1,1191 @@
+明白。你现在真正要决策的是：
+
+A：自己做一个完全独立的桌面客户端
+
+还是
+
+B：不重新做完整客户端，而是围绕 Codex / Claude Code 做一个“增强层/伴侣客户端”，实现模型切换、上下文接力等功能。
+
+我的选择比较明确：
+
+我建议现阶段选 B：先做 Codex / Claude Code 的增强客户端，而不是从零做完整 AI 客户端
+
+但这个产品本身仍然可以是你自己的独立桌面程序，只是不重新实现 Codex、Claude Code 已经做得很好的 Coding Agent 能力。
+
+一、两种路线最大的区别
+路线 A：自己重新做完整客户端
+
+相当于你要自己实现：
+
+SDKMAX Desktop
+│
+├── Chat
+├── Agent
+├── Terminal
+├── 文件读写
+├── Git
+├── Diff
+├── Shell执行
+├── MCP
+├── 权限控制
+├── 上下文
+├── Coding Agent
+├── 模型切换
+└── SDKMAX API
+
+本质上是在自己做：
+
+一个新的 Codex / Claude Code / Cursor。
+
+这条路非常重。
+
+而且你的竞争对手直接变成 OpenAI、Anthropic 等成熟产品。
+
+二、我更推荐的产品应该长这样
+
+你自己开发一个：
+
+SDKMAX Code Hub
+
+但它不是重新实现 Coding Agent。
+
+而是：
+
+                SDKMAX Code Hub
+                      │
+          ┌───────────┴───────────┐
+          │                       │
+     AI Provider              Context Hub
+          │                       │
+   ┌──────┼──────┐         ┌──────┼──────┐
+   │      │      │         │      │      │
+ Codex  Claude  SDKMAX    Task   Memory  Git
+          Code
+
+用户在你的软件里管理：
+
+AI
+Codex
+Claude Code
+未来 Gemini CLI
+SDKMAX API
+项目
+D:\sdkmax
+D:\nova
+其他项目
+上下文
+当前任务
+完成情况
+代码修改
+Git Diff
+重要决策
+测试结果
+下一步
+三、举一个你自己现在就经常遇到的真实场景
+
+你其实就是这个产品非常典型的用户。
+
+现在你的工作方式：
+
+ChatGPT
+↓
+写需求
+
+Codex
+↓
+开发
+
+Claude Code
+↓
+审核
+
+ChatGPT
+↓
+分析报告
+
+Codex
+↓
+修复
+
+Claude Code
+↓
+再次审核
+
+问题是什么？
+
+每次切工具：
+
+都要重新告诉另一个 AI 前面发生了什么。
+
+你的客户端应该解决这个问题。
+
+四、SDKMAX Code Hub 应该怎么工作
+
+例如你打开：
+
+D:\sdkmax
+
+客户端自动建立：
+
+.sdkmax/
+
+里面保存：
+
+project.json
+context.md
+tasks.md
+decisions.md
+changes.md
+handoff.md
+
+然后你让 Codex：
+
+修复 OpenRouter 同步。
+
+Codex完成以后，SDKMAX Code Hub 自动整理：
+
+任务：
+OpenRouter同步
+
+状态：
+Completed
+
+修改：
+model/openrouter_sync.go
+model/pricing.go
+
+测试：
+PASS
+
+遗留：
+AutoMigrate需要生产验证
+
+然后：
+
+Codex额度没有了。
+
+你点：
+
+「切换 Claude Code」
+
+Claude Code启动。
+
+你的系统自动给 Claude：
+
+项目：
+D:\sdkmax
+
+当前任务：
+OpenRouter同步
+
+Codex已经完成：
+......
+
+修改文件：
+......
+
+测试结果：
+......
+
+请继续完成下一阶段。
+
+Claude直接继续。
+
+这才是我认为值得做的产品。
+
+五、甚至不应该真的搬运“记忆”
+
+这里我建议你把产品理念改一下。
+
+不要试图：
+
+读取Codex内部记忆
+↓
+复制
+↓
+写入Claude内部记忆
+
+这会非常麻烦，而且高度依赖不同产品内部实现。
+
+应该：
+
+Codex
+   \
+    \
+     SDKMAX Context
+    /
+   /
+Claude Code
+
+也就是说：
+
+记忆属于项目，而不是属于 AI。
+
+这是这个产品最核心的设计思想。
+
+Codex只是读取它。
+
+Claude Code也读取它。
+
+以后 Gemini CLI 也读取它。
+
+六、那 SDKMAX 的「400模型」怎么办？
+
+不要丢。
+
+它成为第三个执行引擎：
+
+AI Engines
+
+● Codex
+
+○ Claude Code
+
+○ SDKMAX
+    ├ GPT
+    ├ Claude
+    ├ Gemini
+    ├ DeepSeek
+    ├ Qwen
+    └ 400+ Models
+
+这样你的 New API 基础设施仍然非常有价值。
+
+七、为什么不建议现在自己重新做 Codex？
+
+因为 Coding Agent 真正难的不是聊天界面。
+
+真正难的是：
+
+文件读取
+代码编辑
+Shell
+Git
+Diff
+权限
+Tool Calling
+MCP
+Context compression
+任务规划
+错误恢复
+多轮执行
+安全沙箱
+
+这些 Codex / Claude Code 已经投入大量资源解决。
+
+你没必要第一阶段重新造一次。
+
+你的产品应该做它们没有共同解决的问题：
+
+不同 AI Coding Agent 之间的协作。
+
+八、你的竞争逻辑会完全不同
+
+如果做路线 A：
+
+你告诉用户：
+
+“这是一个新的 AI 编程客户端。”
+
+用户第一反应：
+
+为什么不用 Codex / Claude Code / Cursor？
+
+很难回答。
+
+但如果做路线 B：
+
+你告诉用户：
+
+“你继续使用 Codex 和 Claude Code。”
+
+然后：
+
+SDKMAX让它们共享一个项目上下文，并且可以随时接力。
+
+价值非常容易理解。
+
+九、我建议 MVP 第一版只支持两个
+
+不要一开始：
+
+Codex
+Claude
+Gemini
+Cursor
+Windsurf
+Cline
+Aider
+Continue
+……
+
+只支持：
+
+Codex + Claude Code
+
+因为这也是你自己最熟悉的工作流。
+
+MVP：
+
+SDKMAX Code Hub
+│
+├── 添加项目
+│
+├── Codex
+│
+├── Claude Code
+│
+├── Context
+│
+├── Tasks
+│
+├── Changes
+│
+├── Git Diff
+│
+└── 一键接力
+
+就够了。
+
+十、第二版再接 SDKMAX API
+
+然后增加：
+
+第三个Agent：
+
+SDKMAX Agent
+
+它使用：
+
+api.sdkmax.com
+
+一个 Key：
+
+GPT
+Claude
+Gemini
+DeepSeek
+Qwen
+……
+
+这样逐渐降低对 Codex / Claude Code 的依赖。
+
+十一、最终形态就非常有意思
+
+未来可能变成：
+
+                    SDKMAX Code Hub
+
+                         Project
+                            │
+                      Shared Context
+                            │
+       ┌────────────────────┼────────────────────┐
+       │                    │                    │
+     Codex             Claude Code          SDKMAX Agent
+                                               │
+                                   ┌───────────┼───────────┐
+                                   │           │           │
+                                  GPT        Claude       Gemini
+
+用户甚至可以设置：
+
+开发：
+Codex
+
+↓
+
+额度不足：
+Claude Code
+
+↓
+
+Claude额度不足：
+SDKMAX Claude
+
+↓
+
+失败：
+SDKMAX GPT
+
+但是项目：
+
+Context
+Task
+Git
+Decisions
+
+始终不变。
+
+十二、最终决策
+
+如果现在让我替你决定：
+
+不要从零做一个新的 Codex 类客户端。
+
+做：
+
+一个独立的 SDKMAX 桌面客户端，但它第一阶段是 Codex + Claude Code 的统一控制层和上下文层。
+
+也就是：
+
+产品是独立的，执行能力先借 Codex / Claude Code。
+
+这两句话非常重要。
+
+这样你既有自己的产品，又避免第一天就和 OpenAI、Anthropic 正面竞争。
+
+而且这条路线特别适合你现在的开发资源：先把你自己已经在使用的“ChatGPT → Codex开发 → Claude Code审核 → 再交接”的工作方式产品化。
+
+等这个 MVP 跑通，再把 api.sdkmax.com 的 400+ 模型接进来，形成自己的第三套执行引擎。这样商业上也比单纯做“400模型聊天客户端”更有护城河。
+
+从用户的角度，这个产品的表现形式喝使用流程是什么
+
+如果站在普通用户而不是开发者角度，我建议这个产品不要表现成“又一个聊天软件”，也不要让用户理解什么 Context、Agent Router、New API。
+
+它应该表现为一个非常直观的 AI 编程工作台：
+
+打开一个代码项目 → 选择 Codex 或 Claude Code 工作 → 随时切换 → 新 AI 自动知道前一个 AI 做到了哪里。
+
+核心体验只有一句话：
+
+换 AI，不换项目，不重新解释。
+
+一、用户看到的产品是什么样
+
+假设产品暂时叫：
+
+SDKMAX Code
+
+用户下载安装 Windows/macOS 客户端后，打开不是 ChatGPT 那种单纯聊天窗口，而更像一个“AI 项目控制台”。
+
+我建议主界面：
+
+┌─────────────────────────────────────────────────────────────┐
+│ SDKMAX Code                         余额 ¥126    Raymond     │
+├──────────────┬──────────────────────────────────────────────┤
+│              │ SDKMAX                         ● 项目正常     │
+│ 我的项目      │                                              │
+│              │ 当前任务                                     │
+│ ● SDKMAX     │ OpenRouter 自动同步                           │
+│ ○ Nova       │                                              │
+│ ○ Website    │ 已完成                                       │
+│              │ ✓ MySQL 5.7迁移                              │
+│ + 添加项目    │ ✓ OpenRouter同步                             │
+│              │ ✓ Claude审核                                 │
+│──────────────│                                              │
+│ AI 工具       │ 下一步                                       │
+│              │ ○ 部署生产环境                               │
+│ ● Codex      │                                              │
+│ ○ Claude Code│──────────────────────────────────────────────│
+│ ○ SDKMAX AI  │                                              │
+│              │  Codex                                      │
+│              │                                              │
+│              │  已读取项目上下文。                           │
+│              │  当前准备执行生产部署前检查……                 │
+│              │                                              │
+│              │                                              │
+│              │ [ 输入任务................................. ] │
+│              │                                              │
+│              │ [ Codex ▼ ]              [ 执行任务 ]        │
+└──────────────┴──────────────────────────────────────────────┘
+
+这就是用户看到的产品。
+
+二、第一次使用流程应该非常简单
+第一步：下载安装
+
+用户安装：
+
+SDKMAX Code
+
+第一次打开：
+
+欢迎使用 SDKMAX Code
+
+让 Codex、Claude Code 和其他 AI
+在同一个项目里持续工作。
+
+[ 使用 SDKMAX 登录 ]
+
+[ 暂不登录，本地使用 ]
+
+我甚至建议第一版允许“不登录使用”。
+
+因为如果用户只是使用自己的 Codex / Claude Code，不应该强迫他先充值 SDKMAX。
+
+这样获客阻力更小。
+
+三、第二步：检测用户已有 AI 工具
+
+软件自动检查电脑：
+
+正在检查您的 AI 开发工具……
+
+✓ Claude Code        已安装
+✓ Codex CLI          已安装
+○ Gemini CLI         未安装
+○ SDKMAX API         未配置
+
+然后：
+
+已发现 2 个 AI 工具
+
+Codex             ✓ 可用
+Claude Code       ✓ 可用
+
+[继续]
+
+这一步非常重要。
+
+不要要求普通用户配置：
+
+PATH
+CLI
+JSON
+API endpoint
+MCP
+
+尽量自动完成。
+
+四、第三步：添加项目
+
+用户点击：
+
+＋添加项目
+
+选择：
+
+D:\sdkmax
+
+软件自动分析：
+
+正在分析项目……
+
+✓ Git项目
+✓ Go
+✓ React
+✓ MySQL
+✓ Docker
+
+项目名称：
+SDKMAX
+
+[创建项目]
+
+然后 SDKMAX Code 建立自己的项目上下文。
+
+用户不需要知道背后存在 .sdkmax。
+
+五、第四步：选择 AI 开始工作
+
+进入项目以后：
+
+选择AI
+
+┌──────────────┐
+│    Codex     │
+│   ● 可使用   │
+└──────────────┘
+
+┌──────────────┐
+│ Claude Code  │
+│   ● 可使用   │
+└──────────────┘
+
+用户选择：
+
+Codex
+
+输入：
+
+检查 OpenRouter 同步程序为什么有9个模型没有更新。
+
+点击：
+
+开始工作
+
+六、Codex工作的过程中，SDKMAX Code做什么？
+
+用户不用管。
+
+后台自动记录：
+
+任务
+↓
+Codex执行
+↓
+读取文件
+↓
+修改代码
+↓
+Git Diff
+↓
+运行测试
+↓
+测试结果
+↓
+任务总结
+
+最后用户看到的不是几万行日志，而是一张任务卡：
+
+────────────────────────────
+
+OpenRouter 同步问题
+
+执行：Codex
+
+状态：✓ 完成
+
+修改：
+5 个文件
+
+测试：
+18 Passed
+0 Failed
+
+主要修改：
+
+• 修复 missing 模型处理
+• 增加同步状态
+• 增加异常恢复
+
+[查看修改]
+
+[让 Claude 审核]
+
+────────────────────────────
+
+注意最后那个按钮：
+
+「让 Claude 审核」
+
+这应该成为你的明星功能。
+
+七、用户点击「让 Claude 审核」
+
+这是整个产品第一次出现“惊艳感”的地方。
+
+传统方式是：
+
+打开 Claude Code
+
+↓
+
+告诉 Claude：
+
+我刚才让 Codex修改了……
+
+↓
+
+解释需求
+
+↓
+
+让Claude重新读项目
+
+↓
+
+Claude开始审核
+
+你的产品：
+
+用户只点击：
+
+让 Claude 审核
+
+就结束了。
+
+SDKMAX Code 自动准备：
+
+原始需求
+
++
+
+Codex完成内容
+
++
+
+修改文件
+
++
+
+Git Diff
+
++
+
+测试结果
+
++
+
+项目规则
+
++
+
+历史决策
+
+交给 Claude Code。
+
+八、Claude Code看到的不是空白会话
+
+Claude收到类似：
+
+项目：SDKMAX
+
+原始任务：
+修复 OpenRouter 模型同步。
+
+上一执行者：
+Codex
+
+Codex已经完成：
+
+1. 修改 openrouter_sync.go
+2. 修改 pricing.go
+3. 新增 missing 状态
+4. 本地测试通过
+
+修改文件：
+……
+
+Git Diff：
+……
+
+测试：
+18 passed
+
+你的任务：
+
+独立审核 Codex 修改。
+不要直接修改代码。
+发现问题后输出审核报告。
+
+然后 Claude 开始工作。
+
+用户不需要复制粘贴任何东西。
+
+九、这就是「AI接力」
+
+完成以后界面显示：
+
+任务时间线
+
+10:12
+👤 Raymond
+提出需求
+
+   ↓
+
+10:13
+🤖 Codex
+开始开发
+
+   ↓
+
+10:38
+✓ Codex
+开发完成
+
+   ↓
+
+10:39
+🤖 Claude Code
+开始审核
+
+   ↓
+
+10:51
+⚠ Claude Code
+
+发现 2 个问题
+
+1. CNY汇率计算错误
+2. migration缺少数据
+
+[交回 Codex 修复]
+
+用户点击：
+
+「交回 Codex 修复」
+
+Codex自动获得：
+
+原始需求
++
+自己之前修改
++
+Claude审核结果
+
+然后继续。
+
+十、如果 Codex额度用完呢？
+
+这就是你提出的第二个场景。
+
+例如界面：
+
+Codex
+
+⚠ 当前无法继续执行
+
+可能原因：
+额度不足 / 服务不可用
+
+当前任务已经保存。
+
+────────────────────
+
+继续使用：
+
+[ Claude Code ]
+
+[ SDKMAX AI ]
+
+────────────────────
+
+用户点击：
+
+Claude Code
+
+Claude不是重新开始。
+
+而是：
+
+Codex
+  │
+  │ 当前工作状态
+  ▼
+SDKMAX Context
+  │
+  ▼
+Claude Code
+
+界面提示：
+
+Claude Code 已接手 Codex 的任务。
+
+然后继续工作。
+
+十一、用户甚至不需要理解“记忆”
+
+这一点非常重要。
+
+不要在产品里大量使用：
+
+Memory / 记忆同步
+
+普通用户会问：
+
+到底同步了什么记忆？
+
+产品应该叫：
+
+「项目上下文」
+
+或者更简单：
+
+「工作接力」
+
+用户理解的是：
+
+Codex做到一半，Claude可以接着干。
+
+就够了。
+
+十二、400个模型怎么进入这个产品？
+
+我不建议第一版把400个模型直接堆给用户。
+
+后面增加：
+
+AI 工具
+
+Codex
+Claude Code
+
+────────────
+
+SDKMAX AI
+
+用户点击：
+
+SDKMAX AI
+
+看到的是：
+
+选择工作模式
+
+⚡ 快速
+适合简单修改
+
+💻 编程
+适合代码开发
+
+🧠 深度推理
+适合复杂问题
+
+🔍 研究
+适合技术调研
+
+🎨 图像
+
+而不是：
+
+请从400个模型选择一个。
+
+十三、高级用户才看到模型
+
+例如：
+
+编程
+
+自动选择              ✓ 推荐
+
+或者手动：
+
+Claude Sonnet
+GPT-5.x
+Gemini Pro
+DeepSeek
+Qwen Coder
+……
+
+这样你现在 SDKMAX 的模型场景分类正好可以复用。
+
+后台可能是：
+
+编程
+ ↓
+Claude
+GPT
+Gemini
+Qwen
+ ↓
+api.sdkmax.com
+
+普通用户根本不需要知道模型 ID。
+
+十四、最终用户的一天可能是这样
+
+早上打开：
+
+SDKMAX Code
+
+选择：
+
+SDKMAX项目
+
+看到：
+
+昨天进度
+
+✓ OpenRouter同步
+✓ Pricing修复
+✓ MySQL迁移
+
+今天建议：
+生产部署
+
+他说：
+
+Codex，准备生产部署。
+
+Codex开始工作。
+
+Codex完成：
+
+✓ 部署方案准备完成
+
+用户点：
+
+Claude审核
+
+Claude发现问题：
+
+⚠ 数据库 migration 存在风险。
+
+用户：
+
+交回Codex
+
+Codex修复。
+
+Claude再次审核：
+
+✓ APPROVE
+
+用户：
+
+执行部署
+
+整个过程：
+
+用户
+ ↓
+Codex
+ ↓
+Claude
+ ↓
+Codex
+ ↓
+Claude
+
+但用户始终没有：
+
+复制提示词
+复制报告
+重新介绍项目
+切换窗口
+重复说明背景
+
+这就是产品价值。
+
+十五、我认为第一版界面只需要四个核心页面
+
+不要做得太复杂。
+
+页面	用户看到什么
+首页	最近项目、任务、AI状态
+项目	当前任务、进度、AI对话
+接力	Codex → Claude → SDKMAX AI
+设置	Codex、Claude Code、SDKMAX账号
+
+甚至“记忆管理”都暂时不要单独做页面。
+
+它应该在后台自动工作。
+
+十六、真正的核心按钮
+
+我认为 MVP 最值得做的不是400模型按钮。
+
+而是这三个：
+
+①「用 Codex 开发」
+②「让 Claude 审核」
+③「交给另一个 AI 继续」
+
+如果这三个按钮做到真正流畅，产品就已经有明显价值。
+
+十七、从普通用户角度的一句话
+
+用户不会认为自己在使用：
+
+“跨Agent Context Persistence Architecture”。
+
+用户只会觉得：
+
+“以前换一个AI我要重新解释半天，现在点一下它就能接着干。”
+
+这才是你应该追求的体验。
+
+因此我建议把这个独立客户端的第一版产品定位进一步收窄为：
+
+SDKMAX Code —— Codex 与 Claude Code 的 AI 编程协作工作台。
+
+第一版甚至暂时不要把“400个模型”作为首页第一卖点。先把 Codex 开发 → Claude 审核 → Codex 修复 → Claude 接力 这一条体验做到极致；等它成立以后，再把 SDKMAX 的统一 API Key 和400+模型作为第三个执行引擎接进来。这样产品会比“又一个多模型客户端”清晰得多。
+
+还是需要做一个独立的客户端是吧
+
+对。我仍然建议做一个独立客户端，但有一个关键区别：
+
+独立的是“产品和界面”，不是重新开发一套 Codex / Claude Code。
+
+也就是说，我推荐的是：
+
+             SDKMAX Code 独立桌面客户端
+                       │
+          ┌────────────┼────────────┐
+          │            │            │
+       Codex       Claude Code    SDKMAX API
+          │            │            │
+          └────────────┼────────────┘
+                       │
+              SDKMAX 项目上下文
+                       │
+        任务 / 决策 / Git / 修改 / 测试
+
+用户只需要打开 SDKMAX Code 一个软件。在里面选择项目，然后点“用 Codex 开发”“让 Claude Code 审核”“换 Claude Code 继续”。Codex 和 Claude Code 可以作为底层执行引擎存在，用户不需要频繁在多个窗口之间复制提示词和报告。
+
+为什么需要独立客户端？
+
+因为如果不做独立客户端，只给 Codex 写一个插件，那么产品天然依赖 Codex；只给 Claude Code 写功能，又天然依赖 Claude Code。你真正想解决的是：
+
+Codex ↔ Claude Code ↔ 未来其他 AI 之间的切换和工作接力。
+
+因此必须有一个中立的上层控制中心。
+
+例如：
+
+今天
+Codex 开发
+   ↓
+Claude Code 审核
+   ↓
+Codex 修复
+
+未来
+Codex
+   ↓
+Claude Code
+   ↓
+Gemini CLI
+   ↓
+SDKMAX Agent
+
+如果 SDKMAX Code 自己掌握 Project Context，将来增加任何 AI 都不会改变产品核心。
+
+但第一版千万不要做“大而全客户端”
+
+这也是我想强调的。
+
+第一版不要开发自己的 IDE、代码编辑器、Terminal、GitHub Desktop、Codex 替代品。
+
+第一版只做好一个东西：
+
+AI Coding Agent 的统一工作台。
+
+MVP 可以只有：
+
+添加本地项目 → 自动识别 Codex/Claude Code → 给 Codex 任务 → 保存工作状态 → 一键让 Claude 审核 → 一键让另一个 AI 接着做。
+
+甚至第一版都可以暂时不接 SDKMAX 的400模型。
+
+它和你之前设想的 Nova 有明显区别
+
+原来的 Nova 更像：
+
+多模型 API 客户端
+
+现在这个方向更有价值：
+
+AI Coding Agent 协作客户端
+
+我甚至建议不要同时开发两个桌面客户端。
+
+可以把原来的独立客户端项目继续使用，但重新确定 MVP：
+
+D:\nova
+
+V1
+Codex + Claude Code
+工作接力
+
+        ↓
+
+V2
+SDKMAX API
+一个Key → 400+模型
+
+        ↓
+
+V3
+自动模型/Agent路由
+
+        ↓
+
+V4
+团队项目记忆
+
+这样你投入的一套客户端最终把两个想法都装进去，但第一枪只打“Codex ↔ Claude Code 无缝接力”。
+
+所以答案是：**对，需要独立客户端；但不要自己重造 Codex，而是让 Codex 和 Claude Code 成为这个独立客户端下面的两个“执行引擎”。**这才是我推荐的产品架构。

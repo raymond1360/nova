@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Nova · UI 设计稿</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Sans+SC:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink: #12151A;
+    --surface: #191E25;
+    --surface-raised: #212832;
+    --surface-hover: #2A323D;
+    --border: #2C3440;
+    --border-strong: #3C4552;
+    --text-primary: #E7EAEE;
+    --text-secondary: #8E98A6;
+    --text-tertiary: #5C6572;
+    --accent: #4FE0C8;
+    --accent-dim: #2E9C8A;
+    --accent-soft: rgba(79,224,200,0.12);
+    --accent-text: #7FF0DD;
+    --warn: #F0B94C;
+    --warn-soft: rgba(240,185,76,0.12);
+    --danger: #EE6A60;
+    --danger-soft: rgba(238,106,96,0.13);
+    --font-display: 'Space Grotesk','IBM Plex Sans SC',sans-serif;
+    --font-body: 'IBM Plex Sans','IBM Plex Sans SC',sans-serif;
+    --font-mono: 'IBM Plex Mono',monospace;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    background:#0A0C0F;
+    font-family:var(--font-body);
+    color:var(--text-primary);
+  }
+
+  /* ---- mockup switcher (meta nav, not part of the real app) ---- */
+  .mockup-nav{
+    position:sticky;top:0;z-index:50;
+    display:flex;align-items:center;gap:6px;
+    padding:10px 20px;
+    background:#0A0C0F;
+    border-bottom:1px solid var(--border);
+  }
+  .mockup-nav span{
+    font-family:var(--font-mono);
+    font-size:12px;color:var(--text-tertiary);
+    margin-right:8px;
+  }
+  .mockup-nav button{
+    font-family:var(--font-body);
+    font-size:13px;
+    background:transparent;
+    border:1px solid var(--border);
+    color:var(--text-secondary);
+    padding:6px 14px;
+    border-radius:6px;
+    cursor:pointer;
+  }
+  .mockup-nav button.active{
+    background:var(--surface-raised);
+    color:var(--text-primary);
+    border-color:var(--border-strong);
+  }
+
+  .screen{display:none;min-height:100vh;background:var(--ink);}
+  .screen.active{display:block;}
+
+  /* =========================================================
+     SCREEN 1 · LOGIN
+  ========================================================= */
+  #screen-login{
+    display:none;
+    align-items:center;justify-content:center;
+    min-height:calc(100vh - 45px);
+    position:relative;
+    overflow:hidden;
+  }
+  #screen-login.active{display:flex;}
+  .login-bg{
+    position:absolute;inset:0;
+    opacity:0.5;
+  }
+  .login-card{
+    position:relative;
+    z-index:2;
+    width:380px;
+    padding:40px 36px 32px;
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:10px;
+  }
+  .wordmark{
+    font-family:var(--font-display);
+    font-weight:600;
+    font-size:22px;
+    letter-spacing:0.01em;
+    display:flex;align-items:center;gap:9px;
+    margin-bottom:2px;
+  }
+  .wordmark-dot{
+    width:9px;height:9px;border-radius:50%;
+    background:var(--accent);
+    box-shadow:0 0 12px var(--accent);
+  }
+  .login-sub{
+    color:var(--text-secondary);
+    font-size:13.5px;
+    margin:6px 0 28px;
+    line-height:1.6;
+  }
+  .btn-primary{
+    width:100%;
+    display:flex;align-items:center;justify-content:center;gap:9px;
+    background:var(--accent);
+    color:#0A2420;
+    font-family:var(--font-body);
+    font-weight:600;
+    font-size:14px;
+    border:none;
+    border-radius:7px;
+    padding:12px 16px;
+    cursor:pointer;
+  }
+  .login-divider{
+    display:flex;align-items:center;gap:10px;
+    margin:20px 0;
+    color:var(--text-tertiary);
+    font-size:12px;
+  }
+  .login-divider::before,.login-divider::after{
+    content:"";flex:1;height:1px;background:var(--border);
+  }
+  .login-alt{
+    width:100%;
+    background:transparent;
+    border:1px solid var(--border-strong);
+    color:var(--text-secondary);
+    font-size:13px;
+    border-radius:7px;
+    padding:10px 16px;
+    cursor:pointer;
+  }
+  .login-foot{
+    margin-top:24px;
+    padding-top:18px;
+    border-top:1px solid var(--border);
+    font-size:11.5px;
+    color:var(--text-tertiary);
+    line-height:1.7;
+    display:flex;gap:8px;
+  }
+
+  /* =========================================================
+     SCREEN 2 · CONSOLE
+  ========================================================= */
+  #screen-console{display:none;}
+  #screen-console.active{display:grid;}
+  .console-shell{
+    display:grid;
+    grid-template-columns:236px 1fr 300px;
+    grid-template-rows:52px 1fr;
+    height:calc(100vh - 45px);
+  }
+  .topbar{
+    grid-column:1/4;
+    display:flex;align-items:center;
+    padding:0 18px;
+    border-bottom:1px solid var(--border);
+    background:var(--ink);
+    gap:14px;
+  }
+  .topbar-title{
+    font-family:var(--font-display);
+    font-weight:600;font-size:14.5px;
+  }
+  .topbar-search{
+    flex:1;max-width:340px;
+    display:flex;align-items:center;gap:8px;
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:6px;
+    padding:6px 10px;
+    color:var(--text-tertiary);
+    font-size:12.5px;
+    font-family:var(--font-mono);
+  }
+  .sync-pill{
+    display:flex;align-items:center;gap:6px;
+    font-size:12px;color:var(--text-secondary);
+    margin-left:auto;
+  }
+  .sync-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);}
+  .avatar{
+    width:26px;height:26px;border-radius:6px;
+    background:var(--surface-raised);
+    border:1px solid var(--border-strong);
+    display:flex;align-items:center;justify-content:center;
+    font-family:var(--font-display);font-size:11px;
+  }
+
+  .rail{
+    border-right:1px solid var(--border);
+    background:var(--ink);
+    padding:16px 12px;
+    overflow-y:auto;
+  }
+  .rail-label{
+    font-size:11px;color:var(--text-tertiary);
+    font-family:var(--font-mono);
+    padding:0 8px;margin:16px 0 8px;
+  }
+  .rail-label:first-child{margin-top:0;}
+  .scene-item{
+    display:flex;align-items:center;gap:10px;
+    padding:8px 10px;border-radius:7px;
+    cursor:pointer;margin-bottom:2px;
+  }
+  .scene-item:hover{background:var(--surface-hover);}
+  .scene-item.active{background:var(--accent-soft);}
+  .scene-item.active .scene-name{color:var(--text-primary);}
+  .scene-icon{
+    width:26px;height:26px;border-radius:6px;
+    background:var(--surface-raised);
+    display:flex;align-items:center;justify-content:center;
+    font-size:13px;flex-shrink:0;
+  }
+  .scene-item.active .scene-icon{background:var(--accent);color:#0A2420;}
+  .scene-name{font-size:13px;color:var(--text-secondary);flex:1;}
+  .scene-count{font-family:var(--font-mono);font-size:10.5px;color:var(--text-tertiary);}
+
+  .source-item{
+    display:flex;align-items:center;gap:9px;
+    padding:7px 10px;border-radius:7px;
+    font-size:12.5px;color:var(--text-secondary);
+    cursor:pointer;
+  }
+  .source-item:hover{background:var(--surface-hover);}
+  .src-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;}
+  .src-dot.on{background:var(--accent);}
+  .src-dot.off{background:var(--text-tertiary);}
+  .src-badge{
+    margin-left:auto;font-family:var(--font-mono);font-size:9.5px;
+    color:var(--text-tertiary);
+    border:1px solid var(--border);
+    padding:1px 5px;border-radius:4px;
+  }
+  .add-source{
+    display:flex;align-items:center;gap:8px;
+    padding:8px 10px;margin-top:6px;
+    border:1px dashed var(--border-strong);
+    border-radius:7px;
+    color:var(--text-tertiary);
+    font-size:12.5px;cursor:pointer;
+  }
+
+  .main{
+    overflow-y:auto;
+    padding:26px 30px 40px;
+    border-right:1px solid var(--border);
+  }
+  .main-head{margin-bottom:22px;}
+  .main-eyebrow{font-size:12px;color:var(--accent-text);font-family:var(--font-mono);margin-bottom:6px;}
+  .main-title{font-family:var(--font-display);font-size:24px;font-weight:600;margin:0 0 6px;}
+  .main-desc{font-size:13px;color:var(--text-secondary);max-width:480px;line-height:1.6;}
+
+  .route-panel{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:10px;
+    padding:22px 24px;
+    margin-bottom:22px;
+  }
+  .route-panel-head{
+    display:flex;justify-content:space-between;align-items:center;
+    margin-bottom:20px;
+  }
+  .route-panel-title{font-size:13px;color:var(--text-secondary);}
+  .route-live{
+    display:flex;align-items:center;gap:6px;
+    font-family:var(--font-mono);font-size:11px;color:var(--accent-text);
+  }
+  .pulse{
+    width:6px;height:6px;border-radius:50%;background:var(--accent);
+    box-shadow:0 0 0 0 rgba(79,224,200,0.5);
+    animation:pulse 2s infinite;
+  }
+  @keyframes pulse{
+    0%{box-shadow:0 0 0 0 rgba(79,224,200,0.45);}
+    70%{box-shadow:0 0 0 7px rgba(79,224,200,0);}
+    100%{box-shadow:0 0 0 0 rgba(79,224,200,0);}
+  }
+
+  .route-chain{
+    display:flex;align-items:center;gap:0;
+  }
+  .route-node{
+    flex:1;
+    background:var(--surface-raised);
+    border:1px solid var(--border-strong);
+    border-radius:9px;
+    padding:14px 16px;
+    position:relative;
+  }
+  .route-node.primary{border-color:var(--accent-dim);}
+  .route-node.fallback{opacity:0.6;}
+  .node-role{font-family:var(--font-mono);font-size:10px;color:var(--text-tertiary);margin-bottom:8px;}
+  .node-name{font-family:var(--font-display);font-size:15px;font-weight:600;margin-bottom:4px;}
+  .node-meta{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--text-secondary);}
+  .status-dot{width:6px;height:6px;border-radius:50%;}
+  .status-dot.ok{background:var(--accent);}
+  .status-dot.switched{background:var(--warn);}
+  .route-arrow{
+    flex-shrink:0;width:46px;
+    display:flex;align-items:center;justify-content:center;
+    color:var(--text-tertiary);
+    font-family:var(--font-mono);font-size:11px;
+    position:relative;
+  }
+  .route-arrow svg{display:block;}
+  .route-arrow.warn{color:var(--warn);}
+
+  .model-table{margin-top:8px;}
+  .model-row{
+    display:grid;
+    grid-template-columns:22px 1.6fr 1fr 1fr 0.9fr;
+    align-items:center;
+    gap:14px;
+    padding:11px 4px;
+    border-bottom:1px solid var(--border);
+    font-size:12.5px;
+  }
+  .model-row:first-child{
+    color:var(--text-tertiary);font-family:var(--font-mono);font-size:10.5px;
+    border-bottom:1px solid var(--border-strong);
+    padding-bottom:9px;
+  }
+  .model-row:last-child{border-bottom:none;}
+  .model-name{font-weight:500;}
+  .model-tool{
+    display:flex;align-items:center;gap:6px;
+    color:var(--text-secondary);font-size:11.5px;
+  }
+  .tool-chip{
+    font-family:var(--font-mono);font-size:9.5px;
+    border:1px solid var(--border);
+    padding:2px 6px;border-radius:4px;
+    color:var(--text-tertiary);
+  }
+  .latency{font-family:var(--font-mono);color:var(--text-secondary);}
+
+  .side{padding:20px 18px;overflow-y:auto;}
+  .side-title{
+    font-size:12px;color:var(--text-tertiary);
+    font-family:var(--font-mono);
+    margin-bottom:14px;
+  }
+  .log-entry{
+    display:flex;gap:9px;
+    padding:9px 0;
+    border-bottom:1px solid var(--border);
+  }
+  .log-entry:last-child{border-bottom:none;}
+  .log-time{font-family:var(--font-mono);font-size:10.5px;color:var(--text-tertiary);flex-shrink:0;padding-top:1px;}
+  .log-marker{width:6px;height:6px;border-radius:50%;margin-top:5px;flex-shrink:0;}
+  .log-marker.ok{background:var(--accent);}
+  .log-marker.warn{background:var(--warn);}
+  .log-marker.info{background:var(--text-tertiary);}
+  .log-text{font-size:12px;color:var(--text-secondary);line-height:1.55;}
+  .log-text b{color:var(--text-primary);font-weight:500;}
+
+  /* =========================================================
+     SCREEN 3 · PROVIDERS
+  ========================================================= */
+  #screen-providers{display:none;}
+  #screen-providers.active{display:block;}
+  .providers-wrap{
+    max-width:920px;
+    margin:0 auto;
+    padding:40px 32px 60px;
+  }
+  .providers-head{
+    display:flex;justify-content:space-between;align-items:flex-end;
+    margin-bottom:26px;
+  }
+  .providers-title{font-family:var(--font-display);font-size:22px;font-weight:600;margin:0 0 6px;}
+  .providers-desc{font-size:13px;color:var(--text-secondary);}
+  .btn-add{
+    background:var(--accent);color:#0A2420;
+    font-weight:600;font-size:13px;
+    border:none;border-radius:7px;
+    padding:9px 16px;cursor:pointer;
+    white-space:nowrap;
+  }
+  .provider-group{margin-bottom:28px;}
+  .provider-group-label{
+    font-family:var(--font-mono);font-size:11px;color:var(--text-tertiary);
+    margin-bottom:10px;padding-left:2px;
+  }
+  .provider-card{
+    display:grid;
+    grid-template-columns:38px 1.4fr 1fr 1.1fr auto;
+    align-items:center;gap:16px;
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:9px;
+    padding:14px 16px;
+    margin-bottom:8px;
+  }
+  .provider-card.locked{background:var(--surface);border-color:var(--accent-dim);}
+  .p-icon{
+    width:38px;height:38px;border-radius:8px;
+    background:var(--surface-raised);
+    display:flex;align-items:center;justify-content:center;
+    font-family:var(--font-display);font-weight:600;font-size:14px;
+  }
+  .p-name{font-weight:600;font-size:13.5px;margin-bottom:3px;}
+  .p-sub{font-size:11.5px;color:var(--text-tertiary);}
+  .p-tag{
+    display:inline-flex;align-items:center;gap:5px;
+    font-family:var(--font-mono);font-size:10px;
+    padding:3px 8px;border-radius:5px;
+    width:fit-content;
+  }
+  .p-tag.sync{background:var(--accent-soft);color:var(--accent-text);}
+  .p-tag.manual{background:var(--surface-raised);color:var(--text-secondary);border:1px solid var(--border-strong);}
+  .p-key{font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);}
+  .p-status{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary);}
+  .p-actions{display:flex;gap:6px;}
+  .p-actions button{
+    background:transparent;border:1px solid var(--border-strong);
+    color:var(--text-secondary);
+    font-size:11.5px;border-radius:6px;
+    padding:6px 11px;cursor:pointer;
+  }
+  .p-actions button.danger{color:var(--danger);border-color:transparent;}
+</style>
+</head>
+<body>
+
+<div class="mockup-nav">
+  <span>设计稿导览</span>
+  <button class="nav-btn active" data-target="screen-login">01 登录</button>
+  <button class="nav-btn" data-target="screen-console">02 主控台</button>
+  <button class="nav-btn" data-target="screen-providers">03 渠道 / Key 管理</button>
+</div>
+
+<!-- ============ SCREEN 1: LOGIN ============ -->
+<div class="screen active" id="screen-login">
+  <svg class="login-bg" viewBox="0 0 800 600" preserveAspectRatio="xMidYMid slice">
+    <defs>
+      <linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%" stop-color="#4FE0C8" stop-opacity="0.35"/>
+        <stop offset="100%" stop-color="#4FE0C8" stop-opacity="0"/>
+      </linearGradient>
+    </defs>
+    <path d="M -50 300 C 150 200, 250 400, 400 300 C 550 200, 650 400, 850 300" stroke="url(#g1)" stroke-width="1.5" fill="none"/>
+    <path d="M -50 340 C 150 260, 250 440, 400 340 C 550 260, 650 440, 850 340" stroke="#2C3440" stroke-width="1" fill="none"/>
+    <path d="M -50 260 C 150 180, 250 340, 400 260 C 550 180, 650 340, 850 260" stroke="#2C3440" stroke-width="1" fill="none"/>
+    <circle cx="400" cy="300" r="3" fill="#4FE0C8"/>
+  </svg>
+  <div class="login-card">
+    <div class="wordmark"><span class="wordmark-dot"></span>Nova</div>
+    <div class="login-sub">AI 工具统一配置管理中心 —— 一个身份，接入 sdkmax 全部模型与第三方渠道。</div>
+    <button class="btn-primary">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M12 2L4 6v6c0 5 3.5 8.5 8 10 4.5-1.5 8-5 8-10V6l-8-4z" stroke="#0A2420" stroke-width="1.6"/></svg>
+      使用 sdkmax 账号登录
+    </button>
+    <div class="login-divider">其它方式</div>
+    <button class="login-alt">仅接入第三方 / 官方 Key（不登录 sdkmax）</button>
+    <div class="login-foot">
+      <span>·</span>
+      <span>登录状态与 sdkmax.com 网页端实时同步；所有密钥使用系统密钥库加密存储于本机，不会上传至第三方服务器。</span>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SCREEN 2: CONSOLE ============ -->
+<div class="screen" id="screen-console">
+  <div class="console-shell">
+    <div class="topbar">
+      <div class="topbar-title">Nova</div>
+      <div class="topbar-search">
+        <span>⌘K</span><span>跳转场景、模型或渠道…</span>
+      </div>
+      <div class="sync-pill"><span class="sync-dot"></span>与 sdkmax 已同步 · 2 分钟前</div>
+      <div class="avatar">陈</div>
+    </div>
+
+    <div class="rail">
+      <div class="rail-label">场景</div>
+      <div class="scene-item"><div class="scene-icon">💬</div><div class="scene-name">通用对话</div><div class="scene-count">6</div></div>
+      <div class="scene-item active"><div class="scene-icon">⌨</div><div class="scene-name">编程场景</div><div class="scene-count">5</div></div>
+      <div class="scene-item"><div class="scene-icon">✎</div><div class="scene-name">内容创作</div><div class="scene-count">4</div></div>
+      <div class="scene-item"><div class="scene-icon">◎</div><div class="scene-name">学习研究</div><div class="scene-count">3</div></div>
+      <div class="scene-item"><div class="scene-icon">▣</div><div class="scene-name">企业办公</div><div class="scene-count">4</div></div>
+
+      <div class="rail-label">Key 来源</div>
+      <div class="source-item"><span class="src-dot on"></span>sdkmax<span class="src-badge">自动同步</span></div>
+      <div class="source-item"><span class="src-dot on"></span>中转站 · AnyRelay<span class="src-badge">手动</span></div>
+      <div class="source-item"><span class="src-dot off"></span>OpenAI 官方<span class="src-badge">已停用</span></div>
+      <div class="add-source">+ 添加来源</div>
+    </div>
+
+    <div class="main">
+      <div class="main-head">
+        <div class="main-eyebrow">场景 · 编程场景</div>
+        <h1 class="main-title">编程场景</h1>
+        <div class="main-desc">已绑定 5 个模型，按优先级自动路由；当前主模型异常时将在 3 次重试后自动切换至下一优先级。</div>
+      </div>
+
+      <div class="route-panel">
+        <div class="route-panel-head">
+          <div class="route-panel-title">当前路由</div>
+          <div class="route-live"><span class="pulse"></span>实时</div>
+        </div>
+        <div class="route-chain">
+          <div class="route-node fallback">
+            <div class="node-role">主模型 · 已切出</div>
+            <div class="node-name">GPT-4.1</div>
+            <div class="node-meta"><span class="status-dot switched"></span>限流中</div>
+          </div>
+          <div class="route-arrow warn">
+            <svg width="40" height="16" viewBox="0 0 40 16"><path d="M0 8H34M34 8L28 3M34 8L28 13" stroke="currentColor" stroke-width="1.5" fill="none"/></svg>
+          </div>
+          <div class="route-node primary">
+            <div class="node-role">当前生效 · 已切换</div>
+            <div class="node-name">Claude Sonnet 5</div>
+            <div class="node-meta"><span class="status-dot ok"></span>正常 · 340ms</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="route-panel">
+        <div class="route-panel-head">
+          <div class="route-panel-title">场景内模型 · 按优先级</div>
+        </div>
+        <div class="model-table">
+          <div class="model-row">
+            <div></div><div>模型</div><div>绑定工具</div><div>延迟</div><div>状态</div>
+          </div>
+          <div class="model-row">
+            <div class="status-dot ok"></div>
+            <div class="model-name">Claude Sonnet 5</div>
+            <div class="model-tool"><span class="tool-chip">Claude Code</span></div>
+            <div class="latency">340ms</div>
+            <div>生效中</div>
+          </div>
+          <div class="model-row">
+            <div class="status-dot switched"></div>
+            <div class="model-name">GPT-4.1</div>
+            <div class="model-tool"><span class="tool-chip">Codex CLI</span></div>
+            <div class="latency">超时</div>
+            <div>限流</div>
+          </div>
+          <div class="model-row">
+            <div class="status-dot ok"></div>
+            <div class="model-name">DeepSeek-V3</div>
+            <div class="model-tool"><span class="tool-chip">Cline</span></div>
+            <div class="latency">210ms</div>
+            <div>待命</div>
+          </div>
+          <div class="model-row">
+            <div class="status-dot ok"></div>
+            <div class="model-name">Qwen3-Coder</div>
+            <div class="model-tool"><span class="tool-chip">Cursor</span></div>
+            <div class="latency">180ms</div>
+            <div>待命</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="side">
+      <div class="side-title">运行日志</div>
+      <div class="log-entry">
+        <span class="log-marker warn"></span>
+        <div><span class="log-time">14:23:07</span><br><div class="log-text"><b>GPT-4.1</b> 响应超时 3 次，已自动切换至 <b>Claude Sonnet 5</b></div></div>
+      </div>
+      <div class="log-entry">
+        <span class="log-marker ok"></span>
+        <div><span class="log-time">14:22:51</span><br><div class="log-text">对话上下文已重组并发送至 <b>Claude Sonnet 5</b>，共 12 轮</div></div>
+      </div>
+      <div class="log-entry">
+        <span class="log-marker info"></span>
+        <div><span class="log-time">13:58:02</span><br><div class="log-text">sdkmax 令牌余额已刷新，剩余 <b>¥238.40</b></div></div>
+      </div>
+      <div class="log-entry">
+        <span class="log-marker ok"></span>
+        <div><span class="log-time">13:40:15</span><br><div class="log-text">场景 <b>编程场景</b> 配置已写入 Claude Code / Codex CLI</div></div>
+      </div>
+      <div class="log-entry">
+        <span class="log-marker info"></span>
+        <div><span class="log-time">09:12:44</span><br><div class="log-text">已与 sdkmax 完成身份同步，欢迎回来</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SCREEN 3: PROVIDERS ============ -->
+<div class="screen" id="screen-providers">
+  <div class="providers-wrap">
+    <div class="providers-head">
+      <div>
+        <h1 class="providers-title">渠道与 Key</h1>
+        <div class="providers-desc">管理接入 Nova 的所有模型来源 —— sdkmax 自动同步，其余需手动添加。</div>
+      </div>
+      <button class="btn-add">+ 添加来源</button>
+    </div>
+
+    <div class="provider-group">
+      <div class="provider-group-label">sdkmax（自动同步，只读）</div>
+      <div class="provider-card locked">
+        <div class="p-icon">S</div>
+        <div>
+          <div class="p-name">sdkmax 主账号</div>
+          <div class="p-sub">陈明 · 专业版分组</div>
+        </div>
+        <div><span class="p-tag sync">● 自动同步</span></div>
+        <div class="p-key">sk-noVa••••••7f2a</div>
+        <div class="p-actions"><button>查看模型</button></div>
+      </div>
+    </div>
+
+    <div class="provider-group">
+      <div class="provider-group-label">第三方中转站</div>
+      <div class="provider-card">
+        <div class="p-icon">A</div>
+        <div>
+          <div class="p-name">AnyRelay</div>
+          <div class="p-sub">OpenAI 兼容接口</div>
+        </div>
+        <div><span class="p-tag manual">手动添加</span></div>
+        <div class="p-key">sk-any••••••91cd</div>
+        <div class="p-status"><span class="status-dot ok"></span>正常</div>
+        <div class="p-actions"><button>测试</button><button class="danger">移除</button></div>
+      </div>
+      <div class="provider-card">
+        <div class="p-icon">R</div>
+        <div>
+          <div class="p-name">RouterAPI</div>
+          <div class="p-sub">OpenAI 兼容接口</div>
+        </div>
+        <div><span class="p-tag manual">手动添加</span></div>
+        <div class="p-key">sk-rtr••••••3b08</div>
+        <div class="p-status"><span class="status-dot switched"></span>限流</div>
+        <div class="p-actions"><button>测试</button><button class="danger">移除</button></div>
+      </div>
+    </div>
+
+    <div class="provider-group">
+      <div class="provider-group-label">官方渠道</div>
+      <div class="provider-card">
+        <div class="p-icon">O</div>
+        <div>
+          <div class="p-name">OpenAI 官方</div>
+          <div class="p-sub">api.openai.com</div>
+        </div>
+        <div><span class="p-tag manual">手动添加</span></div>
+        <div class="p-key">sk-••••••••e921</div>
+        <div class="p-status" style="color:var(--text-tertiary);"><span class="status-dot" style="background:var(--text-tertiary);"></span>已停用</div>
+        <div class="p-actions"><button>启用</button><button class="danger">移除</button></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const buttons = document.querySelectorAll('.nav-btn');
+  const screens = document.querySelectorAll('.screen');
+  buttons.forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      buttons.forEach(b=>b.classList.remove('active'));
+      screens.forEach(s=>s.classList.remove('active'));
+      btn.classList.add('active');
+      document.getElementById(btn.dataset.target).classList.add('active');
+    });
+  });
+</script>
+</body>
+</html>

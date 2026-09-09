@@ -1,0 +1,113 @@
+# Nova v0.1.0-beta.1 Scope Freeze
+
+Generated: 2026-09-09
+Repository: `D:\nova`
+Phase: 0, baseline audit, scope freeze, and Stage 0 remediation
+
+## Audit Boundary
+
+This phase is not product-feature development. The permitted writes are limited to Stage 0 baseline/remediation documentation, backup/inventory records, and repository hygiene needed to freeze the accepted baseline.
+
+No application source, runtime configuration, tests, lockfiles, dependencies, or build artifacts are in scope for this phase.
+
+## Product Baseline Used
+
+When documents conflict, the effective baseline is:
+
+1. Repository-local mandatory rules, if present. No tracked `AGENTS.md`, `CLAUDE.md`, `README.md`, or `CONTRIBUTING.md` was found in `D:\nova` outside untracked `.cloude\` material during this audit.
+2. `D:\nova\product\NOVA_V1_MVP_PRODUCT_DEVELOPMENT_SPEC_V3.md`
+3. `D:\nova\product\NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md`
+4. Older repository documents under `D:\nova\docs\` and historical audit reports under `D:\nova\audit\`
+
+Important conflict recorded: older files such as `D:\nova\docs\NOVA_PRD_MVP.md` describe the existing SDKMAX API-key chat MVP, while the V3 product baseline defines Nova as a dual-AI development and review desktop client. For `v0.1.0-beta.1`, V3 and the minimum release plan supersede the older SDKMAX chat-only MVP as product scope.
+
+## Version Goal
+
+Nova `v0.1.0-beta.1` must prove one core value:
+
+Non-technical users can describe a development request in natural language, and Nova coordinates one AI to develop, a second AI to independently review, one fix pass, a second review, evidence collection, recoverable task records, and user completion confirmation.
+
+Target platform and stack from the product baseline:
+
+- Windows 10/11 x64 desktop client.
+- Tauri 2 + Vue 3 + TypeScript + Rust + SQLite.
+- Local-first task data, no Nova account required.
+- Simplified Chinese and English UI.
+- Default mode: Codex develops, Claude Code reviews.
+- Optional mode: Claude Code develops, Codex reviews.
+
+## P0 Scope
+
+- First launch and environment checks for Git, Codex CLI, and Claude Code CLI.
+- Three project entries: create product beta from one built-in Vue 3 + Vite + TypeScript template, open local project, and import public GitHub repository.
+- Natural-language requirement input and requirement confirmation.
+- Fixed workflow: requirement confirmation -> development -> first review -> one fix pass -> second review -> user acceptance.
+- Review mode is read-only by default.
+- Explicit role swap before a task starts.
+- Protect user uncommitted work before modification: inspect and preserve Git status/diff before any generated change, block unsafe overwrites, and require user confirmation for any operation that could affect existing work.
+- Real task timeline and durable local task records.
+- Git, file, command, exit-code, and test evidence collection.
+- Standard Markdown task documents.
+- Local interruption recovery.
+- Final completion report and user completion confirmation.
+
+## P1 / Deferred Scope
+
+- Image attachments and screenshot recognition.
+- Built-in web preview.
+- Before/after screenshots.
+- Browser automation tests.
+- Private GitHub repository authorization.
+- GitHub push and pull request automation.
+- More than one automatic rework loop.
+- Usage and cost estimation.
+
+## Explicit Non-Goals
+
+- Automatic deployment or server operations.
+- Automatic Docker, Nginx, domain, or production database management.
+- Automatic dependency installation or automatic execution of imported third-party GitHub projects.
+- GitHub private repository authorization, automatic push, or automatic PR creation.
+- Project-management boards, team workflow, or collaboration features.
+- SDKMAX account, payment, API-key issuance, or model marketplace.
+- Codex/Claude Code quota detection and automatic quota relay.
+- A 400-model selector.
+- Unlimited automatic rework.
+- Displaying or storing private model reasoning chains.
+- Expanding task scope without user confirmation.
+- User-customized or free-form multi-agent workflow orchestration. Nova v0.1.0-beta.1 only supports the fixed loop declared above: one developer AI, one reviewer AI, one fix pass, one second review, then user acceptance.
+
+## Branch Strategy Freeze
+
+- Continue Stage 0 remediation on the current branch: `feature/nova-technical-mvp`.
+- Do not switch, rename, merge, rebase, or rewrite this branch during Stage 0.
+- Treat the accepted Stage 0 baseline commit, after Claude review passes, as the start point for Phase 1 work.
+- Before Phase 1 starts, decide explicitly whether to create `feature/v0.1.0-mvp` from the accepted Stage 0 baseline commit.
+- Do not start Phase 1 from stale `master`.
+- Preserve history; no reset/rewrite strategy is part of Stage 0.
+
+## Phase 0 Allowed Operations
+
+- Read files and repository metadata.
+- Inspect Git status, branch, HEAD, tags, log, and remotes.
+- Inspect directory structure, package manifests, Tauri configuration, test configuration, build scripts, CI configuration, existing reports, and existing test logs.
+- Identify declared commands without running mutating or artifact-producing commands.
+- Create or update Stage 0 audit/remediation documents under `D:\nova\docs\release-v0.1.0\`.
+- Back up and move out unrelated untracked third-party material after checksum verification.
+- Back up and move out byte-identical duplicate root documentation after checksum verification.
+- Label historical conflicting product documents when doing so avoids future baseline confusion.
+- Stage exact accepted paths and create one Stage 0 baseline/remediation commit.
+
+## Phase 0 Forbidden Operations
+
+- Modify application code, tests, runtime configuration, lockfiles, or generated artifacts.
+- Install, upgrade, or delete dependencies.
+- Run formatters, auto-fixers, cleanup commands, or tests/builds that may write files.
+- Switch, create, delete, merge, rebase, or reset branches.
+- Push, pull, tag, or create PRs.
+- Delete, overwrite, clean, or roll back user work.
+- Reveal full secrets, tokens, credentials, or sensitive environment values.
+
+## Stop/Risk Condition Recorded
+
+Current working tree contains many untracked files, including product documents, audit reports, `.cloude\` skill material, and design artifacts. They were not modified by this phase, but they must be resolved or explicitly accepted before formal development begins.

@@ -75,6 +75,7 @@ export type DirectoryStatus =
   | { state: 'not_found' }
   | { state: 'not_a_directory' }
   | { state: 'permission_denied' }
+  | { state: 'cleanup_failed'; detail: string }
   | { state: 'unknown'; detail: string }
 
 export interface PlatformStatus {

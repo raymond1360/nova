@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use credential::{CredentialStore, SystemCredentialStore};
 use db::Database;
+use runtime::detection_slot::DetectionSlot;
 
 pub struct AppState {
     db: Arc<Mutex<Database>>,
@@ -24,7 +25,7 @@ pub struct AppState {
     credentials: Arc<dyn CredentialStore>,
     active_cancel: Arc<Mutex<Option<CancellationToken>>>,
     app_data_dir: PathBuf,
-    detection_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    detection_cancel: DetectionSlot,
 }
 
 impl AppState {
@@ -39,7 +40,7 @@ impl AppState {
             credentials,
             active_cancel: Arc::new(Mutex::new(None)),
             app_data_dir,
-            detection_cancel: Arc::new(Mutex::new(None)),
+            detection_cancel: DetectionSlot::new(),
         }
     }
 }
@@ -79,6 +80,7 @@ pub fn run() {
             commands::detect_runtime_environment,
             commands::cancel_environment_detection,
             commands::check_project_directory_access,
+            commands::check_project_directory_readable,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Nova");

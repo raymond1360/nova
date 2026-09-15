@@ -352,47 +352,61 @@ where
 }
 
 /// Detect Git/Codex CLI/Claude Code CLI readiness, platform support, and
-/// Nova's own app data directory access. Runs under a fresh cancellation
-/// token so a concurrent `cancel_environment_detection` call can stop it.
+/// Nova's own app data directory access.
+///
+/// Serialized via `AppState.detection_cancel` (a [`DetectionSlot`]): only
+/// one detection run may be in flight at a time. A second call while one is
+/// already running is rejected with an error rather than silently
+/// replacing the first run's cancellation token — the earlier Phase 1
+/// review found that an unconditional overwrite let a second call's
+/// completion clear a *third*, unrelated run's token, and let `cancel`
+/// target the wrong run. `DetectionSlot::try_start` only ever holds its
+/// lock for the brief check-and-set, never across the `.await` below, and
+/// its returned handle clears the slot on every exit path — including an
+/// unexpected panic — via `Drop`.
 #[tauri::command]
 pub async fn detect_runtime_environment(
     state: State<'_, AppState>,
 ) -> Result<RuntimeEnvironmentReport, String> {
-    let cancel = CancellationToken::new();
-    *state
+    let (cancel, _handle) = state
         .detection_cancel
-        .lock()
-        .map_err(|_| "无法创建取消令牌".to_string())? = Some(cancel.clone());
+        .try_start()
+        .map_err(|_| "环境检测已在进行中，请稍候或先取消当前检测后重试".to_string())?;
 
     let app_data_dir = state.app_data_dir.clone();
-    let report = detect::build_report(app_data_dir, cancel).await;
-
-    if let Ok(mut guard) = state.detection_cancel.lock() {
-        *guard = None;
-    }
-    Ok(report)
+    Ok(detect::build_report(app_data_dir, cancel).await)
 }
 
 #[tauri::command]
 pub fn cancel_environment_detection(state: State<'_, AppState>) -> Result<(), String> {
-    if let Some(cancel) = state
-        .detection_cancel
-        .lock()
-        .map_err(|_| "无法读取取消令牌".to_string())?
-        .as_ref()
-    {
-        cancel.cancel();
-    }
+    state.detection_cancel.cancel_current();
     Ok(())
 }
 
 /// Check whether a user-selected directory exists, is a directory, and is
-/// readable/writable by Nova. Used before Phase 3+ treats a directory as a
-/// project root; exposed now so the minimal Phase 1 environment panel can
-/// exercise and test the same boundary logic end to end.
+/// writable by Nova (create+write+remove a probe file). Used before Phase
+/// 3+ treats a directory as a project root; exposed now so the minimal
+/// Phase 1 environment panel can exercise and test the same boundary logic
+/// end to end. Callers must only invoke this for a directory the user has
+/// actually selected/authorized — never speculatively in a read-only
+/// context, where [`check_project_directory_readable`] is the correct call.
 #[tauri::command]
 pub fn check_project_directory_access(path: String) -> Result<DirectoryStatus, String> {
-    Ok(detect::check_directory_access(std::path::Path::new(&path)))
+    Ok(detect::check_directory_writable(std::path::Path::new(
+        &path,
+    )))
+}
+
+/// Read-only counterpart to [`check_project_directory_access`]: confirms a
+/// directory exists and is readable without creating, writing, or deleting
+/// anything. This is the correct check for a read-only/review context, or
+/// for inspecting a candidate directory before the user has explicitly
+/// authorized write access to it.
+#[tauri::command]
+pub fn check_project_directory_readable(path: String) -> Result<DirectoryStatus, String> {
+    Ok(detect::check_directory_readable(std::path::Path::new(
+        &path,
+    )))
 }
 
 #[cfg(test)]

@@ -3,6 +3,9 @@
 //! invocations must all go through.
 
 pub mod detect;
+pub mod detection_slot;
+#[cfg(windows)]
+pub mod job_object;
 pub mod path_guard;
 pub mod process;
 pub mod types;

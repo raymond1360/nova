@@ -178,6 +178,14 @@ export const useNovaStore = defineStore('nova', {
       await invoke('cancel_active_chat')
     },
     async detectEnvironment() {
+      // Reentrancy guard, same pattern as sendMessage(): the backend also
+      // serializes detection runs and rejects a second concurrent call, but
+      // guarding here too means a rapid double-click never even reaches the
+      // backend, and never risks one call's `environmentLoading = false` in
+      // `finally` clobbering the state of a different, still-running call.
+      if (this.environmentLoading) {
+        return
+      }
       this.environmentLoading = true
       this.environmentError = ''
       try {

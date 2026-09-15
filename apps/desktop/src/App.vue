@@ -62,6 +62,12 @@ onUnmounted(() => {
   unlistenChunk?.()
   unlistenDone?.()
   unlistenError?.()
+  // Don't leave a detection run orphaned in the backend's single-run slot
+  // after this view goes away — cancel it so a fresh mount can start a new
+  // one immediately instead of hitting "already in progress".
+  if (store.environmentLoading) {
+    store.cancelEnvironmentDetection().catch(() => {})
+  }
 })
 
 function onModelChange(event: Event) {
@@ -156,6 +162,8 @@ function dirLabel(status: DirectoryStatus | undefined): string {
       return '不是目录'
     case 'permission_denied':
       return '权限不足'
+    case 'cleanup_failed':
+      return '探针文件清理失败，请检查目录'
     case 'unknown':
       return '未知错误'
   }

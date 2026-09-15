@@ -72,7 +72,7 @@ Rollback point:
 
 Prerequisites:
 
-- User decision on 241 untracked files.
+- Accepted Stage 0 baseline commit available in history; pre-remediation 241 untracked files were resolved per `01_BASELINE_AUDIT09091050.md` "Resolved Stage 0 blocker".
 - Accepted scope docs committed or otherwise frozen.
 
 Forbidden expansion:
@@ -399,6 +399,8 @@ Local E2E scenarios:
 - Verify generated Markdown task documents and evidence records match the real Git status, diff, command exits, and test results.
 
 Release docs:
+
+Naming rule: all Stage 0/Phase-generated Markdown filenames must append the generation time as `MMDDHHMM` immediately before `.md` (e.g. `04_TEST_PLAN_AND_RESULTS09151230.md`); do not overwrite or delete prior timestamped versions. The base names below are the required document types; the actual file produced at generation time carries the timestamp suffix.
 
 - `04_TEST_PLAN_AND_RESULTS.md`: local E2E test plan and results for every required scenario, including the default and role-swapped fixed workflows, second-review-fails path, user-rejection path, GitHub manual-guide verification, and network-interruption handling.
 - `05_CLAUDE_FINAL_REVIEW.md`: final Claude review result for the release candidate, including scope, gap matrix, implementation map, E2E evidence, release docs, and the exact candidate commit.

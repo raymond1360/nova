@@ -1,9 +1,9 @@
 use std::io::{self, Read};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
 
 use super::path_guard::{self, PathRejection};
@@ -12,64 +12,37 @@ use crate::security::redact_sensitive_text;
 
 #[cfg(windows)]
 use super::job_object;
+#[cfg(windows)]
+use super::win_spawn;
+#[cfg(not(windows))]
+use std::process::{Child, Command, Stdio};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
-
-/// Platform-specific process-tree containment handle. On Windows this is a
-/// live [`job_object::JobObject`] the child was assigned to (`None` only if
-/// containment could not be established — see [`setup_containment`], which
-/// never lets execution proceed in that case). On non-Windows targets this
-/// carries no state: Nova ships Windows-only for v0.1.0, and killing only
-/// the direct child is the same level of protection this codebase always
-/// had there, not a regression.
-#[cfg(windows)]
-type TreeContainer = job_object::JobObject;
-#[cfg(not(windows))]
-type TreeContainer = ();
-
-#[cfg(windows)]
-fn setup_containment(child: &Child) -> io::Result<TreeContainer> {
-    let job = job_object::JobObject::create()?;
-    job.assign(child)?;
-    Ok(job)
-}
-
-#[cfg(not(windows))]
-fn setup_containment(_child: &Child) -> io::Result<TreeContainer> {
-    Ok(())
-}
-
-/// Terminate the whole process tree started for this execution, then reap
-/// the direct child so it is never left as a zombie/orphan from Nova's
-/// point of view. On Windows this terminates the Job Object (killing the
-/// direct child *and* any descendants it spawned); on other platforms it
-/// falls back to killing just the direct child.
-#[cfg(windows)]
-fn terminate_tree(child: &mut Child, container: &TreeContainer) {
-    let _ = container.terminate();
-    let _ = child.wait();
-}
-
-#[cfg(not(windows))]
-fn terminate_tree(child: &mut Child, _container: &TreeContainer) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
 
 /// Run one external program under Nova's safety boundary.
 ///
 /// Contract enforced here, not left to callers:
-/// - `program` + `args` are handed to the OS as an argument array
-///   ([`Command::new`] + [`Command::args`]); nothing is ever concatenated
-///   into a shell command string, and no `cmd.exe`/`powershell`/`sh -c`
-///   wrapper is used.
+/// - `program` + `args` are handed to the OS as an argument array; nothing
+///   is ever concatenated into a shell command string, and no
+///   `cmd.exe`/`powershell`/`sh -c` wrapper is used. On Windows this means
+///   building a `CreateProcessW` command line via
+///   [`win_spawn::quote_windows_arg`]-style MSVC-rule quoting per
+///   argument, not naive string concatenation.
 /// - `cwd` must resolve, via [`path_guard::validate_directory_boundary`],
 ///   inside `allowed_root`. A request with no `allowed_root` is rejected
 ///   outright rather than silently allowed to run anywhere.
+/// - **On Windows, the target process is created suspended, assigned to a
+///   Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and only then
+///   resumed** — see [`win_spawn::spawn_suspended`] and
+///   `runtime::job_object`. The target's own code cannot run, and
+///   therefore cannot spawn an uncontained descendant, before it is a Job
+///   member. The previous implementation spawned normally and assigned to
+///   the job afterward, leaving exactly that race window open.
 /// - stdout/stderr are captured separately, size-capped, and passed through
 ///   [`redact_sensitive_text`] before being stored.
 /// - the child is always waited on (never left as a zombie/orphan): on
-///   timeout or cancellation it is killed and then reaped.
+///   timeout or cancellation the whole Job (Windows) or the direct child
+///   (other platforms) is terminated, then reaped.
 pub async fn execute(request: ExecutionRequest, cancel: CancellationToken) -> ExecutionResult {
     tokio::task::spawn_blocking(move || execute_blocking(request, cancel))
         .await
@@ -118,114 +91,33 @@ pub fn execute_blocking(request: ExecutionRequest, cancel: CancellationToken) ->
         }
     };
 
-    let mut command = Command::new(&request.program);
-    command
-        .args(&request.args)
-        .current_dir(&resolved_cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    apply_no_window(&mut command);
+    #[cfg(windows)]
+    let run = run_windows(&request, &resolved_cwd, &cancel, started_at, start_instant);
+    #[cfg(not(windows))]
+    let run = run_generic(&request, &resolved_cwd, &cancel, started_at, start_instant);
 
-    let mut child: Child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            let kind = match error.kind() {
-                std::io::ErrorKind::NotFound => ExecutionErrorKind::NotFound,
-                std::io::ErrorKind::PermissionDenied => ExecutionErrorKind::PermissionDenied,
-                _ => ExecutionErrorKind::StartFailed,
-            };
-            return finished_without_process(
-                &request,
-                started_at,
-                start_instant,
-                kind,
-                redact_sensitive_text(&error.to_string()),
-            );
-        }
+    let ran = match run {
+        RunResult::EarlyFailure(result) => return result,
+        RunResult::Ran(ran) => ran,
     };
 
-    // Establish process-tree containment *before* touching stdio or
-    // waiting, so the window in which a not-yet-contained child could
-    // spawn an uncontained grandchild is as small as possible. If
-    // containment cannot be established, this execution must not proceed
-    // pretending it has a safety boundary it does not have: the
-    // already-started child is killed and reaped, and a structured
-    // failure is returned instead.
-    let container = match setup_containment(&child) {
-        Ok(container) => container,
-        Err(error) => {
-            return handle_containment_failure(
-                &mut child,
-                &request,
-                started_at,
-                start_instant,
-                error,
-            );
-        }
-    };
-
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let stdout_reader = stdout_pipe.map(|pipe| spawn_capped_reader(pipe, request.max_output_bytes));
-    let stderr_reader = stderr_pipe.map(|pipe| spawn_capped_reader(pipe, request.max_output_bytes));
-
-    let mut forced: Option<ExecutionErrorKind> = None;
-    let exit_status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
-                if cancel.is_cancelled() {
-                    terminate_tree(&mut child, &container);
-                    forced = Some(ExecutionErrorKind::Cancelled);
-                    break None;
-                }
-                if start_instant.elapsed() >= request.timeout {
-                    terminate_tree(&mut child, &container);
-                    forced = Some(ExecutionErrorKind::TimedOut);
-                    break None;
-                }
-                thread::sleep(POLL_INTERVAL);
-            }
-            Err(_) => {
-                forced = Some(ExecutionErrorKind::Unknown);
-                break None;
-            }
-        }
-    };
-    // `container` (the Job Object on Windows) is no longer needed once the
-    // child has exited or been terminated; dropping it here is harmless —
-    // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` only matters while member
-    // processes could still be running, and by this point they are not.
-    drop(container);
-
-    let (stdout_bytes, stdout_truncated) = join_reader(stdout_reader);
-    let (stderr_bytes, stderr_truncated) = join_reader(stderr_reader);
-    let stdout = redact_sensitive_text(&String::from_utf8_lossy(&stdout_bytes));
-    let stderr = redact_sensitive_text(&String::from_utf8_lossy(&stderr_bytes));
-
+    let stdout = redact_sensitive_text(&String::from_utf8_lossy(&ran.stdout_bytes));
+    let stderr = redact_sensitive_text(&String::from_utf8_lossy(&ran.stderr_bytes));
     let ended_at = Utc::now();
     let duration_ms = start_instant.elapsed().as_millis() as u64;
-    let exit_code = exit_status.and_then(|status| status.code());
 
-    let outcome = match forced {
+    let outcome = match ran.forced {
         Some(kind) => ExecutionOutcome::Failed {
             kind,
             detail: forced_kind_detail(kind).to_string(),
         },
-        None => match exit_status {
-            Some(status) if status.success() => ExecutionOutcome::Success,
-            Some(_) => ExecutionOutcome::Failed {
-                kind: ExecutionErrorKind::NonZeroExit,
-                detail: format!(
-                    "退出码 {}",
-                    exit_code.map_or("未知".to_string(), |c| c.to_string())
-                ),
-            },
-            None => ExecutionOutcome::Failed {
-                kind: ExecutionErrorKind::Unknown,
-                detail: "无法获取进程退出状态".to_string(),
-            },
+        None if ran.success => ExecutionOutcome::Success,
+        None => ExecutionOutcome::Failed {
+            kind: ExecutionErrorKind::NonZeroExit,
+            detail: format!(
+                "退出码 {}",
+                ran.exit_code.map_or("未知".to_string(), |c| c.to_string())
+            ),
         },
     };
 
@@ -247,36 +139,189 @@ pub fn execute_blocking(request: ExecutionRequest, cancel: CancellationToken) ->
         started_at,
         ended_at,
         duration_ms,
-        exit_code,
+        exit_code: ran.exit_code,
         stdout,
         stderr,
-        stdout_truncated,
-        stderr_truncated,
+        stdout_truncated: ran.stdout_truncated,
+        stderr_truncated: ran.stderr_truncated,
         outcome,
     }
 }
 
-/// Handle the case where process-tree containment could not be established
-/// for an already-spawned child: kill and reap it immediately (never leave
-/// an uncontained process running just because containment setup failed)
-/// and return a structured `StartFailed` result rather than silently
-/// proceeding without the safety boundary Nova claims to provide.
-///
-/// Extracted as its own function (rather than inlined at the one real call
-/// site) specifically so a test can drive it with a synthetic
-/// [`io::Error`] — deterministically forcing the real Win32
-/// `AssignProcessToJobObject` call to fail is not reliable across Windows
-/// versions/privilege levels, but this function *is* the exact production
-/// code that runs when it does fail, so injecting the failure here proves
-/// the real cleanup behavior, not a simulation of it.
-fn handle_containment_failure(
-    child: &mut Child,
+/// Result of the platform-specific spawn-and-wait stage.
+enum RunResult {
+    /// A terminal `ExecutionResult` was already fully constructed (path
+    /// rejection is handled earlier and never reaches this type, but
+    /// spawn/containment failures before any output could be captured
+    /// are constructed here, via [`finished_without_process`]).
+    EarlyFailure(ExecutionResult),
+    Ran(RanProcess),
+}
+
+/// Everything the shared result-building code in [`execute_blocking`] needs
+/// once a process actually ran to some kind of completion (normal exit,
+/// non-zero exit, timeout, or cancellation) — platform-independent.
+struct RanProcess {
+    forced: Option<ExecutionErrorKind>,
+    success: bool,
+    exit_code: Option<i32>,
+    stdout_bytes: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_bytes: Vec<u8>,
+    stderr_truncated: bool,
+}
+
+fn classify_spawn_error(error: &io::Error) -> ExecutionErrorKind {
+    match error.kind() {
+        io::ErrorKind::NotFound => ExecutionErrorKind::NotFound,
+        io::ErrorKind::PermissionDenied => ExecutionErrorKind::PermissionDenied,
+        _ => ExecutionErrorKind::StartFailed,
+    }
+}
+
+#[cfg(windows)]
+fn run_windows(
     request: &ExecutionRequest,
-    started_at: chrono::DateTime<Utc>,
+    resolved_cwd: &Path,
+    cancel: &CancellationToken,
+    started_at: DateTime<Utc>,
     start_instant: Instant,
+) -> RunResult {
+    // Step 1-2: create the Job Object *first*, with kill-on-close already
+    // configured by `JobObject::create()`. No process exists yet, so a
+    // failure here needs no process cleanup.
+    let job = match job_object::JobObject::create() {
+        Ok(job) => job,
+        Err(error) => {
+            return RunResult::EarlyFailure(finished_without_process(
+                request,
+                started_at,
+                start_instant,
+                ExecutionErrorKind::StartFailed,
+                format!(
+                    "无法创建进程隔离容器：{}",
+                    redact_sensitive_text(&error.to_string())
+                ),
+            ));
+        }
+    };
+
+    // Step 3: create the target process *suspended*. Its initial thread
+    // has not run any of the target's code yet.
+    let mut child = match win_spawn::spawn_suspended(&request.program, &request.args, resolved_cwd)
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let kind = classify_spawn_error(&error);
+            // `job` has no assigned process; dropping it is harmless.
+            return RunResult::EarlyFailure(finished_without_process(
+                request,
+                started_at,
+                start_instant,
+                kind,
+                redact_sensitive_text(&error.to_string()),
+            ));
+        }
+    };
+
+    // Step 4-5: assign to the job *before* resuming, and confirm success.
+    // This is the fix itself — the target cannot run, and therefore cannot
+    // spawn an uncontained descendant, before this succeeds.
+    if let Err(error) = job.assign_handle(child.process_handle()) {
+        return RunResult::EarlyFailure(handle_windows_spawn_failure(
+            &child,
+            request,
+            started_at,
+            start_instant,
+            "加入进程隔离容器",
+            error,
+        ));
+    }
+
+    // Step 6: only now resume the main thread.
+    if let Err(error) = child.resume() {
+        return RunResult::EarlyFailure(handle_windows_spawn_failure(
+            &child,
+            request,
+            started_at,
+            start_instant,
+            "恢复挂起进程",
+            error,
+        ));
+    }
+
+    // Step 7 onward: normal stdout/stderr draining and wait loop, exactly
+    // as before, except termination now always goes through the Job
+    // Object (kills the direct child *and* any descendant it spawned).
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_reader = stdout_pipe.map(|pipe| spawn_capped_reader(pipe, request.max_output_bytes));
+    let stderr_reader = stderr_pipe.map(|pipe| spawn_capped_reader(pipe, request.max_output_bytes));
+
+    let mut forced: Option<ExecutionErrorKind> = None;
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if cancel.is_cancelled() {
+                    let _ = job.terminate();
+                    let _ = child.wait();
+                    forced = Some(ExecutionErrorKind::Cancelled);
+                    break None;
+                }
+                if start_instant.elapsed() >= request.timeout {
+                    let _ = job.terminate();
+                    let _ = child.wait();
+                    forced = Some(ExecutionErrorKind::TimedOut);
+                    break None;
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+            Err(_) => {
+                forced = Some(ExecutionErrorKind::Unknown);
+                break None;
+            }
+        }
+    };
+    // The job is no longer needed once the child has exited or been
+    // terminated; dropping it here is harmless — `JOB_OBJECT_LIMIT_KILL_
+    // ON_JOB_CLOSE` only matters while member processes could still be
+    // running, and by this point they are not.
+    drop(job);
+
+    let (stdout_bytes, stdout_truncated) = join_reader(stdout_reader);
+    let (stderr_bytes, stderr_truncated) = join_reader(stderr_reader);
+
+    RunResult::Ran(RanProcess {
+        forced,
+        success: exit_status.map(|status| status.success()).unwrap_or(false),
+        exit_code: exit_status.and_then(|status| status.code()),
+        stdout_bytes,
+        stdout_truncated,
+        stderr_bytes,
+        stderr_truncated,
+    })
+}
+
+/// Handle a failure in either the "assign to job" or "resume" step: kill
+/// and reap the already-created (still-suspended, or just-resumed)
+/// process, then return a structured `StartFailed` result. Extracted as
+/// its own function specifically so a test can drive it directly with a
+/// synthetic [`io::Error`] against a *real* spawned suspended process —
+/// deterministically forcing the real Win32 `AssignProcessToJobObject`/
+/// `ResumeThread` calls to fail is not reliable across Windows
+/// versions/privilege levels, but this function is the exact production
+/// cleanup code that runs when either does fail.
+#[cfg(windows)]
+fn handle_windows_spawn_failure(
+    child: &win_spawn::SuspendedChild,
+    request: &ExecutionRequest,
+    started_at: DateTime<Utc>,
+    start_instant: Instant,
+    stage: &str,
     error: io::Error,
 ) -> ExecutionResult {
-    let _ = child.kill();
+    let _ = child.terminate();
     let _ = child.wait();
     finished_without_process(
         request,
@@ -284,10 +329,85 @@ fn handle_containment_failure(
         start_instant,
         ExecutionErrorKind::StartFailed,
         format!(
-            "无法建立进程隔离边界，已终止已启动的进程：{}",
+            "{stage}失败，已终止已启动的进程：{}",
             redact_sensitive_text(&error.to_string())
         ),
     )
+}
+
+#[cfg(not(windows))]
+fn run_generic(
+    request: &ExecutionRequest,
+    resolved_cwd: &Path,
+    cancel: &CancellationToken,
+    started_at: DateTime<Utc>,
+    start_instant: Instant,
+) -> RunResult {
+    let mut command = Command::new(&request.program);
+    command
+        .args(&request.args)
+        .current_dir(resolved_cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child: Child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let kind = classify_spawn_error(&error);
+            return RunResult::EarlyFailure(finished_without_process(
+                request,
+                started_at,
+                start_instant,
+                kind,
+                redact_sensitive_text(&error.to_string()),
+            ));
+        }
+    };
+
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_reader = stdout_pipe.map(|pipe| spawn_capped_reader(pipe, request.max_output_bytes));
+    let stderr_reader = stderr_pipe.map(|pipe| spawn_capped_reader(pipe, request.max_output_bytes));
+
+    let mut forced: Option<ExecutionErrorKind> = None;
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if cancel.is_cancelled() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    forced = Some(ExecutionErrorKind::Cancelled);
+                    break None;
+                }
+                if start_instant.elapsed() >= request.timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    forced = Some(ExecutionErrorKind::TimedOut);
+                    break None;
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+            Err(_) => {
+                forced = Some(ExecutionErrorKind::Unknown);
+                break None;
+            }
+        }
+    };
+
+    let (stdout_bytes, stdout_truncated) = join_reader(stdout_reader);
+    let (stderr_bytes, stderr_truncated) = join_reader(stderr_reader);
+
+    RunResult::Ran(RanProcess {
+        forced,
+        success: exit_status.map(|status| status.success()).unwrap_or(false),
+        exit_code: exit_status.and_then(|status| status.code()),
+        stdout_bytes,
+        stdout_truncated,
+        stderr_bytes,
+        stderr_truncated,
+    })
 }
 
 fn finished_without_process(
@@ -365,21 +485,11 @@ fn join_reader(handle: Option<ReaderHandle>) -> (Vec<u8>, bool) {
     }
 }
 
-#[cfg(windows)]
-fn apply_no_window(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(windows))]
-fn apply_no_window(_command: &mut Command) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     fn temp_root(name: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
@@ -399,6 +509,64 @@ mod tests {
             root.to_path_buf(),
             Some(root.to_path_buf()),
         )
+    }
+
+    /// Path to the `nova_test_helper` binary (see `src/bin/nova_test_helper.rs`).
+    ///
+    /// `env!("CARGO_BIN_EXE_nova_test_helper")` is only populated by Cargo
+    /// for integration tests (`tests/`), not for unit tests compiled into
+    /// the library itself — so this is computed at runtime instead: `cargo
+    /// test`/`cargo build` place unit-test binaries at
+    /// `target/<profile>/deps/<crate>-<hash>.exe` and `[[bin]]` targets one
+    /// directory up, at `target/<profile>/<name>.exe`, so the helper is
+    /// found relative to this test binary's own `current_exe()`.
+    fn helper_exe_path() -> PathBuf {
+        let mut path = std::env::current_exe().expect("current_exe for helper lookup");
+        path.pop(); // drop this test binary's own file name
+        if path.file_name().is_some_and(|name| name == "deps") {
+            path.pop(); // deps/ -> target/<profile>/
+        }
+        let exe_name = if cfg!(windows) {
+            "nova_test_helper.exe"
+        } else {
+            "nova_test_helper"
+        };
+        path.push(exe_name);
+        path
+    }
+
+    static HELPER_BUILD: std::sync::Once = std::sync::Once::new();
+
+    /// Path to the `nova_test_helper` binary (see `src/bin/nova_test_helper.rs`).
+    ///
+    /// `cargo test` builds a separate *test-harness* artifact for a
+    /// `[[bin]]` target (to run any `#[test]`s inside that binary crate,
+    /// of which this one has none) — it does not reliably also produce the
+    /// plain, directly-runnable executable this helper needs to spawn as a
+    /// subprocess. So: check for the plain binary first, and if it is
+    /// missing, build it on demand with a direct `cargo build --bin`
+    /// invocation (serialized across threads within this test run via
+    /// `Once`, so concurrent tests do not all redundantly invoke Cargo).
+    fn helper_exe() -> String {
+        let path = helper_exe_path();
+        HELPER_BUILD.call_once(|| {
+            if !path.is_file() {
+                let status = std::process::Command::new(env!("CARGO"))
+                    .args(["build", "--bin", "nova_test_helper"])
+                    .current_dir(env!("CARGO_MANIFEST_DIR"))
+                    .status()
+                    .expect("invoke `cargo build --bin nova_test_helper`");
+                assert!(
+                    status.success(),
+                    "cargo build --bin nova_test_helper failed"
+                );
+            }
+        });
+        assert!(
+            path.is_file(),
+            "nova_test_helper still missing at {path:?} after on-demand build"
+        );
+        path.to_string_lossy().into_owned()
     }
 
     #[test]
@@ -468,9 +636,6 @@ mod tests {
     #[test]
     fn timeout_kills_the_process_and_reports_timed_out() {
         let root = temp_root("timeout");
-        // `ping` is spawned directly (not via `cmd /C`) so the killed
-        // process has no un-killed grandchild: killing the direct child is
-        // enough to leave no orphan process behind.
         let mut req = request("ping", vec!["-n", "30", "127.0.0.1"], &root);
         req.timeout = Duration::from_millis(300);
         let start = Instant::now();
@@ -490,8 +655,6 @@ mod tests {
     #[test]
     fn user_cancellation_kills_the_process_and_reports_cancelled() {
         let root = temp_root("cancel");
-        // Spawned directly (see comment in the timeout test above) so
-        // cancellation cannot leave an orphaned grandchild process.
         let mut req = request("ping", vec!["-n", "30", "127.0.0.1"], &root);
         req.timeout = Duration::from_secs(30);
         let cancel = CancellationToken::new();
@@ -575,58 +738,6 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn containment_failure_kills_and_reaps_the_already_started_child() {
-        // Deterministically forcing the real Win32 `AssignProcessToJobObject`
-        // call to fail is not reliable across Windows versions/privilege
-        // levels (nested-job support varies). Instead, this drives the exact
-        // production cleanup function (`handle_containment_failure`) with a
-        // synthetic error, proving the already-spawned child is genuinely
-        // killed and reaped rather than left running — the actual safety
-        // property the requirement cares about.
-        let root = temp_root("containment-failure");
-        let req = request("ping", vec!["-n", "30", "127.0.0.1"], &root);
-        let resolved_cwd = path_guard::validate_directory_boundary(&req.cwd, &root).unwrap();
-        let mut command = Command::new(&req.program);
-        command
-            .args(&req.args)
-            .current_dir(&resolved_cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        apply_no_window(&mut command);
-        let mut child = command
-            .spawn()
-            .expect("spawn ping for containment-failure test");
-        let pid = child.id();
-
-        let started_at = Utc::now();
-        let start_instant = Instant::now();
-        let synthetic_error = io::Error::other("simulated job assignment failure");
-        let result = handle_containment_failure(
-            &mut child,
-            &req,
-            started_at,
-            start_instant,
-            synthetic_error,
-        );
-
-        match result.outcome {
-            ExecutionOutcome::Failed { kind, .. } => {
-                assert_eq!(kind, ExecutionErrorKind::StartFailed)
-            }
-            other => panic!("expected StartFailed, got {other:?}"),
-        }
-        // `child.wait()` inside `handle_containment_failure` already reaped
-        // it; a second `try_wait()` must report it as gone, not "still
-        // running", proving no process was left behind.
-        assert!(
-            !matches!(child.try_wait(), Ok(None)),
-            "process {pid} should have been killed and reaped on containment failure"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
     #[cfg(windows)]
     fn process_is_running(pid: u32) -> bool {
         use windows_sys::Win32::Foundation::CloseHandle;
@@ -682,7 +793,9 @@ mod tests {
         // automatically include descendants unless they explicitly break
         // away (this script does not), so if timeout only killed the direct
         // child, `ping.exe` would keep running — this test proves it does
-        // not.
+        // not. (This exercises the *normal*, post-assignment containment
+        // path; the immediate-grandchild-race tests below specifically
+        // target the spawn/assign race this remediation round closes.)
         let root = temp_root("grandchild-timeout");
         let mut req = request(
             "powershell",
@@ -743,6 +856,267 @@ mod tests {
             !still_running,
             "grandchild ping.exe (pid {grandchild_pid}) survived job termination on cancel"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // --- Spawn-race remediation: new tests -------------------------------
+
+    #[test]
+    #[cfg(windows)]
+    fn suspended_process_does_not_run_before_job_assignment_and_resume() {
+        // Direct, step-by-step proof of the exact ordering guarantee this
+        // remediation round is about: the target's own code (writing the
+        // marker file) must not have run before it is a Job member, and
+        // must run only after `resume()`.
+        let root = temp_root("suspend-order");
+        let marker = root.join("marker.txt");
+
+        let child = win_spawn::spawn_suspended(
+            &helper_exe(),
+            &["marker".to_string(), marker.to_string_lossy().into_owned()],
+            &root,
+        )
+        .expect("spawn suspended helper");
+        assert!(
+            !marker.exists(),
+            "marker must not exist immediately after suspended creation"
+        );
+
+        let job = job_object::JobObject::create().expect("create job");
+        job.assign_handle(child.process_handle())
+            .expect("assign suspended process to job");
+        assert!(
+            !marker.exists(),
+            "marker must still not exist after job assignment but before resume"
+        );
+
+        child.resume().expect("resume suspended process");
+        let mut marker_seen = false;
+        for _ in 0..50 {
+            if marker.exists() {
+                marker_seen = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(marker_seen, "marker must be written after resume");
+
+        job.terminate().expect("terminate job");
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn handle_windows_spawn_failure_kills_and_reaps_a_real_suspended_process() {
+        // Deterministically forcing the real Win32 `AssignProcessToJobObject`
+        // or `ResumeThread` call to fail is not reliable across Windows
+        // versions/privilege levels. Instead, this drives the exact
+        // production cleanup function with a synthetic error against a real
+        // spawned (never-resumed) suspended process, proving it is
+        // genuinely terminated and reaped rather than left running.
+        let root = temp_root("windows-spawn-failure");
+        let marker = root.join("marker-should-never-appear.txt");
+        let child = win_spawn::spawn_suspended(
+            &helper_exe(),
+            &["marker".to_string(), marker.to_string_lossy().into_owned()],
+            &root,
+        )
+        .expect("spawn suspended helper");
+
+        let req = request(&helper_exe(), vec!["sleep"], &root);
+        let started_at = Utc::now();
+        let start_instant = Instant::now();
+        let synthetic_error = io::Error::other("simulated assign/resume failure");
+        let result = handle_windows_spawn_failure(
+            &child,
+            &req,
+            started_at,
+            start_instant,
+            "模拟阶段",
+            synthetic_error,
+        );
+
+        match result.outcome {
+            ExecutionOutcome::Failed { kind, .. } => {
+                assert_eq!(kind, ExecutionErrorKind::StartFailed)
+            }
+            other => panic!("expected StartFailed, got {other:?}"),
+        }
+        assert!(
+            !matches!(child.try_wait(), Ok(None)),
+            "process should have been killed and reaped on spawn failure"
+        );
+        // Because the process was terminated before ever being resumed,
+        // its own code (writing the marker) must never have run at all.
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !marker.exists(),
+            "a process killed before resume must never have run its own code"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn immediate_grandchild_timeout_terminates_parent_and_grandchild_repeated() {
+        // The helper spawns its grandchild as the *literal first
+        // statement* (see nova_test_helper.rs) — no sleep, no PowerShell
+        // startup delay for job assignment to "get lucky" against. Run
+        // repeatedly to make a race window failure very unlikely to go
+        // unnoticed.
+        for i in 0..20 {
+            let root = temp_root(&format!("immediate-grandchild-timeout-{i}"));
+            let pid_file = root.join("grandchild-pid.txt");
+            let mut req = request(
+                &helper_exe(),
+                vec!["grandchild-race", pid_file.to_str().unwrap()],
+                &root,
+            );
+            req.timeout = Duration::from_millis(400);
+            let result = execute_blocking(req, CancellationToken::new());
+            match result.outcome {
+                ExecutionOutcome::Failed { kind, .. } => {
+                    assert_eq!(kind, ExecutionErrorKind::TimedOut, "iteration {i}")
+                }
+                other => panic!("iteration {i}: expected TimedOut, got {other:?}"),
+            }
+            let pid_text = fs::read_to_string(&pid_file)
+                .unwrap_or_else(|e| panic!("iteration {i}: pid file missing: {e}"));
+            let grandchild_pid: u32 = pid_text.trim().parse().expect("valid pid");
+            let still_running = wait_until_not_running(grandchild_pid, 30);
+            assert!(
+                !still_running,
+                "iteration {i}: immediately-spawned grandchild (pid {grandchild_pid}) survived timeout"
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn immediate_grandchild_cancel_terminates_parent_and_grandchild_repeated() {
+        for i in 0..20 {
+            let root = temp_root(&format!("immediate-grandchild-cancel-{i}"));
+            let pid_file = root.join("grandchild-pid.txt");
+            let mut req = request(
+                &helper_exe(),
+                vec!["grandchild-race", pid_file.to_str().unwrap()],
+                &root,
+            );
+            req.timeout = Duration::from_secs(30);
+            let cancel = CancellationToken::new();
+            let cancel_for_thread = cancel.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(150));
+                cancel_for_thread.cancel();
+            });
+            let result = execute_blocking(req, cancel);
+            match result.outcome {
+                ExecutionOutcome::Failed { kind, .. } => {
+                    assert_eq!(kind, ExecutionErrorKind::Cancelled, "iteration {i}")
+                }
+                other => panic!("iteration {i}: expected Cancelled, got {other:?}"),
+            }
+            let pid_text = fs::read_to_string(&pid_file)
+                .unwrap_or_else(|e| panic!("iteration {i}: pid file missing: {e}"));
+            let grandchild_pid: u32 = pid_text.trim().parse().expect("valid pid");
+            let still_running = wait_until_not_running(grandchild_pid, 30);
+            assert!(
+                !still_running,
+                "iteration {i}: immediately-spawned grandchild (pid {grandchild_pid}) survived cancel"
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn argument_fidelity_round_trips_every_tricky_argument_unmodified() {
+        let root = temp_root("argv-fidelity");
+        let cases = vec![
+            "plain",
+            "",
+            "has space",
+            "中文参数",
+            "say \"quoted\" thing",
+            r"back\slash",
+            r"trailing\\",
+            "&& not && a && command",
+            "| not | a | pipe",
+            "> not > a > redirect",
+            "; not ; a ; separator",
+            "(parens) in [path]",
+            "fake && calc.exe",
+        ];
+        let mut req = request(&helper_exe(), vec!["echo-argv"], &root);
+        req.args.extend(cases.iter().map(|s| s.to_string()));
+        let result = execute_blocking(req, CancellationToken::new());
+        assert!(
+            matches!(result.outcome, ExecutionOutcome::Success),
+            "outcome: {:?}, stderr: {}",
+            result.outcome,
+            result.stderr
+        );
+        let echoed: Vec<&str> = result.stdout.lines().collect();
+        assert_eq!(
+            echoed.len(),
+            cases.len(),
+            "expected exactly {} echoed lines (one per argument, including the empty one), got {:?}",
+            cases.len(),
+            echoed
+        );
+        for (expected, actual) in cases.iter().zip(echoed.iter()) {
+            assert_eq!(expected, actual, "argument round-trip mismatch");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn repeated_runs_leave_no_residual_process_across_all_outcome_kinds() {
+        // Normal exit, non-zero exit, timeout, and cancel, run several
+        // times each, must never accumulate leftover `nova_test_helper`/
+        // `ping` processes. This does not assert a specific OS handle
+        // count (not reliably comparable across a JIT-warming first run),
+        // but does assert zero matching processes remain after each kind,
+        // repeated, which is the concrete safety property that matters.
+        let root = temp_root("no-residual-mixed");
+
+        for _ in 0..5 {
+            let result = execute_blocking(
+                request(&helper_exe(), vec!["echo-argv", "x"], &root),
+                CancellationToken::new(),
+            );
+            assert!(matches!(result.outcome, ExecutionOutcome::Success));
+        }
+
+        for _ in 0..5 {
+            let result = execute_blocking(
+                request(&helper_exe(), vec!["totally-unknown-mode"], &root),
+                CancellationToken::new(),
+            );
+            assert!(matches!(
+                result.outcome,
+                ExecutionOutcome::Failed {
+                    kind: ExecutionErrorKind::NonZeroExit,
+                    ..
+                }
+            ));
+        }
+
+        for _ in 0..3 {
+            let mut req = request(&helper_exe(), vec!["sleep"], &root);
+            req.timeout = Duration::from_millis(200);
+            let result = execute_blocking(req, CancellationToken::new());
+            assert!(matches!(
+                result.outcome,
+                ExecutionOutcome::Failed {
+                    kind: ExecutionErrorKind::TimedOut,
+                    ..
+                }
+            ));
+        }
+
         let _ = fs::remove_dir_all(&root);
     }
 }

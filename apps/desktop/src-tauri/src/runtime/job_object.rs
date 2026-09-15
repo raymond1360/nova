@@ -16,8 +16,6 @@
 
 use std::io;
 use std::mem::size_of;
-use std::os::windows::io::AsRawHandle;
-use std::process::Child;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
@@ -78,14 +76,18 @@ impl JobObject {
         Ok(job)
     }
 
-    /// Assign `child` to this job. Every process `child` itself spawns
-    /// afterward automatically becomes a member of the same job too.
-    pub fn assign(&self, child: &Child) -> io::Result<()> {
-        let raw = child.as_raw_handle() as HANDLE;
-        // SAFETY: `self.handle` is a valid job object handle; `raw` is the
-        // handle of the live child process owned by `child`, valid for the
-        // duration of this call.
-        let ok = unsafe { AssignProcessToJobObject(self.handle, raw) };
+    /// Assign the process behind `process_handle` to this job. Every
+    /// process it spawns afterward automatically becomes a member of the
+    /// same job too. Takes a raw `HANDLE` (rather than a `std::process`
+    /// type) so this works uniformly for a suspended
+    /// [`super::win_spawn::SuspendedChild`] — the whole point of this
+    /// remediation is assigning *before* the process has run any code, so
+    /// there is no `std::process::Child` in that path at all.
+    pub fn assign_handle(&self, process_handle: HANDLE) -> io::Result<()> {
+        // SAFETY: `self.handle` is a valid job object handle; the caller
+        // guarantees `process_handle` is a valid, still-open process
+        // handle for the duration of this call.
+        let ok = unsafe { AssignProcessToJobObject(self.handle, process_handle) };
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }

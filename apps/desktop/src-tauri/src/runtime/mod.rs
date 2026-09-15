@@ -9,3 +9,5 @@ pub mod job_object;
 pub mod path_guard;
 pub mod process;
 pub mod types;
+#[cfg(windows)]
+pub mod win_spawn;

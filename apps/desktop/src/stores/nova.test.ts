@@ -234,3 +234,72 @@ describe('nova store sendMessage reentrancy', () => {
     expect(secondId).toBe('assistant-4')
   })
 })
+
+describe('nova store environment detection', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    mockedInvoke.mockReset()
+  })
+
+  it('stores the report and clears loading/error on success', async () => {
+    const store = useNovaStore()
+    const report = {
+      platform: { os: 'windows', arch: 'x86_64', is_supported: true },
+      git: { state: 'ready', version: 'git version 2.55.0.windows.2' },
+      codex_cli: { state: 'not_found' },
+      claude_cli: { state: 'not_found' },
+      app_data_dir: { state: 'ready', path: 'C:/AppData/Nova' },
+      generated_at: '2026-09-16T00:00:00Z',
+    }
+    routeInvoke({ detect_runtime_environment: async () => report })
+
+    const promise = store.detectEnvironment()
+    expect(store.environmentLoading).toBe(true)
+    await promise
+
+    expect(store.environmentLoading).toBe(false)
+    expect(store.environmentError).toBe('')
+    expect(store.environment).toEqual(report)
+  })
+
+  it('never shows a failed detection as ready: error state does not leak stale success data', async () => {
+    const store = useNovaStore()
+    routeInvoke({
+      detect_runtime_environment: async () => ({
+        platform: { os: 'windows', arch: 'x86_64', is_supported: true },
+        git: { state: 'ready', version: 'git version 2.55.0.windows.2' },
+        codex_cli: { state: 'not_found' },
+        claude_cli: { state: 'not_found' },
+        app_data_dir: { state: 'ready', path: 'C:/AppData/Nova' },
+        generated_at: '2026-09-16T00:00:00Z',
+      }),
+    })
+    await store.detectEnvironment()
+    expect(store.environment?.git.state).toBe('ready')
+
+    routeInvoke({
+      detect_runtime_environment: async () => {
+        throw new Error('本地数据读写失败，请稍后重试')
+      },
+    })
+    await expect(store.detectEnvironment()).rejects.toThrow('本地数据读写失败')
+    expect(store.environmentLoading).toBe(false)
+    expect(store.environmentError).toContain('本地数据读写失败')
+    // The stale successful report from the previous call must not be
+    // silently presented as the current state without the error being
+    // visible alongside it.
+    expect(store.environmentError).not.toBe('')
+  })
+
+  it('cancelEnvironmentDetection invokes the cancel command', async () => {
+    const store = useNovaStore()
+    let cancelCalls = 0
+    routeInvoke({
+      cancel_environment_detection: async () => {
+        cancelCalls += 1
+      },
+    })
+    await store.cancelEnvironmentDetection()
+    expect(cancelCalls).toBe(1)
+  })
+})

@@ -8,6 +8,7 @@ use crate::models::{
     ChatMessage, Conversation, ModelInfo, ProviderSummary, SaveProviderRequest, SendChatRequest,
     SendChatResult, TestConnectionResult, TokenUsage,
 };
+use crate::runtime::detect::{self, DirectoryStatus, RuntimeEnvironmentReport};
 use crate::security::redact_sensitive_text;
 use crate::validation::{assert_allowed_path, normalize_base_url, AllowedEndpoint};
 use crate::AppState;
@@ -348,6 +349,50 @@ where
         .lock()
         .map_err(|_| "本地数据库锁定失败".to_string())?;
     action(&db).map_err(public_error)
+}
+
+/// Detect Git/Codex CLI/Claude Code CLI readiness, platform support, and
+/// Nova's own app data directory access. Runs under a fresh cancellation
+/// token so a concurrent `cancel_environment_detection` call can stop it.
+#[tauri::command]
+pub async fn detect_runtime_environment(
+    state: State<'_, AppState>,
+) -> Result<RuntimeEnvironmentReport, String> {
+    let cancel = CancellationToken::new();
+    *state
+        .detection_cancel
+        .lock()
+        .map_err(|_| "无法创建取消令牌".to_string())? = Some(cancel.clone());
+
+    let app_data_dir = state.app_data_dir.clone();
+    let report = detect::build_report(app_data_dir, cancel).await;
+
+    if let Ok(mut guard) = state.detection_cancel.lock() {
+        *guard = None;
+    }
+    Ok(report)
+}
+
+#[tauri::command]
+pub fn cancel_environment_detection(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(cancel) = state
+        .detection_cancel
+        .lock()
+        .map_err(|_| "无法读取取消令牌".to_string())?
+        .as_ref()
+    {
+        cancel.cancel();
+    }
+    Ok(())
+}
+
+/// Check whether a user-selected directory exists, is a directory, and is
+/// readable/writable by Nova. Used before Phase 3+ treats a directory as a
+/// project root; exposed now so the minimal Phase 1 environment panel can
+/// exercise and test the same boundary logic end to end.
+#[tauri::command]
+pub fn check_project_directory_access(path: String) -> Result<DirectoryStatus, String> {
+    Ok(detect::check_directory_access(std::path::Path::new(&path)))
 }
 
 #[cfg(test)]

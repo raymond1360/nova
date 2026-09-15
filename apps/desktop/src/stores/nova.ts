@@ -1,12 +1,19 @@
 import { defineStore } from 'pinia'
 import { invoke } from '@tauri-apps/api/core'
-import type { ChatMessage, Conversation, ModelInfo, ProviderSummary, TokenUsage } from '../types'
+import type {
+  ChatMessage,
+  Conversation,
+  ModelInfo,
+  ProviderSummary,
+  RuntimeEnvironmentReport,
+  TokenUsage,
+} from '../types'
 
 const SDKMAX_PROVIDER_ID = 'sdkmax'
 
 export const useNovaStore = defineStore('nova', {
   state: () => ({
-    activeTab: 'chat' as 'chat' | 'providers' | 'settings',
+    activeTab: 'chat' as 'chat' | 'providers' | 'settings' | 'environment',
     provider: null as ProviderSummary | null,
     models: [] as ModelInfo[],
     tokenUsage: null as TokenUsage | null,
@@ -18,6 +25,9 @@ export const useNovaStore = defineStore('nova', {
     sending: false,
     lastError: '',
     lastRequestId: '',
+    environment: null as RuntimeEnvironmentReport | null,
+    environmentLoading: false,
+    environmentError: '',
   }),
   getters: {
     activeConversation(state) {
@@ -166,6 +176,21 @@ export const useNovaStore = defineStore('nova', {
     },
     async stopGeneration() {
       await invoke('cancel_active_chat')
+    },
+    async detectEnvironment() {
+      this.environmentLoading = true
+      this.environmentError = ''
+      try {
+        this.environment = await invoke<RuntimeEnvironmentReport>('detect_runtime_environment')
+      } catch (error) {
+        this.environmentError = String(error)
+        throw error
+      } finally {
+        this.environmentLoading = false
+      }
+    },
+    async cancelEnvironmentDetection() {
+      await invoke('cancel_environment_detection')
     },
     async finishSending() {
       this.sending = false

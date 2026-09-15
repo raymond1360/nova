@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useNovaStore } from './stores/nova'
 import { applyStreamChunk, applyStreamError } from './chatEvents'
-import type { ChatMessage } from './types'
+import type { ChatMessage, DirectoryStatus, ToolStatus } from './types'
 
 const store = useNovaStore()
 const providerName = ref('SDKMAX')
@@ -97,6 +97,81 @@ async function send() {
   prompt.value = ''
   await store.sendMessage(text)
 }
+
+async function openEnvironmentTab() {
+  store.activeTab = 'environment'
+  if (!store.environment && !store.environmentLoading) {
+    await store.detectEnvironment().catch(() => {})
+  }
+}
+
+function statusLabel(status: ToolStatus | undefined): string {
+  if (!status) return '未检测'
+  switch (status.state) {
+    case 'ready':
+      return status.version ? `就绪（${status.version}）` : '就绪'
+    case 'not_found':
+      return '未安装或未找到可执行文件'
+    case 'not_logged_in':
+      return '未登录'
+    case 'session_expired':
+      return '登录已失效'
+    case 'quota_exceeded':
+      return '额度不足'
+    case 'permission_denied':
+      return '权限不足'
+    case 'network_interrupted':
+      return '网络中断'
+    case 'start_failed':
+      return '启动失败'
+    case 'non_zero_exit':
+      return `执行出错（退出码 ${status.exit_code ?? '未知'}）`
+    case 'timed_out':
+      return '执行超时'
+    case 'cancelled':
+      return '已取消'
+    case 'unknown':
+      return '未知错误'
+  }
+}
+
+function statusOk(status: ToolStatus | undefined): boolean {
+  return status?.state === 'ready'
+}
+
+function statusDetail(status: ToolStatus | undefined): string | null {
+  if (!status) return null
+  if ('detail' in status) return status.detail
+  return null
+}
+
+function dirLabel(status: DirectoryStatus | undefined): string {
+  if (!status) return '未检测'
+  switch (status.state) {
+    case 'ready':
+      return `可用（${status.path}）`
+    case 'not_found':
+      return '路径不存在'
+    case 'not_a_directory':
+      return '不是目录'
+    case 'permission_denied':
+      return '权限不足'
+    case 'unknown':
+      return '未知错误'
+  }
+}
+
+const environmentDiagnostics = computed(() => {
+  const env = store.environment
+  if (!env) return []
+  return (
+    [
+      ['Git', statusDetail(env.git)],
+      ['Codex CLI', statusDetail(env.codex_cli)],
+      ['Claude Code CLI', statusDetail(env.claude_cli)],
+    ] as const
+  ).filter(([, detail]) => Boolean(detail))
+})
 </script>
 
 <template>
@@ -115,6 +190,7 @@ async function send() {
           供应商
         </button>
         <button :class="{ active: store.activeTab === 'settings' }" @click="store.activeTab = 'settings'">设置</button>
+        <button :class="{ active: store.activeTab === 'environment' }" @click="openEnvironmentTab">环境</button>
       </nav>
       <section class="conversation-list">
         <div class="row">
@@ -219,6 +295,52 @@ async function send() {
         <div><span>最近模型</span><strong>{{ store.selectedModelId || '未选择' }}</strong></div>
         <div><span>供应商</span><strong>{{ store.provider?.base_url }}</strong></div>
       </div>
+    </section>
+
+    <section v-if="store.activeTab === 'environment'" class="page">
+      <header class="page-header">
+        <h2>环境检测</h2>
+        <p>阶段1运行时基础：Git / Codex CLI / Claude Code CLI 就绪状态与应用数据目录访问情况。</p>
+      </header>
+      <div class="actions">
+        <button @click="store.detectEnvironment" :disabled="store.environmentLoading">
+          {{ store.environmentLoading ? '检测中…' : '重新检测' }}
+        </button>
+        <button v-if="store.environmentLoading" class="danger" @click="store.cancelEnvironmentDetection">
+          取消
+        </button>
+      </div>
+      <p v-if="store.environmentError" class="error">{{ store.environmentError }}</p>
+      <div v-if="store.environment" class="settings-list">
+        <div>
+          <span>平台</span>
+          <strong>
+            {{ store.environment.platform.os }} / {{ store.environment.platform.arch }}
+            （{{ store.environment.platform.is_supported ? '支持' : '不支持' }}）
+          </strong>
+        </div>
+        <div><span>应用数据目录</span><strong>{{ dirLabel(store.environment.app_data_dir) }}</strong></div>
+        <div>
+          <span>Git</span>
+          <strong :class="{ success: statusOk(store.environment.git) }">{{ statusLabel(store.environment.git) }}</strong>
+        </div>
+        <div>
+          <span>Codex CLI</span>
+          <strong :class="{ success: statusOk(store.environment.codex_cli) }">
+            {{ statusLabel(store.environment.codex_cli) }}
+          </strong>
+        </div>
+        <div>
+          <span>Claude Code CLI</span>
+          <strong :class="{ success: statusOk(store.environment.claude_cli) }">
+            {{ statusLabel(store.environment.claude_cli) }}
+          </strong>
+        </div>
+      </div>
+      <details v-if="environmentDiagnostics.length" class="diagnostic-details">
+        <summary>技术详情（已脱敏，默认折叠）</summary>
+        <p v-for="[label, detail] in environmentDiagnostics" :key="label" class="diagnostic">{{ label }}: {{ detail }}</p>
+      </details>
     </section>
   </main>
 </template>

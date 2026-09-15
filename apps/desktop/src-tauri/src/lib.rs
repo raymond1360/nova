@@ -4,9 +4,11 @@ mod credential;
 mod db;
 mod error;
 mod models;
+mod runtime;
 mod security;
 mod validation;
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,10 +23,12 @@ pub struct AppState {
     client: reqwest::Client,
     credentials: Arc<dyn CredentialStore>,
     active_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    app_data_dir: PathBuf,
+    detection_cancel: Arc<Mutex<Option<CancellationToken>>>,
 }
 
 impl AppState {
-    fn new(db: Database, credentials: Arc<dyn CredentialStore>) -> Self {
+    fn new(db: Database, credentials: Arc<dyn CredentialStore>, app_data_dir: PathBuf) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(45))
             .build()
@@ -34,6 +38,8 @@ impl AppState {
             client,
             credentials,
             active_cancel: Arc::new(Mutex::new(None)),
+            app_data_dir,
+            detection_cancel: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -47,7 +53,11 @@ pub fn run() {
             let db = Database::open(&db_path)?;
             db.migrate()?;
             db.ensure_default_provider()?;
-            app.manage(AppState::new(db, Arc::new(SystemCredentialStore::new())));
+            app.manage(AppState::new(
+                db,
+                Arc::new(SystemCredentialStore::new()),
+                app_data_dir,
+            ));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -66,6 +76,9 @@ pub fn run() {
             commands::list_messages,
             commands::send_chat_message,
             commands::cancel_active_chat,
+            commands::detect_runtime_environment,
+            commands::cancel_environment_detection,
+            commands::check_project_directory_access,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Nova");

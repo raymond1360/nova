@@ -53,3 +53,41 @@ export interface AppError {
   request_id?: string | null
   diagnostic?: string | null
 }
+
+// Mirrors src-tauri/src/runtime/types.rs::ToolStatus (serde tag = "state").
+export type ToolStatus =
+  | { state: 'not_found' }
+  | { state: 'ready'; version: string | null }
+  | { state: 'not_logged_in' }
+  | { state: 'session_expired' }
+  | { state: 'quota_exceeded' }
+  | { state: 'permission_denied' }
+  | { state: 'network_interrupted' }
+  | { state: 'start_failed'; detail: string }
+  | { state: 'non_zero_exit'; exit_code: number | null; detail: string }
+  | { state: 'timed_out' }
+  | { state: 'cancelled' }
+  | { state: 'unknown'; detail: string }
+
+// Mirrors src-tauri/src/runtime/detect.rs::DirectoryStatus.
+export type DirectoryStatus =
+  | { state: 'ready'; path: string }
+  | { state: 'not_found' }
+  | { state: 'not_a_directory' }
+  | { state: 'permission_denied' }
+  | { state: 'unknown'; detail: string }
+
+export interface PlatformStatus {
+  os: string
+  arch: string
+  is_supported: boolean
+}
+
+export interface RuntimeEnvironmentReport {
+  platform: PlatformStatus
+  git: ToolStatus
+  codex_cli: ToolStatus
+  claude_cli: ToolStatus
+  app_data_dir: DirectoryStatus
+  generated_at: string
+}

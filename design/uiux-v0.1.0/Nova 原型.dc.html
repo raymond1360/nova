@@ -1,0 +1,1261 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+  body { margin:0; background:#111214; -webkit-font-smoothing:antialiased; font-family:-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif; }
+  a { color:#B5572F; text-decoration:none; }
+  a:hover { color:#8E4322; }
+  @keyframes novaIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+  @keyframes novaBlink { 0%,80%,100% { opacity:.25; } 40% { opacity:1; } }
+  @keyframes novaSweep { 0% { transform:translateX(-100%); } 100% { transform:translateX(230%); } }
+</style>
+</helmet>
+
+<div style="--bg:#FCFBF9;--panel:#F8F6F1;--line:#E6E1D8;--ink:#26241F;--ink2:#5C574F;--ink3:#8A847A;--card:#FFFFFF;--accent:#B5572F;--accentLine:#A24E2A;--accentSoft:#F8EEE8;--accentInk:#FFFFFF;--ok:#3F6B4A;--okSoft:#EAF1EA;--warn:#93651B;--warnSoft:#F7F0E2;--userBg:#F1EEE8;--userInk:#26241F;--bub:14px;--rad:12px;display:flex;flex-direction:column;gap:0;height:100vh;overflow:hidden;background:#111214;font-family:-apple-system,'Segoe UI','Microsoft YaHei','PingFang SC',sans-serif">
+<div style="{{ themeVars }}">
+
+  <sc-if value="{{ demo }}" hint-placeholder-val="{{ true }}">
+  <div style="background:#1B1C20;border-bottom:1px solid #303239;padding:11px 16px 13px;display:flex;flex-direction:column;gap:9px">
+    <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">
+      <span style="font-size:11px;letter-spacing:.12em;color:#8B909C;text-transform:uppercase">{{ t.demoTitle }}</span>
+      <span style="font-size:11.5px;color:#6D727D">{{ t.demoNote }}</span>
+      <span style="flex:1"></span>
+      <button onClick="{{ hideDemo }}" style="font:inherit;font-size:11.5px;padding:4px 9px;border-radius:6px;border:1px solid #3A3D45;background:transparent;color:#9AA0AC;cursor:pointer" style-hover="color:#FFFFFF;border-color:#5A5F6A">{{ t.hideDemo }}</button>
+    </div>
+    <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start">
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <span style="font-size:10.5px;color:#6D727D">{{ t.demoScene }}</span>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <sc-for list="{{ scenes }}" as="s" hint-placeholder-count="8">
+            <button onClick="{{ s.on }}" style="font:inherit;font-size:11.5px;padding:5px 10px;border-radius:999px;border:1px solid #3A3D45;background:{{ s.bg }};color:{{ s.fg }};cursor:pointer;white-space:nowrap" style-hover="border-color:#6B7180">{{ s.label }}</button>
+          </sc-for>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <span style="font-size:10.5px;color:#6D727D">{{ t.demoTheme }}</span>
+        <div style="display:flex;gap:6px">
+          <button onClick="{{ setNova }}" style="font:inherit;font-size:11.5px;padding:5px 10px;border-radius:999px;border:1px solid #3A3D45;background:{{ novaBg }};color:{{ novaFg }};cursor:pointer;white-space:nowrap">{{ t.themeNova }}</button>
+          <button onClick="{{ setWx }}" style="font:inherit;font-size:11.5px;padding:5px 10px;border-radius:999px;border:1px solid #3A3D45;background:{{ wxBg }};color:{{ wxFg }};cursor:pointer;white-space:nowrap">{{ t.themeWx }}</button>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <span style="font-size:10.5px;color:#6D727D">{{ t.demoWin }}</span>
+        <div style="display:flex;gap:6px">
+          <sc-for list="{{ wins }}" as="w" hint-placeholder-count="3">
+            <button onClick="{{ w.on }}" style="font:inherit;font-size:11.5px;padding:5px 10px;border-radius:999px;border:1px solid #3A3D45;background:{{ w.bg }};color:{{ w.fg }};cursor:pointer;white-space:nowrap">{{ w.label }}</button>
+          </sc-for>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:5px">
+        <span style="font-size:10.5px;color:#6D727D">{{ t.demoSim }}</span>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button onClick="{{ simDrop }}" style="font:inherit;font-size:11.5px;padding:5px 10px;border-radius:999px;border:1px solid #3A3D45;background:transparent;color:#9AA0AC;cursor:pointer;white-space:nowrap" style-hover="color:#FFFFFF">{{ t.simDrop }}</button>
+          <button onClick="{{ simBad }}" style="font:inherit;font-size:11.5px;padding:5px 10px;border-radius:999px;border:1px solid #3A3D45;background:transparent;color:#9AA0AC;cursor:pointer;white-space:nowrap" style-hover="color:#FFFFFF">{{ t.simBad }}</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  </sc-if>
+
+  <div style="flex:1;min-height:0;padding:16px;display:flex;justify-content:center;background:#111214;overflow:auto">
+  <div style="width:100%;max-width:{{ winW }};height:{{ winH }};display:flex;flex-direction:column;overflow:hidden;border-radius:10px;background:var(--bg,#FCFBF9);color:var(--ink,#26241F);box-shadow:0 22px 60px rgba(0,0,0,.45)">
+
+    <div style="flex:1;min-height:0;display:flex;align-items:stretch">
+
+      <sc-if value="{{ side }}" hint-placeholder-val="{{ true }}">
+      <div style="width:230px;flex:none;min-height:0;overflow-y:auto;border-right:1px solid var(--line,#E6E1D8);background:var(--panel,#F8F6F1);display:flex;flex-direction:column;gap:14px;padding:16px 13px 14px">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:11px;letter-spacing:.06em;color:var(--ink3,#8A847A);flex:1">{{ t.current }}</span>
+          <button onClick="{{ toggleSide }}" title="{{ t.collapse }}" style="font:inherit;flex:none;font-size:11.5px;padding:3px 8px;border-radius:7px;border:1px solid var(--line,#E6E1D8);background:var(--card,#FFF);color:var(--ink2,#5C574F);cursor:pointer" style-hover="color:var(--ink,#26241F)">‹</button>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <div style="display:flex;gap:9px;align-items:center;padding:9px 10px;border-radius:var(--rad,12px);background:var(--card,#FFF);border:1px solid var(--line,#E6E1D8)">
+            <span style="width:26px;height:26px;flex:none;border-radius:8px;background:var(--accent,#B5572F);color:var(--accentInk,#FFF);display:flex;align-items:center;justify-content:center;font-size:12.5px">{{ t.projGlyph }}</span>
+            <span style="display:flex;flex-direction:column;gap:1px;min-width:0">
+              <span style="font-size:13.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ t.projName }}</span>
+              <span style="font-size:11.5px;color:var(--ink3,#8A847A);white-space:nowrap">{{ t.projMeta }}</span>
+            </span>
+          </div>
+          <sc-for list="{{ otherProjects }}" as="p" hint-placeholder-count="2">
+            <div style="display:flex;gap:9px;align-items:center;padding:9px 10px;border-radius:var(--rad,12px);cursor:pointer" style-hover="background:var(--card,#FFF)">
+              <span style="width:26px;height:26px;flex:none;border-radius:8px;background:var(--line,#E6E1D8);color:var(--ink2,#5C574F);display:flex;align-items:center;justify-content:center;font-size:12.5px">{{ p.glyph }}</span>
+              <span style="display:flex;flex-direction:column;gap:1px;min-width:0">
+                <span style="font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ p.name }}</span>
+                <span style="font-size:11.5px;color:var(--ink3,#8A847A);white-space:nowrap">{{ p.meta }}</span>
+              </span>
+            </div>
+          </sc-for>
+        </div>
+        <button onClick="{{ newProject }}" style="font:inherit;font-size:12.5px;padding:9px 10px;border-radius:var(--rad,12px);border:1px dashed var(--line,#E6E1D8);background:transparent;color:var(--ink2,#5C574F);cursor:pointer;text-align:left" style-hover="background:var(--card,#FFF);color:var(--ink,#26241F)">＋ {{ t.newProject }}</button>
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <span style="font-size:11px;letter-spacing:.06em;color:var(--ink3,#8A847A);padding:0 10px">{{ t.history }}</span>
+          <sc-for list="{{ historyItems }}" as="h" hint-placeholder-count="3">
+            <div style="display:flex;gap:8px;align-items:center;font-size:12.5px;padding:8px 10px;border-radius:9px;color:var(--ink2,#5C574F);cursor:pointer" style-hover="background:var(--card,#FFF)">
+              <span style="width:6px;height:6px;flex:none;border-radius:50%;background:{{ h.dot }}"></span>
+              <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ h.label }}</span>
+            </div>
+          </sc-for>
+        </div>
+        <span style="flex:1"></span>
+        <button style="font:inherit;font-size:12.5px;padding:8px 10px;border-radius:9px;border:none;background:transparent;color:var(--ink3,#8A847A);cursor:pointer;text-align:left" style-hover="background:var(--card,#FFF);color:var(--ink,#26241F)">{{ t.settings }}</button>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{ sideClosed }}" hint-placeholder-val="{{ false }}">
+      <button onClick="{{ toggleSide }}" title="{{ t.expandSide }}" style="font:inherit;width:48px;flex:none;border:none;border-right:1px solid var(--line,#E6E1D8);background:var(--panel,#F8F6F1);display:flex;flex-direction:column;align-items:center;gap:12px;padding:18px 0 20px;cursor:pointer;color:var(--ink2,#5C574F)" style-hover="color:var(--ink,#26241F)">
+        <span style="width:24px;height:24px;flex:none;border-radius:50%;border:1px solid var(--line,#E6E1D8);background:var(--card,#FFF);display:flex;align-items:center;justify-content:center;font-size:12px;line-height:1">›</span>
+        <span style="display:flex;flex-direction:column;align-items:center;gap:4px">
+          <span style="width:32px;height:32px;flex:none;border-radius:9px;background:var(--accent,#B5572F);color:var(--accentInk,#FFF);display:flex;align-items:center;justify-content:center;font-size:13px">{{ t.projGlyph }}</span>
+          <span style="font-size:10.5px;line-height:1;color:var(--ink3,#8A847A)">{{ t.sideCount }}</span>
+        </span>
+        <span style="writing-mode:vertical-rl;font-size:12.5px;letter-spacing:3px">{{ t.sideLabel }}</span>
+      </button>
+      </sc-if>
+
+      <div style="flex:1;min-width:0;display:flex;flex-direction:column;background:var(--bg,#FCFBF9)">
+
+        <div style="flex:none;display:flex;align-items:center;gap:10px;padding:12px 18px;border-bottom:1px solid var(--line,#E6E1D8);background:var(--bg,#FCFBF9)">
+          <span style="display:flex;flex-direction:column;gap:1px;min-width:0">
+            <span style="font-size:14.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ t.projName }}</span>
+            <span style="font-size:11.5px;color:var(--ink3,#8A847A);white-space:nowrap">{{ t.headMeta }}</span>
+          </span>
+          <span style="flex:1"></span>
+          <button onClick="{{ toggleLang }}" style="font:inherit;flex:none;font-size:12px;padding:7px 11px;border-radius:999px;border:1px solid var(--line,#E6E1D8);background:var(--card,#FFF);color:var(--ink2,#5C574F);cursor:pointer;white-space:nowrap" style-hover="color:var(--ink,#26241F)">{{ t.langBtn }}</button>
+          <button onClick="{{ openDrawer }}" style="font:inherit;flex:none;font-size:12px;padding:7px 11px;border-radius:999px;border:1px solid var(--line,#E6E1D8);background:var(--card,#FFF);color:var(--ink2,#5C574F);cursor:pointer;white-space:nowrap" style-hover="color:var(--ink,#26241F)">{{ t.details }}</button>
+        </div>
+
+        <div style="flex:1;min-height:0;position:relative;display:flex;flex-direction:column">
+          <div ref="{{ scrollRef }}" onScroll="{{ onScroll }}" style="flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding:24px 22px 8px">
+            <div style="max-width:740px;margin:0 auto;display:flex;flex-direction:column;gap:20px">
+
+              <sc-for list="{{ msgs }}" as="m" hint-placeholder-count="3">
+                <div style="display:flex;flex-direction:column;gap:9px;animation:novaIn .22s ease-out">
+
+                  <sc-if value="{{ m.isUser }}" hint-placeholder-val="{{ false }}">
+                  <div style="display:flex;justify-content:flex-end">
+                    <div style="max-width:80%;display:flex;flex-direction:column;gap:7px;padding:11px 14px;border-radius:var(--bub,14px);background:var(--userBg,#F1EEE8);color:var(--userInk,#26241F);font-size:15px;line-height:1.7;white-space:pre-wrap;word-break:break-word">
+                      <span>{{ m.text }}</span>
+                      <sc-if value="{{ m.hasFiles }}" hint-placeholder-val="{{ false }}">
+                      <div style="display:flex;gap:6px;flex-wrap:wrap">
+                        <sc-for list="{{ m.files }}" as="f" hint-placeholder-count="1">
+                          <span style="display:flex;align-items:center;gap:6px;font-size:12px;padding:5px 9px;border-radius:8px;background:rgba(255,255,255,.65);color:var(--ink2,#5C574F);white-space:nowrap;max-width:230px"><span>{{ f.icon }}</span><span style="overflow:hidden;text-overflow:ellipsis">{{ f.name }}</span></span>
+                        </sc-for>
+                      </div>
+                      </sc-if>
+                    </div>
+                  </div>
+                  </sc-if>
+
+                  <sc-if value="{{ m.isNova }}" hint-placeholder-val="{{ true }}">
+                  <div style="display:flex;gap:11px;align-items:flex-start">
+                    <span style="width:28px;height:28px;flex:none;border-radius:50%;background:var(--accentSoft,#F8EEE8);color:var(--accent,#B5572F);display:flex;align-items:center;justify-content:center;font-size:13px;margin-top:2px">◎</span>
+                    <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:11px">
+
+                      <sc-if value="{{ m.isStatus }}" hint-placeholder-val="{{ false }}">
+                      <div style="display:flex;align-items:center;gap:9px;font-size:14.5px;color:var(--ink2,#5C574F)">
+                        <span>{{ m.text }}</span>
+                        <span style="display:flex;gap:3px;align-items:center">
+                          <span style="width:4px;height:4px;border-radius:50%;background:var(--ink3,#8A847A);animation:novaBlink 1.1s infinite"></span>
+                          <span style="width:4px;height:4px;border-radius:50%;background:var(--ink3,#8A847A);animation:novaBlink 1.1s infinite .18s"></span>
+                          <span style="width:4px;height:4px;border-radius:50%;background:var(--ink3,#8A847A);animation:novaBlink 1.1s infinite .36s"></span>
+                        </span>
+                      </div>
+                      </sc-if>
+
+                      <sc-if value="{{ m.isText }}" hint-placeholder-val="{{ true }}">
+                      <div style="display:flex;flex-direction:column;gap:8px;font-size:15.5px;line-height:1.8;color:var(--ink,#26241F)">
+                        <sc-for list="{{ m.lines }}" as="ln" hint-placeholder-count="2">
+                          <span style="text-wrap:pretty">{{ ln.text }}</span>
+                        </sc-for>
+                      </div>
+                      </sc-if>
+
+                      <sc-if value="{{ m.isCard }}" hint-placeholder-val="{{ false }}">
+                      <div style="border:1px solid var(--line,#E6E1D8);border-radius:var(--rad,12px);background:var(--card,#FFF);padding:15px 17px;display:flex;flex-direction:column;gap:12px">
+                        <div style="display:flex;align-items:center;gap:9px;flex-wrap:wrap">
+                          <span style="font-size:15px;font-weight:500">{{ m.title }}</span>
+                          <sc-if value="{{ m.hasTag }}" hint-placeholder-val="{{ false }}">
+                          <span style="font-size:11.5px;padding:2px 9px;border-radius:999px;background:{{ m.tagBg }};color:{{ m.tagFg }};white-space:nowrap">{{ m.tag }}</span>
+                          </sc-if>
+                        </div>
+
+                        <sc-if value="{{ m.hasBar }}" hint-placeholder-val="{{ false }}">
+                        <div style="height:5px;border-radius:999px;background:var(--line,#E6E1D8);overflow:hidden;position:relative">
+                          <span style="position:absolute;inset:0 auto 0 0;width:{{ m.barPct }};background:var(--accent,#B5572F);border-radius:999px;transition:width .5s ease"></span>
+                        </div>
+                        </sc-if>
+
+                        <sc-if value="{{ m.hasRows }}" hint-placeholder-val="{{ true }}">
+                        <div style="display:flex;flex-direction:column;gap:9px">
+                          <sc-for list="{{ m.rows }}" as="r" hint-placeholder-count="3">
+                            <div style="display:flex;gap:10px;align-items:flex-start;font-size:14px;line-height:1.65">
+                              <span style="flex:none;width:18px;text-align:center;color:{{ r.color }};font-size:13px;margin-top:1px">{{ r.icon }}</span>
+                              <span style="flex:1;min-width:0;color:var(--ink,#26241F);text-wrap:pretty">{{ r.label }}</span>
+                              <sc-if value="{{ r.hasValue }}" hint-placeholder-val="{{ false }}">
+                              <span style="flex:none;font-size:13px;color:{{ r.color }};white-space:nowrap">{{ r.value }}</span>
+                              </sc-if>
+                            </div>
+                          </sc-for>
+                        </div>
+                        </sc-if>
+
+                        <sc-if value="{{ m.hasMeta }}" hint-placeholder-val="{{ false }}">
+                        <div style="display:flex;gap:9px;align-items:center;font-size:13px;color:var(--ink3,#8A847A);flex-wrap:wrap;padding-top:2px;border-top:1px solid var(--line,#E6E1D8)">
+                          <span style="width:110px;height:3px;border-radius:999px;background:var(--line,#E6E1D8);overflow:hidden;position:relative;flex:none"><span style="position:absolute;top:0;bottom:0;width:42%;background:var(--accent,#B5572F);animation:novaSweep 1.5s linear infinite"></span></span>
+                          <span style="text-wrap:pretty">{{ m.meta }}</span>
+                        </div>
+                        </sc-if>
+
+                        <sc-if value="{{ m.hasNote }}" hint-placeholder-val="{{ false }}">
+                        <div style="font-size:13.5px;line-height:1.75;color:var(--ink2,#5C574F);background:var(--panel,#F8F6F1);border-radius:10px;padding:11px 13px;text-wrap:pretty">{{ m.note }}</div>
+                        </sc-if>
+
+                        <sc-if value="{{ m.hasTech }}" hint-placeholder-val="{{ false }}">
+                        <div style="display:flex;flex-direction:column;gap:8px">
+                          <button onClick="{{ m.onTech }}" style="font:inherit;align-self:flex-start;font-size:12.5px;padding:5px 10px;border-radius:8px;border:1px solid var(--line,#E6E1D8);background:transparent;color:var(--ink3,#8A847A);cursor:pointer" style-hover="color:var(--ink2,#5C574F)">{{ m.techLabel }}</button>
+                          <sc-if value="{{ m.techOpen }}" hint-placeholder-val="{{ false }}">
+                          <div style="display:flex;flex-direction:column;gap:5px;font-size:12.5px;line-height:1.7;color:var(--ink3,#8A847A);background:var(--panel,#F8F6F1);border-radius:10px;padding:11px 13px">
+                            <sc-for list="{{ m.techRows }}" as="x" hint-placeholder-count="2">
+                              <span>{{ x.text }}</span>
+                            </sc-for>
+                          </div>
+                          </sc-if>
+                        </div>
+                        </sc-if>
+
+                        <sc-if value="{{ m.hasActions }}" hint-placeholder-val="{{ false }}">
+                        <div style="display:flex;gap:10px;flex-wrap:wrap">
+                          <sc-for list="{{ m.actions }}" as="a" hint-placeholder-count="2">
+                            <button onClick="{{ a.on }}" style="font:inherit;flex:none;font-size:14.5px;font-weight:{{ a.weight }};padding:12px 18px;border-radius:10px;border:1px solid {{ a.border }};background:{{ a.bg }};color:{{ a.fg }};cursor:pointer;white-space:nowrap" style-hover="filter:brightness(.97)">{{ a.label }}</button>
+                          </sc-for>
+                        </div>
+                        </sc-if>
+                      </div>
+                      </sc-if>
+
+                      <sc-if value="{{ m.hasChips }}" hint-placeholder-val="{{ false }}">
+                      <div style="display:flex;flex-direction:column;gap:8px">
+                        <div style="display:flex;gap:8px;flex-wrap:wrap">
+                          <sc-for list="{{ m.chips }}" as="c" hint-placeholder-count="3">
+                            <button onClick="{{ c.on }}" style="font:inherit;flex:none;font-size:14px;padding:9px 15px;border-radius:999px;border:1px solid var(--line,#E6E1D8);background:var(--card,#FFF);color:var(--ink,#26241F);cursor:pointer;white-space:nowrap" style-hover="border-color:var(--accent,#B5572F);color:var(--accent,#B5572F)" style-active="transform:translateY(1px)">{{ c.label }}</button>
+                          </sc-for>
+                        </div>
+                        <span style="font-size:12.5px;color:var(--ink3,#8A847A)">{{ t.chipNote }}</span>
+                      </div>
+                      </sc-if>
+
+                    </div>
+                  </div>
+                  </sc-if>
+
+                </div>
+              </sc-for>
+
+              <div style="height:6px;flex:none"></div>
+            </div>
+          </div>
+
+          <sc-if value="{{ showJump }}" hint-placeholder-val="{{ false }}">
+          <button onClick="{{ jumpBottom }}" style="font:inherit;position:absolute;left:50%;bottom:14px;transform:translateX(-50%);font-size:12.5px;padding:7px 14px;border-radius:999px;border:1px solid var(--line,#E6E1D8);background:var(--card,#FFF);color:var(--ink2,#5C574F);cursor:pointer;box-shadow:0 6px 18px rgba(38,36,31,.12);white-space:nowrap">↓ {{ t.toBottom }}</button>
+          </sc-if>
+        </div>
+
+        <div style="flex:none;padding:12px 22px 18px;background:var(--bg,#FCFBF9)">
+          <div style="max-width:740px;margin:0 auto;display:flex;flex-direction:column;gap:8px">
+
+            <sc-if value="{{ busy }}" hint-placeholder-val="{{ false }}">
+            <span style="font-size:12.5px;color:var(--ink3,#8A847A);padding-left:4px">{{ t.busyHint }}</span>
+            </sc-if>
+
+            <sc-if value="{{ hasErr }}" hint-placeholder-val="{{ false }}">
+            <div style="display:flex;align-items:center;gap:9px;font-size:13px;padding:10px 13px;border-radius:10px;background:var(--warnSoft,#F7F0E2);color:var(--warn,#93651B)">
+              <span style="flex:1;text-wrap:pretty">{{ err }}</span>
+              <button onClick="{{ clearErr }}" style="font:inherit;flex:none;font-size:12px;padding:4px 9px;border-radius:7px;border:1px solid currentColor;background:transparent;color:inherit;cursor:pointer">{{ t.gotIt }}</button>
+            </div>
+            </sc-if>
+
+            <div onDragOver="{{ onDragOver }}" onDragLeave="{{ onDragLeave }}" onDrop="{{ onDrop }}" style="border:1px {{ dropStyle }} {{ dropColor }};border-radius:var(--rad,12px);background:var(--card,#FFF);padding:10px 12px 9px;display:flex;flex-direction:column;gap:9px;box-shadow:0 2px 10px rgba(38,36,31,.04)">
+
+              <sc-if value="{{ hasFiles }}" hint-placeholder-val="{{ false }}">
+              <div style="display:flex;gap:7px;flex-wrap:wrap">
+                <sc-for list="{{ files }}" as="f" hint-placeholder-count="1">
+                  <span style="display:flex;align-items:center;gap:8px;font-size:12.5px;padding:6px 8px 6px 10px;border-radius:9px;background:var(--panel,#F8F6F1);color:var(--ink2,#5C574F);max-width:250px">
+                    <span style="flex:none">{{ f.icon }}</span>
+                    <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ f.name }}</span>
+                    <sc-if value="{{ f.uploading }}" hint-placeholder-val="{{ false }}">
+                    <span style="flex:none;font-size:11.5px;color:var(--ink3,#8A847A)">{{ t.uploading }}</span>
+                    </sc-if>
+                    <button onClick="{{ f.onRemove }}" title="{{ t.remove }}" style="font:inherit;flex:none;width:18px;height:18px;border-radius:50%;border:none;background:transparent;color:var(--ink3,#8A847A);cursor:pointer;font-size:13px;line-height:1">×</button>
+                  </span>
+                </sc-for>
+              </div>
+              </sc-if>
+
+              <textarea ref="{{ taRef }}" value="{{ draft }}" onChange="{{ onDraft }}" onKeyDown="{{ onKey }}" onPaste="{{ onPaste }}" rows="{{ rows }}" placeholder="{{ t.placeholder }}" style="width:100%;box-sizing:border-box;border:none;outline:none;resize:none;background:transparent;font:inherit;font-size:15.5px;line-height:1.7;color:var(--ink,#26241F);max-height:190px;overflow-y:auto;padding:4px 2px"></textarea>
+
+              <div style="display:flex;align-items:center;gap:9px">
+                <span style="position:relative;display:inline-flex">
+                  <button style="font:inherit;font-size:13px;padding:7px 11px;border-radius:9px;border:1px solid var(--line,#E6E1D8);background:transparent;color:var(--ink2,#5C574F);cursor:pointer;white-space:nowrap" style-hover="color:var(--ink,#26241F)">＋ {{ t.attach }}</button>
+                  <input type="file" multiple="{{ true }}" onChange="{{ onPick }}" style="position:absolute;inset:0;opacity:0;cursor:pointer;font-size:0" />
+                </span>
+                <span style="font-size:12px;color:var(--ink3,#8A847A);white-space:nowrap">{{ t.enterHint }}</span>
+                <span style="flex:1"></span>
+                <button onClick="{{ send }}" disabled="{{ cantSend }}" style="font:inherit;flex:none;font-size:14px;font-weight:500;padding:9px 18px;border-radius:9px;border:1px solid {{ sendBorder }};background:{{ sendBg }};color:{{ sendFg }};cursor:{{ sendCursor }};white-space:nowrap">{{ sendLabel }}</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <sc-if value="{{ drawer }}" hint-placeholder-val="{{ false }}">
+      <div style="width:286px;flex:none;border-left:1px solid var(--line,#E6E1D8);background:var(--panel,#F8F6F1);padding:16px 16px 18px;display:flex;flex-direction:column;gap:15px;overflow-y:auto">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:14px;font-weight:500;flex:1">{{ t.details }}</span>
+          <button onClick="{{ toggleDrawer }}" style="font:inherit;flex:none;font-size:11.5px;padding:3px 8px;border-radius:7px;border:1px solid var(--line,#E6E1D8);background:var(--card,#FFF);color:var(--ink2,#5C574F);cursor:pointer">›</button>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:7px">
+          <span style="font-size:11.5px;color:var(--ink3,#8A847A)">{{ t.dTasks }}</span>
+          <sc-for list="{{ drawerTasks }}" as="d" hint-placeholder-count="3">
+            <div style="display:flex;gap:9px;align-items:flex-start;font-size:13px;line-height:1.6;padding:9px 11px;border-radius:10px;background:var(--card,#FFF)">
+              <span style="flex:none;color:{{ d.color }};font-size:12px;margin-top:1px">{{ d.icon }}</span>
+              <span style="flex:1;text-wrap:pretty">{{ d.label }}</span>
+            </div>
+          </sc-for>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <span style="font-size:11.5px;color:var(--ink3,#8A847A)">{{ t.dStats }}</span>
+          <div style="display:flex;flex-direction:column;gap:4px;font-size:12.5px;line-height:1.65;color:var(--ink2,#5C574F);padding:10px 11px;border-radius:10px;background:var(--card,#FFF)">
+            <sc-for list="{{ statLines }}" as="s" hint-placeholder-count="3">
+              <span>{{ s.text }}</span>
+            </sc-for>
+          </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <button onClick="{{ toggleTech }}" style="font:inherit;align-self:flex-start;font-size:12.5px;padding:5px 10px;border-radius:8px;border:1px solid var(--line,#E6E1D8);background:var(--card,#FFF);color:var(--ink3,#8A847A);cursor:pointer">{{ t.techToggle }}</button>
+          <sc-if value="{{ tech }}" hint-placeholder-val="{{ false }}">
+          <div style="display:flex;flex-direction:column;gap:5px;font-size:12px;line-height:1.7;color:var(--ink3,#8A847A);padding:10px 11px;border-radius:10px;background:var(--card,#FFF)">
+            <sc-for list="{{ techLines }}" as="x" hint-placeholder-count="3">
+              <span>{{ x.text }}</span>
+            </sc-for>
+          </div>
+          </sc-if>
+        </div>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{ drawerClosed }}" hint-placeholder-val="{{ true }}">
+      <button onClick="{{ toggleDrawer }}" title="{{ t.expandDrawer }}" style="font:inherit;width:48px;flex:none;border:none;border-left:1px solid var(--line,#E6E1D8);background:var(--panel,#F8F6F1);display:flex;flex-direction:column;align-items:center;gap:12px;padding:18px 0 20px;cursor:pointer;color:var(--ink2,#5C574F)" style-hover="color:var(--ink,#26241F)">
+        <span style="width:24px;height:24px;flex:none;border-radius:50%;border:1px solid var(--line,#E6E1D8);background:var(--card,#FFF);display:flex;align-items:center;justify-content:center;font-size:12px;line-height:1">‹</span>
+        <span style="display:flex;flex-direction:column;align-items:center;gap:4px">
+          <span style="position:relative;width:32px;height:32px;flex:none;border-radius:50%;background:{{ ringBg }};display:flex;align-items:center;justify-content:center">
+            <span style="position:absolute;inset:4px;border-radius:50%;background:var(--panel,#F8F6F1)"></span>
+            <span style="position:relative;font-size:11px;font-weight:500;color:var(--ok,#3F6B4A);letter-spacing:-.3px">{{ ringText }}</span>
+          </span>
+          <span style="font-size:10.5px;line-height:1;color:var(--ink3,#8A847A)">{{ t.ringLabel }}</span>
+        </span>
+        <span style="writing-mode:vertical-rl;font-size:12.5px;letter-spacing:3px">{{ t.details }}</span>
+      </button>
+      </sc-if>
+
+    </div>
+  </div>
+  </div>
+
+  <sc-if value="{{ demoHidden }}" hint-placeholder-val="{{ false }}">
+  <div style="padding:0 16px 16px;background:#111214;display:flex;justify-content:center">
+    <button onClick="{{ showDemo }}" style="font:inherit;font-size:11.5px;padding:6px 12px;border-radius:999px;border:1px solid #3A3D45;background:#1B1C20;color:#9AA0AC;cursor:pointer">{{ t.showDemo }}</button>
+  </div>
+  </sc-if>
+
+</div>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1320,&quot;height&quot;:900},&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;nova&quot;,&quot;wechat&quot;],&quot;default&quot;:&quot;wechat&quot;,&quot;tsType&quot;:&quot;'nova' | 'wechat'&quot;,&quot;section&quot;:&quot;外观&quot;},&quot;lang&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;zh&quot;,&quot;en&quot;],&quot;default&quot;:&quot;zh&quot;,&quot;tsType&quot;:&quot;'zh' | 'en'&quot;,&quot;section&quot;:&quot;外观&quot;},&quot;showDemoPanel&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;原型演示&quot;}}">
+const ZH = 0, EN = 1;
+
+const P = (zh, en) => ({ zh, en });
+
+class Component extends DCLogic {
+  uid = 0;
+  timers = [];
+  tick = null;
+  scroller = null;
+  ta = null;
+
+  state = {
+    lang: this.props.lang || 'zh',
+    theme: this.props.theme || 'nova',
+    demo: this.props.showDemoPanel !== false,
+    win: 'fluid',
+    scene: 'new',
+    side: true, drawer: false, tech: false,
+    msgs: [], draft: '', files: [], busy: false, drag: false, err: null,
+    atBottom: true, elapsed: 0, workId: null, techOpen: {}
+  };
+
+  componentDidMount() { this.seed('new'); }
+  componentWillUnmount() { this.stopAll(); }
+
+  /* ---------- infra ---------- */
+  L(o) { if (o === undefined || o === null) return ''; if (typeof o === 'string') return o; return this.state.lang === 'en' ? o.en : o.zh; }
+  stopAll() { this.timers.forEach(clearTimeout); this.timers = []; if (this.tick) { clearInterval(this.tick); this.tick = null; } }
+  push(m) { this.setState(s => ({ msgs: [...s.msgs, { ...m, id: ++this.uid }] })); this.scrollSoon(); }
+  clearStatus() { this.setState(s => ({ msgs: s.msgs.filter(m => m.kind !== 'status') })); }
+  setStatus(o) {
+    this.setState(s => {
+      const m = [...s.msgs];
+      if (m.length && m[m.length - 1].kind === 'status') m[m.length - 1] = { id: m[m.length - 1].id, role: 'nova', kind: 'status', label: o };
+      else m.push({ id: ++this.uid, role: 'nova', kind: 'status', label: o });
+      return { msgs: m };
+    });
+    this.scrollSoon();
+  }
+  patch(id, obj) { this.setState(s => ({ msgs: s.msgs.map(m => (m.id === id ? { ...m, ...obj } : m)) })); this.scrollSoon(); }
+  scrollSoon() { this.wantBottom = true; }
+
+  componentDidUpdate() {
+    const el = this.scroller;
+    if (!el) return;
+    if (this.wantBottom && this.state.atBottom) {
+      this.wantBottom = false;
+      el.scrollTop = el.scrollHeight;
+      requestAnimationFrame(() => { if (this.scroller && this.state.atBottom) this.scroller.scrollTop = this.scroller.scrollHeight; });
+    }
+    const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const near = gap < 90;
+    if (near !== this.state.atBottom) this.setState({ atBottom: near });
+  }
+  runSteps(steps) {
+    if (!steps || !steps.length) return;
+    this.setState({ busy: true });
+    let t = 0;
+    steps.forEach((s, i) => {
+      t += s[0];
+      this.timers.push(setTimeout(() => { s[1].call(this); if (i === steps.length - 1) this.setState({ busy: false }); }, t));
+    });
+  }
+  S(d, o) { return [d, function () { this.setStatus(o); }]; }
+  M(d, m) { return [d, function () { this.clearStatus(); this.push(m); }]; }
+  F(d, fn) { return [d, fn]; }
+
+  /* ---------- message builders ---------- */
+  U(zh, en, files) { return { role: 'user', kind: 'text', label: P(zh, en), files: files || [] }; }
+  T(zh, en, chips) { return { role: 'nova', kind: 'text', lines: P(zh, en), chips: chips || null }; }
+  C(o) { return { role: 'nova', kind: 'card', ...o }; }
+
+  row(zh, en, tone, vzh, ven) { return { label: P(zh, en), tone: tone || 'plain', value: vzh ? P(vzh, ven) : null }; }
+
+  greet() {
+    return this.T(
+      ['你好，我是 Nova，你的项目经理。', '告诉我你想做什么就行——想找一个产品、想用一个现成的产品，或者想改一个已有的产品。不需要懂代码，也不用管 GitHub 怎么用。'],
+      ["Hi, I'm Nova, your project manager.", 'Just tell me what you want to do — find a product, use one that already exists, or change one you have. No coding, and you never need to understand GitHub.'],
+      [
+        { id: 'find', label: P('帮我找一个记账产品', 'Help me find a budgeting app') },
+        { id: 'analyze', label: P('我有一个 GitHub 地址', 'I have a GitHub link') },
+        { id: 'local', label: P('打开我电脑上的项目', 'Open a project on my computer') }
+      ]
+    );
+  }
+
+  briefCard() {
+    return this.C({
+      title: P('家庭记账 · 我看到的情况', 'Home Budget · what I found'),
+      tag: P('还没有改动任何东西', 'Nothing changed yet'), tagTone: 'plain',
+      rows: [
+        this.row('用来做什么：记录家庭收支、按月统计、导出表格', 'What it does: track household income and spending, monthly summaries, export a sheet'),
+        this.row('现在能直接用吗', 'Can you use it as-is?', 'ok', '可以', 'Yes'),
+        this.row('适合改吗', 'Is it safe to change?', 'ok', '适合', 'Yes'),
+        this.row('界面语言', 'Interface language', 'warn', '英文', 'English')
+      ],
+      note: P('我只是看了项目说明和文件结构，没有动任何东西。', 'I only read the project description and file layout. I have not touched anything.')
+    });
+  }
+
+  launchCard() {
+    return this.C({
+      title: P('现在就可以打开使用', 'Ready to open'),
+      rows: [
+        this.row('能不能正常启动', 'Does it start?', 'ok', '已通过', 'Passed'),
+        this.row('数据会不会丢', 'Will your data be safe?', 'ok', '已通过', 'Passed'),
+        this.row('需要你操作的步骤', 'Steps you need to do', 'ok', '没有', 'None')
+      ],
+      actions: [
+        { id: 'openProduct', label: P('打开产品', 'Open the product'), primary: true },
+        { id: 'req', label: P('我想改几个地方', 'I want a few changes') }
+      ]
+    });
+  }
+
+  summaryCard() {
+    return this.C({
+      title: P('本次要做的事', 'What I will do'),
+      rows: [
+        this.row('1　界面全部改成中文', '1  Translate the whole interface into Chinese'),
+        this.row('2　填完金额自动保存，不用点按钮', '2  Save automatically after each entry'),
+        this.row('3　可以导出成 Excel 表格', '3  Export to an Excel sheet')
+      ],
+      note: P('这三项一轮就能做完。技术方案我来定，你不用选。', 'All three fit in one round. I decide the technical approach — you do not have to choose.'),
+      actions: [
+        { id: 'startWork', label: P('就这样开始', 'Start with this'), primary: true },
+        { id: 'more', label: P('我要再补充一点', 'I want to add something') }
+      ]
+    });
+  }
+
+  tasks(done, doing) {
+    const t = [P('界面改成中文', 'Interface in Chinese'), P('填完自动保存', 'Auto-save entries'), P('导出 Excel 表格', 'Export to Excel')];
+    return t.map((x, i) => {
+      const tone = i < done ? 'ok' : i === doing ? 'doing' : 'wait';
+      return { label: x, tone, value: i < done ? P('已完成', 'Done') : i === doing ? P('进行中', 'In progress') : P('等待', 'Waiting') };
+    });
+  }
+
+  workCard() {
+    return this.C({
+      kindWork: true,
+      title: P('正在处理你的 3 项要求', 'Working on your 3 requests'),
+      tag: P('已交给 Codex', 'Handed to Codex'), tagTone: 'accent',
+      bar: 0.12,
+      rows: this.tasks(0, 0),
+      meta: P('已用 0 分 02 秒 · 最新动作：正在修改首页文字', 'Elapsed 0m 02s · Latest: editing the text on the home screen'),
+      tech: [P('分支：nova/work-3', 'Branch: nova/work-3'), P('已修改 4 个文件，没有删除任何内容', '4 files changed, nothing deleted')]
+    });
+  }
+
+  verifyFailCard() {
+    return this.C({
+      title: P('我检查了一遍，有一项没通过', 'I checked the result — one item did not pass'),
+      tag: P('1 项未通过', '1 item failed'), tagTone: 'warn',
+      rows: [
+        this.row('界面改成中文', 'Interface in Chinese', 'ok', '通过', 'Passed'),
+        this.row('填完自动保存', 'Auto-save entries', 'ok', '通过', 'Passed'),
+        this.row('导出的表格打不开', 'The exported sheet will not open', 'warn', '未通过', 'Failed')
+      ],
+      note: P('对你的影响：前两项已经可以正常用，只有导出暂时不能用。我先在安全范围内自己修，不会动你的数据。', 'What this means for you: the first two already work, only the export is unusable. I will fix it safely myself and will not touch your data.')
+    });
+  }
+
+  verifyPassCard() {
+    return this.C({
+      title: P('修好了，这次全部通过', 'Fixed — everything passes now'),
+      tag: P('3 / 3 通过', '3 / 3 passed'), tagTone: 'ok',
+      rows: [
+        this.row('界面改成中文', 'Interface in Chinese', 'ok', '通过', 'Passed'),
+        this.row('填完自动保存', 'Auto-save entries', 'ok', '通过', 'Passed'),
+        this.row('导出 Excel 表格', 'Export to Excel', 'ok', '通过', 'Passed')
+      ],
+      note: P('我只改了导出这一处，其他地方没有动。', 'I only changed the export. Nothing else was touched.'),
+      actions: [{ id: 'openPreview', label: P('打开修改后的产品', 'Open the updated product'), primary: true }]
+    });
+  }
+
+  tsCard1() {
+    return this.C({
+      title: P('还差一步，需要你点一下', 'One step left — needs a click from you'),
+      rows: [this.row('你的电脑缺少一个运行需要的系统软件。点下面的按钮，我带你装好，只需要这一次。', 'Your computer is missing one piece of system software. Click below and I will install it with you — just this once.')],
+      note: P('装好以后，以后打开产品都不用再做这一步。', 'Once it is installed you will never need this step again.'),
+      actions: [
+        { id: 'tsInstall', label: P('开始安装', 'Start the install'), primary: true },
+        { id: 'tsHelp', label: P('我没看到这个页面', "I don't see that window") }
+      ]
+    });
+  }
+
+  tsCard2() {
+    return this.C({
+      title: P('在弹出的窗口里一直点「下一步」就好', 'In the window that opened, keep clicking "Next"'),
+      rows: [this.row('看到「完成」就可以关掉那个窗口，然后回来点下面的按钮。', 'When you see "Finish", close that window and come back to the button below.')],
+      actions: [
+        { id: 'tsRecheck', label: P('我已经完成这一步', 'I finished this step'), primary: true },
+        { id: 'tsHelp', label: P('还是无法打开', 'It still will not open') }
+      ]
+    });
+  }
+
+  openCard() {
+    return this.C({
+      title: P('可以打开了', 'Ready to open'),
+      rows: [this.row('产品会在一个新窗口里打开，界面已经是中文。', 'The product opens in a new window, already in Chinese.')],
+      actions: [{ id: 'openProduct', label: P('打开产品', 'Open the product'), primary: true }]
+    });
+  }
+
+  doneCard() {
+    return this.C({
+      title: P('这一轮完成了，请你看一下', 'This round is done — please take a look'),
+      tag: P('等你确认', 'Waiting for you'), tagTone: 'accent',
+      rows: [
+        this.row('界面已经全部是中文', 'The interface is fully in Chinese', 'ok'),
+        this.row('填完金额会自己保存', 'Entries save by themselves', 'ok'),
+        this.row('可以导出 Excel，我打开验证过', 'Export to Excel works — I opened the file to check', 'ok'),
+        this.row('要留意：导出的表格在很旧的 Excel 里可能没有颜色', 'Worth knowing: in very old Excel versions the export has no colours', 'warn')
+      ],
+      actions: [
+        { id: 'openProduct', label: P('打开修改后的产品', 'Open the updated product'), primary: true },
+        { id: 'adjust', label: P('还需要调整', 'Needs more work') },
+        { id: 'finish', label: P('我满意，完成项目', "I'm happy, finish it") }
+      ]
+    });
+  }
+
+  resumeMsg() {
+    return this.T(
+      ['欢迎回来。昨天已经做完界面中文化和自动保存，现在还差最后一次打开确认。', '你可以接着看，也可以直接告诉我新的想法。'],
+      ['Welcome back. Yesterday we finished the Chinese interface and auto-save. All that is left is one final check.', 'You can pick up where we stopped, or just tell me something new.'],
+      [
+        { id: 'openPreview', label: P('继续上次工作', 'Continue where we stopped') },
+        { id: 'openProduct', label: P('先打开当前结果', 'Open what we have') },
+        { id: 'req', label: P('我想补充一个要求', 'I want to add a request') }
+      ]
+    );
+  }
+
+  /* ---------- flows ---------- */
+  nodes() {
+    const self = this;
+    return {
+      find: {
+        user: P('帮我找一个能记家庭收支的产品。', 'Help me find something to track household spending.'),
+        steps: [
+          this.S(600, P('正在找适合普通用户的现成产品', 'Looking for ready-made products for non-technical users')),
+          this.S(1500, P('正在对比哪些还在维护、能不能直接用', 'Comparing which ones are maintained and usable as-is')),
+          this.M(1600, this.T(
+            ['我找到一个比较合适的：家庭记账。它能记收支、按月统计、导出表格，作者还在更新。', '我帮你看过了，它现在可以直接在你的电脑上用，只是界面是英文的。'],
+            ['I found a good match: Home Budget. It tracks income and spending, summarises by month and exports a sheet, and the author still updates it.', 'I checked it for you: it runs on your computer as-is, but the interface is in English.']
+          )),
+          this.M(400, this.briefCard()),
+          this.M(200, this.T([], [], [
+            { id: 'use', label: P('先打开看看', 'Open it and see') },
+            { id: 'req', label: P('我已经知道要改什么', 'I know what I want changed') },
+            { id: 'advise', label: P('帮我判断要不要改', 'Tell me whether it needs changes') }
+          ]))
+        ]
+      },
+      analyze: {
+        user: P('这个项目我想用：github.com/opensource/home-budget', 'I want to use this project: github.com/opensource/home-budget'),
+        steps: [
+          this.S(600, P('正在读取项目说明', 'Reading the project description')),
+          this.S(1400, P('正在确认能不能在你的电脑上运行', 'Checking whether it can run on your computer')),
+          this.M(1500, this.T(
+            ['这是一个家庭记账产品：记收支、按月统计、导出表格。', '它现在可以直接在你的电脑上用，界面是英文的。'],
+            ['This is a home budgeting product: track income and spending, monthly summaries, export a sheet.', 'It runs on your computer as-is. The interface is in English.']
+          )),
+          this.M(400, this.briefCard()),
+          this.M(200, this.T([], [], [
+            { id: 'use', label: P('先打开看看', 'Open it and see') },
+            { id: 'req', label: P('我已经知道要改什么', 'I know what I want changed') },
+            { id: 'advise', label: P('帮我判断要不要改', 'Tell me whether it needs changes') }
+          ]))
+        ]
+      },
+      local: {
+        user: P('打开我电脑上的项目。', 'Open a project on my computer.'),
+        steps: [
+          this.S(600, P('正在查看你选的文件夹', 'Looking at the folder you picked')),
+          this.M(1600, this.T(
+            ['看懂了，这是一个记账产品，之前有人改过一部分。', '我可以直接帮你打开试用，也可以先听你想改什么。'],
+            ['Got it — a budgeting product that someone has already partly modified.', 'I can open it for you to try, or you can tell me what you want changed first.'],
+            [
+              { id: 'use', label: P('先打开看看', 'Open it and see') },
+              { id: 'req', label: P('我已经知道要改什么', 'I know what I want changed') }
+            ]
+          ))
+        ]
+      },
+      use: {
+        user: P('我想先看看这个产品能不能直接使用。', 'I want to see whether I can just use it as it is.'),
+        steps: [
+          this.S(600, P('正在确认启动方式和使用条件', 'Checking how it starts and what it needs')),
+          this.S(1500, P('正在准备运行环境（这一步我自己做）', 'Preparing what it needs to run — I handle this myself')),
+          this.M(1600, this.T(
+            ['可以直接用，我已经准备好了。第一次打开会慢一点，之后就快了。'],
+            ['You can use it as-is — everything is ready. The first launch is a little slow, after that it is fast.']
+          )),
+          this.M(300, this.launchCard())
+        ]
+      },
+      advise: {
+        user: P('帮我判断要不要改。', 'Tell me whether it needs changes.'),
+        steps: [
+          this.S(600, P('正在按普通用户的使用习惯检查', 'Checking it the way an everyday user would')),
+          this.M(1800, this.T(
+            ['我的建议是：先把界面改成中文，其他先不动。', '英文界面对你每天记账影响最大；其他功能已经够用，改了反而增加出问题的机会。'],
+            ['My advice: translate the interface into Chinese first and leave everything else alone.', 'The English interface is what will slow you down daily. The rest is good enough, and changing it only adds risk.'],
+            [
+              { id: 'freeCn', label: P('就按你的建议改', 'Do what you suggested') },
+              { id: 'req', label: P('我还想加一个功能', 'I also want a new feature') },
+              { id: 'use', label: P('先不改，我先用', 'No changes, let me use it') }
+            ]
+          ))
+        ]
+      },
+      req: {
+        user: P('我已经知道要改什么。', 'I know what I want changed.'),
+        steps: [
+          this.M(700, this.T(
+            ['好，你说。一句话就行，比如「界面改成中文，填完能自动保存」。'],
+            ['Go ahead. One sentence is enough, for example "make it Chinese and save entries automatically".'],
+            [
+              { id: 'freeCn', label: P('界面改成中文', 'Make the interface Chinese') },
+              { id: 'freeAll', label: P('中文 + 自动保存 + 导出 Excel', 'Chinese + auto-save + Excel export') }
+            ]
+          ))
+        ]
+      },
+      freeCn: { user: P('把界面全部改成中文。', 'Translate the whole interface into Chinese.'), steps: this.summarySteps() },
+      freeAll: { user: P('界面改成中文，填完能自动保存，还要能导出 Excel。', 'Make it Chinese, save entries automatically, and let me export to Excel.'), steps: this.summarySteps() },
+      more: {
+        user: P('我要再补充一点。', 'I want to add something.'),
+        steps: [this.M(600, this.T(['好，你说，我把它加进这一轮。'], ['Sure — tell me and I will add it to this round.']))]
+      },
+      startWork: {
+        user: P('按照这个方案开始修改。', 'Go ahead with this plan.'),
+        steps: [
+          this.M(700, this.T(
+            ['好的，我已经确认本次需要完成 3 项工作，现在开始处理。', '过程里你可以随时在下面追加要求，不用等我。'],
+            ['Confirmed: 3 items this round. Starting now.', 'You can add requests below at any time — no need to wait for me.']
+          )),
+          this.F(500, function () { this.startWork(); })
+        ]
+      },
+      openPreview: {
+        user: P('打开修改后的产品。', 'Open the updated product.'),
+        steps: [
+          this.S(600, P('正在启动产品', 'Starting the product')),
+          this.M(2000, this.T(
+            ['产品没有成功打开。我先自己查原因，你不用做任何事。'],
+            ['It did not open. I am looking into why — you do not need to do anything yet.']
+          )),
+          this.S(700, P('正在判断原因', 'Working out the cause')),
+          this.M(2000, this.tsCard1())
+        ]
+      },
+      tsInstall: {
+        user: P('我点了开始安装。', 'I clicked to start the install.'),
+        steps: [
+          this.S(600, P('正在为你打开安装程序', 'Opening the installer for you')),
+          this.M(1600, this.tsCard2())
+        ]
+      },
+      tsRecheck: {
+        user: P('我已经完成这一步。', 'I finished this step.'),
+        steps: [
+          this.S(600, P('正在重新检查', 'Checking again')),
+          this.M(2000, this.T(['检查通过，缺的东西已经装好了。'], ['All good — the missing piece is installed.'])),
+          this.M(300, this.openCard())
+        ]
+      },
+      tsHelp: {
+        user: P('我没看到这个页面。', "I don't see that window."),
+        steps: [
+          this.M(800, this.C({
+            title: P('没关系，我们换一种方式', 'No problem — let us try another way'),
+            rows: [this.row('请看一下屏幕最下面一排，有没有一个新出现的图标。点它就能把窗口调出来。', 'Look at the very bottom row of your screen for a new icon. Clicking it brings the window back.')],
+            actions: [
+              { id: 'tsRecheck', label: P('找到了，已经点开', 'Found it, opened') },
+              { id: 'tsGiveUp', label: P('还是没有', 'Still nothing') }
+            ]
+          }))
+        ]
+      },
+      tsGiveUp: {
+        user: P('还是没有。', 'Still nothing.'),
+        steps: [
+          this.M(800, this.T(
+            ['那这一步我来做，你不用管。我用另一种方式装，大概一分钟。'],
+            ['Then I will do it myself — you can leave it to me. I will install it another way, about a minute.']
+          )),
+          this.S(600, P('正在用另一种方式安装', 'Installing another way')),
+          this.M(2600, this.T(['装好了。'], ['Done.'])),
+          this.M(200, this.openCard())
+        ]
+      },
+      openProduct: {
+        user: P('我打开看看。', 'Let me open it.'),
+        steps: [
+          this.S(500, P('正在打开产品窗口', 'Opening the product window')),
+          this.M(1700, this.T(
+            ['已经打开了，你可以试着记一笔，然后点导出看看。', '看完回来告诉我满意还是要调整就行。'],
+            ['It is open. Try adding an entry, then try the export.', 'Come back and tell me whether you are happy or want changes.']
+          )),
+          this.M(300, this.doneCard())
+        ]
+      },
+      adjust: {
+        user: P('还需要调整。', 'It needs more work.'),
+        steps: [
+          this.M(700, this.T(
+            ['好的，直接说要调整什么就行，我们接着聊，不用重新开始。'],
+            ['Sure — just tell me what to adjust. We keep going from here, nothing restarts.'],
+            [
+              { id: 'freeTone', label: P('中文再自然一点', 'Make the Chinese sound more natural') },
+              { id: 'freeDate', label: P('导出的表格加上日期', 'Add the date to the export') }
+            ]
+          ))
+        ]
+      },
+      freeTone: { user: P('中文再自然一点，有几个词很生硬。', 'Make the Chinese more natural — a few words sound stiff.'), steps: this.summarySteps(1) },
+      freeDate: { user: P('导出的表格加上日期。', 'Add the date to the exported sheet.'), steps: this.summarySteps(1) },
+      finish: {
+        user: P('我满意，完成项目。', "I'm happy — finish the project."),
+        steps: [
+          this.M(700, this.T(['好，这个项目就算完成了。我把记录留着。'], ['Done. I will keep the record of this project.'])),
+          this.M(300, this.C({
+            title: P('项目记录', 'Project record'),
+            tag: P('已完成', 'Completed'), tagTone: 'ok',
+            rows: [
+              this.row('这次一共完成 3 项要求', 'Three requests completed'),
+              this.row('用了 2 天，开发 1 轮，我检查 2 轮', 'Two days, one development round, two checks by me'),
+              this.row('你确认了 1 次', 'You confirmed once')
+            ],
+            note: P('以后想继续改，回来说一句就行，我记得这个项目的全部情况。', 'Come back any time — I remember everything about this project.')
+          }))
+        ]
+      }
+    };
+  }
+
+  summarySteps(one) {
+    if (one) {
+      return [
+        this.S(600, P('正在整理你的要求', 'Sorting out what you asked for')),
+        this.M(1600, this.T(['明白了，这算一项小改动，我直接做，做完再请你看。'], ['Understood — that is a small change. I will do it and show you the result.'])),
+        this.F(400, function () { this.startWork(true); })
+      ];
+    }
+    return [
+      this.S(600, P('正在整理你的要求', 'Sorting out what you asked for')),
+      this.S(1500, P('正在确认这些改动会不会互相影响', 'Checking whether these changes affect each other')),
+      this.M(1500, this.T(['我把你的要求整理成了 3 项工作，你看一下对不对。'], ['I turned your request into 3 items. Have a look.'])),
+      this.M(400, this.summaryCard())
+    ];
+  }
+
+  startWork(small) {
+    this.clearStatus();
+    this.push(this.workCard());
+    const id = this.uid;
+    const t0 = Date.now();
+    this.setState({ workId: id, elapsed: 0 });
+    if (this.tick) clearInterval(this.tick);
+    this.tick = setInterval(() => this.setState({ elapsed: Math.floor((Date.now() - t0) / 1000) }), 1000);
+    const fmt = () => {
+      const s = Math.floor((Date.now() - t0) / 1000);
+      const mm = Math.floor(s / 60), ss = s % 60;
+      return this.state.lang === 'en' ? 'Elapsed ' + mm + 'm ' + (ss < 10 ? '0' : '') + ss + 's' : '已用 ' + mm + ' 分 ' + (ss < 10 ? '0' : '') + ss + ' 秒';
+    };
+    const steps = [
+      [3200, { rows: this.tasks(1, 1), bar: 0.42, meta: P('最新动作：正在加入自动保存', 'Latest: adding auto-save') }],
+      [6400, { rows: this.tasks(2, 2), bar: 0.72, meta: P('最新动作：正在做导出表格', 'Latest: building the export') }],
+      [9200, { rows: this.tasks(3, -1), bar: 1, tag: P('开发完成', 'Development done'), tagTone: 'ok', meta: P('三项都改完了，我去检查真实结果', 'All three are done — now I check the real result') }]
+    ];
+    steps.forEach(([d, obj]) => this.timers.push(setTimeout(() => this.patch(id, obj), d)));
+    this.timers.push(setTimeout(() => {
+      if (this.tick) { clearInterval(this.tick); this.tick = null; }
+      this.patch(id, { workDone: true, metaStatic: true });
+      this.runSteps(this.verifySteps(small));
+    }, 9800));
+    this.workFmt = fmt;
+  }
+
+  verifySteps(small) {
+    if (small) {
+      return [
+        this.S(600, P('Nova 正在打开并检查修改后的产品', 'Nova is opening and checking the updated product')),
+        this.M(2400, this.T(['检查通过了，改动已经生效。'], ['It passes — the change is live.'])),
+        this.M(300, this.openCard())
+      ];
+    }
+    return [
+      this.S(600, P('Nova 正在打开并检查修改后的产品', 'Nova is opening and checking the updated product')),
+      this.M(2600, this.verifyFailCard()),
+      this.S(600, P('Nova 正在尝试安全修复', 'Nova is trying a safe fix')),
+      this.S(2400, P('正在重新检查', 'Checking again')),
+      this.M(2400, this.verifyPassCard())
+    ];
+  }
+
+  /* ---------- user input ---------- */
+  act(id) {
+    const n = this.nodes()[id];
+    if (!n) return;
+    if (this.state.workId && this.isWorkLive() && (id.indexOf('free') === 0)) { this.addDuringWork(n.user); return; }
+    if (n.user) this.push(this.U(n.user.zh, n.user.en));
+    this.runSteps(n.steps);
+  }
+  isWorkLive() {
+    const m = this.state.msgs.find(x => x.id === this.state.workId);
+    return !!(m && !m.workDone);
+  }
+  addDuringWork(u) {
+    this.push(this.U(u.zh, u.en));
+    this.runSteps([
+      this.S(500, P('正在看这条要求要不要插到现在这一轮', 'Checking whether this fits into the current round')),
+      this.M(1800, this.T(
+        ['记下来了。当前这一轮会照常做完，我把它排在下一步，做完这轮马上处理。'],
+        ['Noted. The current round finishes as planned, and I put this next in line right after it.']
+      ))
+    ]);
+    const id = this.state.workId;
+    const m = this.state.msgs.find(x => x.id === id);
+    if (m) this.patch(id, { next: (m.next || 0) + 1 });
+  }
+
+  send() {
+    const txt = this.state.draft.trim();
+    const files = this.state.files.filter(f => !f.uploading);
+    if (!txt && !files.length) return;
+    this.push(this.U(txt || (this.state.lang === 'en' ? '(file attached)' : '（附件）'), txt || '(file attached)', files.map(f => ({ name: f.name, icon: f.icon }))));
+    this.setState({ draft: '', files: [] });
+    if (this.ta) this.ta.focus();
+    const low = txt.toLowerCase();
+    if (this.state.workId && this.isWorkLive()) {
+      this.runSteps([
+        this.S(500, P('正在看这条要求要不要插到现在这一轮', 'Checking whether this fits into the current round')),
+        this.M(1800, this.T(
+          ['记下来了。当前这一轮会照常做完，我把它排在下一步。', '如果你希望现在就停下来改，告诉我一声也可以。'],
+          ['Noted. The current round finishes as planned and this goes next in line.', 'If you would rather I stop and do it now, just say so.']
+        ))
+      ]);
+      const id = this.state.workId;
+      const m = this.state.msgs.find(x => x.id === id);
+      if (m) this.patch(id, { next: (m.next || 0) + 1 });
+      return;
+    }
+    if (low.indexOf('github.com') >= 0) { this.runSteps(this.nodes().analyze.steps); return; }
+    if (files.length) {
+      this.runSteps([
+        this.S(600, P('正在看你给的参考文件', 'Looking at the file you gave me')),
+        this.M(2000, this.T(
+          ['看到了，我按这个参考来改。要我先只改这一处，还是连相关的地方一起改？'],
+          ['Got it — I will follow this reference. Should I change just this one place, or the related parts too?'],
+          [
+            { id: 'freeCn', label: P('只改这一处', 'Just this one place') },
+            { id: 'freeAll', label: P('相关的地方一起改', 'The related parts too') }
+          ]
+        ))
+      ]);
+      return;
+    }
+    if (/中文|翻译|chinese|translate|保存|save|导出|export|加|增加|add|改|change|功能|feature/i.test(txt)) { this.runSteps(this.summarySteps()); return; }
+    if (/打开|启动|预览|open|launch|preview/i.test(txt)) { this.runSteps(this.nodes().openPreview.steps); return; }
+    if (/进度|多久|怎么样|progress|status|how long/i.test(txt)) {
+      this.runSteps([this.M(900, this.T(['目前这一轮还没开始，你说完要求我就开始。'], ['This round has not started yet — say the word and I begin.']))]);
+      return;
+    }
+    this.runSteps([
+      this.S(500, P('正在理解你的要求', 'Understanding what you need')),
+      this.M(1800, this.T(
+        ['我大概明白了。为了不做错，我只问一个问题：这次是要改现在这个产品，还是想再找一个更合适的？'],
+        ['I think I follow. One question so I do not get it wrong: change this product, or look for a better fit?'],
+        [
+          { id: 'freeAll', label: P('改现在这个', 'Change this one') },
+          { id: 'find', label: P('再找一个', 'Look for another') }
+        ]
+      ))
+    ]);
+  }
+
+  /* ---------- files ---------- */
+  fileIcon(name) {
+    const n = name.toLowerCase();
+    if (/\.(png|jpg|jpeg|gif|webp|bmp)$/.test(n)) return '▣';
+    if (/\.(pdf)$/.test(n)) return '▤';
+    if (/\.(doc|docx|txt|md)$/.test(n)) return '▥';
+    if (/\.(xls|xlsx|csv)$/.test(n)) return '▦';
+    return '▧';
+  }
+  addFiles(list) {
+    const bad = [];
+    const ok = [];
+    list.forEach(name => {
+      if (/\.(exe|msi|dmg|bat|sh|zip|rar)$/i.test(name)) bad.push(name);
+      else ok.push({ name, icon: this.fileIcon(name), uploading: true, key: 'f' + (++this.uid) });
+    });
+    if (bad.length) {
+      this.setState({ err: P('这种文件我暂时看不了：' + bad.join('、') + '。可以给我图片、PDF、文档或表格。', 'I cannot read this kind of file yet: ' + bad.join(', ') + '. Images, PDFs, documents and spreadsheets all work.') });
+    }
+    if (ok.length) {
+      this.setState(s => ({ files: [...s.files, ...ok] }));
+      ok.forEach(f => this.timers.push(setTimeout(() => this.setState(s => ({ files: s.files.map(x => (x.key === f.key ? { ...x, uploading: false } : x)) })), 1200)));
+    }
+  }
+
+  /* ---------- seeds ---------- */
+  seed(name) {
+    this.stopAll();
+    const g = this.greet();
+    const uA = this.U('这个项目我想用：github.com/opensource/home-budget', 'I want to use this project: github.com/opensource/home-budget');
+    const tA = this.T(
+      ['这是一个家庭记账产品：记收支、按月统计、导出表格。', '它现在可以直接在你的电脑上用，界面是英文的。'],
+      ['This is a home budgeting product: track income and spending, monthly summaries, export a sheet.', 'It runs on your computer as-is. The interface is in English.']
+    );
+    const chipsA = this.T([], [], [
+      { id: 'use', label: P('先打开看看', 'Open it and see') },
+      { id: 'req', label: P('我已经知道要改什么', 'I know what I want changed') },
+      { id: 'advise', label: P('帮我判断要不要改', 'Tell me whether it needs changes') }
+    ]);
+    const uR = this.U('界面改成中文，填完能自动保存，还要能导出 Excel。', 'Make it Chinese, save entries automatically, and let me export to Excel.');
+    const tR = this.T(['我把你的要求整理成了 3 项工作，你看一下对不对。'], ['I turned your request into 3 items. Have a look.']);
+    const uS = this.U('按照这个方案开始修改。', 'Go ahead with this plan.');
+    const tS = this.T(['好的，我已经确认本次需要完成 3 项工作，现在开始处理。'], ['Confirmed: 3 items this round. Starting now.']);
+
+    const base = [g];
+    const afterAnalyze = [...base, uA, tA, this.briefCard(), chipsA];
+    const afterSummary = [...base, uA, tA, this.briefCard(), uR, tR, this.summaryCard()];
+    const beforeWork = [...base, uA, tA, uR, tR, uS, tS];
+
+    let msgs = base;
+    let extra = null;
+    if (name === 'analyzed') msgs = afterAnalyze;
+    else if (name === 'summary') msgs = afterSummary;
+    else if (name === 'work') { msgs = beforeWork; extra = 'work'; }
+    else if (name === 'verify') { msgs = [...beforeWork, { ...this.workCard(), workDone: true, rows: this.tasks(3, -1), bar: 1, tag: P('开发完成', 'Development done'), tagTone: 'ok', metaStatic: true, meta: P('用了 4 分 12 秒', 'Took 4m 12s') }]; extra = 'verify'; }
+    else if (name === 'preview') {
+      msgs = [...beforeWork, this.verifyPassCard(), this.U('打开修改后的产品。', 'Open the updated product.'),
+        this.T(['产品没有成功打开。我先自己查原因，你不用做任何事。'], ['It did not open. I am looking into why — you do not need to do anything yet.']),
+        this.tsCard1()];
+    }
+    else if (name === 'done') msgs = [...beforeWork, this.verifyPassCard(), this.U('我打开看看。', 'Let me open it.'), this.T(['已经打开了，你可以试着记一笔，然后点导出看看。'], ['It is open. Try adding an entry, then try the export.']), this.doneCard()];
+    else if (name === 'resume') {
+      msgs = [
+        this.U('界面改成中文，填完能自动保存。', 'Make it Chinese and save entries automatically.'),
+        this.T(['昨天这两项我都做完了，也检查过。'], ['I finished and checked both of these yesterday.']),
+        this.resumeMsg()
+      ];
+    }
+
+    msgs = msgs.map(m => ({ ...m, id: ++this.uid }));
+    this.setState({ scene: name, msgs, draft: '', files: [], err: null, busy: false, workId: null, atBottom: true, drawer: false, side: true }, () => {
+      if (this.scroller) this.scroller.scrollTop = this.scroller.scrollHeight;
+      this.wantBottom = true;
+      if (extra === 'work') this.startWork();
+      if (extra === 'verify') this.runSteps(this.verifySteps());
+    });
+  }
+
+  /* ---------- view ---------- */
+  copy() {
+    const zh = {
+      demoTitle: '原型演示控制面板', demoNote: '仅用于设计评审，不属于正式产品界面',
+      demoScene: '场景', demoTheme: '配色方案', demoWin: '窗口尺寸', demoSim: '模拟操作',
+      simDrop: '模拟拖入截图', simBad: '模拟不支持的文件', hideDemo: '隐藏面板', showDemo: '显示演示控制面板',
+      themeNova: 'A · Nova 暖纸（备选）', themeWx: 'B · 微信绿（主方案）',
+      current: '当前项目', collapse: '收起项目栏', expandSide: '展开项目与任务列表', sideLabel: '项目与任务', sideCount: '3 项',
+      projGlyph: '家', projName: '家庭记账', projMeta: '进行中 · 3 项任务', headMeta: '第 2 天 · 已完成 2 项 · 进行中 1 项',
+      newProject: '新建项目', history: '历史任务', settings: '设置',
+      langBtn: 'EN', details: '项目详情', expandDrawer: '展开项目详情（任务、统计）',
+      dTasks: '本轮任务', dStats: '项目统计', techToggle: '技术细节', ringLabel: '任务',
+      chipNote: '也可以直接在下面告诉 Nova 你的想法。',
+      placeholder: '告诉 Nova 你想做什么，也可以继续补充或拖入参考文件……',
+      attach: '添加附件', enterHint: 'Enter 发送 · Shift+Enter 换行', uploading: '上传中…', remove: '删除',
+      send: '发送', sending: '发送中…', busyHint: 'Nova 正在回复，你可以继续输入，不用等我。', gotIt: '知道了',
+      stats: ['· 已进行 2 天 · 共 3 项任务', '· 已完成 2 · 进行中 1 · 等待确认 0', '· 开发 1 轮 · 我核对 2 轮 · 你确认 1 次'],
+      tech: ['分支 nova/work-3', '已修改 4 个文件，没有删除内容', '未执行任何系统级改动'],
+      techLabelOpen: '收起技术细节', techLabelClosed: '技术细节（可不看）',
+      projects: [{ glyph: '店', name: '小店库存', meta: '已完成 · 5 天前' }, { glyph: '课', name: '课程表', meta: '已完成 · 上周' }],
+      historyItems: [{ label: '界面中文化', tone: 'ok' }, { label: '自动保存', tone: 'ok' }, { label: '导出 Excel', tone: 'doing' }],
+      drawerTasks: [{ label: '界面改成中文', tone: 'ok' }, { label: '填完自动保存', tone: 'ok' }, { label: '导出 Excel 表格', tone: 'doing' }],
+      wins: [{ id: 'fluid', label: '自适应' }, { id: 'w1366', label: '1366×768' }, { id: 'w1600', label: '1600×900' }],
+      scenes: [
+        { id: 'new', label: '新项目开场' }, { id: 'analyzed', label: '分析完成' }, { id: 'summary', label: '需求总结' },
+        { id: 'work', label: 'AI 工作中' }, { id: 'verify', label: '验证未通过' }, { id: 'preview', label: '预览失败排障' },
+        { id: 'done', label: '完工验收' }, { id: 'resume', label: '跨天恢复' }
+      ],
+      toBottom: '回到最新消息'
+    };
+    const en = {
+      demoTitle: 'Prototype demo panel', demoNote: 'For design review only — not part of the product UI',
+      demoScene: 'Scene', demoTheme: 'Colour scheme', demoWin: 'Window size', demoSim: 'Simulate',
+      simDrop: 'Drop a screenshot', simBad: 'Unsupported file', hideDemo: 'Hide panel', showDemo: 'Show demo panel',
+      themeNova: 'A · Nova warm paper (alt)', themeWx: 'B · WeChat green (primary)',
+      current: 'Current project', collapse: 'Collapse project list', expandSide: 'Expand projects and tasks', sideLabel: 'Projects', sideCount: '3',
+      projGlyph: 'H', projName: 'Home Budget', projMeta: 'Active · 3 tasks', headMeta: 'Day 2 · 2 done · 1 in progress',
+      newProject: 'New project', history: 'Past tasks', settings: 'Settings',
+      langBtn: '中文', details: 'Project details', expandDrawer: 'Expand project details',
+      dTasks: 'This round', dStats: 'Project stats', techToggle: 'Technical details', ringLabel: 'tasks',
+      chipNote: 'You can also just type what you have in mind below.',
+      placeholder: 'Tell Nova what you want to do, add more details, or drop a reference file…',
+      attach: 'Attach', enterHint: 'Enter to send · Shift+Enter for a new line', uploading: 'uploading…', remove: 'Remove',
+      send: 'Send', sending: 'Sending…', busyHint: 'Nova is replying — keep typing if you want, no need to wait.', gotIt: 'Got it',
+      stats: ['· Day 2 · 3 tasks total', '· 2 done · 1 in progress · 0 awaiting you', '· 1 development round · 2 checks by Nova · 1 confirmation by you'],
+      tech: ['Branch nova/work-3', '4 files changed, nothing deleted', 'No system-level changes made'],
+      techLabelOpen: 'Hide technical details', techLabelClosed: 'Technical details (optional)',
+      projects: [{ glyph: 'S', name: 'Shop Stock', meta: 'Done · 5 days ago' }, { glyph: 'T', name: 'Timetable', meta: 'Done · last week' }],
+      historyItems: [{ label: 'Chinese interface', tone: 'ok' }, { label: 'Auto-save', tone: 'ok' }, { label: 'Excel export', tone: 'doing' }],
+      drawerTasks: [{ label: 'Interface in Chinese', tone: 'ok' }, { label: 'Auto-save entries', tone: 'ok' }, { label: 'Export to Excel', tone: 'doing' }],
+      wins: [{ id: 'fluid', label: 'Fluid' }, { id: 'w1366', label: '1366×768' }, { id: 'w1600', label: '1600×900' }],
+      scenes: [
+        { id: 'new', label: 'New project' }, { id: 'analyzed', label: 'Analysed' }, { id: 'summary', label: 'Request summary' },
+        { id: 'work', label: 'AI working' }, { id: 'verify', label: 'Check failed' }, { id: 'preview', label: 'Preview troubleshooting' },
+        { id: 'done', label: 'Sign-off' }, { id: 'resume', label: 'Next-day resume' }
+      ],
+      toBottom: 'Jump to latest'
+    };
+    return this.state.lang === 'en' ? en : zh;
+  }
+
+  toneColor(tone) {
+    if (tone === 'ok') return 'var(--ok,#3F6B4A)';
+    if (tone === 'warn') return 'var(--warn,#93651B)';
+    if (tone === 'doing') return 'var(--accent,#B5572F)';
+    return 'var(--ink3,#8A847A)';
+  }
+  toneIcon(tone) { return tone === 'ok' ? '✓' : tone === 'warn' ? '!' : tone === 'doing' ? '◔' : '·'; }
+
+  renderVals() {
+    const s = this.state;
+    const t = this.copy();
+    const L = o => this.L(o);
+    const wx = s.theme === 'wechat';
+    const themeVars = wx
+      ? '--bg:#F7F7F7;--panel:#EDEDED;--line:#E1E1E1;--ink:#0F0F0F;--ink2:#4C4C4C;--ink3:#7F7F7F;--card:#FFFFFF;--accent:#07C160;--accentLine:#06AE56;--accentSoft:#E8F8EE;--accentInk:#FFFFFF;--ok:#07C160;--okSoft:#E8F8EE;--warn:#FA9D3B;--warnSoft:#FDF1E3;--userBg:#95EC69;--userInk:#0F0F0F;--bub:5px;--rad:6px;display:flex;flex-direction:column'
+      : '';
+    const layer = 'display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden;';
+
+    const chipFor = (c) => ({ label: L(c.label), on: () => this.act(c.id) });
+
+    const msgs = s.msgs.map(m => {
+      const isUser = m.role === 'user';
+      const v = {
+        isUser, isNova: !isUser,
+        isStatus: m.kind === 'status',
+        isText: m.kind === 'text' && !!(m.lines && (L(m.lines) || []).length),
+        isCard: m.kind === 'card',
+        text: isUser ? L(m.label) : L(m.label),
+        hasFiles: isUser && !!(m.files && m.files.length),
+        files: (m.files || []).map(f => ({ name: f.name, icon: f.icon })),
+        lines: ((m.lines && L(m.lines)) || []).map((x, i) => ({ text: x, key: i })),
+        hasChips: !!(m.chips && m.chips.length),
+        chips: (m.chips || []).map(chipFor)
+      };
+      if (m.kind === 'card') {
+        let meta = m.meta ? L(m.meta) : '';
+        if (m.id === s.workId && !m.workDone) {
+          const mm = Math.floor(s.elapsed / 60), ss = s.elapsed % 60;
+          const el = s.lang === 'en' ? 'Elapsed ' + mm + 'm ' + (ss < 10 ? '0' : '') + ss + 's' : '已用 ' + mm + ' 分 ' + (ss < 10 ? '0' : '') + ss + ' 秒';
+          meta = el + ' · ' + meta;
+        }
+        if (m.next) meta = meta + (s.lang === 'en' ? ' · ' + m.next + ' request(s) queued for next round' : ' · 下一轮已记录 ' + m.next + ' 项');
+        const open = !!s.techOpen[m.id];
+        Object.assign(v, {
+          title: L(m.title),
+          hasTag: !!m.tag, tag: L(m.tag),
+          tagBg: m.tagTone === 'ok' ? 'var(--okSoft,#EAF1EA)' : m.tagTone === 'warn' ? 'var(--warnSoft,#F7F0E2)' : m.tagTone === 'accent' ? 'var(--accentSoft,#F8EEE8)' : 'var(--panel,#F8F6F1)',
+          tagFg: m.tagTone === 'ok' ? 'var(--ok,#3F6B4A)' : m.tagTone === 'warn' ? 'var(--warn,#93651B)' : m.tagTone === 'accent' ? 'var(--accent,#B5572F)' : 'var(--ink3,#8A847A)',
+          hasBar: typeof m.bar === 'number', barPct: Math.round((m.bar || 0) * 100) + '%',
+          hasRows: !!(m.rows && m.rows.length),
+          rows: (m.rows || []).map((r, i) => ({ key: i, label: L(r.label), icon: this.toneIcon(r.tone), color: this.toneColor(r.tone), hasValue: !!r.value, value: r.value ? L(r.value) : '' })),
+          hasMeta: !!meta && !m.metaStatic, meta,
+          hasNote: !!m.note, note: L(m.note),
+          hasTech: !!(m.tech && m.tech.length), techOpen: open,
+          techLabel: open ? t.techLabelOpen : t.techLabelClosed,
+          techRows: (m.tech || []).map((x, i) => ({ key: i, text: L(x) })),
+          onTech: () => this.setState(p => ({ techOpen: { ...p.techOpen, [m.id]: !p.techOpen[m.id] } })),
+          hasActions: !!(m.actions && m.actions.length),
+          actions: (m.actions || []).map(a => ({
+            label: L(a.label), on: () => this.act(a.id),
+            weight: a.primary ? '500' : '400',
+            bg: a.primary ? 'var(--accent,#B5572F)' : 'var(--card,#FFF)',
+            fg: a.primary ? 'var(--accentInk,#FFF)' : 'var(--ink,#26241F)',
+            border: a.primary ? 'var(--accentLine,#A24E2A)' : 'var(--line,#E6E1D8)'
+          }))
+        });
+        if (m.metaStatic && m.meta) { v.hasMeta = false; v.hasNote = v.hasNote || true; v.note = v.note || L(m.meta); }
+      }
+      return v;
+    });
+
+    const canSend = !!(s.draft.trim() || s.files.some(f => !f.uploading));
+    const rows = Math.min(6, Math.max(1, s.draft.split('\n').length, Math.ceil(s.draft.length / 46)));
+
+    return {
+      t, themeVars: layer + themeVars, msgs,
+      demo: s.demo, demoHidden: !s.demo,
+      hideDemo: () => this.setState({ demo: false }),
+      showDemo: () => this.setState({ demo: true }),
+      scenes: t.scenes.map(x => ({
+        label: x.label, on: () => this.seed(x.id),
+        bg: s.scene === x.id ? '#3C4048' : 'transparent',
+        fg: s.scene === x.id ? '#FFFFFF' : '#9AA0AC'
+      })),
+      setNova: () => this.setState({ theme: 'nova' }), setWx: () => this.setState({ theme: 'wechat' }),
+      novaBg: wx ? 'transparent' : '#3C4048', novaFg: wx ? '#9AA0AC' : '#FFFFFF',
+      wxBg: wx ? '#07C160' : 'transparent', wxFg: wx ? '#FFFFFF' : '#9AA0AC',
+      wins: t.wins.map(w => ({
+        label: w.label, on: () => this.setState({ win: w.id }),
+        bg: s.win === w.id ? '#3C4048' : 'transparent', fg: s.win === w.id ? '#FFFFFF' : '#9AA0AC'
+      })),
+      winW: s.win === 'w1366' ? '1366px' : s.win === 'w1600' ? '1600px' : '100%',
+      winH: s.win === 'fluid' ? '100%' : s.win === 'w1366' ? '768px' : '900px',
+
+      side: s.side && !s.drawer, sideClosed: !(s.side && !s.drawer),
+      drawer: s.drawer, drawerClosed: !s.drawer,
+      toggleSide: () => this.setState(p => (p.drawer ? { side: true, drawer: false } : { side: !p.side })),
+      toggleDrawer: () => this.setState(p => ({ drawer: !p.drawer })),
+      openDrawer: () => this.setState({ drawer: true }),
+      tech: s.tech, toggleTech: () => this.setState(p => ({ tech: !p.tech })),
+      toggleLang: () => this.setState(p => ({ lang: p.lang === 'zh' ? 'en' : 'zh' })),
+      newProject: () => this.seed('new'),
+
+      otherProjects: t.projects.map((p, i) => ({ key: i, glyph: p.glyph, name: p.name, meta: p.meta })),
+      historyItems: t.historyItems.map((h, i) => ({ key: i, label: h.label, dot: this.toneColor(h.tone) })),
+      drawerTasks: t.drawerTasks.map((d, i) => ({ key: i, label: d.label, icon: this.toneIcon(d.tone), color: this.toneColor(d.tone) })),
+      statLines: t.stats.map((x, i) => ({ key: i, text: x })),
+      techLines: t.tech.map((x, i) => ({ key: i, text: x })),
+      ringBg: 'conic-gradient(var(--ok,#3F6B4A) 0turn .667turn, var(--line,#E0DBD1) .667turn 1turn)',
+      ringText: '2/3',
+
+      draft: s.draft, rows,
+      onDraft: e => this.setState({ draft: e.target.value }),
+      onKey: e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); this.send(); } },
+      onPaste: () => {},
+      taRef: el => { this.ta = el; },
+      scrollRef: el => { this.scroller = el; },
+      onScroll: e => {
+        const el = e.target;
+        const near = el.scrollHeight - el.scrollTop - el.clientHeight < 90;
+        if (near !== s.atBottom) this.setState({ atBottom: near });
+      },
+      showJump: !s.atBottom,
+      jumpBottom: () => { if (this.scroller) this.scroller.scrollTop = this.scroller.scrollHeight; this.setState({ atBottom: true }); },
+
+      busy: s.busy, hasErr: !!s.err, err: L(s.err), clearErr: () => this.setState({ err: null }),
+      hasFiles: !!s.files.length,
+      files: s.files.map(f => ({ key: f.key, name: f.name, icon: f.icon, uploading: f.uploading, onRemove: () => this.setState(p => ({ files: p.files.filter(x => x.key !== f.key) })) })),
+      onPick: e => { const names = Array.from(e.target.files || []).map(f => f.name); this.addFiles(names); e.target.value = ''; },
+      onDragOver: e => { e.preventDefault(); if (!s.drag) this.setState({ drag: true }); },
+      onDragLeave: () => this.setState({ drag: false }),
+      onDrop: e => {
+        e.preventDefault();
+        this.setState({ drag: false });
+        const names = Array.from((e.dataTransfer && e.dataTransfer.files) || []).map(f => f.name);
+        this.addFiles(names.length ? names : ['screenshot.png']);
+      },
+      dropStyle: s.drag ? 'dashed' : 'solid',
+      dropColor: s.drag ? 'var(--accent,#B5572F)' : 'var(--line,#E6E1D8)',
+      simDrop: () => this.addFiles(['首页截图.png']),
+      simBad: () => this.addFiles(['setup.exe']),
+
+      send: () => this.send(),
+      cantSend: !canSend,
+      sendLabel: canSend ? t.send : t.send,
+      sendBg: canSend ? 'var(--accent,#B5572F)' : 'var(--panel,#F8F6F1)',
+      sendFg: canSend ? 'var(--accentInk,#FFF)' : 'var(--ink3,#8A847A)',
+      sendBorder: canSend ? 'var(--accentLine,#A24E2A)' : 'var(--line,#E6E1D8)',
+      sendCursor: canSend ? 'pointer' : 'default'
+    };
+  }
+}
+
+</script>
+</body>
+</html>

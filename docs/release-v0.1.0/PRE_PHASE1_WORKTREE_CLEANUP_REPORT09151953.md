@@ -252,3 +252,74 @@ git remote -v -> （无输出）
 - [ ] `docs/product/NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md`（已移入备份的旧快照）与权威版本的差异仅记录，未做进一步归档判断，留待后续确认（见第7节）。
 
 **本报告不构成 Stage 0 已通过的结论。是否可进入 Phase 1，以 Codex 独立只读复审的结果为准。**
+
+---
+
+## 14. 收尾执行结果
+
+执行时间：2026-09-15 20:27 +0800（Beijing time）
+
+### 文件移动结果
+
+用户已关闭此前锁定 `product/NOVA_STAGE0_5_CLAUDE_CODE_EXECUTION_PROMPT09151635.md` 的 Microsoft Word 窗口。重新尝试移动：
+
+```
+mv "product/NOVA_STAGE0_5_CLAUDE_CODE_EXECUTION_PROMPT09151635.md" \
+   "D:\nova-backup\pre-phase1\20260915-194822\moved-from-repo\product\NOVA_STAGE0_5_CLAUDE_CODE_EXECUTION_PROMPT09151635.md"
+退出码: 0（一次成功，未再遇到 "Device or resource busy"）
+```
+
+移动前确认：
+- 目标目录 `D:\nova-backup\pre-phase1\20260915-194822\moved-from-repo\product\` 中已存在的 `NOVA_STAGE0_5_CLAUDE_CODE_EXECUTION_PROMPT09151635.md.readonly-copy-still-locked-in-repo`（上一轮生成的只读备份副本）未被触碰、未被覆盖。
+- 目标路径 `NOVA_STAGE0_5_CLAUDE_CODE_EXECUTION_PROMPT09151635.md`（不带 `.readonly-copy-...` 后缀）此前不存在，移动不构成覆盖。
+
+原始文件未被删除——仅从 `D:\nova\product\` 同盘移动（rename）到备份目录；`D:\nova\product\` 现仅剩 `NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md`（已跟踪权威版本）与 `NOVA_V1_MVP_PRODUCT_DEVELOPMENT_SPEC_V3.md`（已跟踪）。
+
+### 移动前后 SHA256
+
+| 阶段 | SHA256 |
+|---|---|
+| 移动前（`D:\nova\product\NOVA_STAGE0_5_CLAUDE_CODE_EXECUTION_PROMPT09151635.md`） | `1f351eaa6cb3f8e6fa7bd82108c041f4f60ec2824634bcf5e655712862b29ceb` |
+| 移动后（`D:\nova-backup\pre-phase1\20260915-194822\moved-from-repo\product\NOVA_STAGE0_5_CLAUDE_CODE_EXECUTION_PROMPT09151635.md`） | `1f351eaa6cb3f8e6fa7bd82108c041f4f60ec2824634bcf5e655712862b29ceb` |
+
+**核对结果：一致。** 与本报告第5、6节记录的、锁定前预先计算的哈希值也完全一致，且与同批次生成的只读副本 `...readonly-copy-still-locked-in-repo` 哈希相同，三方互证内容未被改动。
+
+### 移动后 git status
+
+```
+git status --short --untracked-files=all       -> （无输出）
+git status --porcelain=v2 --untracked-files=all -> （无输出）
+```
+
+### 当前分支和 HEAD（移动后、报告提交前）
+
+```
+git rev-parse --abbrev-ref HEAD -> feature/nova-technical-mvp
+git rev-parse HEAD              -> b075a4061db090a4c6652771fc8d25e20ea17d43
+```
+
+### git remote -v
+
+```
+（无输出，未配置远程，未添加，未猜测）
+```
+
+### 三个整理提交
+
+1. `802efa7b5836327a8ffc8e166c3800682ef68c14` — `docs(release): accept final stage 0 evidence`
+2. `883850cd7b545d6551d1b30c87122c1fcf87d6d8` — `docs(design): accept v0.1.0 uiux baseline`
+3. 本报告的提交 SHA：见下方"报告提交状态"（本节写入后需要单独提交才能得到最终 SHA，因为提交内容是本文件自身，SHA 无法在写入前预知）
+
+### 报告提交状态
+
+本文件此前已在提交 `b075a4061db090a4c6652771fc8d25e20ea17d43`（`docs(release): record pre phase 1 cleanup`）中提交过一次首版内容。本"收尾执行结果"章节是在该提交之后新增的内容，因此在写入本节的这一刻，本文件相对于 HEAD 是"已修改、未提交"状态。按任务书要求，将以精确路径单独暂存并提交这一次更新，提交信息沿用 `docs(release): record pre phase 1 cleanup`，构成第4个整理相关提交。提交后的精确 SHA见本次任务对用户的最终汇总消息（因 SHA 依赖提交时刻的完整文件内容，此处不做自我预测）。
+
+### 是否已满足 Codex 复审条件
+
+**本节涵盖的两项检查项已满足：**
+- [x] `git status --short --untracked-files=all` 与 `git status --porcelain=v2 --untracked-files=all` 均无输出（移动后、本报告更新提交前已验证；提交本更新后将再次复核）。
+- [x] 被锁定文件已安全移出仓库，移动前后 SHA256 一致，未删除、未覆盖任何文件。
+
+**仍待确认的一项**（见第13节，未改变）：`docs/product/NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md` 的产品文档差异，本轮未做进一步归档判断,不影响工作区干净这一 Codex 复审的核心阻断项。
+
+**本报告仍不构成 Stage 0 已通过的结论，最终结论由 Codex 独立只读复审决定。**

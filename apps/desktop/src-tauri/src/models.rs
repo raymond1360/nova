@@ -322,6 +322,12 @@ pub struct Task {
     pub done_criteria: Option<String>,
     pub ai_kind: Option<String>,
     pub state: TaskState,
+    /// Monotonically incrementing counter, bumped every time the task
+    /// produces a fresh result (enters `preview_ready`). `0` means the task
+    /// has never produced a result yet — `completed` requires this to be
+    /// `> 0` and a matching `accepted = 1` `user_acceptance` row for this
+    /// exact generation. See `storage::tasks::bump_result_generation`.
+    pub result_generation: i64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -519,6 +525,11 @@ pub struct UserAcceptance {
     pub id: String,
     pub project_id: String,
     pub task_id: String,
+    /// Which of the task's results this acceptance/rejection applies to —
+    /// see [`Task::result_generation`]. `UNIQUE(task_id, result_generation)`
+    /// at the schema level: a task can have one acceptance record per
+    /// generation, but never two for the same generation.
+    pub result_generation: i64,
     pub accepted: bool,
     pub user_note: Option<String>,
     pub accepted_at: String,

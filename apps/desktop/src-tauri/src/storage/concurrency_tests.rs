@@ -484,3 +484,400 @@ fn startup_recovery_scan_runs_safely_alongside_a_concurrent_plain_read() {
     let _ = fs::remove_dir_all(&harness_dir);
     let _ = fs::remove_dir_all(&project_dir);
 }
+
+#[test]
+fn concurrent_startup_recovery_from_two_connections_never_duplicates_records() {
+    let harness_dir = temp_dir("concurrent-recovery");
+    let project_dir = temp_dir("concurrent-recovery-project");
+    let db_path = harness_dir.join("nova.sqlite3");
+
+    let setup = open_migrated(&db_path);
+    let project = setup
+        .create_project(&CreateProjectRequest {
+            name: "P".to_string(),
+            local_path: project_dir.to_string_lossy().into_owned(),
+            source_type: "local".to_string(),
+            source_url: None,
+            purpose: None,
+            long_term_goal: None,
+            user_preferences: None,
+            prohibitions: None,
+        })
+        .unwrap();
+    setup.set_last_active_project(&project.id).unwrap();
+    let task = setup
+        .create_task(
+            &CreateTaskRequest {
+                project_id: project.id.clone(),
+                title: "T".to_string(),
+                goal: None,
+                in_scope: None,
+                not_in_scope: None,
+                done_criteria: None,
+                ai_kind: None,
+            },
+            Actor::User,
+        )
+        .unwrap();
+    for state in [
+        TaskState::AwaitingConfirmation,
+        TaskState::Confirmed,
+        TaskState::Queued,
+        TaskState::Running,
+    ] {
+        setup
+            .transition_task(&task.id, state, Actor::System, None, None, false, None)
+            .unwrap();
+    }
+    drop(setup);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = [(); 2]
+        .into_iter()
+        .map(|_| {
+            let path = db_path.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let db = Database::open(&path).unwrap();
+                barrier.wait();
+                db.run_startup_recovery()
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let result = handle.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "concurrent recovery scans must not error/panic: {result:?}"
+        );
+    }
+
+    let verify_conn = open_migrated(&db_path);
+    let final_task = verify_conn.task(&task.id).unwrap();
+    assert_eq!(final_task.state, TaskState::Interrupted);
+
+    let checkpoint_count: i64 = verify_conn
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM recovery_checkpoints WHERE task_id = ?1",
+            rusqlite::params![task.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        checkpoint_count, 1,
+        "two concurrent recovery scans must not produce duplicate checkpoints"
+    );
+
+    let interrupted_events: i64 = verify_conn
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM task_state_events WHERE task_id = ?1 AND new_state = 'interrupted'",
+            rusqlite::params![task.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        interrupted_events, 1,
+        "two concurrent recovery scans must not produce duplicate state transitions"
+    );
+
+    let _ = fs::remove_dir_all(&harness_dir);
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[test]
+fn concurrent_start_action_for_a_non_read_only_action_only_one_wins() {
+    let harness_dir = temp_dir("cas-start-action");
+    let project_dir = temp_dir("cas-start-action-project");
+    let db_path = harness_dir.join("nova.sqlite3");
+
+    let setup = open_migrated(&db_path);
+    let project = setup
+        .create_project(&CreateProjectRequest {
+            name: "P".to_string(),
+            local_path: project_dir.to_string_lossy().into_owned(),
+            source_type: "local".to_string(),
+            source_url: None,
+            purpose: None,
+            long_term_goal: None,
+            user_preferences: None,
+            prohibitions: None,
+        })
+        .unwrap();
+    let task = setup
+        .create_task(
+            &CreateTaskRequest {
+                project_id: project.id.clone(),
+                title: "T".to_string(),
+                goal: None,
+                in_scope: None,
+                not_in_scope: None,
+                done_criteria: None,
+                ai_kind: None,
+            },
+            Actor::User,
+        )
+        .unwrap();
+    setup
+        .plan_action(&task.id, "git_commit", "start-race-key")
+        .unwrap();
+    drop(setup);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let task_id = task.id.clone();
+    let handles: Vec<_> = [(); 2]
+        .into_iter()
+        .map(|_| {
+            let path = db_path.clone();
+            let barrier = Arc::clone(&barrier);
+            let task_id = task_id.clone();
+            thread::spawn(move || {
+                let db = Database::open(&path).unwrap();
+                barrier.wait();
+                db.start_action(&task_id, "start-race-key", false)
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let succeeded = results.iter().filter(|r| r.is_ok()).count();
+    let failed = results.iter().filter(|r| r.is_err()).count();
+    assert_eq!(
+        succeeded, 1,
+        "exactly one of two concurrent starts of a non-read-only action must win: {results:?}"
+    );
+    assert_eq!(
+        failed, 1,
+        "the loser must get a clean domain error, never a silent second start"
+    );
+
+    let verify_conn = open_migrated(&db_path);
+    let action = verify_conn
+        .find_action(&task_id, "start-race-key")
+        .unwrap()
+        .unwrap();
+    assert_eq!(action.status, ActionStatus::Started);
+    assert_eq!(
+        action.attempt_number, 1,
+        "only one legitimate start happened, no phantom retry bump"
+    );
+
+    let _ = fs::remove_dir_all(&harness_dir);
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[test]
+fn concurrent_finish_action_for_the_same_started_action_only_one_wins() {
+    let harness_dir = temp_dir("cas-finish-action");
+    let project_dir = temp_dir("cas-finish-action-project");
+    let db_path = harness_dir.join("nova.sqlite3");
+
+    let setup = open_migrated(&db_path);
+    let project = setup
+        .create_project(&CreateProjectRequest {
+            name: "P".to_string(),
+            local_path: project_dir.to_string_lossy().into_owned(),
+            source_type: "local".to_string(),
+            source_url: None,
+            purpose: None,
+            long_term_goal: None,
+            user_preferences: None,
+            prohibitions: None,
+        })
+        .unwrap();
+    let task = setup
+        .create_task(
+            &CreateTaskRequest {
+                project_id: project.id.clone(),
+                title: "T".to_string(),
+                goal: None,
+                in_scope: None,
+                not_in_scope: None,
+                done_criteria: None,
+                ai_kind: None,
+            },
+            Actor::User,
+        )
+        .unwrap();
+    setup
+        .plan_action(&task.id, "git_commit", "finish-race-key")
+        .unwrap();
+    setup
+        .start_action(&task.id, "finish-race-key", false)
+        .unwrap();
+    drop(setup);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let task_id = task.id.clone();
+    let handles: Vec<_> = [ActionStatus::Succeeded, ActionStatus::Failed]
+        .into_iter()
+        .map(|status| {
+            let path = db_path.clone();
+            let barrier = Arc::clone(&barrier);
+            let task_id = task_id.clone();
+            thread::spawn(move || {
+                let db = Database::open(&path).unwrap();
+                barrier.wait();
+                db.finish_action(&task_id, "finish-race-key", status, None, None)
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let succeeded = results.iter().filter(|r| r.is_ok()).count();
+    let failed = results.iter().filter(|r| r.is_err()).count();
+    assert_eq!(
+        succeeded, 1,
+        "exactly one of two concurrent finishes must win: {results:?}"
+    );
+    assert_eq!(
+        failed, 1,
+        "the loser must get a clean domain error, never a silent double-finish"
+    );
+
+    let verify_conn = open_migrated(&db_path);
+    let action = verify_conn
+        .find_action(&task_id, "finish-race-key")
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            action.status,
+            ActionStatus::Succeeded | ActionStatus::Failed
+        ),
+        "final status must be exactly one terminal outcome, not corrupted: {:?}",
+        action.status
+    );
+    assert!(action.finished_at.is_some());
+
+    let _ = fs::remove_dir_all(&harness_dir);
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[test]
+fn concurrent_completion_and_a_fresh_result_never_completes_a_stale_generation() {
+    let harness_dir = temp_dir("cas-generation-race");
+    let project_dir = temp_dir("cas-generation-race-project");
+    let db_path = harness_dir.join("nova.sqlite3");
+
+    let setup = open_migrated(&db_path);
+    let project = setup
+        .create_project(&CreateProjectRequest {
+            name: "P".to_string(),
+            local_path: project_dir.to_string_lossy().into_owned(),
+            source_type: "local".to_string(),
+            source_url: None,
+            purpose: None,
+            long_term_goal: None,
+            user_preferences: None,
+            prohibitions: None,
+        })
+        .unwrap();
+    let task = setup
+        .create_task(
+            &CreateTaskRequest {
+                project_id: project.id.clone(),
+                title: "T".to_string(),
+                goal: None,
+                in_scope: None,
+                not_in_scope: None,
+                done_criteria: None,
+                ai_kind: None,
+            },
+            Actor::User,
+        )
+        .unwrap();
+    for state in [
+        TaskState::AwaitingConfirmation,
+        TaskState::Confirmed,
+        TaskState::Queued,
+        TaskState::Running,
+        TaskState::Verifying,
+        TaskState::PreviewReady,
+        TaskState::AwaitingUserAcceptance,
+    ] {
+        setup
+            .transition_task(&task.id, state, Actor::System, None, None, false, None)
+            .unwrap();
+    }
+    setup
+        .record_user_acceptance(&project.id, &task.id, true, None)
+        .unwrap();
+    drop(setup);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let task_id = task.id.clone();
+
+    // Thread A races to complete the (currently validly-accepted)
+    // generation 1 result. Thread B races to move the task on to
+    // `safe_fixing` -- simulating "actually, one more change" -- which,
+    // if it lands first, both moves the task out of
+    // `awaiting_user_acceptance` and will eventually produce a new,
+    // not-yet-accepted generation.
+    let path_a = db_path.clone();
+    let barrier_a = Arc::clone(&barrier);
+    let task_id_a = task_id.clone();
+    let complete_handle = thread::spawn(move || {
+        let db = Database::open(&path_a).unwrap();
+        barrier_a.wait();
+        db.transition_task(
+            &task_id_a,
+            TaskState::Completed,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+    });
+
+    let path_b = db_path.clone();
+    let barrier_b = Arc::clone(&barrier);
+    let task_id_b = task_id.clone();
+    let safe_fix_handle = thread::spawn(move || {
+        let db = Database::open(&path_b).unwrap();
+        barrier_b.wait();
+        db.transition_task(
+            &task_id_b,
+            TaskState::SafeFixing,
+            Actor::User,
+            Some("再改一下"),
+            None,
+            false,
+            None,
+        )
+    });
+
+    let complete_result = complete_handle.join().unwrap();
+    let _safe_fix_result = safe_fix_handle.join().unwrap();
+
+    // Whichever thread's write actually landed first, the invariant that
+    // matters is: if the task ended up `completed`, that can only be
+    // because the acceptance for its exact final result_generation was
+    // valid -- never a stale one left over from before a concurrent
+    // "one more change" request landed.
+    let verify_conn = open_migrated(&db_path);
+    let final_task = verify_conn.task(&task_id).unwrap();
+    if final_task.state == TaskState::Completed {
+        assert!(
+            complete_result.is_ok(),
+            "task is completed, so the completing thread must have observed success"
+        );
+        let acceptance = verify_conn.user_acceptance_for_task(&task_id).unwrap();
+        let acceptance = acceptance
+            .expect("a completed task must have an acceptance row for its current generation");
+        assert_eq!(acceptance.result_generation, final_task.result_generation);
+        assert!(acceptance.accepted);
+    } else {
+        // The safe-fixing request won the race instead -- equally
+        // correct, and specifically proves the old acceptance was not
+        // reused to force a completion the concurrent request had just
+        // superseded.
+        assert_eq!(final_task.state, TaskState::SafeFixing);
+    }
+
+    let _ = fs::remove_dir_all(&harness_dir);
+    let _ = fs::remove_dir_all(&project_dir);
+}

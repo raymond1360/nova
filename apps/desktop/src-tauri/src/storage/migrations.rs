@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// Current schema version this build of Nova understands. Bump this and
 /// append a new [`Migration`] to [`MIGRATIONS`] whenever the schema changes
 /// — never edit an already-shipped migration's SQL in place.
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug)]
 pub enum MigrationError {
@@ -326,6 +326,188 @@ const PHASE2_SQL: &str = "
     CREATE INDEX idx_evidence_refs_event ON evidence_refs(event_id);
 ";
 
+/// Phase 2 remediation (Codex `CODEX_PHASE2_TASK_STATE_RECOVERY_REVIEW`):
+///
+/// 1. **Blocker 1 fix** — `tasks.result_generation` is a monotonically
+///    incrementing counter bumped every time a task produces a fresh
+///    result (enters `preview_ready`). `user_acceptance` is redesigned
+///    from "one row per task" to "one row per (task, result_generation)":
+///    old rows are preserved for audit but migrated in as
+///    `result_generation = 0`, a value no real task ever reaches via
+///    [`crate::storage::tasks::bump_result_generation`] (which starts
+///    counting at 1) — so pre-migration acceptance rows can never satisfy
+///    the `completed` gate, which requires an `accepted = 1` row whose
+///    `result_generation` matches the task's *current* one.
+/// 2. **Suggestion / Minor 3 fix** — every Phase 2 table that carries a
+///    `project_id` but lacked a foreign key back to `nova_projects` is
+///    recreated with that FK added (`task_state_events`,
+///    `recovery_checkpoints`, `timeline_events`, `command_evidence`,
+///    `git_evidence`, `file_change_evidence`, `test_evidence`,
+///    `generated_documents`, and the redesigned `user_acceptance`).
+///    SQLite cannot `ALTER TABLE ... ADD FOREIGN KEY`, so each is rebuilt
+///    via `CREATE TABLE ... AS copy -> INSERT SELECT -> DROP -> RENAME`,
+///    preserving any existing rows exactly.
+const V3_SQL: &str = "
+    ALTER TABLE tasks ADD COLUMN result_generation INTEGER NOT NULL DEFAULT 0;
+
+    CREATE TABLE task_state_events_v3 (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES nova_projects(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        old_state TEXT,
+        new_state TEXT NOT NULL,
+        reason TEXT,
+        actor TEXT NOT NULL CHECK(actor IN ('user','nova','connected_ai','system')),
+        correlation_id TEXT,
+        is_recovery INTEGER NOT NULL DEFAULT 0,
+        safety_summary TEXT,
+        created_at TEXT NOT NULL
+    );
+    INSERT INTO task_state_events_v3 (id, project_id, task_id, old_state, new_state, reason, actor, correlation_id, is_recovery, safety_summary, created_at)
+      SELECT id, project_id, task_id, old_state, new_state, reason, actor, correlation_id, is_recovery, safety_summary, created_at FROM task_state_events;
+    DROP TABLE task_state_events;
+    ALTER TABLE task_state_events_v3 RENAME TO task_state_events;
+    CREATE INDEX idx_task_state_events_task ON task_state_events(task_id);
+    CREATE INDEX idx_task_state_events_created_at ON task_state_events(created_at);
+
+    CREATE TABLE recovery_checkpoints_v3 (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES nova_projects(id) ON DELETE CASCADE,
+        task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+        detected_state TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        risk_flag INTEGER NOT NULL DEFAULT 0,
+        resolved_at TEXT,
+        resolution TEXT,
+        created_at TEXT NOT NULL
+    );
+    INSERT INTO recovery_checkpoints_v3 (id, project_id, task_id, detected_state, summary, risk_flag, resolved_at, resolution, created_at)
+      SELECT id, project_id, task_id, detected_state, summary, risk_flag, resolved_at, resolution, created_at FROM recovery_checkpoints;
+    DROP TABLE recovery_checkpoints;
+    ALTER TABLE recovery_checkpoints_v3 RENAME TO recovery_checkpoints;
+    CREATE INDEX idx_recovery_checkpoints_project ON recovery_checkpoints(project_id);
+    CREATE INDEX idx_recovery_checkpoints_task ON recovery_checkpoints(task_id);
+
+    CREATE TABLE timeline_events_v3 (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES nova_projects(id) ON DELETE CASCADE,
+        task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+        phase TEXT,
+        event_type TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        detail TEXT,
+        source TEXT NOT NULL CHECK(source IN ('cli','nova_collected','ai_summarized')),
+        correlation_id TEXT,
+        created_at TEXT NOT NULL
+    );
+    INSERT INTO timeline_events_v3 (id, project_id, task_id, phase, event_type, summary, detail, source, correlation_id, created_at)
+      SELECT id, project_id, task_id, phase, event_type, summary, detail, source, correlation_id, created_at FROM timeline_events;
+    DROP TABLE timeline_events;
+    ALTER TABLE timeline_events_v3 RENAME TO timeline_events;
+    CREATE INDEX idx_timeline_events_project ON timeline_events(project_id);
+    CREATE INDEX idx_timeline_events_task ON timeline_events(task_id);
+    CREATE INDEX idx_timeline_events_created_at ON timeline_events(created_at);
+
+    CREATE TABLE command_evidence_v3 (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES nova_projects(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        command_redacted TEXT NOT NULL,
+        exit_code INTEGER,
+        started_at TEXT,
+        finished_at TEXT,
+        stdout_ref TEXT,
+        stderr_ref TEXT,
+        created_at TEXT NOT NULL
+    );
+    INSERT INTO command_evidence_v3 (id, project_id, task_id, command_redacted, exit_code, started_at, finished_at, stdout_ref, stderr_ref, created_at)
+      SELECT id, project_id, task_id, command_redacted, exit_code, started_at, finished_at, stdout_ref, stderr_ref, created_at FROM command_evidence;
+    DROP TABLE command_evidence;
+    ALTER TABLE command_evidence_v3 RENAME TO command_evidence;
+    CREATE INDEX idx_command_evidence_task ON command_evidence(task_id);
+
+    CREATE TABLE git_evidence_v3 (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES nova_projects(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        event_kind TEXT NOT NULL,
+        commit_sha TEXT,
+        branch TEXT,
+        diff_stat TEXT,
+        created_at TEXT NOT NULL
+    );
+    INSERT INTO git_evidence_v3 (id, project_id, task_id, event_kind, commit_sha, branch, diff_stat, created_at)
+      SELECT id, project_id, task_id, event_kind, commit_sha, branch, diff_stat, created_at FROM git_evidence;
+    DROP TABLE git_evidence;
+    ALTER TABLE git_evidence_v3 RENAME TO git_evidence;
+    CREATE INDEX idx_git_evidence_task ON git_evidence(task_id);
+
+    CREATE TABLE file_change_evidence_v3 (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES nova_projects(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        file_path TEXT NOT NULL,
+        change_kind TEXT NOT NULL CHECK(change_kind IN ('created','modified','deleted')),
+        summary TEXT,
+        created_at TEXT NOT NULL
+    );
+    INSERT INTO file_change_evidence_v3 (id, project_id, task_id, file_path, change_kind, summary, created_at)
+      SELECT id, project_id, task_id, file_path, change_kind, summary, created_at FROM file_change_evidence;
+    DROP TABLE file_change_evidence;
+    ALTER TABLE file_change_evidence_v3 RENAME TO file_change_evidence;
+    CREATE INDEX idx_file_change_evidence_task ON file_change_evidence(task_id);
+
+    CREATE TABLE test_evidence_v3 (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES nova_projects(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        test_command_redacted TEXT NOT NULL,
+        passed_count INTEGER NOT NULL DEFAULT 0,
+        failed_count INTEGER NOT NULL DEFAULT 0,
+        skipped_count INTEGER NOT NULL DEFAULT 0,
+        exit_code INTEGER,
+        created_at TEXT NOT NULL
+    );
+    INSERT INTO test_evidence_v3 (id, project_id, task_id, test_command_redacted, passed_count, failed_count, skipped_count, exit_code, created_at)
+      SELECT id, project_id, task_id, test_command_redacted, passed_count, failed_count, skipped_count, exit_code, created_at FROM test_evidence;
+    DROP TABLE test_evidence;
+    ALTER TABLE test_evidence_v3 RENAME TO test_evidence;
+    CREATE INDEX idx_test_evidence_task ON test_evidence(task_id);
+
+    CREATE TABLE generated_documents_v3 (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES nova_projects(id) ON DELETE CASCADE,
+        task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+        document_type TEXT NOT NULL,
+        file_path TEXT,
+        generated_by TEXT,
+        generated_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    INSERT INTO generated_documents_v3 (id, project_id, task_id, document_type, file_path, generated_by, generated_at, created_at)
+      SELECT id, project_id, task_id, document_type, file_path, generated_by, generated_at, created_at FROM generated_documents;
+    DROP TABLE generated_documents;
+    ALTER TABLE generated_documents_v3 RENAME TO generated_documents;
+    CREATE INDEX idx_generated_documents_task ON generated_documents(task_id);
+
+    CREATE TABLE user_acceptance_v3 (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES nova_projects(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        result_generation INTEGER NOT NULL,
+        accepted INTEGER NOT NULL,
+        user_note TEXT,
+        accepted_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(task_id, result_generation)
+    );
+    INSERT INTO user_acceptance_v3 (id, project_id, task_id, result_generation, accepted, user_note, accepted_at, created_at)
+      SELECT id, project_id, task_id, 0, accepted, user_note, accepted_at, created_at FROM user_acceptance;
+    DROP TABLE user_acceptance;
+    ALTER TABLE user_acceptance_v3 RENAME TO user_acceptance;
+    CREATE INDEX idx_user_acceptance_task ON user_acceptance(task_id);
+";
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -336,6 +518,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 2,
         requires_backup: true,
         sql: PHASE2_SQL,
+    },
+    Migration {
+        version: 3,
+        requires_backup: true,
+        sql: V3_SQL,
     },
 ];
 
@@ -578,6 +765,77 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_a_v2_database_to_v3_relabeling_old_acceptance_as_generation_zero() {
+        let dir = temp_dir("v2-to-v3");
+        let (conn, path) = open_file_db(&dir);
+        // Simulate an existing Phase 2 (v2) install: baseline + Phase 2
+        // schema, `user_version = 2`, with one real project/task and one
+        // pre-remediation acceptance row (the old `task_id`-only-unique
+        // shape).
+        conn.execute_batch(BASELINE_SQL).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(PHASE2_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, purpose, long_term_goal, user_preferences, prohibitions, last_activity_at, created_at, updated_at, last_opened_at, data_format_version) VALUES ('proj-1','P','C:\\p','c:\\p','local',NULL,NULL,NULL,NULL,'t','t','t','t',1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_memory (project_id, updated_at) VALUES ('proj-1','t')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, created_at, updated_at) VALUES ('task-1','proj-1','T','awaiting_user_acceptance','t','t')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO user_acceptance (id, project_id, task_id, accepted, user_note, accepted_at, created_at) VALUES ('acc-1','proj-1','task-1',1,'old note','t','t')",
+            [],
+        )
+        .unwrap();
+
+        run(&conn, Some(&path)).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+
+        let result_generation: i64 = conn
+            .query_row(
+                "SELECT result_generation FROM tasks WHERE id = 'task-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            result_generation, 0,
+            "existing tasks default to generation 0"
+        );
+
+        let (migrated_generation, migrated_accepted): (i64, i64) = conn
+            .query_row(
+                "SELECT result_generation, accepted FROM user_acceptance WHERE id = 'acc-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            migrated_generation, 0,
+            "pre-remediation acceptance rows migrate in as generation 0"
+        );
+        assert_eq!(
+            migrated_accepted, 1,
+            "the historical accepted value itself is preserved"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn non_trivial_migration_creates_a_backup_file() {
         let dir = temp_dir("backup-created");
         let (conn, path) = open_file_db(&dir);
@@ -596,8 +854,8 @@ mod tests {
             .collect();
         assert_eq!(
             entries.len(),
-            1,
-            "expected exactly one backup (only migration 2 requires one): {entries:?}"
+            2,
+            "expected exactly two backups (migration 2 and migration 3 both require one): {entries:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -609,7 +867,7 @@ mod tests {
         run(&conn, Some(&path)).unwrap();
 
         // A second, independent database in the same directory must not
-        // collide with or overwrite the first backup.
+        // collide with or overwrite the first database's backups.
         let dir2 = temp_dir("backup-unique-2");
         let (conn2, path2) = open_file_db(&dir2);
         run(&conn2, Some(&path2)).unwrap();
@@ -620,8 +878,18 @@ mod tests {
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names.len(), 1);
-        assert!(names[0].len() > "nova-backup-YYYYMMDDHHMMSS-".len());
+        assert_eq!(
+            names.len(),
+            2,
+            "migration 2 and migration 3 each produce their own backup"
+        );
+        assert_ne!(
+            names[0], names[1],
+            "two backups from the same run must not collide"
+        );
+        for name in &names {
+            assert!(name.len() > "nova-backup-YYYYMMDDHHMMSS-".len());
+        }
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&dir2);
@@ -745,8 +1013,8 @@ mod tests {
         let backups_dir = dir.join("backups");
         let count = fs::read_dir(&backups_dir).unwrap().count();
         assert_eq!(
-            count, 1,
-            "already-applied migrations must not be re-run, so no extra backups"
+            count, 2,
+            "already-applied migrations must not be re-run, so no extra backups beyond the two produced by the first run"
         );
         let _ = fs::remove_dir_all(&dir);
     }

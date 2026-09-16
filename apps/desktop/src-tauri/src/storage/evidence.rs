@@ -222,15 +222,26 @@ impl Database {
             .map_err(Into::into)
     }
 
-    /// Records the user's explicit accept/reject decision for a task. This
-    /// must only ever be called from the Tauri command wired to the
-    /// literal "我已经看过，符合需要" confirmation action in the UI — never
-    /// from `nova`/`connected_ai`/`system` code paths — so that
-    /// [`Database::transition_task`]'s `completed` gate (which checks for
-    /// an `accepted = 1` row here) can never be satisfied by anything other
-    /// than a real user action. One row per task (`UNIQUE(task_id)`);
-    /// calling again updates the same row rather than creating a second
-    /// one, so a task has at most one acceptance record at a time.
+    /// Records the user's explicit accept/reject decision for a task's
+    /// *current* result. This must only ever be called from the Tauri
+    /// command wired to the literal "我已经看过，符合需要" confirmation
+    /// action in the UI — never from `nova`/`connected_ai`/`system` code
+    /// paths — so that [`Database::transition_task`]'s `completed` gate
+    /// can never be satisfied by anything other than a real user action.
+    ///
+    /// The write is only accepted while the task is currently
+    /// `awaiting_user_acceptance`, and it is stamped with the task's
+    /// current `result_generation` — both facts are read from `tasks`
+    /// inside the very same `INSERT ... SELECT ... WHERE` statement that
+    /// performs the write, so there is no window between "check state" and
+    /// "write" for a concurrent `transition_task` call to invalidate the
+    /// decision (e.g. by moving the task to `safe_fixing`/bumping the
+    /// generation in between). One row per `(task_id, result_generation)`;
+    /// calling again for the same generation updates that row rather than
+    /// creating a second one — a task can freely be re-accepted/re-rejected
+    /// while still on the same result, but a *new* result (new generation)
+    /// always starts with no acceptance row of its own, never inheriting
+    /// the old generation's verdict.
     pub fn record_user_acceptance(
         &self,
         project_id: &str,
@@ -238,30 +249,55 @@ impl Database {
         accepted: bool,
         user_note: Option<&str>,
     ) -> NovaResult<UserAcceptance> {
-        self.assert_task_belongs_to_project(project_id, task_id)?;
+        let user_note = user_note.map(redact_sensitive_text);
         let now = now();
-        self.conn().execute(
-            "INSERT INTO user_acceptance (id, project_id, task_id, accepted, user_note, accepted_at, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-             ON CONFLICT(task_id) DO UPDATE SET
+        let rows_affected = self.conn().execute(
+            "INSERT INTO user_acceptance (id, project_id, task_id, result_generation, accepted, user_note, accepted_at, created_at)
+             SELECT ?1, project_id, id, result_generation, ?2, ?3, ?4, ?4
+             FROM tasks
+             WHERE id = ?5 AND project_id = ?6 AND state = 'awaiting_user_acceptance'
+             ON CONFLICT(task_id, result_generation) DO UPDATE SET
                accepted = excluded.accepted,
                user_note = excluded.user_note,
                accepted_at = excluded.accepted_at",
-            params![new_id(), project_id, task_id, accepted as i64, user_note, now],
+            params![new_id(), accepted as i64, user_note, now, task_id, project_id],
         )?;
+
+        if rows_affected == 0 {
+            // Diagnose why, purely for a clear error message.
+            let task = self.task(task_id)?;
+            if task.project_id != project_id {
+                return Err(NovaError::Config(
+                    "证据的 project_id 与任务所属项目不一致，已拒绝写入".to_string(),
+                ));
+            }
+            return Err(NovaError::Config(format!(
+                "只有任务处于 awaiting_user_acceptance 状态时才能记录验收，当前状态：{}",
+                task.state
+            )));
+        }
+
         self.conn()
             .query_row(
-                "SELECT id, project_id, task_id, accepted, user_note, accepted_at, created_at FROM user_acceptance WHERE task_id = ?1",
+                "SELECT id, project_id, task_id, result_generation, accepted, user_note, accepted_at, created_at
+                 FROM user_acceptance WHERE task_id = ?1 ORDER BY result_generation DESC LIMIT 1",
                 params![task_id],
                 read_user_acceptance,
             )
             .map_err(Into::into)
     }
 
+    /// The acceptance row for a task's *current* `result_generation`, if
+    /// one exists — this is what `completed` actually depends on. Older
+    /// generations' rows still exist for audit but are deliberately not
+    /// returned here, since they can never authorize the current result.
     pub fn user_acceptance_for_task(&self, task_id: &str) -> NovaResult<Option<UserAcceptance>> {
         self.conn()
             .query_row(
-                "SELECT id, project_id, task_id, accepted, user_note, accepted_at, created_at FROM user_acceptance WHERE task_id = ?1",
+                "SELECT ua.id, ua.project_id, ua.task_id, ua.result_generation, ua.accepted, ua.user_note, ua.accepted_at, ua.created_at
+                 FROM user_acceptance ua
+                 JOIN tasks t ON t.id = ua.task_id
+                 WHERE ua.task_id = ?1 AND ua.result_generation = t.result_generation",
                 params![task_id],
                 read_user_acceptance,
             )
@@ -389,15 +425,16 @@ fn read_test_evidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<TestEvidence>
 }
 
 fn read_user_acceptance(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserAcceptance> {
-    let accepted: i64 = row.get(3)?;
+    let accepted: i64 = row.get(4)?;
     Ok(UserAcceptance {
         id: row.get(0)?,
         project_id: row.get(1)?,
         task_id: row.get(2)?,
+        result_generation: row.get(3)?,
         accepted: accepted != 0,
-        user_note: row.get(4)?,
-        accepted_at: row.get(5)?,
-        created_at: row.get(6)?,
+        user_note: row.get(5)?,
+        accepted_at: row.get(6)?,
+        created_at: row.get(7)?,
     })
 }
 
@@ -417,9 +454,27 @@ fn read_generated_document(row: &rusqlite::Row<'_>) -> rusqlite::Result<Generate
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Actor, CreateProjectRequest, CreateTaskRequest};
+    use crate::models::{Actor, CreateProjectRequest, CreateTaskRequest, TaskState};
     use std::fs;
     use std::path::PathBuf;
+
+    /// Drives a freshly-created (`draft`) task all the way to
+    /// `awaiting_user_acceptance`, the only state `record_user_acceptance`
+    /// will accept a write in.
+    fn drive_to_awaiting_acceptance(db: &Database, task_id: &str) {
+        for state in [
+            TaskState::AwaitingConfirmation,
+            TaskState::Confirmed,
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::Verifying,
+            TaskState::PreviewReady,
+            TaskState::AwaitingUserAcceptance,
+        ] {
+            db.transition_task(task_id, state, Actor::System, None, None, false, None)
+                .unwrap();
+        }
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
@@ -529,6 +584,7 @@ mod tests {
     fn user_acceptance_is_uniquely_associated_with_one_task() {
         let dir = temp_dir("unique-acceptance");
         let (db, project_id, task_id) = db_with_task(&dir, "P");
+        drive_to_awaiting_acceptance(&db, &task_id);
         db.record_user_acceptance(&project_id, &task_id, true, Some("看起来不错"))
             .unwrap();
         db.record_user_acceptance(&project_id, &task_id, true, Some("再次确认"))
@@ -545,7 +601,32 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "a task must have at most one acceptance row");
+        assert_eq!(
+            count, 1,
+            "a task must have at most one acceptance row per result_generation"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn acceptance_note_is_redacted_before_storage() {
+        let dir = temp_dir("redact-acceptance-note");
+        let (db, project_id, task_id) = db_with_task(&dir, "P");
+        drive_to_awaiting_acceptance(&db, &task_id);
+        db.record_user_acceptance(
+            &project_id,
+            &task_id,
+            true,
+            Some("token=abc123supersecretvalue"),
+        )
+        .unwrap();
+
+        let acceptance = db.user_acceptance_for_task(&task_id).unwrap().unwrap();
+        let note = acceptance.user_note.as_deref().unwrap();
+        assert!(
+            !note.contains("abc123supersecretvalue"),
+            "acceptance note must be redacted before storage: {note}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

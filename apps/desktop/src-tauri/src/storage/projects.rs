@@ -43,38 +43,60 @@ impl Database {
 
         let id = new_id();
         let now = now();
-        self.conn().execute(
-            "INSERT INTO nova_projects (
-                id, name, local_path, normalized_path, source_type, source_url,
-                current_branch, last_head_summary, purpose, long_term_goal,
-                user_preferences, prohibitions, last_activity_at, created_at,
-                updated_at, last_opened_at, data_format_version
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1)",
-            params![
-                id,
-                request.name,
-                request.local_path,
-                normalized_path,
-                source_type.as_str(),
-                request.source_url,
-                request.purpose,
-                request.long_term_goal,
-                request.user_preferences,
-                request.prohibitions,
-                now,
-                now,
-                now,
-                now,
-            ],
-        )?;
-        // A newly-created project's memory row is established up front so
-        // every other repository can assume `project_memory` always has
-        // exactly one row per project.
-        self.conn().execute(
-            "INSERT INTO project_memory (project_id, updated_at) VALUES (?1, ?2)",
-            params![id, now],
-        )?;
-        self.project(&id)
+
+        // The project row and its one-per-project memory row must exist
+        // together or not at all: if the memory insert failed after the
+        // project insert already committed, the database would carry a
+        // half-created project that every other repository function
+        // assumes can never happen (see the comment below). Both writes
+        // therefore happen inside one transaction, rolled back in full on
+        // either failure.
+        self.conn().execute("BEGIN IMMEDIATE;", [])?;
+        let result = (|| -> NovaResult<()> {
+            self.conn().execute(
+                "INSERT INTO nova_projects (
+                    id, name, local_path, normalized_path, source_type, source_url,
+                    current_branch, last_head_summary, purpose, long_term_goal,
+                    user_preferences, prohibitions, last_activity_at, created_at,
+                    updated_at, last_opened_at, data_format_version
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1)",
+                params![
+                    id,
+                    request.name,
+                    request.local_path,
+                    normalized_path,
+                    source_type.as_str(),
+                    request.source_url,
+                    request.purpose,
+                    request.long_term_goal,
+                    request.user_preferences,
+                    request.prohibitions,
+                    now,
+                    now,
+                    now,
+                    now,
+                ],
+            )?;
+            // A newly-created project's memory row is established up front
+            // so every other repository can assume `project_memory` always
+            // has exactly one row per project.
+            self.conn().execute(
+                "INSERT INTO project_memory (project_id, updated_at) VALUES (?1, ?2)",
+                params![id, now],
+            )?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn().execute("COMMIT;", [])?;
+                self.project(&id)
+            }
+            Err(error) => {
+                let _ = self.conn().execute("ROLLBACK;", []);
+                Err(error)
+            }
+        }
     }
 
     pub fn project(&self, id: &str) -> NovaResult<Project> {
@@ -131,17 +153,40 @@ impl Database {
     /// refreshes its `last_opened_at`/`last_activity_at`/`updated_at`.
     /// Fails if the project does not exist, so a stale/deleted ID can never
     /// silently become "last active".
+    /// Refreshes the project's activity timestamps and moves the single
+    /// last-active pointer, atomically: if the `app_settings` write were to
+    /// fail after the timestamp `UPDATE` had already committed, the project
+    /// would look freshly touched without actually being last-active,
+    /// which is exactly the drift this transaction rules out.
     pub fn set_last_active_project(&self, project_id: &str) -> NovaResult<Project> {
         let now = now();
-        let updated = self.conn().execute(
-            "UPDATE nova_projects SET last_activity_at = ?1, updated_at = ?1, last_opened_at = ?1 WHERE id = ?2",
-            params![now, project_id],
-        )?;
-        if updated == 0 {
-            return Err(NovaError::Config("项目不存在".to_string()));
+        self.conn().execute("BEGIN IMMEDIATE;", [])?;
+        let result = (|| -> NovaResult<()> {
+            let updated = self.conn().execute(
+                "UPDATE nova_projects SET last_activity_at = ?1, updated_at = ?1, last_opened_at = ?1 WHERE id = ?2",
+                params![now, project_id],
+            )?;
+            if updated == 0 {
+                return Err(NovaError::Config("项目不存在".to_string()));
+            }
+            self.conn().execute(
+                "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                params![LAST_ACTIVE_PROJECT_SETTING_KEY, project_id, now],
+            )?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn().execute("COMMIT;", [])?;
+                self.project(project_id)
+            }
+            Err(error) => {
+                let _ = self.conn().execute("ROLLBACK;", []);
+                Err(error)
+            }
         }
-        self.set_setting(LAST_ACTIVE_PROJECT_SETTING_KEY, project_id)?;
-        self.project(project_id)
     }
 
     pub fn last_active_project_id(&self) -> NovaResult<Option<String>> {
@@ -267,6 +312,90 @@ mod tests {
     }
 
     #[test]
+    fn creating_a_project_also_creates_exactly_one_memory_row_in_the_same_transaction() {
+        let db = db();
+        let dir = temp_dir("create-with-memory");
+        let project = db.create_project(&create_req(&dir, "Demo")).unwrap();
+
+        let memory_rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM project_memory WHERE project_id = ?1",
+                params![project.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(memory_rows, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_memory_insert_leaves_no_half_created_project_behind() {
+        let db = db();
+        let dir = temp_dir("atomic-failure");
+        // Force the second insert (`project_memory`) to fail deterministically
+        // by dropping its table first, while `nova_projects` remains intact
+        // — this proves the whole `create_project` call rolls back as one
+        // unit rather than leaving a project row with no memory row.
+        db.conn()
+            .execute_batch("DROP TABLE project_memory;")
+            .unwrap();
+
+        let result = db.create_project(&create_req(&dir, "WillFail"));
+        assert!(
+            result.is_err(),
+            "create_project must fail when the memory insert fails"
+        );
+
+        let project_rows: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM nova_projects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            project_rows, 0,
+            "a failed create_project must not leave a half-created nova_projects row behind"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_duplicate_or_constraint_conflicting_project_leaves_no_half_created_row() {
+        let db = db();
+        let dir = temp_dir("duplicate-atomic");
+        db.create_project(&create_req(&dir, "First")).unwrap();
+
+        let project_count_before: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM nova_projects", [], |row| row.get(0))
+            .unwrap();
+        let memory_count_before: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM project_memory", [], |row| row.get(0))
+            .unwrap();
+
+        let result = db.create_project(&create_req(&dir, "Second-different-name"));
+        assert!(result.is_err());
+
+        let project_count_after: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM nova_projects", [], |row| row.get(0))
+            .unwrap();
+        let memory_count_after: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM project_memory", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            project_count_before, project_count_after,
+            "a rejected duplicate must not add a project row"
+        );
+        assert_eq!(
+            memory_count_before, memory_count_after,
+            "a rejected duplicate must not add a memory row"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_same_normalized_directory_cannot_be_registered_twice() {
         let db = db();
         let dir = temp_dir("dup");
@@ -304,6 +433,37 @@ mod tests {
         let dir = temp_dir("中文 项目 空格 test");
         let project = db.create_project(&create_req(&dir, "中文项目")).unwrap();
         assert_eq!(project.name, "中文项目");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_last_active_project_is_atomic_with_the_app_settings_write() {
+        let db = db();
+        let dir = temp_dir("last-active-atomic");
+        let project = db.create_project(&create_req(&dir, "P")).unwrap();
+        let before = db.project(&project.id).unwrap();
+
+        // Force the `app_settings` half of the write to fail
+        // deterministically, while the `nova_projects` timestamp update
+        // would otherwise have succeeded on its own.
+        db.conn().execute_batch("DROP TABLE app_settings;").unwrap();
+
+        let result = db.set_last_active_project(&project.id);
+        assert!(result.is_err());
+
+        // The failure must not have left the timestamps updated without
+        // the pointer actually moving.
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);",
+            )
+            .unwrap();
+        let after = db.project(&project.id).unwrap();
+        assert_eq!(
+            before.last_activity_at, after.last_activity_at,
+            "a failed app_settings write must roll back the timestamp update too"
+        );
+        assert_eq!(before.last_opened_at, after.last_opened_at);
         let _ = fs::remove_dir_all(&dir);
     }
 

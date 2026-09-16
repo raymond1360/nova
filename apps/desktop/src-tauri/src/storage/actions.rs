@@ -52,68 +52,97 @@ impl Database {
             .ok_or_else(|| NovaError::Database("刚插入的动作记录未能读回".to_string()))
     }
 
-    /// Marks the action as started, refusing to proceed for a
-    /// non-read-only action whose last known outcome was `succeeded` (must
-    /// never re-run a destructive operation that already completed) or
-    /// `uncertain` (must not auto-retry an operation whose true outcome is
-    /// unknown — the caller must route through
-    /// [`Database::acknowledge_uncertain_action`] first, which requires an
-    /// explicit actor). Read-only actions (`is_read_only = true`) are
-    /// exempt from both restrictions and may always be retried.
+    /// Marks the action as started via a single conditional `UPDATE`, not a
+    /// read followed by a write: the legality check (which prior statuses
+    /// may become `started`) is part of the `WHERE` clause itself, so the
+    /// decision and the write happen as one atomic statement. Under two
+    /// concurrent connections racing the same non-read-only action, at
+    /// most one `UPDATE` can match a row still in an eligible prior status
+    /// — the loser's `rows_affected` is `0`, never a second silent
+    /// "success". Non-read-only actions may only start from `planned`;
+    /// read-only actions (`is_read_only = true`) may also (re)start from
+    /// any terminal status, including `uncertain` (their retries are safe
+    /// by definition — see [`Database::acknowledge_uncertain_action`] for
+    /// the non-read-only equivalent, which is required first).
     pub fn start_action(
         &self,
         task_id: &str,
         idempotency_key: &str,
         is_read_only: bool,
     ) -> NovaResult<TaskAction> {
-        let existing = self
-            .find_action(task_id, idempotency_key)?
-            .ok_or_else(|| NovaError::Config("动作尚未创建计划记录，无法启动".to_string()))?;
-
-        let is_retry = matches!(
-            existing.status,
-            ActionStatus::Succeeded
-                | ActionStatus::Failed
-                | ActionStatus::Cancelled
-                | ActionStatus::Uncertain
-        );
-
-        if is_retry && !is_read_only {
-            let message = match existing.status {
-                ActionStatus::Succeeded => {
-                    "相同 idempotency key 的操作已经成功执行过，拒绝重复执行"
-                }
-                ActionStatus::Uncertain => {
-                    "该操作状态不确定（可能已部分执行），需要先经过用户确认才能重试"
-                }
-                _ => "该非只读操作已有终态记录，重试前需要新的确认",
-            };
-            return Err(NovaError::Config(message.to_string()));
-        }
-
-        if existing.status == ActionStatus::Started {
-            return Err(NovaError::Config("该操作已经处于进行中状态".to_string()));
-        }
-
         let now = now();
-        let next_attempt = if is_retry {
-            existing.attempt_number + 1
+        let rows_affected = if is_read_only {
+            self.conn().execute(
+                "UPDATE task_actions
+                 SET status = 'started',
+                     started_at = ?1,
+                     finished_at = NULL,
+                     attempt_number = CASE WHEN status = 'planned' THEN attempt_number ELSE attempt_number + 1 END,
+                     updated_at = ?1
+                 WHERE task_id = ?2 AND idempotency_key = ?3
+                   AND status IN ('planned', 'succeeded', 'failed', 'cancelled', 'uncertain')",
+                params![now, task_id, idempotency_key],
+            )?
         } else {
-            existing.attempt_number
+            self.conn().execute(
+                "UPDATE task_actions
+                 SET status = 'started', started_at = ?1, finished_at = NULL, updated_at = ?1
+                 WHERE task_id = ?2 AND idempotency_key = ?3 AND status = 'planned'",
+                params![now, task_id, idempotency_key],
+            )?
         };
-        self.conn().execute(
-            "UPDATE task_actions SET status = ?1, started_at = ?2, finished_at = NULL, attempt_number = ?3, updated_at = ?2
-             WHERE task_id = ?4 AND idempotency_key = ?5",
-            params![ActionStatus::Started.as_str(), now, next_attempt, task_id, idempotency_key],
-        )?;
+
+        if rows_affected == 0 {
+            // Diagnose why, purely for a clear error message — this read
+            // is not authoritative for the decision, which was already
+            // made atomically above.
+            return Err(self.start_action_conflict_message(
+                task_id,
+                idempotency_key,
+                is_read_only,
+            )?);
+        }
+
         self.find_action(task_id, idempotency_key)?
             .ok_or_else(|| NovaError::Database("动作记录在更新后丢失".to_string()))
     }
 
-    /// Records a terminal outcome for an action that was `started`.
-    /// `status` must be one of `succeeded`/`failed`/`cancelled` — anything
-    /// else is rejected, since `planned`/`started`/`uncertain` are not
-    /// valid finishing states.
+    fn start_action_conflict_message(
+        &self,
+        task_id: &str,
+        idempotency_key: &str,
+        is_read_only: bool,
+    ) -> NovaResult<NovaError> {
+        let existing = self.find_action(task_id, idempotency_key)?;
+        Ok(match existing {
+            None => NovaError::Config("动作尚未创建计划记录，无法启动".to_string()),
+            Some(action) if action.status == ActionStatus::Started => {
+                NovaError::Config("该操作已经处于进行中状态".to_string())
+            }
+            Some(action) if is_read_only => NovaError::Config(format!(
+                "只读动作在当前状态（{:?}）下也无法启动",
+                action.status
+            )),
+            Some(action) if action.status == ActionStatus::Succeeded => NovaError::Config(
+                "相同 idempotency key 的操作已经成功执行过，拒绝重复执行".to_string(),
+            ),
+            Some(action) if action.status == ActionStatus::Uncertain => NovaError::Config(
+                "该操作状态不确定（可能已部分执行），需要先经过用户确认才能重试".to_string(),
+            ),
+            Some(_) => {
+                NovaError::Config("该非只读操作已有终态记录，重试前需要新的确认".to_string())
+            }
+        })
+    }
+
+    /// Records a terminal outcome for an action, via a single conditional
+    /// `UPDATE ... WHERE status = 'started'` — the same read-free
+    /// compare-and-set pattern as [`Database::start_action`], so two
+    /// concurrent connections racing to finish the same action can never
+    /// both succeed. `status` must be one of `succeeded`/`failed`/
+    /// `cancelled` — anything else is rejected before touching the
+    /// database, since `planned`/`started`/`uncertain` are not valid
+    /// finishing states.
     pub fn finish_action(
         &self,
         task_id: &str,
@@ -130,21 +159,22 @@ impl Database {
                 "finish_action 只能写入 succeeded/failed/cancelled".to_string(),
             ));
         }
-        let existing = self
-            .find_action(task_id, idempotency_key)?
-            .ok_or_else(|| NovaError::Config("动作记录不存在".to_string()))?;
-        if existing.status != ActionStatus::Started {
-            return Err(NovaError::Config(
-                "只有处于 started 状态的动作才能被结束".to_string(),
-            ));
-        }
 
         let now = now();
-        self.conn().execute(
-            "UPDATE task_actions SET status = ?1, finished_at = ?2, evidence_ref = ?3, error_summary = ?4, updated_at = ?2
-             WHERE task_id = ?5 AND idempotency_key = ?6",
+        let rows_affected = self.conn().execute(
+            "UPDATE task_actions
+             SET status = ?1, finished_at = ?2, evidence_ref = ?3, error_summary = ?4, updated_at = ?2
+             WHERE task_id = ?5 AND idempotency_key = ?6 AND status = 'started'",
             params![status.as_str(), now, evidence_ref, error_summary, task_id, idempotency_key],
         )?;
+
+        if rows_affected == 0 {
+            return Err(match self.find_action(task_id, idempotency_key)? {
+                None => NovaError::Config("动作记录不存在".to_string()),
+                Some(_) => NovaError::Config("只有处于 started 状态的动作才能被结束".to_string()),
+            });
+        }
+
         self.find_action(task_id, idempotency_key)?
             .ok_or_else(|| NovaError::Database("动作记录在更新后丢失".to_string()))
     }
@@ -163,20 +193,18 @@ impl Database {
         task_id: &str,
         idempotency_key: &str,
     ) -> NovaResult<TaskAction> {
-        let existing = self
-            .find_action(task_id, idempotency_key)?
-            .ok_or_else(|| NovaError::Config("动作记录不存在".to_string()))?;
-        if existing.status != ActionStatus::Uncertain {
-            return Err(NovaError::Config(
-                "只有 uncertain 状态的动作可以被确认".to_string(),
-            ));
-        }
         let now = now();
-        self.conn().execute(
+        let rows_affected = self.conn().execute(
             "UPDATE task_actions SET status = ?1, attempt_number = attempt_number + 1, updated_at = ?2
-             WHERE task_id = ?3 AND idempotency_key = ?4",
+             WHERE task_id = ?3 AND idempotency_key = ?4 AND status = 'uncertain'",
             params![ActionStatus::Planned.as_str(), now, task_id, idempotency_key],
         )?;
+        if rows_affected == 0 {
+            return Err(match self.find_action(task_id, idempotency_key)? {
+                None => NovaError::Config("动作记录不存在".to_string()),
+                Some(_) => NovaError::Config("只有 uncertain 状态的动作可以被确认".to_string()),
+            });
+        }
         self.find_action(task_id, idempotency_key)?
             .ok_or_else(|| NovaError::Database("动作记录在更新后丢失".to_string()))
     }

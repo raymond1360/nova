@@ -3,6 +3,7 @@ use rusqlite::params;
 use crate::db::Database;
 use crate::error::{NovaError, NovaResult};
 use crate::models::{Actor, CreateTaskRequest, Task, TaskState, TaskStateEvent};
+use crate::security::redact_sensitive_text;
 
 use super::{new_id, now};
 
@@ -148,7 +149,7 @@ impl Database {
     pub fn task(&self, id: &str) -> NovaResult<Task> {
         self.conn()
             .query_row(
-                "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, created_at, updated_at
+                "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, created_at, updated_at
                  FROM tasks WHERE id = ?1",
                 params![id],
                 read_task,
@@ -158,7 +159,7 @@ impl Database {
 
     pub fn list_tasks_for_project(&self, project_id: &str) -> NovaResult<Vec<Task>> {
         let mut stmt = self.conn().prepare(
-            "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, created_at, updated_at
+            "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, created_at, updated_at
              FROM tasks WHERE project_id = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt
@@ -173,7 +174,7 @@ impl Database {
     pub fn unfinished_task_for_project(&self, project_id: &str) -> NovaResult<Option<Task>> {
         self.conn()
             .query_row(
-                "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, created_at, updated_at
+                "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, created_at, updated_at
                  FROM tasks
                  WHERE project_id = ?1 AND state NOT IN ('completed', 'cancelled', 'failed')
                  ORDER BY updated_at DESC LIMIT 1",
@@ -205,11 +206,12 @@ impl Database {
 
     /// The single authoritative entry point for moving a task from one
     /// state to another. Validates the transition against
-    /// [`LEGAL_TRANSITIONS`], enforces the `completed` user-acceptance gate
-    /// and the automatic-fix-cycle cap, then writes the new `tasks.state`
-    /// and the `task_state_events` audit row in one transaction — the two
-    /// can never be observed out of sync, including across a crash (SQLite
-    /// either commits both or neither).
+    /// [`LEGAL_TRANSITIONS`] and the automatic-fix-cycle cap up front, then
+    /// performs the state write, the `completed` acceptance-generation
+    /// gate, and the `task_state_events` audit insert as one atomic
+    /// conditional write — see the inline comment on the `UPDATE` below for
+    /// why the completion gate itself is embedded in the `WHERE` clause
+    /// rather than checked beforehand.
     #[allow(clippy::too_many_arguments)]
     pub fn transition_task(
         &self,
@@ -230,24 +232,13 @@ impl Database {
             )));
         }
 
-        if to == TaskState::Completed {
-            let has_acceptance: i64 = self.conn().query_row(
-                "SELECT COUNT(*) FROM user_acceptance WHERE task_id = ?1 AND accepted = 1",
-                params![task_id],
-                |row| row.get(0),
-            )?;
-            if has_acceptance == 0 {
-                return Err(NovaError::Config(
-                    "无法进入 completed：缺少用户确认记录".to_string(),
-                ));
-            }
-        }
-
         if to == TaskState::SafeFixing && actor != Actor::User && !is_recovery {
             let existing = self.count_automatic_safe_fixing_entries(task_id)?;
             assert_fix_cycle_allowed(existing).map_err(NovaError::Config)?;
         }
 
+        let reason = reason.map(redact_sensitive_text);
+        let safety_summary = safety_summary.map(redact_sensitive_text);
         let now = now();
         self.conn().execute("BEGIN IMMEDIATE;", [])?;
         let result = (|| -> NovaResult<()> {
@@ -258,15 +249,70 @@ impl Database {
             // the lock, `rows_affected` is 0 and we abort instead of
             // silently recording a second, stale transition on top of
             // whatever really happened.
+            //
+            // The `completed` acceptance gate is folded into this same
+            // `WHERE` clause (rather than a preceding `SELECT COUNT(*)`
+            // check) so the whole decision — legal prior state AND, only
+            // for `completed`, "current result_generation has a matching
+            // accepted=1 row" — is evaluated and committed atomically in
+            // one statement. A separate read-then-write here would reopen
+            // exactly the kind of TOCTOU race this remediation closes:
+            // two concurrent `completed` attempts could otherwise both
+            // observe a valid acceptance row and both "win".
             let rows_affected = self.conn().execute(
-                "UPDATE tasks SET state = ?1, updated_at = ?2 WHERE id = ?3 AND state = ?4",
+                "UPDATE tasks
+                 SET state = ?1, updated_at = ?2
+                 WHERE id = ?3
+                   AND state = ?4
+                   AND (
+                     ?1 <> 'completed'
+                     OR (
+                       result_generation > 0
+                       AND EXISTS (
+                         SELECT 1 FROM user_acceptance ua
+                         WHERE ua.task_id = tasks.id
+                           AND ua.result_generation = tasks.result_generation
+                           AND ua.accepted = 1
+                       )
+                     )
+                   )",
                 params![to.as_str(), now, task_id, from.as_str()],
             )?;
             if rows_affected == 0 {
+                // Diagnose why, purely for a clear error message — this
+                // read is not authoritative for the decision itself, which
+                // was already made atomically above.
+                let current = self.task(task_id)?;
+                if current.state != from {
+                    return Err(NovaError::Config(format!(
+                        "任务状态已被并发修改，{from} -> {to} 已取消（当前状态不再是 {from}）"
+                    )));
+                }
+                if to == TaskState::Completed {
+                    return Err(NovaError::Config(
+                        "无法进入 completed：当前结果版本（result_generation）缺少匹配的用户确认记录"
+                            .to_string(),
+                    ));
+                }
                 return Err(NovaError::Config(format!(
-                    "任务状态已被并发修改，{from} -> {to} 已取消（当前状态不再是 {from}）"
+                    "任务状态转换失败：{from} -> {to}"
                 )));
             }
+
+            // A fresh result supersedes any acceptance recorded for an
+            // earlier generation — bumping here, inside the same
+            // transaction as the state write, is what makes "old
+            // acceptance can't authorize a new result" hold even under
+            // concurrency: no other writer can observe the task as
+            // `preview_ready` with the old `result_generation` still in
+            // effect.
+            if to == TaskState::PreviewReady {
+                self.conn().execute(
+                    "UPDATE tasks SET result_generation = result_generation + 1 WHERE id = ?1",
+                    params![task_id],
+                )?;
+            }
+
             self.conn().execute(
                 "INSERT INTO task_state_events (id, project_id, task_id, old_state, new_state, reason, actor, correlation_id, is_recovery, safety_summary, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -335,8 +381,9 @@ fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         done_criteria: row.get(6)?,
         ai_kind: row.get(7)?,
         state: parse_enum(state)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        result_generation: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
@@ -631,6 +678,186 @@ mod tests {
     }
 
     #[test]
+    fn rejecting_the_current_result_does_not_allow_completion() {
+        let dir = temp_dir("rejected-result");
+        let (db, project_id) = db_with_project(&dir);
+        let task = new_task(&db, &project_id);
+        drive_to_awaiting_acceptance(&db, &task.id);
+        db.record_user_acceptance(&project_id, &task.id, false, Some("需要修改"))
+            .unwrap();
+
+        let result = db.transition_task(
+            &task.id,
+            TaskState::Completed,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "an explicit rejection must not unlock completion"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn acceptance_can_only_be_recorded_while_awaiting_user_acceptance() {
+        let dir = temp_dir("acceptance-state-gate");
+        let (db, project_id) = db_with_project(&dir);
+        let task = new_task(&db, &project_id);
+        assert!(
+            db.record_user_acceptance(&project_id, &task.id, true, None)
+                .is_err(),
+            "a draft task has never reached awaiting_user_acceptance"
+        );
+
+        db.transition_task(
+            &task.id,
+            TaskState::AwaitingConfirmation,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            db.record_user_acceptance(&project_id, &task.id, true, None)
+                .is_err(),
+            "awaiting_confirmation is not awaiting_user_acceptance"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_result_generation_invalidates_the_old_accepted_generation() {
+        let dir = temp_dir("new-generation-invalidates-old");
+        let (db, project_id) = db_with_project(&dir);
+        let task = new_task(&db, &project_id);
+        drive_to_awaiting_acceptance(&db, &task.id);
+        assert_eq!(db.task(&task.id).unwrap().result_generation, 1);
+
+        db.record_user_acceptance(&project_id, &task.id, true, None)
+            .unwrap();
+
+        // The user asks for one more change: a fresh result is produced,
+        // which must invalidate the generation-1 acceptance.
+        db.transition_task(
+            &task.id,
+            TaskState::SafeFixing,
+            Actor::User,
+            Some("再改一下"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task.id,
+            TaskState::Verifying,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task.id,
+            TaskState::PreviewReady,
+            Actor::ConnectedAi,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.task(&task.id).unwrap().result_generation,
+            2,
+            "a new result bumps the generation"
+        );
+        db.transition_task(
+            &task.id,
+            TaskState::AwaitingUserAcceptance,
+            Actor::Nova,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let stale_completion = db.transition_task(
+            &task.id,
+            TaskState::Completed,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(
+            stale_completion.is_err(),
+            "the generation-1 acceptance must not be able to complete generation 2"
+        );
+
+        db.record_user_acceptance(&project_id, &task.id, true, None)
+            .unwrap();
+        let completed = db
+            .transition_task(
+                &task.id,
+                TaskState::Completed,
+                Actor::User,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(completed.state, TaskState::Completed);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrated_generation_zero_acceptance_cannot_complete_a_newer_generation() {
+        let dir = temp_dir("legacy-generation-zero");
+        let (db, project_id) = db_with_project(&dir);
+        let task = new_task(&db, &project_id);
+        // Simulate exactly what the v2 -> v3 migration produces for a
+        // pre-remediation acceptance row: `result_generation = 0`,
+        // inserted directly (not through `record_user_acceptance`, which
+        // would refuse it — this row predates that gate).
+        db.conn()
+            .execute(
+                "INSERT INTO user_acceptance (id, project_id, task_id, result_generation, accepted, user_note, accepted_at, created_at)
+                 VALUES (?1, ?2, ?3, 0, 1, NULL, ?4, ?4)",
+                rusqlite::params![new_id(), project_id, task.id, "2026-01-01T00:00:00Z"],
+            )
+            .unwrap();
+
+        drive_to_awaiting_acceptance(&db, &task.id);
+        assert_eq!(db.task(&task.id).unwrap().result_generation, 1);
+
+        let result = db.transition_task(
+            &task.id,
+            TaskState::Completed,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "a migrated generation-0 acceptance must never authorize completion of a real (generation >= 1) result"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn failed_and_cancelled_can_never_reach_completed() {
         let dir = temp_dir("failed-cancelled-terminal");
         let (db, project_id) = db_with_project(&dir);
@@ -686,8 +913,14 @@ mod tests {
             None,
         )
         .unwrap();
-        db.record_user_acceptance(&project_id, &failing_task.id, true, None)
-            .unwrap();
+        // A task that's already `failed` isn't `awaiting_user_acceptance`,
+        // so it can't even have an acceptance recorded against it anymore
+        // — the completion gate is doubly closed.
+        assert!(
+            db.record_user_acceptance(&project_id, &failing_task.id, true, None)
+                .is_err(),
+            "acceptance must be refused once the task has left awaiting_user_acceptance"
+        );
         assert!(db
             .transition_task(
                 &failing_task.id,
@@ -711,8 +944,11 @@ mod tests {
             None,
         )
         .unwrap();
-        db.record_user_acceptance(&project_id, &cancelled_task.id, true, None)
-            .unwrap();
+        assert!(
+            db.record_user_acceptance(&project_id, &cancelled_task.id, true, None)
+                .is_err(),
+            "acceptance must be refused for a cancelled task"
+        );
         assert!(db
             .transition_task(
                 &cancelled_task.id,
@@ -1043,6 +1279,59 @@ mod tests {
             events.last().unwrap().correlation_id.as_deref(),
             Some("corr-1")
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transition_reason_is_redacted_before_it_reaches_task_state_events() {
+        let dir = temp_dir("redact-transition-reason");
+        let (db, project_id) = db_with_project(&dir);
+        let task = new_task(&db, &project_id);
+        db.transition_task(
+            &task.id,
+            TaskState::AwaitingConfirmation,
+            Actor::User,
+            Some("token=abc123supersecretvalue"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let events = db.list_task_state_events(&task.id).unwrap();
+        let reason = events.last().unwrap().reason.as_deref().unwrap();
+        assert!(
+            !reason.contains("abc123supersecretvalue"),
+            "the reason text must be redacted before it is ever persisted: {reason}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Backend-internal code (recovery, system-driven transitions) must
+    /// keep working with non-`user` actors — only the Tauri command
+    /// boundary is restricted to `Actor::User`, not `Database::transition_task`
+    /// itself.
+    #[test]
+    fn internal_callers_can_still_use_system_and_recovery_actors() {
+        let dir = temp_dir("internal-actors-still-work");
+        let (db, project_id) = db_with_project(&dir);
+        let task = new_task(&db, &project_id);
+        let result = db.transition_task(
+            &task.id,
+            TaskState::AwaitingConfirmation,
+            Actor::System,
+            Some("系统自动提交"),
+            None,
+            true,
+            Some("恢复流程"),
+        );
+        assert!(
+            result.is_ok(),
+            "backend-internal Actor::System + is_recovery must still be usable"
+        );
+        let events = db.list_task_state_events(&task.id).unwrap();
+        assert_eq!(events.last().unwrap().actor, Actor::System);
+        assert!(events.last().unwrap().is_recovery);
         let _ = fs::remove_dir_all(&dir);
     }
 

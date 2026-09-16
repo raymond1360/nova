@@ -3,6 +3,7 @@ use rusqlite::params;
 use crate::db::Database;
 use crate::error::{NovaError, NovaResult};
 use crate::models::{Actor, ProjectMemory, ProjectMemoryRevision};
+use crate::security::redact_sensitive_text;
 
 use super::{new_id, now};
 
@@ -68,6 +69,12 @@ impl Database {
         if old_value.as_deref() == new_value {
             return self.project_memory(project_id);
         }
+
+        // `reason` is free text (why the field changed) and, unlike
+        // `old_value`/`new_value` — which *are* the memory content itself
+        // — is exactly the kind of incidental commentary that can leak a
+        // pasted secret; redact it before it ever reaches the database.
+        let reason = reason.map(redact_sensitive_text);
 
         let now = now();
         self.conn().execute("BEGIN IMMEDIATE;", [])?;
@@ -287,6 +294,28 @@ mod tests {
             Some("使用 SQLite + 迁移备份")
         );
         assert_eq!(revisions[1].reason.as_deref(), Some("补充了备份要求"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revision_reason_is_redacted_before_storage() {
+        let dir = temp_dir("redact-revision-reason");
+        let (db, project_id) = db_with_project(&dir, "P");
+        db.update_project_memory_field(
+            &project_id,
+            "known_issues",
+            Some("issue A"),
+            Actor::User,
+            Some("token=abc123supersecretvalue"),
+        )
+        .unwrap();
+
+        let revisions = db.list_memory_revisions(&project_id).unwrap();
+        let reason = revisions[0].reason.as_deref().unwrap();
+        assert!(
+            !reason.contains("abc123supersecretvalue"),
+            "revision reason must be redacted before storage: {reason}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -472,22 +472,26 @@ pub fn get_project_memory(
     with_db(&state, |db| db.project_memory(&project_id))
 }
 
+/// `changed_by` is deliberately not a frontend-supplied parameter — every
+/// memory edit reachable through this command was, by construction, made
+/// through the Nova UI by a person, so it is always attributed to
+/// `Actor::User` server-side. A frontend caller cannot make this command
+/// masquerade as `nova`/`connected_ai`/`system`; only backend-internal code
+/// (not exposed as any Tauri command) can record those actors.
 #[tauri::command]
 pub fn update_project_memory_field(
     project_id: String,
     field_name: String,
     new_value: Option<String>,
-    changed_by: String,
     reason: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<ProjectMemory, String> {
-    let actor: Actor = changed_by.parse().map_err(|error: String| error)?;
     with_db(&state, |db| {
         db.update_project_memory_field(
             &project_id,
             &field_name,
             new_value.as_deref(),
-            actor,
+            Actor::User,
             reason.as_deref(),
         )
     })
@@ -519,23 +523,29 @@ pub fn list_tasks_for_project(
 /// [`crate::storage::tasks::is_legal_transition`] rejects; the backend is
 /// the sole authority on what's legal, matching the "前端传入目标状态不能绕过
 /// 合法转换" architecture requirement.
-#[allow(clippy::too_many_arguments)]
+///
+/// `actor` is deliberately not a parameter here: every transition reachable
+/// through this command is, by construction, requested by a person through
+/// the Nova UI, so it is always recorded as `Actor::User` server-side — a
+/// frontend caller cannot forge `system`/`nova`/`connected_ai`/recovery
+/// authority through this or any other exposed command. Those actors, and
+/// the `is_recovery` flag, are only ever set by backend-internal code (see
+/// `storage::recovery`, `storage::tasks::Database::create_task`), never by
+/// anything the frontend can reach.
 #[tauri::command]
 pub fn transition_task(
     task_id: String,
     to_state: String,
-    actor: String,
     reason: Option<String>,
     correlation_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Task, String> {
     let to: TaskState = to_state.parse().map_err(|error: String| error)?;
-    let actor: Actor = actor.parse().map_err(|error: String| error)?;
     with_db(&state, |db| {
         db.transition_task(
             &task_id,
             to,
-            actor,
+            Actor::User,
             reason.as_deref(),
             correlation_id.as_deref(),
             false,

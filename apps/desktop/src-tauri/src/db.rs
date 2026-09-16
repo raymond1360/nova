@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -6,9 +6,11 @@ use uuid::Uuid;
 
 use crate::models::{ChatMessage, Conversation, ProviderSummary};
 use crate::security::mask_secret;
+use crate::storage::migrations;
 
 pub struct Database {
     conn: Connection,
+    db_path: Option<PathBuf>,
 }
 
 pub struct RequestLogEntry<'a> {
@@ -22,9 +24,17 @@ pub struct RequestLogEntry<'a> {
 }
 
 impl Database {
+    /// Opens (creating if absent) the database file at `path`. Sets a
+    /// 5-second `busy_timeout` so a transient lock — most plausibly a
+    /// second Nova process briefly holding a write lock on the same file —
+    /// makes this connection wait and retry internally instead of
+    /// immediately surfacing `SQLITE_BUSY` as a hard error.
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self {
-            conn: Connection::open(path)?,
+            conn,
+            db_path: Some(path.to_path_buf()),
         })
     }
 
@@ -32,59 +42,24 @@ impl Database {
     pub fn memory() -> rusqlite::Result<Self> {
         Ok(Self {
             conn: Connection::open_in_memory()?,
+            db_path: None,
         })
     }
 
-    pub fn migrate(&self) -> rusqlite::Result<()> {
-        self.conn.execute_batch(
-            "
-            PRAGMA foreign_keys = ON;
-            CREATE TABLE IF NOT EXISTS providers (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                base_url TEXT NOT NULL,
-                masked_key TEXT,
-                has_key INTEGER NOT NULL DEFAULT 0,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS app_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS conversations (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                provider_id TEXT NOT NULL,
-                model_id TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS messages (
-                id TEXT PRIMARY KEY,
-                conversation_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                provider_id TEXT NOT NULL,
-                model_id TEXT NOT NULL,
-                status TEXT NOT NULL,
-                request_id TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS request_logs (
-                id TEXT PRIMARY KEY,
-                provider_id TEXT NOT NULL,
-                model_id TEXT,
-                endpoint TEXT NOT NULL,
-                status_code INTEGER,
-                error_code TEXT,
-                message TEXT,
-                request_id TEXT,
-                created_at TEXT NOT NULL
-            );
-            ",
-        )
+    /// Direct access to the underlying connection, for the `storage::*`
+    /// repository modules — kept `pub(crate)` so it can never be reached
+    /// from a Tauri command or the frontend, only from other backend
+    /// modules in this crate.
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Applies every pending schema migration in order (see
+    /// [`storage::migrations`]), backing up the database file first for any
+    /// non-trivial step. Safe to call on every app startup: already-applied
+    /// migrations are skipped via `PRAGMA user_version`.
+    pub fn migrate(&self) -> Result<(), migrations::MigrationError> {
+        migrations::run(&self.conn, self.db_path.as_deref())
     }
 
     pub fn ensure_default_provider(&self) -> rusqlite::Result<()> {

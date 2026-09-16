@@ -5,11 +5,14 @@ use crate::api::{self, ApiProvider, StreamChunk};
 use crate::db::RequestLogEntry;
 use crate::error::{public_error, NovaError, NovaResult};
 use crate::models::{
-    ChatMessage, Conversation, ModelInfo, ProviderSummary, SaveProviderRequest, SendChatRequest,
-    SendChatResult, TestConnectionResult, TokenUsage,
+    Actor, ChatMessage, Conversation, CreateProjectRequest, CreateTaskRequest, ModelInfo, Project,
+    ProjectDirectoryState, ProjectMemory, ProjectMemoryRevision, ProviderSummary, RecoverySummary,
+    SaveProviderRequest, SendChatRequest, SendChatResult, Task, TaskState, TaskStateEvent,
+    TestConnectionResult, TokenUsage, UserAcceptance,
 };
 use crate::runtime::detect::{self, DirectoryStatus, RuntimeEnvironmentReport};
 use crate::security::redact_sensitive_text;
+use crate::storage::projects::check_project_directory_state;
 use crate::validation::{assert_allowed_path, normalize_base_url, AllowedEndpoint};
 use crate::AppState;
 
@@ -407,6 +410,184 @@ pub fn check_project_directory_readable(path: String) -> Result<DirectoryStatus,
     Ok(detect::check_directory_readable(std::path::Path::new(
         &path,
     )))
+}
+
+// --- Phase 2: project registry, memory, task state machine, and
+// crash-recovery commands. All SQL lives in `storage::*`/`db.rs`; these
+// commands only translate between the frontend and those repository
+// functions, and never touch the database directly. ---
+
+#[tauri::command]
+pub fn create_project(
+    request: CreateProjectRequest,
+    state: State<'_, AppState>,
+) -> Result<Project, String> {
+    with_db(&state, |db| db.create_project(&request))
+}
+
+#[tauri::command]
+pub fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
+    with_db(&state, |db| db.list_projects())
+}
+
+#[tauri::command]
+pub fn get_project(project_id: String, state: State<'_, AppState>) -> Result<Project, String> {
+    with_db(&state, |db| db.project(&project_id))
+}
+
+#[tauri::command]
+pub fn set_last_active_project(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Project, String> {
+    with_db(&state, |db| db.set_last_active_project(&project_id))
+}
+
+#[tauri::command]
+pub fn get_last_active_project(state: State<'_, AppState>) -> Result<Option<Project>, String> {
+    with_db(&state, |db| db.last_active_project())
+}
+
+/// Read-only directory-existence check for an already-registered project
+/// (moved/deleted-directory detection) — distinct from
+/// [`check_project_directory_access`]/[`check_project_directory_readable`],
+/// which validate a directory the user is about to select, before it is
+/// ever registered as a project.
+#[tauri::command]
+pub fn project_directory_state(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<ProjectDirectoryState, String> {
+    with_db(&state, |db| {
+        let project = db.project(&project_id)?;
+        Ok(check_project_directory_state(&project))
+    })
+}
+
+#[tauri::command]
+pub fn get_project_memory(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<ProjectMemory, String> {
+    with_db(&state, |db| db.project_memory(&project_id))
+}
+
+#[tauri::command]
+pub fn update_project_memory_field(
+    project_id: String,
+    field_name: String,
+    new_value: Option<String>,
+    changed_by: String,
+    reason: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ProjectMemory, String> {
+    let actor: Actor = changed_by.parse().map_err(|error: String| error)?;
+    with_db(&state, |db| {
+        db.update_project_memory_field(
+            &project_id,
+            &field_name,
+            new_value.as_deref(),
+            actor,
+            reason.as_deref(),
+        )
+    })
+}
+
+#[tauri::command]
+pub fn list_memory_revisions(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ProjectMemoryRevision>, String> {
+    with_db(&state, |db| db.list_memory_revisions(&project_id))
+}
+
+#[tauri::command]
+pub fn create_task(request: CreateTaskRequest, state: State<'_, AppState>) -> Result<Task, String> {
+    with_db(&state, |db| db.create_task(&request, Actor::User))
+}
+
+#[tauri::command]
+pub fn list_tasks_for_project(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<Task>, String> {
+    with_db(&state, |db| db.list_tasks_for_project(&project_id))
+}
+
+/// The single authoritative entry point the frontend has for moving a task
+/// between states — it can never pass a state transition that
+/// [`crate::storage::tasks::is_legal_transition`] rejects; the backend is
+/// the sole authority on what's legal, matching the "前端传入目标状态不能绕过
+/// 合法转换" architecture requirement.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub fn transition_task(
+    task_id: String,
+    to_state: String,
+    actor: String,
+    reason: Option<String>,
+    correlation_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Task, String> {
+    let to: TaskState = to_state.parse().map_err(|error: String| error)?;
+    let actor: Actor = actor.parse().map_err(|error: String| error)?;
+    with_db(&state, |db| {
+        db.transition_task(
+            &task_id,
+            to,
+            actor,
+            reason.as_deref(),
+            correlation_id.as_deref(),
+            false,
+            None,
+        )
+    })
+}
+
+#[tauri::command]
+pub fn list_task_state_events(
+    task_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<TaskStateEvent>, String> {
+    with_db(&state, |db| db.list_task_state_events(&task_id))
+}
+
+/// Must only be invoked by the UI action tied to the user's explicit
+/// "我已经看过，符合需要" confirmation — never automatically. See
+/// [`crate::db::Database::record_user_acceptance`].
+#[tauri::command]
+pub fn record_user_acceptance(
+    project_id: String,
+    task_id: String,
+    accepted: bool,
+    user_note: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<UserAcceptance, String> {
+    with_db(&state, |db| {
+        db.record_user_acceptance(&project_id, &task_id, accepted, user_note.as_deref())
+    })
+}
+
+/// Returns the recovery summary computed once at app startup (see
+/// `AppState::startup_recovery_summary`) — the minimal "恢复上次工作" panel's
+/// only data source. Recomputing this on every call would defeat the
+/// point of a single, idempotent startup scan.
+#[tauri::command]
+pub fn get_startup_recovery_summary(
+    state: State<'_, AppState>,
+) -> Result<Option<RecoverySummary>, String> {
+    Ok(state.startup_recovery_summary.clone())
+}
+
+#[tauri::command]
+pub fn resolve_recovery_checkpoint(
+    checkpoint_id: String,
+    resolution: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    with_db(&state, |db| {
+        db.resolve_recovery_checkpoint(&checkpoint_id, &resolution)
+    })
 }
 
 #[cfg(test)]

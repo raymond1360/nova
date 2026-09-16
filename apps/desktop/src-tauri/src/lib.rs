@@ -6,6 +6,7 @@ mod error;
 mod models;
 mod runtime;
 mod security;
+mod storage;
 mod validation;
 
 use std::path::PathBuf;
@@ -17,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use credential::{CredentialStore, SystemCredentialStore};
 use db::Database;
+use models::RecoverySummary;
 use runtime::detection_slot::DetectionSlot;
 
 pub struct AppState {
@@ -26,10 +28,20 @@ pub struct AppState {
     active_cancel: Arc<Mutex<Option<CancellationToken>>>,
     app_data_dir: PathBuf,
     detection_cancel: DetectionSlot,
+    /// Computed once, synchronously, during `setup()` — before any Tauri
+    /// command can run — by `Database::run_startup_recovery`. Never
+    /// recomputed afterward: the whole point is a single, idempotent scan
+    /// at process start, not a live/repeatedly-polled value.
+    startup_recovery_summary: Option<RecoverySummary>,
 }
 
 impl AppState {
-    fn new(db: Database, credentials: Arc<dyn CredentialStore>, app_data_dir: PathBuf) -> Self {
+    fn new(
+        db: Database,
+        credentials: Arc<dyn CredentialStore>,
+        app_data_dir: PathBuf,
+        startup_recovery_summary: Option<RecoverySummary>,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(45))
             .build()
@@ -41,6 +53,7 @@ impl AppState {
             active_cancel: Arc::new(Mutex::new(None)),
             app_data_dir,
             detection_cancel: DetectionSlot::new(),
+            startup_recovery_summary,
         }
     }
 }
@@ -54,10 +67,17 @@ pub fn run() {
             let db = Database::open(&db_path)?;
             db.migrate()?;
             db.ensure_default_provider()?;
+            // Runs before any command is dispatched: sweeps any
+            // crash-orphaned `started` actions to `uncertain` and, if the
+            // last-active project had a task mid-flight, moves it to
+            // `interrupted` — never re-running a command, a write, or an
+            // AI call. See `storage::recovery`.
+            let startup_recovery_summary = db.run_startup_recovery()?;
             app.manage(AppState::new(
                 db,
                 Arc::new(SystemCredentialStore::new()),
                 app_data_dir,
+                startup_recovery_summary,
             ));
             Ok(())
         })
@@ -81,6 +101,22 @@ pub fn run() {
             commands::cancel_environment_detection,
             commands::check_project_directory_access,
             commands::check_project_directory_readable,
+            commands::create_project,
+            commands::list_projects,
+            commands::get_project,
+            commands::set_last_active_project,
+            commands::get_last_active_project,
+            commands::project_directory_state,
+            commands::get_project_memory,
+            commands::update_project_memory_field,
+            commands::list_memory_revisions,
+            commands::create_task,
+            commands::list_tasks_for_project,
+            commands::transition_task,
+            commands::list_task_state_events,
+            commands::record_user_acceptance,
+            commands::get_startup_recovery_summary,
+            commands::resolve_recovery_checkpoint,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Nova");

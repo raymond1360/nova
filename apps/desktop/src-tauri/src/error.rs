@@ -38,6 +38,12 @@ impl From<std::io::Error> for NovaError {
     }
 }
 
+impl From<crate::storage::migrations::MigrationError> for NovaError {
+    fn from(value: crate::storage::migrations::MigrationError) -> Self {
+        Self::Database(value.to_string())
+    }
+}
+
 pub type NovaResult<T> = Result<T, NovaError>;
 
 pub fn public_error(error: NovaError) -> String {

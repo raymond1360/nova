@@ -9,6 +9,24 @@ edition = "2021"
 name = "nova_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# `nova_test_helper` (tests/fixtures/nova_test_helper.rs) is a test-only
+# fixture process, never part of the shipped application. It is declared as
+# an explicit [[bin]] below, gated behind this non-default feature, and its
+# source lives outside `src/bin/` specifically so Cargo's automatic bin
+# discovery never picks it up — an ordinary `cargo build --release` or
+# `npm run tauri -- build` (neither of which enables this feature) must
+# never produce or package it. `cargo test`/`cargo clippy --all-features`
+# build it on demand instead (see `helper_exe()` in
+# `src/runtime/process.rs`'s test module).
+[features]
+default = []
+nova-test-helper = []
+
+[[bin]]
+name = "nova_test_helper"
+path = "tests/fixtures/nova_test_helper.rs"
+required-features = ["nova-test-helper"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

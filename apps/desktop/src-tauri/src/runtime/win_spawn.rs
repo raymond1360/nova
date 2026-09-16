@@ -55,6 +55,47 @@ fn to_wide_null(text: &str) -> Vec<u16> {
         .collect()
 }
 
+/// Reject `program`, `cwd`, and every element of `args` if any contains an
+/// embedded NUL (`\0`/U+0000) — checked once, before any PATH resolution
+/// or command-line construction, so no downstream code path can forget it
+/// or accidentally see a silently-reshaped string instead.
+///
+/// Win32 wide strings are implicitly NUL-terminated: [`to_wide_null`]
+/// appends its own terminator at the *end* of whatever it is given. An
+/// embedded NUL earlier in the string would make `CreateProcessW` see a
+/// *shorter* string than Nova intended — anything after the embedded NUL,
+/// including content the caller believed was still part of the same
+/// argument, would be silently dropped rather than rejected. A process
+/// safety boundary must never let that happen invisibly: this is Nova's
+/// own explicit refusal, not something Win32 discovers and reports for us.
+fn validate_process_request_strings(program: &str, args: &[String], cwd: &Path) -> io::Result<()> {
+    if program.as_bytes().contains(&0) {
+        return Err(nul_rejection_error("可执行程序路径"));
+    }
+    if cwd.as_os_str().encode_wide().any(|unit| unit == 0) {
+        return Err(nul_rejection_error("工作目录"));
+    }
+    for arg in args {
+        if arg.as_bytes().contains(&0) {
+            return Err(nul_rejection_error("命令行参数"));
+        }
+    }
+    Ok(())
+}
+
+/// Builds an `InvalidInput` error that names *which kind* of string was
+/// rejected but never echoes its actual (possibly sensitive) content —
+/// `classify_spawn_error` in `process.rs` maps `InvalidInput` to
+/// `ExecutionErrorKind::StartFailed`, and the message text below is all
+/// that ever reaches `ExecutionResult` (itself still passed through
+/// `redact_sensitive_text` as defense in depth).
+fn nul_rejection_error(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{what}包含 Windows 无法表示的 NUL 字符，已拒绝启动"),
+    )
+}
+
 /// Quote one argument following the MSVC C runtime / `CommandLineToArgvW`
 /// rules, so the receiving program's own argv parser reconstructs exactly
 /// this string as one argument — the same rules `std::process::Command`
@@ -346,6 +387,8 @@ impl SuspendedChild {
 /// so no other handle in the Nova process can leak into the child even if
 /// `bInheritHandles` is `TRUE`.
 pub fn spawn_suspended(program: &str, args: &[String], cwd: &Path) -> io::Result<SuspendedChild> {
+    validate_process_request_strings(program, args, cwd)?;
+
     let executable = resolve_executable(program)?;
     if !executable.is_file() {
         return Err(io::Error::from(io::ErrorKind::NotFound));
@@ -582,6 +625,115 @@ mod tests {
         assert!(
             result.is_err(),
             "a file outside every PATH directory must never be resolved by bare name"
+        );
+    }
+
+    // --- Embedded-NUL rejection --------------------------------------------
+
+    fn ok_args() -> Vec<String> {
+        vec!["--version".to_string()]
+    }
+
+    fn ok_cwd() -> std::path::PathBuf {
+        std::env::temp_dir()
+    }
+
+    #[test]
+    fn rejects_program_with_embedded_nul() {
+        let program = "git\0evil";
+        let err = validate_process_request_strings(program, &ok_args(), &ok_cwd()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_cwd_with_embedded_nul() {
+        let mut cwd = ok_cwd();
+        cwd.push("bad\0dir");
+        let err = validate_process_request_strings("git", &ok_args(), &cwd).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_first_arg_with_embedded_nul() {
+        let args = vec!["bad\0first".to_string(), "safe".to_string()];
+        let err = validate_process_request_strings("git", &args, &ok_cwd()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_middle_arg_with_embedded_nul() {
+        let args = vec![
+            "safe-one".to_string(),
+            "bad\0middle".to_string(),
+            "safe-two".to_string(),
+        ];
+        let err = validate_process_request_strings("git", &args, &ok_cwd()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_last_arg_with_embedded_nul() {
+        let args = vec!["safe".to_string(), "bad\0last".to_string()];
+        let err = validate_process_request_strings("git", &args, &ok_cwd()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_nul_even_when_surrounded_by_shell_metacharacters() {
+        // Proves the NUL check runs independently of (and before) any
+        // quoting/escaping logic — a NUL wrapped in shell-looking noise is
+        // still rejected, not "cleaned up" and allowed through.
+        let args = vec!["&& calc.exe \0 | rm -rf / ;".to_string()];
+        let err = validate_process_request_strings("git", &args, &ok_cwd()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn nul_rejection_error_message_does_not_leak_the_offending_value() {
+        let fake_secret = ["sk", "totally-fake-nul-adjacent-secret"].join("-");
+        let args = vec![format!("{fake_secret}\0trailing")];
+        let err = validate_process_request_strings("git", &args, &ok_cwd()).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            !message.contains(&fake_secret),
+            "error message must not echo the offending argument's content: {message:?}"
+        );
+        assert!(
+            message.contains("NUL"),
+            "error message should explain what was rejected"
+        );
+    }
+
+    #[test]
+    fn does_not_reject_ordinary_unicode_and_chinese_text() {
+        let args = vec!["项目 目录 with spaces 中文".to_string(), "café".to_string()];
+        assert!(validate_process_request_strings("git", &args, &ok_cwd()).is_ok());
+    }
+
+    #[test]
+    fn does_not_reject_a_normal_empty_string_argument() {
+        let args = vec![String::new(), "safe".to_string()];
+        assert!(validate_process_request_strings("git", &args, &ok_cwd()).is_ok());
+    }
+
+    #[test]
+    fn spawn_suspended_rejects_embedded_nul_before_touching_the_filesystem() {
+        // End-to-end: `spawn_suspended` itself (not just the standalone
+        // validator) must refuse a NUL-containing argument, and must do so
+        // before `resolve_executable`/`CreateProcessW` run at all — proven
+        // here by pointing `program` at a deliberately nonexistent name: if
+        // validation ran *after* executable resolution, this would fail
+        // with `NotFound` instead of `InvalidInput`.
+        let program = format!("nova-nonexistent-{}", uuid::Uuid::new_v4());
+        let args = vec!["bad\0arg".to_string()];
+        let err = match spawn_suspended(&program, &args, &ok_cwd()) {
+            Err(error) => error,
+            Ok(_) => panic!("expected spawn_suspended to reject the NUL-containing argument"),
+        };
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidInput,
+            "expected InvalidInput (validation-before-resolution), got {err:?}"
         );
     }
 }

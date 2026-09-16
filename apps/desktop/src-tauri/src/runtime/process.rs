@@ -255,8 +255,28 @@ fn run_windows(
     // Object (kills the direct child *and* any descendant it spawned).
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
-    let stdout_reader = stdout_pipe.map(|pipe| spawn_capped_reader(pipe, request.max_output_bytes));
-    let stderr_reader = stderr_pipe.map(|pipe| spawn_capped_reader(pipe, request.max_output_bytes));
+    let (stdout_reader, stderr_reader) =
+        match spawn_reader_pair(stdout_pipe, stderr_pipe, request.max_output_bytes) {
+            Ok(readers) => readers,
+            Err(error) => {
+                // The process has already been resumed and may have
+                // spawned its own descendants by now, so cleanup must go
+                // through the Job Object (kills the whole tree), not just
+                // the direct child.
+                let _ = job.terminate();
+                let _ = child.wait();
+                return RunResult::EarlyFailure(finished_without_process(
+                    request,
+                    started_at,
+                    start_instant,
+                    ExecutionErrorKind::StartFailed,
+                    format!(
+                        "无法创建输出读取线程，已终止进程：{}",
+                        redact_sensitive_text(&error.to_string())
+                    ),
+                ));
+            }
+        };
 
     let mut forced: Option<ExecutionErrorKind> = None;
     let exit_status = loop {
@@ -367,8 +387,24 @@ fn run_generic(
 
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
-    let stdout_reader = stdout_pipe.map(|pipe| spawn_capped_reader(pipe, request.max_output_bytes));
-    let stderr_reader = stderr_pipe.map(|pipe| spawn_capped_reader(pipe, request.max_output_bytes));
+    let (stdout_reader, stderr_reader) =
+        match spawn_reader_pair(stdout_pipe, stderr_pipe, request.max_output_bytes) {
+            Ok(readers) => readers,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return RunResult::EarlyFailure(finished_without_process(
+                    request,
+                    started_at,
+                    start_instant,
+                    ExecutionErrorKind::StartFailed,
+                    format!(
+                        "无法创建输出读取线程，已终止进程：{}",
+                        redact_sensitive_text(&error.to_string())
+                    ),
+                ));
+            }
+        };
 
     let mut forced: Option<ExecutionErrorKind> = None;
     let exit_status = loop {
@@ -448,34 +484,104 @@ fn forced_kind_detail(kind: ExecutionErrorKind) -> &'static str {
 
 type ReaderHandle = thread::JoinHandle<(Vec<u8>, bool)>;
 
-fn spawn_capped_reader<R>(mut reader: R, cap: usize) -> ReaderHandle
+/// Spawns a capped output-draining thread via `Builder::spawn`, which
+/// returns `io::Result` instead of panicking when the OS cannot create a
+/// new thread (unlike bare `thread::spawn`). Callers must handle the
+/// `Err` case by tearing down the already-started process/job — never by
+/// unwrapping or panicking.
+fn spawn_capped_reader<R>(mut reader: R, cap: usize) -> io::Result<ReaderHandle>
 where
     R: Read + Send + 'static,
 {
-    thread::spawn(move || {
-        let mut collected = Vec::with_capacity(cap.min(64 * 1024));
-        let mut truncated = false;
-        let mut buffer = [0u8; 8192];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    if collected.len() < cap {
-                        let remaining = cap - collected.len();
-                        let take = remaining.min(read);
-                        collected.extend_from_slice(&buffer[..take]);
-                        if take < read {
+    thread::Builder::new()
+        .name("nova-process-reader".to_string())
+        .spawn(move || {
+            let mut collected = Vec::with_capacity(cap.min(64 * 1024));
+            let mut truncated = false;
+            let mut buffer = [0u8; 8192];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if collected.len() < cap {
+                            let remaining = cap - collected.len();
+                            let take = remaining.min(read);
+                            collected.extend_from_slice(&buffer[..take]);
+                            if take < read {
+                                truncated = true;
+                            }
+                        } else {
                             truncated = true;
                         }
-                    } else {
-                        truncated = true;
                     }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
-        (collected, truncated)
-    })
+            (collected, truncated)
+        })
+}
+
+/// Spawns the stdout/stderr reader threads together. If the stderr reader
+/// fails to spawn after the stdout reader already started, the started
+/// stdout reader is joined before returning the error so no thread is
+/// ever left behind.
+fn spawn_reader_pair<A, B>(
+    stdout_pipe: Option<A>,
+    stderr_pipe: Option<B>,
+    cap: usize,
+) -> io::Result<(Option<ReaderHandle>, Option<ReaderHandle>)>
+where
+    A: Read + Send + 'static,
+    B: Read + Send + 'static,
+{
+    spawn_reader_pair_with(
+        stdout_pipe,
+        stderr_pipe,
+        cap,
+        spawn_capped_reader,
+        spawn_capped_reader,
+    )
+}
+
+/// Same as [`spawn_reader_pair`], but with the two thread-spawning
+/// operations passed in explicitly. Production code always goes through
+/// [`spawn_reader_pair`], which wires up the real
+/// [`spawn_capped_reader`] for both sides — this indirection exists
+/// solely so tests can inject a synthetic thread-creation failure (real
+/// OS-level thread-creation failure is not reliably reproducible in a
+/// test, the same reasoning already applied to
+/// `handle_windows_spawn_failure` above) without adding any
+/// failure-injection surface to the production API.
+fn spawn_reader_pair_with<A, B, FA, FB>(
+    stdout_pipe: Option<A>,
+    stderr_pipe: Option<B>,
+    cap: usize,
+    spawn_stdout: FA,
+    spawn_stderr: FB,
+) -> io::Result<(Option<ReaderHandle>, Option<ReaderHandle>)>
+where
+    A: Read + Send + 'static,
+    B: Read + Send + 'static,
+    FA: FnOnce(A, usize) -> io::Result<ReaderHandle>,
+    FB: FnOnce(B, usize) -> io::Result<ReaderHandle>,
+{
+    let stdout_reader = match stdout_pipe {
+        Some(pipe) => Some(spawn_stdout(pipe, cap)?),
+        None => None,
+    };
+    let stderr_reader = match stderr_pipe {
+        Some(pipe) => match spawn_stderr(pipe, cap) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                if let Some(handle) = stdout_reader {
+                    let _ = handle.join();
+                }
+                return Err(error);
+            }
+        },
+        None => None,
+    };
+    Ok((stdout_reader, stderr_reader))
 }
 
 fn join_reader(handle: Option<ReaderHandle>) -> (Vec<u8>, bool) {
@@ -490,6 +596,8 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     fn temp_root(name: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
@@ -551,14 +659,30 @@ mod tests {
         let path = helper_exe_path();
         HELPER_BUILD.call_once(|| {
             if !path.is_file() {
+                // `nova_test_helper` is gated behind the non-default
+                // `nova-test-helper` feature specifically so it is never
+                // built by an ordinary `cargo build --release`/
+                // `npm run tauri -- build` — those must never enable this
+                // feature. `cargo test` does not enable it either (it is
+                // not in `default = []`), so it is built on demand here,
+                // explicitly, with the feature turned on for this one
+                // invocation only.
                 let status = std::process::Command::new(env!("CARGO"))
-                    .args(["build", "--bin", "nova_test_helper"])
+                    .args([
+                        "build",
+                        "--bin",
+                        "nova_test_helper",
+                        "--features",
+                        "nova-test-helper",
+                    ])
                     .current_dir(env!("CARGO_MANIFEST_DIR"))
                     .status()
-                    .expect("invoke `cargo build --bin nova_test_helper`");
+                    .expect(
+                        "invoke `cargo build --bin nova_test_helper --features nova-test-helper`",
+                    );
                 assert!(
                     status.success(),
-                    "cargo build --bin nova_test_helper failed"
+                    "cargo build --bin nova_test_helper --features nova-test-helper failed"
                 );
             }
         });
@@ -735,6 +859,68 @@ mod tests {
         );
         let result = execute_blocking(req, CancellationToken::new());
         assert!(!result.args.iter().any(|a| a.contains(&fake_token)));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn embedded_nul_in_an_argument_is_rejected_end_to_end_without_starting_a_process() {
+        // Uses the real helper binary in "marker" mode as `program` (a
+        // legitimate, existing executable) but with a NUL-containing
+        // second argument. If the request were merely truncated rather
+        // than rejected outright, the helper would still start (using
+        // whatever survived up to the NUL) and write its marker file —
+        // this test's whole point is proving that never happens.
+        let root = temp_root("nul-end-to-end");
+        let marker = root.join("marker-must-not-appear.txt");
+        let mut req = request(&helper_exe(), vec!["marker", "placeholder"], &root);
+        req.args[1] = format!("{}\0trailing", marker.to_string_lossy());
+        let result = execute_blocking(req, CancellationToken::new());
+
+        assert!(
+            !matches!(result.outcome, ExecutionOutcome::Success),
+            "a NUL-containing argument must never produce Success, got {:?}",
+            result.outcome
+        );
+        match result.outcome {
+            ExecutionOutcome::Failed { kind, .. } => {
+                assert_eq!(kind, ExecutionErrorKind::StartFailed)
+            }
+            other => panic!("expected StartFailed, got {other:?}"),
+        }
+        // Give a slow spawn plenty of time to prove a negative: no marker
+        // file must appear, meaning the helper's own code never ran at all.
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            !marker.exists(),
+            "process must never have started (and therefore never written its marker) \
+             for a request Nova rejected before CreateProcessW"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn embedded_nul_in_program_and_cwd_are_also_rejected_end_to_end() {
+        let root = temp_root("nul-program-cwd");
+
+        let req_program = request("git\0evil", vec!["--version"], &root);
+        let result = execute_blocking(req_program, CancellationToken::new());
+        match result.outcome {
+            ExecutionOutcome::Failed { kind, .. } => {
+                assert_eq!(kind, ExecutionErrorKind::StartFailed)
+            }
+            other => panic!("expected StartFailed for NUL in program, got {other:?}"),
+        }
+
+        let mut req_cwd = request("git", vec!["--version"], &root);
+        let mut bad_cwd = root.clone();
+        bad_cwd.push("bad\0dir");
+        req_cwd.cwd = bad_cwd;
+        req_cwd.allowed_root = Some(root.clone());
+        let result = execute_blocking(req_cwd, CancellationToken::new());
+        assert!(!matches!(result.outcome, ExecutionOutcome::Success));
+
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1117,6 +1303,154 @@ mod tests {
             ));
         }
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // --- Reader-thread creation failure (Minor: `spawn_capped_reader` must
+    // never panic on OS thread-creation failure) --------------------------
+    //
+    // A real OS-level thread-creation failure (resource exhaustion) is not
+    // reliably reproducible in a test — the same limitation already applies
+    // to `AssignProcessToJobObject`/`ResumeThread` above, whose cleanup
+    // (`handle_windows_spawn_failure`) is likewise exercised with a
+    // synthetic `io::Error` rather than a forced real failure. The tests
+    // below apply that identical approach to `spawn_reader_pair_with`,
+    // which is the exact production cleanup/propagation code that runs
+    // when either reader thread fails to spawn.
+
+    #[test]
+    fn spawn_reader_pair_with_propagates_stdout_reader_creation_failure_without_touching_stderr() {
+        let stderr_attempted = Arc::new(AtomicBool::new(false));
+        let stderr_attempted_clone = Arc::clone(&stderr_attempted);
+
+        let result = spawn_reader_pair_with(
+            Some(io::Cursor::new(Vec::<u8>::new())),
+            Some(io::Cursor::new(Vec::<u8>::new())),
+            1024,
+            |_pipe: io::Cursor<Vec<u8>>, _cap: usize| -> io::Result<ReaderHandle> {
+                Err(io::Error::other(
+                    "synthetic stdout reader thread-creation failure",
+                ))
+            },
+            move |pipe: io::Cursor<Vec<u8>>, cap: usize| -> io::Result<ReaderHandle> {
+                stderr_attempted_clone.store(true, Ordering::SeqCst);
+                spawn_capped_reader(pipe, cap)
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "a stdout reader thread-creation failure must propagate as Err, never panic"
+        );
+        assert!(
+            !stderr_attempted.load(Ordering::SeqCst),
+            "the stderr reader must never even be attempted once the stdout reader has already failed to spawn"
+        );
+    }
+
+    #[test]
+    fn spawn_reader_pair_with_joins_the_started_stdout_reader_when_stderr_reader_creation_fails() {
+        let stdout_finished = Arc::new(AtomicBool::new(false));
+        let stdout_finished_clone = Arc::clone(&stdout_finished);
+
+        let result = spawn_reader_pair_with(
+            Some(io::Cursor::new(Vec::<u8>::new())),
+            Some(io::Cursor::new(Vec::<u8>::new())),
+            1024,
+            move |_pipe: io::Cursor<Vec<u8>>, _cap: usize| -> io::Result<ReaderHandle> {
+                let flag = Arc::clone(&stdout_finished_clone);
+                thread::Builder::new().spawn(move || {
+                    // Long enough that, if `spawn_reader_pair_with` did NOT
+                    // join this thread before returning, the assertion
+                    // below (checked immediately after the call returns)
+                    // would very likely observe `false` instead.
+                    thread::sleep(Duration::from_millis(200));
+                    flag.store(true, Ordering::SeqCst);
+                    (Vec::new(), false)
+                })
+            },
+            |_pipe: io::Cursor<Vec<u8>>, _cap: usize| -> io::Result<ReaderHandle> {
+                Err(io::Error::other(
+                    "synthetic stderr reader thread-creation failure",
+                ))
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "a stderr reader thread-creation failure must propagate as Err, never panic"
+        );
+        assert!(
+            stdout_finished.load(Ordering::SeqCst),
+            "the already-started stdout reader must be joined (waited for completion) \
+             before returning the error, proving no reader thread is left running in \
+             the background after a partial failure"
+        );
+    }
+
+    #[test]
+    fn spawn_reader_pair_still_works_normally_after_an_earlier_injected_failure() {
+        // An injected failure must not leave any shared/global state
+        // corrupted — a completely ordinary `spawn_reader_pair` call
+        // immediately afterwards must still succeed and read real data.
+        let _ = spawn_reader_pair_with(
+            Some(io::Cursor::new(Vec::<u8>::new())),
+            Some(io::Cursor::new(Vec::<u8>::new())),
+            1024,
+            |_pipe: io::Cursor<Vec<u8>>, _cap: usize| -> io::Result<ReaderHandle> {
+                Err(io::Error::other("synthetic failure"))
+            },
+            |_pipe: io::Cursor<Vec<u8>>, _cap: usize| -> io::Result<ReaderHandle> {
+                Err(io::Error::other("synthetic failure"))
+            },
+        );
+
+        let (stdout_reader, stderr_reader) = spawn_reader_pair(
+            Some(io::Cursor::new(b"stdout-data".to_vec())),
+            Some(io::Cursor::new(b"stderr-data".to_vec())),
+            1024,
+        )
+        .expect("spawn_reader_pair must still succeed after an unrelated earlier failure");
+        let (stdout_bytes, stdout_truncated) = join_reader(stdout_reader);
+        let (stderr_bytes, stderr_truncated) = join_reader(stderr_reader);
+        assert_eq!(stdout_bytes, b"stdout-data");
+        assert_eq!(stderr_bytes, b"stderr-data");
+        assert!(!stdout_truncated);
+        assert!(!stderr_truncated);
+    }
+
+    #[test]
+    fn reader_thread_spawn_failure_message_is_redacted_and_reports_start_failed_not_success() {
+        let root = temp_root("reader-thread-failure-message");
+        let req = request("git", vec!["--version"], &root);
+        let secret_bearing_error =
+            io::Error::other("cannot create thread: token=abc123supersecretvalue");
+        let result = finished_without_process(
+            &req,
+            Utc::now(),
+            Instant::now(),
+            ExecutionErrorKind::StartFailed,
+            format!(
+                "无法创建输出读取线程，已终止进程：{}",
+                redact_sensitive_text(&secret_bearing_error.to_string())
+            ),
+        );
+
+        assert!(
+            !matches!(result.outcome, ExecutionOutcome::Success),
+            "a reader-thread spawn failure must never be reported as Success"
+        );
+        match result.outcome {
+            ExecutionOutcome::Failed { kind, detail } => {
+                assert_eq!(kind, ExecutionErrorKind::StartFailed);
+                assert!(
+                    !detail.contains("abc123supersecretvalue"),
+                    "reader-thread failure detail must not leak raw secret-looking \
+                     content from the underlying io::Error: {detail}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
         let _ = fs::remove_dir_all(&root);
     }
 }

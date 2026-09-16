@@ -2,6 +2,7 @@
 //! process-execution boundary that Nova's future Codex/Claude/Git
 //! invocations must all go through.
 
+pub mod ai_adapter;
 pub mod detect;
 pub mod detection_slot;
 #[cfg(windows)]

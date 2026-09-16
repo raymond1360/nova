@@ -548,3 +548,25 @@ pub struct GeneratedDocument {
     pub generated_at: String,
     pub created_at: String,
 }
+
+// --- Phase 3: Open Local Project Dual-AI Core Loop ---
+
+/// One independent review round for a task's current result. `verdict` is
+/// stored as free text matching the schema `CHECK` constraint
+/// (`approve`/`changes_required`/`insufficient_evidence`/
+/// `integrity_violation`) rather than a Rust enum here, consistent with how
+/// other free-form-but-constrained text columns in this codebase (e.g.
+/// `nova_projects.source_type`) are modeled — the authoritative enum lives
+/// with the code that produces it (`runtime::ai_adapter::ReviewVerdict`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskReview {
+    pub id: String,
+    pub project_id: String,
+    pub task_id: String,
+    pub result_generation: i64,
+    pub round: i64,
+    pub reviewer_ai_kind: String,
+    pub verdict: String,
+    pub findings_summary: Option<String>,
+    pub created_at: String,
+}

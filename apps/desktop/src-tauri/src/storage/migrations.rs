@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// Current schema version this build of Nova understands. Bump this and
 /// append a new [`Migration`] to [`MIGRATIONS`] whenever the schema changes
 /// — never edit an already-shipped migration's SQL in place.
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug)]
 pub enum MigrationError {
@@ -508,6 +508,31 @@ const V3_SQL: &str = "
     CREATE INDEX idx_user_acceptance_task ON user_acceptance(task_id);
 ";
 
+/// Phase 3 (Open Local Project Dual-AI Core Loop): one row per review round
+/// (first/second) for a task, recording the independent reviewer's
+/// structured verdict. `integrity_violation` is a fourth verdict beyond the
+/// product spec's three (`approve`/`changes_required`/
+/// `insufficient_evidence`) — it is what `storage::core_loop` records when
+/// its technical read-only enforcement detects the reviewer actually
+/// changed the working tree, which must never be silently treated as a
+/// normal review outcome.
+const V4_SQL: &str = "
+    CREATE TABLE task_reviews (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES nova_projects(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        result_generation INTEGER NOT NULL,
+        round INTEGER NOT NULL,
+        reviewer_ai_kind TEXT NOT NULL,
+        verdict TEXT NOT NULL CHECK(verdict IN ('approve', 'changes_required', 'insufficient_evidence', 'integrity_violation')),
+        findings_summary TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(task_id, result_generation, round)
+    );
+    CREATE INDEX idx_task_reviews_task ON task_reviews(task_id);
+    CREATE INDEX idx_task_reviews_project ON task_reviews(project_id);
+";
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -523,6 +548,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 3,
         requires_backup: true,
         sql: V3_SQL,
+    },
+    Migration {
+        version: 4,
+        requires_backup: true,
+        sql: V4_SQL,
     },
 ];
 
@@ -802,7 +832,10 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(
+            version, CURRENT_SCHEMA_VERSION,
+            "must continue past v3 all the way to the current version"
+        );
 
         let result_generation: i64 = conn
             .query_row(
@@ -836,6 +869,98 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_a_v3_database_to_v4_adding_task_reviews() {
+        let dir = temp_dir("v3-to-v4");
+        let (conn, path) = open_file_db(&dir);
+        conn.execute_batch(BASELINE_SQL).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(PHASE2_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        conn.execute_batch(V3_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+
+        run(&conn, Some(&path)).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+
+        // The new table must exist and enforce its CHECK/UNIQUE constraints.
+        conn.query_row("SELECT COUNT(*) FROM task_reviews", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn schema_v4_passes_integrity_and_foreign_key_pragma_checks() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn, None).unwrap();
+
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            fk_violations, 0,
+            "a fresh v4 database must have zero foreign key violations"
+        );
+
+        let tasks_columns: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(tasks)").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(
+            tasks_columns.contains(&"result_generation".to_string()),
+            "tasks.result_generation must exist after v4: {tasks_columns:?}"
+        );
+
+        let acceptance_columns: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(user_acceptance)").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(
+            acceptance_columns.contains(&"result_generation".to_string()),
+            "user_acceptance.result_generation must exist after v4: {acceptance_columns:?}"
+        );
+
+        let acceptance_fk_tables: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA foreign_key_list(user_acceptance)")
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(2))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(
+            acceptance_fk_tables
+                .iter()
+                .any(|table| table == "nova_projects"),
+            "user_acceptance must have a foreign key to nova_projects: {acceptance_fk_tables:?}"
+        );
+        assert!(
+            acceptance_fk_tables.iter().any(|table| table == "tasks"),
+            "user_acceptance must have a foreign key to tasks: {acceptance_fk_tables:?}"
+        );
+    }
+
+    #[test]
     fn non_trivial_migration_creates_a_backup_file() {
         let dir = temp_dir("backup-created");
         let (conn, path) = open_file_db(&dir);
@@ -854,8 +979,8 @@ mod tests {
             .collect();
         assert_eq!(
             entries.len(),
-            2,
-            "expected exactly two backups (migration 2 and migration 3 both require one): {entries:?}"
+            3,
+            "expected exactly three backups (migrations 2, 3, and 4 each require one): {entries:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -880,12 +1005,14 @@ mod tests {
             .collect();
         assert_eq!(
             names.len(),
-            2,
-            "migration 2 and migration 3 each produce their own backup"
+            3,
+            "migrations 2, 3, and 4 each produce their own backup"
         );
-        assert_ne!(
-            names[0], names[1],
-            "two backups from the same run must not collide"
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            3,
+            "all backups from the same run must have distinct names, never collide"
         );
         for name in &names {
             assert!(name.len() > "nova-backup-YYYYMMDDHHMMSS-".len());
@@ -1013,8 +1140,8 @@ mod tests {
         let backups_dir = dir.join("backups");
         let count = fs::read_dir(&backups_dir).unwrap().count();
         assert_eq!(
-            count, 2,
-            "already-applied migrations must not be re-run, so no extra backups beyond the two produced by the first run"
+            count, 3,
+            "already-applied migrations must not be re-run, so no extra backups beyond the three produced by the first run"
         );
         let _ = fs::remove_dir_all(&dir);
     }

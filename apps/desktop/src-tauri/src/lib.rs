@@ -1,5 +1,6 @@
 mod api;
 mod commands;
+mod core_loop;
 mod credential;
 mod db;
 mod error;
@@ -117,6 +118,8 @@ pub fn run() {
             commands::record_user_acceptance,
             commands::get_startup_recovery_summary,
             commands::resolve_recovery_checkpoint,
+            commands::start_core_loop,
+            commands::list_task_reviews,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Nova");

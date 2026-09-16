@@ -6,6 +6,7 @@ pub mod memory;
 pub mod migrations;
 pub mod projects;
 pub mod recovery;
+pub mod reviews;
 pub mod tasks;
 
 pub(crate) fn now() -> String {

@@ -600,6 +600,76 @@ pub fn resolve_recovery_checkpoint(
     })
 }
 
+// --- Phase 3: Open Local Project Dual-AI Core Loop ---
+
+/// Starts the dual-AI core loop for a confirmed/queued task in the
+/// background and returns immediately — a real developer-AI/reviewer-AI
+/// run can take many minutes, far too long to hold a synchronous Tauri
+/// command response (or the shared `AppState.db` mutex) open for. The
+/// precondition check here is a fast, synchronous read on the shared
+/// connection; the actual loop runs on its own, independent SQLite
+/// connection to the same database file (safe under Phase 2's tested
+/// multi-connection concurrency guarantees), so a long-running core loop
+/// never blocks any other command. Progress is observable through the
+/// already-exposed `list_task_state_events`/`get_project`/
+/// `list_tasks_for_project` commands; this command intentionally adds no
+/// new live-progress/event infrastructure, matching Phase 3's "no more
+/// than the minimal interface" scope.
+#[tauri::command]
+pub fn start_core_loop(
+    task_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    with_db(&state, |db| {
+        let task = db.task(&task_id)?;
+        if !matches!(task.state, TaskState::Confirmed | TaskState::Queued) {
+            return Err(NovaError::Config(format!(
+                "只能从 confirmed 或 queued 状态启动核心循环，当前状态：{}",
+                task.state
+            )));
+        }
+        Ok(())
+    })?;
+
+    let db_path = state.app_data_dir.join("nova.sqlite3");
+    let cancel = CancellationToken::new();
+    let task_id_for_event = task_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let outcome = tokio::task::spawn_blocking(move || {
+            let db = crate::db::Database::open(&db_path).ok()?;
+            let adapter = crate::runtime::ai_adapter::RealCliAdapter;
+            crate::core_loop::run_core_loop(&db, &task_id, &adapter, &cancel).ok()
+        })
+        .await
+        .ok()
+        .flatten();
+
+        // A minimal, final-state-only signal — deliberately not a
+        // step-by-step progress stream, matching Phase 3's "no more than
+        // the minimal interface" scope. Callers can still poll
+        // `list_task_state_events`/`list_task_reviews` for detail.
+        if let Some(outcome) = outcome {
+            let _ = app.emit(
+                "core-loop://done",
+                serde_json::json!({
+                    "task_id": task_id_for_event,
+                    "state": outcome.task.state,
+                }),
+            );
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub fn list_task_reviews(
+    task_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::models::TaskReview>, String> {
+    with_db(&state, |db| db.list_task_reviews(&task_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

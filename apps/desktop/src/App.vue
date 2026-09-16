@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useNovaStore } from './stores/nova'
 import { applyStreamChunk, applyStreamError } from './chatEvents'
 import type { ChatMessage, DirectoryStatus, ToolStatus } from './types'
+import CoreLoopView from './components/CoreLoopView.vue'
 
 const store = useNovaStore()
 const providerName = ref('SDKMAX')
@@ -199,6 +200,9 @@ const environmentDiagnostics = computed(() => {
         </button>
         <button :class="{ active: store.activeTab === 'settings' }" @click="store.activeTab = 'settings'">设置</button>
         <button :class="{ active: store.activeTab === 'environment' }" @click="openEnvironmentTab">环境</button>
+        <button :class="{ active: store.activeTab === 'coreloop' }" @click="store.activeTab = 'coreloop'">
+          项目任务
+        </button>
       </nav>
       <section class="conversation-list">
         <div class="row">
@@ -349,6 +353,10 @@ const environmentDiagnostics = computed(() => {
         <summary>技术详情（已脱敏，默认折叠）</summary>
         <p v-for="[label, detail] in environmentDiagnostics" :key="label" class="diagnostic">{{ label }}: {{ detail }}</p>
       </details>
+    </section>
+
+    <section v-if="store.activeTab === 'coreloop'" class="page">
+      <CoreLoopView />
     </section>
   </main>
 </template>

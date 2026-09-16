@@ -92,3 +92,89 @@ export interface RuntimeEnvironmentReport {
   app_data_dir: DirectoryStatus
   generated_at: string
 }
+
+// --- Phase 3: Open Local Project Dual-AI Core Loop ---
+
+export interface Project {
+  id: string
+  name: string
+  local_path: string
+  normalized_path: string
+  source_type: string
+  source_url: string | null
+  current_branch: string | null
+  last_head_summary: string | null
+  purpose: string | null
+  long_term_goal: string | null
+  user_preferences: string | null
+  prohibitions: string | null
+  last_activity_at: string | null
+  created_at: string
+  updated_at: string
+  last_opened_at: string | null
+}
+
+export type TaskState =
+  | 'draft'
+  | 'awaiting_confirmation'
+  | 'confirmed'
+  | 'queued'
+  | 'running'
+  | 'verifying'
+  | 'safe_fixing'
+  | 'preview_ready'
+  | 'awaiting_user_acceptance'
+  | 'completed'
+  | 'needs_user_action'
+  | 'interrupted'
+  | 'failed'
+  | 'cancelled'
+
+export interface Task {
+  id: string
+  project_id: string
+  title: string
+  goal: string | null
+  in_scope: string | null
+  not_in_scope: string | null
+  done_criteria: string | null
+  ai_kind: string | null
+  state: TaskState
+  result_generation: number
+  test_command_redacted: string | null
+  test_command_source: 'auto' | 'user' | null
+  created_at: string
+  updated_at: string
+}
+
+export interface TaskStateEvent {
+  id: string
+  project_id: string
+  task_id: string
+  old_state: TaskState | null
+  new_state: TaskState
+  reason: string | null
+  actor: string
+  created_at: string
+}
+
+export interface TaskReview {
+  id: string
+  project_id: string
+  task_id: string
+  result_generation: number
+  round: number
+  reviewer_ai_kind: string
+  verdict: 'approve' | 'changes_required' | 'insufficient_evidence' | 'integrity_violation'
+  findings_summary: string | null
+  created_at: string
+}
+
+export interface CoreLoopReadiness {
+  dev_kind: string
+  reviewer_kind: string
+  dev_ready: boolean
+  review_ready: boolean
+  dev_message: string
+  review_message: string
+}

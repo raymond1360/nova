@@ -24,12 +24,35 @@ use crate::security::redact_sensitive_text;
 
 use super::{new_id, now};
 
+/// Parameters for [`Database::record_test_evidence`] — a struct rather than
+/// a long positional argument list, since Blocker 3 needs considerably more
+/// fields than the original Phase 2 stub did.
+pub struct RecordTestEvidenceRequest<'a> {
+    pub project_id: &'a str,
+    pub task_id: &'a str,
+    pub result_generation: i64,
+    pub round: i64,
+    pub test_command_redacted: Option<&'a str>,
+    pub status: &'a str,
+    pub passed_count: i64,
+    pub failed_count: i64,
+    pub skipped_count: i64,
+    pub exit_code: Option<i64>,
+    pub reason: Option<&'a str>,
+    pub stdout_ref: Option<&'a str>,
+    pub stderr_ref: Option<&'a str>,
+}
+
 impl Database {
     /// Fails if `task_id` does not belong to `project_id` — the guard every
     /// evidence-writing function below runs first, so evidence can never be
     /// attributed to the wrong project even if a caller passes a mismatched
     /// pair by mistake.
-    fn assert_task_belongs_to_project(&self, project_id: &str, task_id: &str) -> NovaResult<()> {
+    pub(super) fn assert_task_belongs_to_project(
+        &self,
+        project_id: &str,
+        task_id: &str,
+    ) -> NovaResult<()> {
         let task = self.task(task_id)?;
         if task.project_id != project_id {
             return Err(NovaError::Config(
@@ -192,34 +215,77 @@ impl Database {
             .map_err(Into::into)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Phase 3 remediation (Blocker 3): records one independently-run test
+    /// attempt for a task's *current* `(result_generation, round)`. Every
+    /// field is exactly what Nova itself observed running the command
+    /// through `runtime::process` — never anything an AI merely claimed.
+    /// `test_command_redacted`/`reason`/`stdout_ref`/`stderr_ref` are
+    /// redacted before storage, same as every other evidence-writing
+    /// function in this module.
     pub fn record_test_evidence(
         &self,
-        project_id: &str,
-        task_id: &str,
-        test_command_redacted: &str,
-        passed_count: i64,
-        failed_count: i64,
-        skipped_count: i64,
-        exit_code: Option<i64>,
+        request: &RecordTestEvidenceRequest<'_>,
     ) -> NovaResult<TestEvidence> {
-        self.assert_task_belongs_to_project(project_id, task_id)?;
+        self.assert_task_belongs_to_project(request.project_id, request.task_id)?;
         let id = new_id();
         let now = now();
-        let test_command_redacted = redact_sensitive_text(test_command_redacted);
+        let test_command_redacted = request.test_command_redacted.map(redact_sensitive_text);
+        let reason = request.reason.map(redact_sensitive_text);
+        let stdout_ref = request.stdout_ref.map(redact_sensitive_text);
+        let stderr_ref = request.stderr_ref.map(redact_sensitive_text);
         self.conn().execute(
-            "INSERT INTO test_evidence (id, project_id, task_id, test_command_redacted, passed_count, failed_count, skipped_count, exit_code, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![id, project_id, task_id, test_command_redacted, passed_count, failed_count, skipped_count, exit_code, now],
+            "INSERT INTO test_evidence (id, project_id, task_id, result_generation, round, test_command_redacted, status, passed_count, failed_count, skipped_count, exit_code, reason, stdout_ref, stderr_ref, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                id,
+                request.project_id,
+                request.task_id,
+                request.result_generation,
+                request.round,
+                test_command_redacted,
+                request.status,
+                request.passed_count,
+                request.failed_count,
+                request.skipped_count,
+                request.exit_code,
+                reason,
+                stdout_ref,
+                stderr_ref,
+                now
+            ],
         )?;
         self.conn()
             .query_row(
-                "SELECT id, project_id, task_id, test_command_redacted, passed_count, failed_count, skipped_count, exit_code, created_at
+                "SELECT id, project_id, task_id, result_generation, round, test_command_redacted, status, passed_count, failed_count, skipped_count, exit_code, reason, stdout_ref, stderr_ref, created_at
                  FROM test_evidence WHERE id = ?1",
                 params![id],
                 read_test_evidence,
             )
             .map_err(Into::into)
+    }
+
+    /// Every test-evidence row for a task's *current* `(result_generation,
+    /// round)` — a review may only ever consider evidence matching this
+    /// exact pair, never a stale earlier round's (Blocker 3 requirement).
+    pub fn list_test_evidence_for_round(
+        &self,
+        project_id: &str,
+        task_id: &str,
+        result_generation: i64,
+        round: i64,
+    ) -> NovaResult<Vec<TestEvidence>> {
+        self.assert_task_belongs_to_project(project_id, task_id)?;
+        let mut stmt = self.conn().prepare(
+            "SELECT id, project_id, task_id, result_generation, round, test_command_redacted, status, passed_count, failed_count, skipped_count, exit_code, reason, stdout_ref, stderr_ref, created_at
+             FROM test_evidence WHERE task_id = ?1 AND result_generation = ?2 AND round = ?3 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![task_id, result_generation, round],
+                read_test_evidence,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Records the user's explicit accept/reject decision for a task's
@@ -415,12 +481,18 @@ fn read_test_evidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<TestEvidence>
         id: row.get(0)?,
         project_id: row.get(1)?,
         task_id: row.get(2)?,
-        test_command_redacted: row.get(3)?,
-        passed_count: row.get(4)?,
-        failed_count: row.get(5)?,
-        skipped_count: row.get(6)?,
-        exit_code: row.get(7)?,
-        created_at: row.get(8)?,
+        result_generation: row.get(3)?,
+        round: row.get(4)?,
+        test_command_redacted: row.get(5)?,
+        status: row.get(6)?,
+        passed_count: row.get(7)?,
+        failed_count: row.get(8)?,
+        skipped_count: row.get(9)?,
+        exit_code: row.get(10)?,
+        reason: row.get(11)?,
+        stdout_ref: row.get(12)?,
+        stderr_ref: row.get(13)?,
+        created_at: row.get(14)?,
     })
 }
 
@@ -725,7 +797,21 @@ mod tests {
         let dir = temp_dir("test-evidence");
         let (db, project_id, task_id) = db_with_task(&dir, "P");
         let evidence = db
-            .record_test_evidence(&project_id, &task_id, "cargo test", 125, 0, 0, Some(0))
+            .record_test_evidence(&RecordTestEvidenceRequest {
+                project_id: &project_id,
+                task_id: &task_id,
+                result_generation: 0,
+                round: 1,
+                test_command_redacted: Some("cargo test"),
+                status: "passed",
+                passed_count: 125,
+                failed_count: 0,
+                skipped_count: 0,
+                exit_code: Some(0),
+                reason: None,
+                stdout_ref: None,
+                stderr_ref: None,
+            })
             .unwrap();
         assert_eq!(evidence.passed_count, 125);
         assert_eq!(evidence.exit_code, Some(0));
@@ -767,7 +853,21 @@ mod tests {
             )
             .unwrap();
         let test_evidence = db
-            .record_test_evidence(&project_id, &task_id, "cargo test", 10, 0, 0, Some(0))
+            .record_test_evidence(&RecordTestEvidenceRequest {
+                project_id: &project_id,
+                task_id: &task_id,
+                result_generation: 0,
+                round: 1,
+                test_command_redacted: Some("cargo test"),
+                status: "passed",
+                passed_count: 10,
+                failed_count: 0,
+                skipped_count: 0,
+                exit_code: Some(0),
+                reason: None,
+                stdout_ref: None,
+                stderr_ref: None,
+            })
             .unwrap();
         db.link_evidence_ref(&event.id, "test", &test_evidence.id)
             .unwrap();

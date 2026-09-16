@@ -208,8 +208,12 @@ fn run_windows(
 
     // Step 3: create the target process *suspended*. Its initial thread
     // has not run any of the target's code yet.
-    let mut child = match win_spawn::spawn_suspended(&request.program, &request.args, resolved_cwd)
-    {
+    let mut child = match win_spawn::spawn_suspended(
+        &request.program,
+        &request.args,
+        resolved_cwd,
+        request.stdin.is_some(),
+    ) {
         Ok(child) => child,
         Err(error) => {
             let kind = classify_spawn_error(&error);
@@ -249,6 +253,25 @@ fn run_windows(
             error,
         ));
     }
+
+    // If the caller provided stdin content, write it on its own thread
+    // (never inline, never blocking this function) and then drop the pipe
+    // to close it — signaling EOF to the child. A dedicated thread avoids a
+    // deadlock: if the child also writes enough stdout/stderr to fill its
+    // own pipe buffers before it has finished reading stdin, a synchronous
+    // write here could block forever waiting for buffer space that only
+    // frees up once *this* function starts draining stdout/stderr.
+    let stdin_writer = child.stdin.take().map(|mut pipe| {
+        let content = request.stdin.clone().unwrap_or_default();
+        thread::Builder::new()
+            .name("nova-process-stdin-writer".to_string())
+            .spawn(move || {
+                use std::io::Write as _;
+                let _ = pipe.write_all(&content);
+                // Dropping `pipe` here closes the parent's write handle,
+                // which is the child's only signal that stdin has ended.
+            })
+    });
 
     // Step 7 onward: normal stdout/stderr draining and wait loop, exactly
     // as before, except termination now always goes through the Job
@@ -309,6 +332,14 @@ fn run_windows(
     // running, and by this point they are not.
     drop(job);
 
+    // Best-effort join: by the time the child has exited, its stdin has
+    // necessarily already been fully read or the child never needed the
+    // rest of it — either way there is nothing further for this thread to
+    // do, and joining just reclaims it rather than leaking a handle.
+    if let Some(Ok(handle)) = stdin_writer {
+        let _ = handle.join();
+    }
+
     let (stdout_bytes, stdout_truncated) = join_reader(stdout_reader);
     let (stderr_bytes, stderr_truncated) = join_reader(stderr_reader);
 
@@ -367,7 +398,11 @@ fn run_generic(
     command
         .args(&request.args)
         .current_dir(resolved_cwd)
-        .stdin(Stdio::null())
+        .stdin(if request.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -384,6 +419,16 @@ fn run_generic(
             ));
         }
     };
+
+    let stdin_writer = child.stdin.take().map(|mut pipe| {
+        let content = request.stdin.clone().unwrap_or_default();
+        thread::Builder::new()
+            .name("nova-process-stdin-writer".to_string())
+            .spawn(move || {
+                use std::io::Write as _;
+                let _ = pipe.write_all(&content);
+            })
+    });
 
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
@@ -431,6 +476,10 @@ fn run_generic(
             }
         }
     };
+
+    if let Some(Ok(handle)) = stdin_writer {
+        let _ = handle.join();
+    }
 
     let (stdout_bytes, stdout_truncated) = join_reader(stdout_reader);
     let (stderr_bytes, stderr_truncated) = join_reader(stderr_reader);
@@ -1061,6 +1110,7 @@ mod tests {
             &helper_exe(),
             &["marker".to_string(), marker.to_string_lossy().into_owned()],
             &root,
+            false,
         )
         .expect("spawn suspended helper");
         assert!(
@@ -1107,6 +1157,7 @@ mod tests {
             &helper_exe(),
             &["marker".to_string(), marker.to_string_lossy().into_owned()],
             &root,
+            false,
         )
         .expect("spawn suspended helper");
 
@@ -1214,6 +1265,42 @@ mod tests {
             );
             let _ = fs::remove_dir_all(&root);
         }
+    }
+
+    #[test]
+    fn stdin_content_is_written_to_the_child_and_read_back_via_stdout() {
+        // Proves the Phase 3 remediation stdin-piping addition end to end:
+        // content set via `ExecutionRequest::with_stdin` really does arrive
+        // at the child process's stdin (not a file path, not an argv
+        // element) — the exact property Blocker 2 requires of the real
+        // Codex/Claude CLI adapters.
+        let root = temp_root("stdin-roundtrip");
+        let content = "task package content\n中文 with spaces\nline three"
+            .as_bytes()
+            .to_vec();
+        let req = request(&helper_exe(), vec!["cat-stdin"], &root).with_stdin(content.clone());
+        let result = execute_blocking(req, CancellationToken::new());
+        assert!(
+            matches!(result.outcome, ExecutionOutcome::Success),
+            "outcome: {:?}, stderr: {}",
+            result.outcome,
+            result.stderr
+        );
+        assert_eq!(result.stdout.as_bytes(), content.as_slice());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_stdin_content_still_behaves_exactly_as_before_this_field_existed() {
+        let root = temp_root("stdin-none");
+        let req = request(&helper_exe(), vec!["cat-stdin"], &root);
+        let result = execute_blocking(req, CancellationToken::new());
+        assert!(matches!(result.outcome, ExecutionOutcome::Success));
+        assert_eq!(
+            result.stdout, "",
+            "no stdin content means nothing to echo back"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

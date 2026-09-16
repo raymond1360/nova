@@ -328,6 +328,16 @@ pub struct Task {
     /// `> 0` and a matching `accepted = 1` `user_acceptance` row for this
     /// exact generation. See `storage::tasks::bump_result_generation`.
     pub result_generation: i64,
+    /// Phase 3 remediation (Blocker 3): the test command Nova will run
+    /// independently of the developer AI, either auto-detected from a known
+    /// project marker or explicitly confirmed by the user (see
+    /// `test_command_source`). `None` means no command has been determined
+    /// yet — `core_loop` re-attempts auto-detection each round rather than
+    /// treating that as a permanent "no tests" answer.
+    pub test_command_redacted: Option<String>,
+    /// `"auto"` or `"user"` — mirrors [`crate::core_loop::test_runner::DetectedCommand`]'s
+    /// two legal sources; never anything derived from AI output.
+    pub test_command_source: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -512,11 +522,31 @@ pub struct TestEvidence {
     pub id: String,
     pub project_id: String,
     pub task_id: String,
-    pub test_command_redacted: String,
+    /// Phase 3 remediation (Blocker 3): which result generation/review round
+    /// this test run belongs to — a review of the *current* round may only
+    /// recognize test evidence carrying that exact
+    /// `(result_generation, round)` pair, never a stale earlier run's.
+    pub result_generation: i64,
+    pub round: i64,
+    /// `None` only for the `no_tests_applicable` status — every other
+    /// status always carries the actual command that was run.
+    pub test_command_redacted: Option<String>,
+    /// One of `passed` / `failed` / `no_tests_applicable` / `timed_out` /
+    /// `cancelled` / `insufficient_evidence` (enforced by a `CHECK`
+    /// constraint). The *only* field a caller may treat as "did the tests
+    /// really pass" — never inferred from `failed_count == 0` alone, since
+    /// a `no_tests_applicable`/`timed_out`/`cancelled` row also has
+    /// `failed_count == 0` without meaning "passed".
+    pub status: String,
     pub passed_count: i64,
     pub failed_count: i64,
     pub skipped_count: i64,
     pub exit_code: Option<i64>,
+    /// Human-readable reason, required for `no_tests_applicable` (why no
+    /// test command could be determined/no test framework was detected).
+    pub reason: Option<String>,
+    pub stdout_ref: Option<String>,
+    pub stderr_ref: Option<String>,
     pub created_at: String,
 }
 

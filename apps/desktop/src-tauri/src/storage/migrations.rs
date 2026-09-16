@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// Current schema version this build of Nova understands. Bump this and
 /// append a new [`Migration`] to [`MIGRATIONS`] whenever the schema changes
 /// — never edit an already-shipped migration's SQL in place.
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug)]
 pub enum MigrationError {
@@ -533,6 +533,96 @@ const V4_SQL: &str = "
     CREATE INDEX idx_task_reviews_project ON task_reviews(project_id);
 ";
 
+/// Phase 3 remediation (Major 3): `task_reviews` project/task ownership
+/// integrity. V4 left `project_id`/`task_id` as two independent, only
+/// loosely-related columns — a row could claim any `project_id` regardless
+/// of which project the referenced task actually belongs to, letting the
+/// frontend read another project's review findings just by guessing/reusing
+/// a `task_id`. This step adds a composite foreign key
+/// `(task_id, project_id) REFERENCES tasks(id, project_id)`, which SQLite
+/// can only enforce against a UNIQUE index on that exact column pair — so
+/// `tasks(id, project_id)` gets one first (harmless: `id` is already the
+/// primary key, so `(id, project_id)` is trivially unique too). `round` also
+/// gains `CHECK(round IN (1, 2))`, matching Phase 3's fixed "at most one
+/// automatic fix pass" product rule (never a third round). The migration
+/// copies forward only rows that are actually internally consistent
+/// (`INNER JOIN tasks ... AND t.project_id = tr.project_id`, `round IN
+/// (1,2)`); any row that fails either check is a `V4_SQL` data-integrity bug
+/// that must not have been possible during normal Phase 3 operation, so
+/// silently dropping it during the upgrade (rather than aborting the whole
+/// migration) is the safe choice — never a legal Phase 3-produced row.
+const V5_SQL: &str = "
+    CREATE UNIQUE INDEX idx_tasks_id_project_id ON tasks(id, project_id);
+    CREATE TABLE task_reviews_v5 (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        result_generation INTEGER NOT NULL,
+        round INTEGER NOT NULL CHECK(round IN (1, 2)),
+        reviewer_ai_kind TEXT NOT NULL,
+        verdict TEXT NOT NULL CHECK(verdict IN ('approve', 'changes_required', 'insufficient_evidence', 'integrity_violation')),
+        findings_summary TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(task_id, result_generation, round),
+        FOREIGN KEY (task_id, project_id) REFERENCES tasks(id, project_id) ON DELETE CASCADE
+    );
+    INSERT INTO task_reviews_v5 (id, project_id, task_id, result_generation, round, reviewer_ai_kind, verdict, findings_summary, created_at)
+      SELECT tr.id, tr.project_id, tr.task_id, tr.result_generation, tr.round, tr.reviewer_ai_kind, tr.verdict, tr.findings_summary, tr.created_at
+      FROM task_reviews tr
+      INNER JOIN tasks t ON t.id = tr.task_id AND t.project_id = tr.project_id
+      WHERE tr.round IN (1, 2);
+    DROP TABLE task_reviews;
+    ALTER TABLE task_reviews_v5 RENAME TO task_reviews;
+    CREATE INDEX idx_task_reviews_task ON task_reviews(task_id);
+    CREATE INDEX idx_task_reviews_project ON task_reviews(project_id);
+";
+
+/// Phase 3 remediation (Blocker 3): independent target-project test
+/// execution. `tasks` gains the user-confirmed-or-Nova-auto-detected test
+/// command (`test_command_redacted`/`test_command_source`); `test_evidence`
+/// is rebuilt with a `(result_generation, round)`-scoped composite FK to
+/// `tasks` (same pattern as v5's `task_reviews` fix) plus the richer status
+/// vocabulary Blocker 3 requires — `no_tests_applicable`/`timed_out`/
+/// `cancelled`/`insufficient_evidence` alongside the original `passed`/
+/// `failed` — so \"no test command\" and \"tests genuinely passed\" can
+/// never be confused. Pre-existing v5 `test_evidence` rows (which have no
+/// generation/round concept at all) migrate forward as `(generation 0,
+/// round 1)` with a `status` inferred from their `failed_count`, exactly
+/// mirroring how v3 relabeled pre-Phase-3 acceptance rows.
+const V6_SQL: &str = "
+    ALTER TABLE tasks ADD COLUMN test_command_redacted TEXT;
+    ALTER TABLE tasks ADD COLUMN test_command_source TEXT CHECK(test_command_source IS NULL OR test_command_source IN ('auto', 'user'));
+
+    CREATE TABLE test_evidence_v6 (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        result_generation INTEGER NOT NULL,
+        round INTEGER NOT NULL,
+        test_command_redacted TEXT,
+        status TEXT NOT NULL CHECK(status IN ('passed', 'failed', 'no_tests_applicable', 'timed_out', 'cancelled', 'insufficient_evidence')),
+        passed_count INTEGER NOT NULL DEFAULT 0,
+        failed_count INTEGER NOT NULL DEFAULT 0,
+        skipped_count INTEGER NOT NULL DEFAULT 0,
+        exit_code INTEGER,
+        reason TEXT,
+        stdout_ref TEXT,
+        stderr_ref TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (task_id, project_id) REFERENCES tasks(id, project_id) ON DELETE CASCADE
+    );
+    INSERT INTO test_evidence_v6 (id, project_id, task_id, result_generation, round, test_command_redacted, status, passed_count, failed_count, skipped_count, exit_code, created_at)
+      SELECT te.id, te.project_id, te.task_id, 0, 1, te.test_command_redacted,
+             CASE WHEN te.failed_count > 0 THEN 'failed' ELSE 'passed' END,
+             te.passed_count, te.failed_count, te.skipped_count, te.exit_code, te.created_at
+      FROM test_evidence te
+      INNER JOIN tasks t ON t.id = te.task_id AND t.project_id = te.project_id;
+    DROP TABLE test_evidence;
+    ALTER TABLE test_evidence_v6 RENAME TO test_evidence;
+    CREATE INDEX idx_test_evidence_task ON test_evidence(task_id);
+    CREATE INDEX idx_test_evidence_task_gen_round ON test_evidence(task_id, result_generation, round);
+";
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -553,6 +643,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 4,
         requires_backup: true,
         sql: V4_SQL,
+    },
+    Migration {
+        version: 5,
+        requires_backup: true,
+        sql: V5_SQL,
+    },
+    Migration {
+        version: 6,
+        requires_backup: true,
+        sql: V6_SQL,
     },
 ];
 
@@ -881,10 +981,13 @@ mod tests {
 
         run(&conn, Some(&path)).unwrap();
 
+        // `run()` always migrates all the way to `CURRENT_SCHEMA_VERSION`
+        // (now 6), not just to 4 — a v3 database run through today's `run()`
+        // legitimately lands on 6, cascading through the v5/v6 steps too.
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 6);
 
         // The new table must exist and enforce its CHECK/UNIQUE constraints.
         conn.query_row("SELECT COUNT(*) FROM task_reviews", [], |row| {
@@ -961,6 +1064,309 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_a_v4_database_to_v5_with_a_consistent_review_row_preserved() {
+        let dir = temp_dir("v4-to-v5-preserve");
+        let (conn, path) = open_file_db(&dir);
+        conn.execute_batch(BASELINE_SQL).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(PHASE2_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        conn.execute_batch(V3_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+        conn.execute_batch(V4_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
+
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, created_at, updated_at)
+             VALUES ('proj-1', 'P', 'C:/p', 'c:/p', 'local', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+             VALUES ('task-1', 'proj-1', 'T', 'draft', 0, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_reviews (id, project_id, task_id, result_generation, round, reviewer_ai_kind, verdict, findings_summary, created_at)
+             VALUES ('rev-1', 'proj-1', 'task-1', 1, 1, 'claude_cli', 'approve', 'ok', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+
+        run(&conn, Some(&path)).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_reviews", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "a consistent v4 review row must survive the v5 upgrade"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v4_to_v5_upgrade_drops_a_review_row_whose_project_id_does_not_match_its_task() {
+        let dir = temp_dir("v4-to-v5-drop-inconsistent");
+        let (conn, path) = open_file_db(&dir);
+        conn.execute_batch(BASELINE_SQL).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(PHASE2_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        conn.execute_batch(V3_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+        conn.execute_batch(V4_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
+
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, created_at, updated_at)
+             VALUES ('proj-real', 'P', 'C:/p', 'c:/p', 'local', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, created_at, updated_at)
+             VALUES ('proj-other', 'Q', 'C:/q', 'c:/q', 'local', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+             VALUES ('task-1', 'proj-real', 'T', 'draft', 0, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        // A row whose project_id (proj-other) disagrees with what task-1
+        // actually belongs to (proj-real) — exactly the cross-project
+        // over-reach shape Major 3 flags. Foreign keys are off for this raw
+        // insert so the pre-v5 schema (which has no composite FK at all)
+        // accepts it, matching how a genuine V4-era inconsistency could
+        // have been written.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO task_reviews (id, project_id, task_id, result_generation, round, reviewer_ai_kind, verdict, findings_summary, created_at)
+             VALUES ('rev-bad', 'proj-other', 'task-1', 1, 1, 'claude_cli', 'approve', 'ok', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        run(&conn, Some(&path)).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_reviews", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "a review row with a project_id inconsistent with its task must not survive the v5 upgrade"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn schema_v5_rejects_a_round_outside_one_or_two() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn, None).unwrap();
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, created_at, updated_at)
+             VALUES ('proj-1', 'P', 'C:/p', 'c:/p', 'local', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+             VALUES ('task-1', 'proj-1', 'T', 'draft', 0, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        let result = conn.execute(
+            "INSERT INTO task_reviews (id, project_id, task_id, result_generation, round, reviewer_ai_kind, verdict, findings_summary, created_at)
+             VALUES ('rev-1', 'proj-1', 'task-1', 1, 3, 'claude_cli', 'approve', NULL, '2026-01-01')",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "round=3 must be rejected by CHECK(round IN (1,2))"
+        );
+    }
+
+    #[test]
+    fn schema_v5_rejects_a_review_whose_project_id_does_not_match_its_task_via_the_composite_fk() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn, None).unwrap();
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, created_at, updated_at)
+             VALUES ('proj-real', 'P', 'C:/p', 'c:/p', 'local', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, created_at, updated_at)
+             VALUES ('proj-other', 'Q', 'C:/q', 'c:/q', 'local', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+             VALUES ('task-1', 'proj-real', 'T', 'draft', 0, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        let result = conn.execute(
+            "INSERT INTO task_reviews (id, project_id, task_id, result_generation, round, reviewer_ai_kind, verdict, findings_summary, created_at)
+             VALUES ('rev-bad', 'proj-other', 'task-1', 1, 1, 'claude_cli', 'approve', NULL, '2026-01-01')",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "a project_id that disagrees with the task's real project must be rejected by the composite FK"
+        );
+    }
+
+    #[test]
+    fn schema_v5_passes_integrity_and_foreign_key_pragma_checks() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn, None).unwrap();
+
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            fk_violations, 0,
+            "a fresh v5 database must have zero foreign key violations"
+        );
+    }
+
+    #[test]
+    fn upgrades_a_v5_database_to_v6_migrating_a_pre_existing_test_evidence_row() {
+        let dir = temp_dir("v5-to-v6-preserve");
+        let (conn, path) = open_file_db(&dir);
+        conn.execute_batch(BASELINE_SQL).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(PHASE2_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        conn.execute_batch(V3_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+        conn.execute_batch(V4_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
+        conn.execute_batch(V5_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 5;").unwrap();
+
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, created_at, updated_at)
+             VALUES ('proj-1', 'P', 'C:/p', 'c:/p', 'local', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+             VALUES ('task-1', 'proj-1', 'T', 'draft', 0, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO test_evidence (id, project_id, task_id, test_command_redacted, passed_count, failed_count, skipped_count, exit_code, created_at)
+             VALUES ('te-1', 'proj-1', 'task-1', 'cargo test', 10, 0, 0, 0, '2026-01-01')",
+            [],
+        )
+        .unwrap();
+
+        run(&conn, Some(&path)).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+
+        let (status, generation, round): (String, i64, i64) = conn
+            .query_row(
+                "SELECT status, result_generation, round FROM test_evidence WHERE id = 'te-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "passed");
+        assert_eq!(generation, 0);
+        assert_eq!(round, 1);
+
+        let tasks_columns: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(tasks)").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(tasks_columns.contains(&"test_command_redacted".to_string()));
+        assert!(tasks_columns.contains(&"test_command_source".to_string()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn schema_v6_rejects_an_invalid_test_evidence_status() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn, None).unwrap();
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, created_at, updated_at)
+             VALUES ('proj-1', 'P', 'C:/p', 'c:/p', 'local', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+             VALUES ('task-1', 'proj-1', 'T', 'draft', 0, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        let result = conn.execute(
+            "INSERT INTO test_evidence (id, project_id, task_id, result_generation, round, status, created_at)
+             VALUES ('te-1', 'proj-1', 'task-1', 0, 1, 'maybe_passed', '2026-01-01')",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "an unrecognized status must be rejected by the CHECK constraint"
+        );
+    }
+
+    #[test]
+    fn schema_v6_passes_integrity_and_foreign_key_pragma_checks() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn, None).unwrap();
+
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            fk_violations, 0,
+            "a fresh v6 database must have zero foreign key violations"
+        );
+    }
+
+    #[test]
     fn non_trivial_migration_creates_a_backup_file() {
         let dir = temp_dir("backup-created");
         let (conn, path) = open_file_db(&dir);
@@ -979,8 +1385,8 @@ mod tests {
             .collect();
         assert_eq!(
             entries.len(),
-            3,
-            "expected exactly three backups (migrations 2, 3, and 4 each require one): {entries:?}"
+            5,
+            "expected exactly five backups (migrations 2, 3, 4, 5, and 6 each require one): {entries:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1005,13 +1411,13 @@ mod tests {
             .collect();
         assert_eq!(
             names.len(),
-            3,
-            "migrations 2, 3, and 4 each produce their own backup"
+            5,
+            "migrations 2, 3, 4, 5, and 6 each produce their own backup"
         );
         let unique: std::collections::HashSet<&String> = names.iter().collect();
         assert_eq!(
             unique.len(),
-            3,
+            5,
             "all backups from the same run must have distinct names, never collide"
         );
         for name in &names {
@@ -1140,8 +1546,8 @@ mod tests {
         let backups_dir = dir.join("backups");
         let count = fs::read_dir(&backups_dir).unwrap().count();
         assert_eq!(
-            count, 3,
-            "already-applied migrations must not be re-run, so no extra backups beyond the three produced by the first run"
+            count, 5,
+            "already-applied migrations must not be re-run, so no extra backups beyond the five produced by the first run"
         );
         let _ = fs::remove_dir_all(&dir);
     }

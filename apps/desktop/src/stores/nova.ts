@@ -13,7 +13,7 @@ const SDKMAX_PROVIDER_ID = 'sdkmax'
 
 export const useNovaStore = defineStore('nova', {
   state: () => ({
-    activeTab: 'chat' as 'chat' | 'providers' | 'settings' | 'environment',
+    activeTab: 'chat' as 'chat' | 'providers' | 'settings' | 'environment' | 'coreloop',
     provider: null as ProviderSummary | null,
     models: [] as ModelInfo[],
     tokenUsage: null as TokenUsage | null,

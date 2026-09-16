@@ -97,6 +97,14 @@ pub struct ExecutionRequest {
     pub allowed_root: Option<PathBuf>,
     pub timeout: Duration,
     pub max_output_bytes: usize,
+    /// Content to write to the child's stdin, then close (signaling EOF).
+    /// `None` (the default) connects the child's stdin to `NUL`, exactly as
+    /// every request behaved before this field existed. Added for the
+    /// Phase 3 remediation CLI adapters (`runtime::ai_adapter`), which must
+    /// pass a task package's actual text content into the developer/
+    /// reviewer CLI as real stdin content — never a file path masquerading
+    /// as a prompt.
+    pub stdin: Option<Vec<u8>>,
 }
 
 impl ExecutionRequest {
@@ -113,11 +121,17 @@ impl ExecutionRequest {
             allowed_root,
             timeout: Duration::from_secs(20),
             max_output_bytes: 64 * 1024,
+            stdin: None,
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_stdin(mut self, content: Vec<u8>) -> Self {
+        self.stdin = Some(content);
         self
     }
 }

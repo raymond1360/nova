@@ -275,9 +275,43 @@ fn create_inheritable_pipe() -> io::Result<InheritablePipe> {
     Ok(InheritablePipe { read, write })
 }
 
+/// The mirror image of [`create_inheritable_pipe`]: the *read* end
+/// (child-side, for stdin) is inheritable and the *write* end (parent-side)
+/// is not. Used only when a caller actually wants to write content to the
+/// child's stdin — the far more common `stdin: None` case keeps using
+/// [`open_nul_inheritable`], unchanged.
+fn create_inheritable_pipe_for_child_stdin() -> io::Result<InheritablePipe> {
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: null_mut(),
+        bInheritHandle: 1,
+    };
+    let mut read_handle: HANDLE = null_mut();
+    let mut write_handle: HANDLE = null_mut();
+    // SAFETY: both out-pointers are valid stack locals; `sa` is a
+    // correctly sized, stack-local `SECURITY_ATTRIBUTES`.
+    let ok = unsafe { CreatePipe(&mut read_handle, &mut write_handle, &sa, 0) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let read = OwnedHandle(read_handle);
+    let write = OwnedHandle(write_handle);
+    // The parent's write end must not be inherited by the child — only the
+    // read end (already inheritable from `CreatePipe`'s security
+    // attributes) is meant to cross into the child.
+    // SAFETY: `write.0` is the just-created, still-valid write handle.
+    let ok = unsafe {
+        windows_sys::Win32::Foundation::SetHandleInformation(write.0, HANDLE_FLAG_INHERIT, 0)
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(InheritablePipe { read, write })
+}
+
 /// A process created suspended and (once [`resume`](Self::resume) is
 /// called after Job assignment) running. Owns the process and thread
-/// handles plus the parent-side ends of the stdout/stderr pipes.
+/// handles plus the parent-side ends of the stdout/stderr/stdin pipes.
 pub struct SuspendedChild {
     process: OwnedHandle,
     thread: OwnedHandle,
@@ -287,6 +321,13 @@ pub struct SuspendedChild {
     /// a plain non-`Option` field would make that a partial move error.
     pub stdout: Option<std::fs::File>,
     pub stderr: Option<std::fs::File>,
+    /// Parent-side write end of the child's stdin pipe. `None` when
+    /// `spawn_suspended` was called with `stdin: None` (the child's stdin is
+    /// then connected to `NUL`, exactly as before this field existed).
+    /// `.take()`-able for the same reason as `stdout`/`stderr`, and must be
+    /// dropped (closing the pipe, signaling EOF to the child) once all
+    /// intended input has been written.
+    pub stdin: Option<std::fs::File>,
 }
 
 /// A `WaitForSingleObject`/`GetExitCodeProcess`-derived status, shaped like
@@ -386,7 +427,12 @@ impl SuspendedChild {
 /// mechanism `std::process::Command` itself uses internally on Windows —
 /// so no other handle in the Nova process can leak into the child even if
 /// `bInheritHandles` is `TRUE`.
-pub fn spawn_suspended(program: &str, args: &[String], cwd: &Path) -> io::Result<SuspendedChild> {
+pub fn spawn_suspended(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    with_stdin_pipe: bool,
+) -> io::Result<SuspendedChild> {
     validate_process_request_strings(program, args, cwd)?;
 
     let executable = resolve_executable(program)?;
@@ -396,7 +442,26 @@ pub fn spawn_suspended(program: &str, args: &[String], cwd: &Path) -> io::Result
 
     let stdout_pipe = create_inheritable_pipe()?;
     let stderr_pipe = create_inheritable_pipe()?;
-    let stdin_handle = open_nul_inheritable()?;
+    // Two disjoint shapes, matching the two fields this can populate:
+    // `with_stdin_pipe == false` connects the child's stdin to `NUL` (the
+    // original, unchanged behavior for every caller that never writes
+    // anything to a child) via a single "handle" branch; `true` creates a
+    // real pipe and keeps *both* the inheritable child-side read handle
+    // (for `CreateProcessW`) and the parent-side write handle (returned to
+    // the caller as `SuspendedChild::stdin`).
+    enum StdinSetup {
+        Nul(OwnedHandle),
+        Pipe(InheritablePipe),
+    }
+    let stdin_setup = if with_stdin_pipe {
+        StdinSetup::Pipe(create_inheritable_pipe_for_child_stdin()?)
+    } else {
+        StdinSetup::Nul(open_nul_inheritable()?)
+    };
+    let stdin_child_handle = match &stdin_setup {
+        StdinSetup::Nul(handle) => handle.0,
+        StdinSetup::Pipe(pipe) => pipe.read.0,
+    };
 
     let app_name = to_wide_null(&executable.to_string_lossy());
     let mut command_line = to_wide_null(&build_command_line(&executable.to_string_lossy(), args));
@@ -405,7 +470,7 @@ pub fn spawn_suspended(program: &str, args: &[String], cwd: &Path) -> io::Result
     // Build the attribute list restricting inherited handles to exactly the
     // three the child needs.
     let mut inherit_handles: [HANDLE; 3] =
-        [stdin_handle.0, stdout_pipe.write.0, stderr_pipe.write.0];
+        [stdin_child_handle, stdout_pipe.write.0, stderr_pipe.write.0];
     let mut attribute_list_size: usize = 0;
     // SAFETY: a null attribute-list pointer with count 1 is the documented
     // way to query the required buffer size.
@@ -448,7 +513,7 @@ pub fn spawn_suspended(program: &str, args: &[String], cwd: &Path) -> io::Result
     let mut startup_info_ex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     startup_info_ex.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup_info_ex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup_info_ex.StartupInfo.hStdInput = stdin_handle.0;
+    startup_info_ex.StartupInfo.hStdInput = stdin_child_handle;
     startup_info_ex.StartupInfo.hStdOutput = stdout_pipe.write.0;
     startup_info_ex.StartupInfo.hStdError = stderr_pipe.write.0;
     startup_info_ex.lpAttributeList = attribute_list;
@@ -491,14 +556,32 @@ pub fn spawn_suspended(program: &str, args: &[String], cwd: &Path) -> io::Result
     }
 
     // The child now owns its own copies of the inheritable handles; the
-    // parent's copies of the *write*/*stdin* ends must be closed so the
+    // parent's copies of the *write*/*stdin-read* ends must be closed so the
     // parent is not left holding a pipe-write reference that would keep
     // the read end from ever seeing EOF once the child exits (the pipe
     // read loop blocks until every write-end handle, including any the
-    // parent still held, is closed).
+    // parent still held, is closed). The child's stdin *read* end is the
+    // symmetric case: the parent's copy of it must also be closed (it only
+    // ever needed to exist long enough for `CreateProcessW` to inherit it).
     drop(stdout_pipe.write);
     drop(stderr_pipe.write);
-    drop(stdin_handle);
+    let stdin_write_file = match stdin_setup {
+        StdinSetup::Nul(handle) => {
+            drop(handle);
+            None
+        }
+        StdinSetup::Pipe(pipe) => {
+            drop(pipe.read);
+            // SAFETY: `pipe.write` was created as a valid, non-inheritable
+            // handle above; wrapping it in `std::fs::File` transfers
+            // ownership to the caller, who writes stdin content to it and
+            // drops it (closing the pipe, signaling EOF to the child) once
+            // done.
+            let file = unsafe { std::fs::File::from_raw_handle(pipe.write.0 as _) };
+            std::mem::forget(pipe.write);
+            Some(file)
+        }
+    };
 
     // SAFETY: pipe read ends were created as valid, non-inheritable
     // handles above; wrapping them in `std::fs::File` transfers ownership
@@ -515,6 +598,7 @@ pub fn spawn_suspended(program: &str, args: &[String], cwd: &Path) -> io::Result
         thread: OwnedHandle(process_information.hThread),
         stdout: Some(stdout),
         stderr: Some(stderr),
+        stdin: stdin_write_file,
     })
 }
 
@@ -726,7 +810,7 @@ mod tests {
         // with `NotFound` instead of `InvalidInput`.
         let program = format!("nova-nonexistent-{}", uuid::Uuid::new_v4());
         let args = vec!["bad\0arg".to_string()];
-        let err = match spawn_suspended(&program, &args, &ok_cwd()) {
+        let err = match spawn_suspended(&program, &args, &ok_cwd(), false) {
             Err(error) => error,
             Ok(_) => panic!("expected spawn_suspended to reject the NUL-containing argument"),
         };

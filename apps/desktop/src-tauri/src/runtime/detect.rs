@@ -267,7 +267,7 @@ fn stage_outcome(result: &ExecutionResult) -> StageOutcome {
     }
 }
 
-fn infra_status(kind: ExecutionErrorKind, detail: &str) -> ToolStatus {
+pub(crate) fn infra_status(kind: ExecutionErrorKind, detail: &str) -> ToolStatus {
     match kind {
         ExecutionErrorKind::NotFound => ToolStatus::NotFound,
         ExecutionErrorKind::PermissionDenied => ToolStatus::PermissionDenied,

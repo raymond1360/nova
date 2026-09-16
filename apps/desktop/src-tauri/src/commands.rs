@@ -602,6 +602,115 @@ pub fn resolve_recovery_checkpoint(
 
 // --- Phase 3: Open Local Project Dual-AI Core Loop ---
 
+/// Phase 3 remediation (Blocker 3): read-only auto-detection of a test
+/// command for a project, exposed so the minimal UI can show the user what
+/// Nova would run and let them confirm or edit it before a task starts.
+/// Never executes anything itself.
+#[tauri::command]
+pub fn detect_test_command(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let project_dir = with_db(&state, |db| db.project(&project_id))?;
+    Ok(
+        crate::core_loop::test_runner::detect_test_command(std::path::Path::new(
+            &project_dir.local_path,
+        ))
+        .map(|command| command.display()),
+    )
+}
+
+/// Records the user-confirmed (or Nova-auto-detected, re-confirmed by the
+/// user in the UI) test command for a task. `source` must be exactly
+/// `"auto"` or `"user"` — never anything derived from AI output.
+#[tauri::command]
+pub fn confirm_task_test_command(
+    task_id: String,
+    command: String,
+    source: String,
+    state: State<'_, AppState>,
+) -> Result<Task, String> {
+    with_db(&state, |db| {
+        db.set_task_test_command(&task_id, &command, &source)
+    })
+}
+
+/// Both real CLIs' readiness for the role combination `dev_kind` (the
+/// other kind reviews). Phase 3 remediation (Blocker 2): a real,
+/// just-executed probe against each configured binary — never asserted
+/// from memory. Exposed to the frontend so Major 1's minimal UI can show
+/// installed/not-installed/not-logged-in/lacks-safe-review-capability/
+/// ready *before* the user tries to start a task.
+#[derive(serde::Serialize)]
+pub struct CoreLoopReadiness {
+    pub dev_kind: String,
+    pub reviewer_kind: String,
+    pub dev_ready: bool,
+    pub review_ready: bool,
+    pub dev_message: String,
+    pub review_message: String,
+}
+
+/// CLI binary paths, configurable (not PATH-only): read from
+/// `app_settings` (`codex_binary_path`/`claude_binary_path`, set via the
+/// already-exposed generic `set_setting` command) with a bare-name PATH
+/// fallback. A missing/unreadable setting is never an error here — it just
+/// means "use PATH", which is a legal, common configuration.
+fn cli_binary_paths(state: &AppState) -> (String, String) {
+    let db = state.db.lock().unwrap();
+    let codex = db
+        .get_setting("codex_binary_path")
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "codex".to_string());
+    let claude = db
+        .get_setting("claude_binary_path")
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "claude".to_string());
+    (codex, claude)
+}
+
+fn build_dual_adapter(state: &AppState) -> crate::runtime::ai_adapter::DualCliAdapter {
+    let (codex_binary, claude_binary) = cli_binary_paths(state);
+    crate::runtime::ai_adapter::DualCliAdapter::new(
+        crate::runtime::ai_adapter::CliConfig::from_binary_name(&codex_binary),
+        crate::runtime::ai_adapter::CliConfig::from_binary_name(&claude_binary),
+    )
+}
+
+fn display_name(kind: crate::runtime::types::ToolKind) -> &'static str {
+    match kind {
+        crate::runtime::types::ToolKind::CodexCli => "Codex CLI",
+        crate::runtime::types::ToolKind::ClaudeCli => "Claude CLI",
+        crate::runtime::types::ToolKind::Git => "Git",
+    }
+}
+
+#[tauri::command]
+pub fn get_core_loop_readiness(
+    dev_ai_kind: String,
+    state: State<'_, AppState>,
+) -> Result<CoreLoopReadiness, String> {
+    let dev_kind = crate::runtime::ai_adapter::ai_kind_from_str(&dev_ai_kind)
+        .ok_or_else(|| "未知的开发 AI 类型".to_string())?;
+    let reviewer_kind = crate::runtime::ai_adapter::the_other(dev_kind);
+    let dual = build_dual_adapter(&state);
+    let cancel = CancellationToken::new();
+    let dev_readiness = dual.probe_dev(dev_kind, &state.app_data_dir, &cancel);
+    let review_readiness = dual.probe_dev(reviewer_kind, &state.app_data_dir, &cancel);
+    Ok(CoreLoopReadiness {
+        dev_kind: crate::runtime::ai_adapter::ai_kind_to_str(dev_kind).to_string(),
+        reviewer_kind: crate::runtime::ai_adapter::ai_kind_to_str(reviewer_kind).to_string(),
+        dev_ready: dev_readiness.dev_ready(),
+        review_ready: review_readiness.review_ready(),
+        dev_message: dev_readiness.user_message(display_name(dev_kind)),
+        review_message: review_readiness.user_message(display_name(reviewer_kind)),
+    })
+}
+
 /// Starts the dual-AI core loop for a confirmed/queued task in the
 /// background and returns immediately — a real developer-AI/reviewer-AI
 /// run can take many minutes, far too long to hold a synchronous Tauri
@@ -615,13 +724,19 @@ pub fn resolve_recovery_checkpoint(
 /// `list_tasks_for_project` commands; this command intentionally adds no
 /// new live-progress/event infrastructure, matching Phase 3's "no more
 /// than the minimal interface" scope.
+///
+/// Phase 3 remediation (Blocker 2): before any AI is invoked or the task is
+/// transitioned to `running`, both the developer and reviewer CLI's
+/// readiness is checked via a real probe. If either is not ready, this
+/// returns a clear, actionable Chinese error and the task is left exactly
+/// where it was — never transitioned, never touched by any AI call.
 #[tauri::command]
 pub fn start_core_loop(
     task_id: String,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    with_db(&state, |db| {
+    let dev_kind = with_db(&state, |db| {
         let task = db.task(&task_id)?;
         if !matches!(task.state, TaskState::Confirmed | TaskState::Queued) {
             return Err(NovaError::Config(format!(
@@ -629,21 +744,77 @@ pub fn start_core_loop(
                 task.state
             )));
         }
-        Ok(())
+        let dev_kind =
+            crate::runtime::ai_adapter::ai_kind_from_str(task.ai_kind.as_deref().unwrap_or(""))
+                .ok_or_else(|| {
+                    NovaError::Config("任务未设置有效的开发 AI 类型（ai_kind）".to_string())
+                })?;
+        Ok(dev_kind)
     })?;
+    let reviewer_kind = crate::runtime::ai_adapter::the_other(dev_kind);
 
+    // Only one active run handle per task at a time: reserve the slot with
+    // a CAS-style check before doing anything else observable.
+    {
+        let mut guard = state.core_loop_cancel.lock().unwrap();
+        if guard.contains_key(&task_id) {
+            return Err("该任务已在运行核心循环，请勿重复启动".to_string());
+        }
+        guard.insert(task_id.clone(), CancellationToken::new());
+    }
+
+    let dual = build_dual_adapter(&state);
+    let readiness_cancel = CancellationToken::new();
+    let dev_readiness = dual.probe_dev(dev_kind, &state.app_data_dir, &readiness_cancel);
+    let review_readiness = dual.probe_dev(reviewer_kind, &state.app_data_dir, &readiness_cancel);
+    if !dev_readiness.dev_ready() || !review_readiness.review_ready() {
+        state.core_loop_cancel.lock().unwrap().remove(&task_id);
+        let mut messages = Vec::new();
+        if !dev_readiness.dev_ready() {
+            messages.push(dev_readiness.user_message(display_name(dev_kind)));
+        }
+        if !review_readiness.review_ready() {
+            messages.push(review_readiness.user_message(display_name(reviewer_kind)));
+        }
+        return Err(messages.join("；"));
+    }
+
+    let cancel = state
+        .core_loop_cancel
+        .lock()
+        .unwrap()
+        .get(&task_id)
+        .cloned()
+        .expect("just inserted above");
+
+    let (codex_binary, claude_binary) = cli_binary_paths(&state);
     let db_path = state.app_data_dir.join("nova.sqlite3");
-    let cancel = CancellationToken::new();
+    let app_data_dir = state.app_data_dir.clone();
     let task_id_for_event = task_id.clone();
+    let task_id_for_cleanup = task_id.clone();
+    let core_loop_cancel = state.core_loop_cancel.clone();
     tauri::async_runtime::spawn(async move {
         let outcome = tokio::task::spawn_blocking(move || {
             let db = crate::db::Database::open(&db_path).ok()?;
-            let adapter = crate::runtime::ai_adapter::RealCliAdapter;
-            crate::core_loop::run_core_loop(&db, &task_id, &adapter, &cancel).ok()
+            let adapter = crate::runtime::ai_adapter::DualCliAdapter::new(
+                crate::runtime::ai_adapter::CliConfig::from_binary_name(&codex_binary),
+                crate::runtime::ai_adapter::CliConfig::from_binary_name(&claude_binary),
+            );
+            crate::core_loop::run_core_loop(&db, &task_id, &adapter, &cancel, &app_data_dir).ok()
         })
         .await
         .ok()
         .flatten();
+
+        // The run handle is only ever meant to exist while the loop is
+        // genuinely in flight — remove it now that it has returned
+        // (success, failure, or cancellation), so `cancel_core_loop` can
+        // never target a completed run and a fresh `start_core_loop` for
+        // the same task is never blocked by a stale entry.
+        core_loop_cancel
+            .lock()
+            .unwrap()
+            .remove(&task_id_for_cleanup);
 
         // A minimal, final-state-only signal — deliberately not a
         // step-by-step progress stream, matching Phase 3's "no more than
@@ -662,12 +833,33 @@ pub fn start_core_loop(
     Ok(())
 }
 
+/// Phase 3 remediation (Major 4): cancels a currently-running core-loop
+/// task. Terminates the corresponding CLI process (via the `CancellationToken`
+/// `runtime::process` already watches on every wait loop iteration),
+/// causing `run_core_loop` to record `cancelled`/`needs_user_action`
+/// through the normal Action Ledger + state machine path — this command
+/// itself performs no state transition, it only signals cancellation.
+/// Cancelling a task with no active run handle (already finished, or never
+/// started) returns a clear error rather than silently doing nothing.
+#[tauri::command]
+pub fn cancel_core_loop(task_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let guard = state.core_loop_cancel.lock().unwrap();
+    match guard.get(&task_id) {
+        Some(token) => {
+            token.cancel();
+            Ok(())
+        }
+        None => Err("该任务当前没有正在运行的核心循环，无法取消".to_string()),
+    }
+}
+
 #[tauri::command]
 pub fn list_task_reviews(
+    project_id: String,
     task_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::models::TaskReview>, String> {
-    with_db(&state, |db| db.list_task_reviews(&task_id))
+    with_db(&state, |db| db.list_task_reviews(&project_id, &task_id))
 }
 
 #[cfg(test)]

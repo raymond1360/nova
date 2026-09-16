@@ -1,4 +1,5 @@
 mod api;
+mod app_paths;
 mod commands;
 mod core_loop;
 mod credential;
@@ -10,6 +11,7 @@ mod security;
 mod storage;
 mod validation;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -27,6 +29,14 @@ pub struct AppState {
     client: reqwest::Client,
     credentials: Arc<dyn CredentialStore>,
     active_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    /// Phase 3 remediation (Major 4): one cancellation handle per
+    /// currently-running core-loop task, keyed by `task_id`. Distinct from
+    /// `active_cancel` above (that one is chat-only). Only ever holds an
+    /// entry for a task that is genuinely mid-run; `commands::start_core_loop`
+    /// inserts it just before spawning the loop and removes it once the loop
+    /// returns (success, failure, or cancellation), so a stale entry can
+    /// never outlive its run.
+    core_loop_cancel: Arc<Mutex<HashMap<String, CancellationToken>>>,
     app_data_dir: PathBuf,
     detection_cancel: DetectionSlot,
     /// Computed once, synchronously, during `setup()` — before any Tauri
@@ -52,6 +62,7 @@ impl AppState {
             client,
             credentials,
             active_cancel: Arc::new(Mutex::new(None)),
+            core_loop_cancel: Arc::new(Mutex::new(HashMap::new())),
             app_data_dir,
             detection_cancel: DetectionSlot::new(),
             startup_recovery_summary,
@@ -119,8 +130,31 @@ pub fn run() {
             commands::get_startup_recovery_summary,
             commands::resolve_recovery_checkpoint,
             commands::start_core_loop,
+            commands::cancel_core_loop,
+            commands::get_core_loop_readiness,
+            commands::detect_test_command,
+            commands::confirm_task_test_command,
             commands::list_task_reviews,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Nova");
+        .build(tauri::generate_context!())
+        .expect("error while building Nova")
+        .run(|app_handle, event| {
+            // Major 4: on app shutdown, every core-loop task still in
+            // flight must be cancelled — never left as an orphaned CLI
+            // process outliving the Nova process itself. `RunEvent::Exit`
+            // fires once, right before the process actually terminates.
+            if let tauri::RunEvent::Exit = event {
+                let state = app_handle.state::<AppState>();
+                let tokens: Vec<CancellationToken> = state
+                    .core_loop_cancel
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .cloned()
+                    .collect();
+                for token in tokens {
+                    token.cancel();
+                }
+            }
+        });
 }

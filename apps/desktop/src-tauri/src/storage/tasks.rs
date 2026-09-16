@@ -149,7 +149,7 @@ impl Database {
     pub fn task(&self, id: &str) -> NovaResult<Task> {
         self.conn()
             .query_row(
-                "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, created_at, updated_at
+                "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, test_command_redacted, test_command_source, created_at, updated_at
                  FROM tasks WHERE id = ?1",
                 params![id],
                 read_task,
@@ -157,9 +157,34 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Phase 3 remediation (Blocker 3): records the test command Nova will
+    /// run independently for this task — either auto-detected
+    /// (`source = "auto"`) or explicitly confirmed by the user
+    /// (`source = "user"`). `source` is validated against exactly those two
+    /// values; never anything derived from AI output. Redacted before
+    /// storage like every other free-text field a task carries.
+    pub fn set_task_test_command(
+        &self,
+        task_id: &str,
+        command_redacted: &str,
+        source: &str,
+    ) -> NovaResult<Task> {
+        if source != "auto" && source != "user" {
+            return Err(NovaError::Config(format!(
+                "test_command_source 必须是 auto 或 user，实际为：{source}"
+            )));
+        }
+        let command_redacted = redact_sensitive_text(command_redacted);
+        self.conn().execute(
+            "UPDATE tasks SET test_command_redacted = ?1, test_command_source = ?2, updated_at = ?3 WHERE id = ?4",
+            params![command_redacted, source, now(), task_id],
+        )?;
+        self.task(task_id)
+    }
+
     pub fn list_tasks_for_project(&self, project_id: &str) -> NovaResult<Vec<Task>> {
         let mut stmt = self.conn().prepare(
-            "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, created_at, updated_at
+            "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, test_command_redacted, test_command_source, created_at, updated_at
              FROM tasks WHERE project_id = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt
@@ -174,7 +199,7 @@ impl Database {
     pub fn unfinished_task_for_project(&self, project_id: &str) -> NovaResult<Option<Task>> {
         self.conn()
             .query_row(
-                "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, created_at, updated_at
+                "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, test_command_redacted, test_command_source, created_at, updated_at
                  FROM tasks
                  WHERE project_id = ?1 AND state NOT IN ('completed', 'cancelled', 'failed')
                  ORDER BY updated_at DESC LIMIT 1",
@@ -382,8 +407,10 @@ fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         ai_kind: row.get(7)?,
         state: parse_enum(state)?,
         result_generation: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
+        test_command_redacted: row.get(10)?,
+        test_command_source: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 

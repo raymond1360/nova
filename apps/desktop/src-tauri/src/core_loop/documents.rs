@@ -1,0 +1,406 @@
+//! Phase 3 remediation (Major 5): the seven-document set Nova generates
+//! for a task, regenerated in full from the database's *current* truth
+//! every time it is called — never incrementally patched — so the on-disk
+//! documents can never drift out of sync with (or contradict) a later state
+//! change. Every value written comes from Nova's own independently-recorded
+//! evidence (the Action Ledger, `task_reviews`, `test_evidence`,
+//! `user_acceptance`) — never from anything an AI merely claimed. A
+//! document for a step that has not happened yet still exists, with an
+//! explicit "not yet triggered" status, rather than being silently absent.
+
+use std::path::{Path, PathBuf};
+
+use crate::app_paths;
+use crate::db::Database;
+use crate::error::NovaResult;
+use crate::models::{Task, TaskState};
+
+const NOT_TRIGGERED_ZH: &str = "（尚未触发）";
+
+/// Regenerates all seven documents for `task_id` under
+/// `<app_data_dir>/result-documents/<project_id>/<task_id>/` — a third
+/// app-owned root, distinct from `task-packages/` and `review-workspaces/`.
+/// Safe to call at any point in the task's lifecycle; always reflects
+/// exactly what the database currently says, nothing more.
+pub fn generate_result_documents(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    app_data_dir: &Path,
+) -> NovaResult<()> {
+    let task = db.task(task_id)?;
+    let dir = app_paths::safe_app_owned_dir(
+        &app_data_dir.join("result-documents"),
+        &[project_id, task_id],
+    )
+    .map_err(crate::error::NovaError::from)?;
+
+    write_doc(&dir, "REQUIREMENT.md", &requirement_doc(&task))?;
+    write_doc(
+        &dir,
+        "DEVELOPMENT_REPORT.md",
+        &development_report_doc(db, task_id, 1)?,
+    )?;
+    write_doc(
+        &dir,
+        "TEST_REPORT.md",
+        &test_report_doc(db, project_id, task_id, &task)?,
+    )?;
+    write_doc(
+        &dir,
+        "FIRST_REVIEW.md",
+        &review_doc(db, project_id, task_id, &task, 1, "First review")?,
+    )?;
+    write_doc(&dir, "FIX_REPORT.md", &fix_report_doc(db, task_id)?)?;
+    write_doc(
+        &dir,
+        "SECOND_REVIEW.md",
+        &review_doc(
+            db,
+            project_id,
+            task_id,
+            &task,
+            2,
+            "Second review (automatic fix pass)",
+        )?,
+    )?;
+    write_doc(
+        &dir,
+        "FINAL_RESULT.md",
+        &final_result_doc(db, project_id, task_id, &task)?,
+    )?;
+
+    Ok(())
+}
+
+fn write_doc(dir: &Path, name: &str, content: &str) -> NovaResult<()> {
+    let path: PathBuf = dir.join(name);
+    app_paths::atomic_write(&path, content.as_bytes()).map_err(crate::error::NovaError::from)
+}
+
+fn requirement_doc(task: &Task) -> String {
+    format!(
+        "# REQUIREMENT\n\ntask_id: {}\nresult_generation: {}\n\n## Goal\n\n{}\n\n## In scope\n\n{}\n\n## Not in scope\n\n{}\n\n## Done means\n\n{}\n",
+        task.id,
+        task.result_generation,
+        task.goal.as_deref().unwrap_or("(not specified)"),
+        task.in_scope.as_deref().unwrap_or("(not specified)"),
+        task.not_in_scope.as_deref().unwrap_or("(not specified)"),
+        task.done_criteria.as_deref().unwrap_or("(not specified)"),
+    )
+}
+
+fn development_report_doc(db: &Database, task_id: &str, round: i64) -> NovaResult<String> {
+    let dev_key = format!("dev-{task_id}-round-{round}");
+    let action = db.find_action(task_id, &dev_key)?;
+    let body = match action {
+        None => NOT_TRIGGERED_ZH.to_string(),
+        Some(action) => format!(
+            "status: {:?}\nstarted_at: {}\nfinished_at: {}\nerror_summary: {}\n",
+            action.status,
+            action.started_at.as_deref().unwrap_or("-"),
+            action.finished_at.as_deref().unwrap_or("-"),
+            action.error_summary.as_deref().unwrap_or("(none)"),
+        ),
+    };
+    Ok(format!("# DEVELOPMENT_REPORT (round {round})\n\n{body}"))
+}
+
+fn test_report_doc(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    task: &Task,
+) -> NovaResult<String> {
+    let mut body = String::from("# TEST_REPORT\n\n");
+    for round in [1_i64, 2] {
+        let evidence =
+            db.list_test_evidence_for_round(project_id, task_id, task.result_generation, round)?;
+        body.push_str(&format!("## Round {round}\n\n"));
+        if evidence.is_empty() {
+            body.push_str(NOT_TRIGGERED_ZH);
+            body.push_str("\n\n");
+            continue;
+        }
+        for row in &evidence {
+            body.push_str(&format!(
+                "- status: {}\n  command: {}\n  passed: {}, failed: {}, skipped: {}\n  reason: {}\n\n",
+                row.status,
+                row.test_command_redacted.as_deref().unwrap_or("(none)"),
+                row.passed_count,
+                row.failed_count,
+                row.skipped_count,
+                row.reason.as_deref().unwrap_or("-"),
+            ));
+        }
+    }
+    Ok(body)
+}
+
+fn review_doc(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    task: &Task,
+    round: i64,
+    title: &str,
+) -> NovaResult<String> {
+    let reviews = db.list_task_reviews(project_id, task_id)?;
+    let this_round: Vec<_> = reviews
+        .iter()
+        .filter(|r| r.round == round && r.result_generation == task.result_generation)
+        .collect();
+    let mut body = format!("# {title}\n\n");
+    if this_round.is_empty() {
+        body.push_str(NOT_TRIGGERED_ZH);
+        body.push('\n');
+        return Ok(body);
+    }
+    for review in this_round {
+        body.push_str(&format!(
+            "reviewer: {}\nverdict: {}\nfindings:\n\n{}\n",
+            review.reviewer_ai_kind,
+            review.verdict,
+            review.findings_summary.as_deref().unwrap_or("(none)"),
+        ));
+    }
+    Ok(body)
+}
+
+fn fix_report_doc(db: &Database, task_id: &str) -> NovaResult<String> {
+    let dev_key = format!("dev-{task_id}-round-2");
+    let action = db.find_action(task_id, &dev_key)?;
+    let body = match action {
+        None => format!("# FIX_REPORT\n\n{NOT_TRIGGERED_ZH}\n"),
+        Some(action) => format!(
+            "# FIX_REPORT\n\nstatus: {:?}\nstarted_at: {}\nfinished_at: {}\n",
+            action.status,
+            action.started_at.as_deref().unwrap_or("-"),
+            action.finished_at.as_deref().unwrap_or("-"),
+        ),
+    };
+    Ok(body)
+}
+
+fn final_result_doc(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    task: &Task,
+) -> NovaResult<String> {
+    let acceptance = db.user_acceptance_for_task(task_id)?;
+    let accepted_current_generation = acceptance
+        .as_ref()
+        .is_some_and(|a| a.result_generation == task.result_generation && a.accepted);
+
+    // Never fabricate a passing round that never happened: the review gate
+    // is satisfied only by a real `approve` row for the task's *current*
+    // (result_generation, round-that-actually-produced-this-result) pair —
+    // never assumed from the task's state alone.
+    let reviews = db.list_task_reviews(project_id, task_id)?;
+    let review_gate_ok = reviews
+        .iter()
+        .any(|r| r.result_generation == task.result_generation && r.verdict == "approve");
+    let round_that_approved = reviews
+        .iter()
+        .find(|r| r.result_generation == task.result_generation && r.verdict == "approve")
+        .map(|r| r.round)
+        .unwrap_or(1);
+    let test_gate_ok = {
+        let evidence = db.list_test_evidence_for_round(
+            project_id,
+            task_id,
+            task.result_generation,
+            round_that_approved,
+        )?;
+        evidence
+            .iter()
+            .any(|e| e.status == "passed" || e.status == "no_tests_applicable")
+    };
+
+    let status_line = if task.state == TaskState::Completed && accepted_current_generation {
+        "已完成（用户已验收）"
+    } else if task.state == TaskState::AwaitingUserAcceptance && review_gate_ok && test_gate_ok {
+        "等待用户验收"
+    } else if task.state == TaskState::Failed {
+        "未通过：二次审核仍未通过，或独立测试未通过"
+    } else if task.state == TaskState::Cancelled {
+        "已取消"
+    } else if task.state == TaskState::NeedsUserAction {
+        "需要用户处理"
+    } else {
+        "进行中"
+    };
+
+    Ok(format!(
+        "# FINAL_RESULT\n\ntask_id: {}\nresult_generation: {}\ncurrent_state: {}\nstatus: {status_line}\n",
+        task.id, task.result_generation, task.state,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Actor, CreateProjectRequest, CreateTaskRequest};
+    use std::fs;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "nova-documents-test-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn db_with_task(dir: &Path) -> (Database, String, String) {
+        let db = Database::memory().unwrap();
+        db.migrate().unwrap();
+        let project = db
+            .create_project(&CreateProjectRequest {
+                name: "P".to_string(),
+                local_path: dir.to_string_lossy().into_owned(),
+                source_type: "local".to_string(),
+                source_url: None,
+                purpose: None,
+                long_term_goal: None,
+                user_preferences: None,
+                prohibitions: None,
+            })
+            .unwrap();
+        let task = db
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "T".to_string(),
+                    goal: Some("goal text".to_string()),
+                    in_scope: Some("in scope text".to_string()),
+                    not_in_scope: None,
+                    done_criteria: Some("done means text".to_string()),
+                    ai_kind: Some("codex_cli".to_string()),
+                },
+                Actor::User,
+            )
+            .unwrap();
+        (db, project.id, task.id)
+    }
+
+    #[test]
+    fn generates_all_seven_documents_with_not_triggered_status_for_a_fresh_task() {
+        let dir = temp_dir("fresh-task");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        let app_data_dir = temp_dir("fresh-task-appdata");
+
+        generate_result_documents(&db, &project_id, &task_id, &app_data_dir).unwrap();
+
+        let doc_dir = app_data_dir
+            .join("result-documents")
+            .join(&project_id)
+            .join(&task_id);
+        for name in [
+            "REQUIREMENT.md",
+            "DEVELOPMENT_REPORT.md",
+            "TEST_REPORT.md",
+            "FIRST_REVIEW.md",
+            "FIX_REPORT.md",
+            "SECOND_REVIEW.md",
+            "FINAL_RESULT.md",
+        ] {
+            let content = fs::read_to_string(doc_dir.join(name))
+                .unwrap_or_else(|e| panic!("{name} missing: {e}"));
+            assert!(!content.trim().is_empty(), "{name} must not be empty");
+        }
+        let fix_report = fs::read_to_string(doc_dir.join("FIX_REPORT.md")).unwrap();
+        assert!(fix_report.contains(NOT_TRIGGERED_ZH));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&app_data_dir);
+    }
+
+    #[test]
+    fn requirement_doc_reflects_the_real_task_fields() {
+        let dir = temp_dir("requirement-fields");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        let app_data_dir = temp_dir("requirement-fields-appdata");
+
+        generate_result_documents(&db, &project_id, &task_id, &app_data_dir).unwrap();
+
+        let doc_dir = app_data_dir
+            .join("result-documents")
+            .join(&project_id)
+            .join(&task_id);
+        let content = fs::read_to_string(doc_dir.join("REQUIREMENT.md")).unwrap();
+        assert!(content.contains("goal text"));
+        assert!(content.contains("in scope text"));
+        assert!(content.contains("done means text"));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&app_data_dir);
+    }
+
+    #[test]
+    fn final_result_never_says_completed_before_a_real_user_acceptance_exists() {
+        let dir = temp_dir("final-result-honest");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        let app_data_dir = temp_dir("final-result-honest-appdata");
+
+        generate_result_documents(&db, &project_id, &task_id, &app_data_dir).unwrap();
+
+        let doc_dir = app_data_dir
+            .join("result-documents")
+            .join(&project_id)
+            .join(&task_id);
+        let content = fs::read_to_string(doc_dir.join("FINAL_RESULT.md")).unwrap();
+        assert!(!content.contains("已完成"));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&app_data_dir);
+    }
+
+    #[test]
+    fn documents_live_outside_the_project_directory_under_the_app_owned_root() {
+        let dir = temp_dir("outside-project");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        let app_data_dir = temp_dir("outside-project-appdata");
+
+        generate_result_documents(&db, &project_id, &task_id, &app_data_dir).unwrap();
+
+        assert!(!dir.join("result-documents").exists());
+        let doc_dir = app_data_dir
+            .join("result-documents")
+            .join(&project_id)
+            .join(&task_id);
+        assert!(doc_dir.join("REQUIREMENT.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&app_data_dir);
+    }
+
+    #[test]
+    fn regenerating_after_a_state_change_never_leaves_stale_conflicting_content() {
+        let dir = temp_dir("regenerate-fresh");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        let app_data_dir = temp_dir("regenerate-fresh-appdata");
+
+        generate_result_documents(&db, &project_id, &task_id, &app_data_dir).unwrap();
+        db.record_task_review(
+            &project_id,
+            &task_id,
+            0,
+            1,
+            "claude_cli",
+            "approve",
+            Some("looks good"),
+        )
+        .unwrap();
+        generate_result_documents(&db, &project_id, &task_id, &app_data_dir).unwrap();
+
+        let doc_dir = app_data_dir
+            .join("result-documents")
+            .join(&project_id)
+            .join(&task_id);
+        let content = fs::read_to_string(doc_dir.join("FIRST_REVIEW.md")).unwrap();
+        assert!(content.contains("approve"));
+        assert!(!content.contains(NOT_TRIGGERED_ZH));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&app_data_dir);
+    }
+}

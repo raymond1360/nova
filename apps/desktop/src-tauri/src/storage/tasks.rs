@@ -149,7 +149,7 @@ impl Database {
     pub fn task(&self, id: &str) -> NovaResult<Task> {
         self.conn()
             .query_row(
-                "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, test_command_redacted, test_command_source, created_at, updated_at
+                "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, test_command_redacted, test_command_source, document_sync_pending, created_at, updated_at
                  FROM tasks WHERE id = ?1",
                 params![id],
                 read_task,
@@ -182,9 +182,23 @@ impl Database {
         self.task(task_id)
     }
 
+    /// Second re-review remediation (Major 5): flips `document_sync_pending`
+    /// — set to `true` when a follow-up seven-document regeneration failed
+    /// after an otherwise-successful acceptance/rejection/completion write
+    /// (see `commands::accept_task_result`), cleared back to `false` once a
+    /// later regeneration attempt succeeds. Never itself fails the caller's
+    /// larger operation — this is a best-effort marker, not a gate.
+    pub fn set_document_sync_pending(&self, task_id: &str, pending: bool) -> NovaResult<()> {
+        self.conn().execute(
+            "UPDATE tasks SET document_sync_pending = ?1, updated_at = ?2 WHERE id = ?3",
+            params![pending as i64, now(), task_id],
+        )?;
+        Ok(())
+    }
+
     pub fn list_tasks_for_project(&self, project_id: &str) -> NovaResult<Vec<Task>> {
         let mut stmt = self.conn().prepare(
-            "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, test_command_redacted, test_command_source, created_at, updated_at
+            "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, test_command_redacted, test_command_source, document_sync_pending, created_at, updated_at
              FROM tasks WHERE project_id = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt
@@ -199,7 +213,7 @@ impl Database {
     pub fn unfinished_task_for_project(&self, project_id: &str) -> NovaResult<Option<Task>> {
         self.conn()
             .query_row(
-                "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, test_command_redacted, test_command_source, created_at, updated_at
+                "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, test_command_redacted, test_command_source, document_sync_pending, created_at, updated_at
                  FROM tasks
                  WHERE project_id = ?1 AND state NOT IN ('completed', 'cancelled', 'failed')
                  ORDER BY updated_at DESC LIMIT 1",
@@ -409,8 +423,9 @@ fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         result_generation: row.get(9)?,
         test_command_redacted: row.get(10)?,
         test_command_source: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
+        document_sync_pending: row.get::<_, i64>(12)? != 0,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
     })
 }
 

@@ -449,6 +449,18 @@ impl CodexCliAdapter {
                 "exec".to_string(),
                 "--sandbox".to_string(),
                 sandbox_mode.to_string(),
+                // Second re-review (Blocker 1): confirmed via a real,
+                // executed smoke test against the actual `codex` binary —
+                // `-C`/`--cd` is a genuine, working second directive for
+                // the working root, redundant with (not instead of) Phase
+                // 1's own OS-level `cwd`; `--skip-git-repo-check` is
+                // required because the isolated review workspace
+                // deliberately excludes `.git` (see
+                // `core_loop::review_isolation`), so Codex must not refuse
+                // to start just because it cannot find a repository there.
+                "-C".to_string(),
+                cwd.to_string_lossy().into_owned(),
+                "--skip-git-repo-check".to_string(),
             ],
             cwd.to_path_buf(),
             Some(cwd.to_path_buf()),
@@ -507,7 +519,14 @@ impl ClaudeCliAdapter {
             app_data_dir,
             cancel,
             &["-p", "--print", "print"],
-            &["permission-mode", "permission mode"],
+            // Second re-review (Blocker 1): review readiness now depends on
+            // a real *capability removal* mechanism (`--tools`), not the
+            // `--permission-mode plan` prompt-level mode the original
+            // review correctly flagged as not a technical write boundary —
+            // `plan` mode still runs with every tool enabled and only asks
+            // the model to plan before acting, which is not the same thing
+            // as the tool being physically unavailable.
+            &["--tools", "disallowedtools", "disallowed-tools"],
             None,
         )
     }
@@ -516,18 +535,16 @@ impl ClaudeCliAdapter {
         &self,
         cwd: &Path,
         package_path: &Path,
-        permission_mode: &str,
+        mode_args: &[&str],
         timeout: Duration,
         cancel: CancellationToken,
     ) -> ExecutionResult {
         let content = read_package_content(package_path);
+        let mut args = vec!["-p".to_string()];
+        args.extend(mode_args.iter().map(|s| s.to_string()));
         let request = ExecutionRequest::new(
             self.config.binary_path.clone(),
-            vec![
-                "-p".to_string(),
-                "--permission-mode".to_string(),
-                permission_mode.to_string(),
-            ],
+            args,
             cwd.to_path_buf(),
             Some(cwd.to_path_buf()),
         )
@@ -546,17 +563,32 @@ impl DevReviewAdapter for ClaudeCliAdapter {
         self.invoke(
             &request.project_dir,
             &request.package_path,
-            "acceptEdits",
+            &["--permission-mode", "acceptEdits"],
             request.timeout,
             cancel,
         )
     }
 
     fn run_review(&self, request: &ReviewRequest, cancel: CancellationToken) -> ExecutionResult {
+        // Second re-review (Blocker 1): the reviewer's tool set is reduced
+        // to exactly `Read` — real, verified (via `claude --help`) capability
+        // removal, not a permission-mode prompt. `--disallowedTools` on top
+        // is defense in depth (redundant if `--tools Read` already works as
+        // documented, but costs nothing and narrows the blast radius if a
+        // future CLI version's `--tools` semantics ever change underneath
+        // this best-effort argv).
         self.invoke(
             &request.isolated_workspace_dir,
             &request.package_path,
-            "plan",
+            &[
+                "--tools",
+                "Read",
+                "--disallowedTools",
+                "Bash",
+                "Edit",
+                "Write",
+                "NotebookEdit",
+            ],
             request.timeout,
             cancel,
         )
@@ -1082,9 +1114,17 @@ mod tests {
 
         let log_line = fs::read_to_string(&log_path).unwrap();
         assert!(log_line.contains("read-only"));
+        // The real cwd a spawned process reports never carries Windows's
+        // `\\?\` extended-length prefix `fs::canonicalize` itself adds —
+        // `win_spawn::win32_cwd_form` strips it before ever handing the
+        // directory to `CreateProcessW` (see that function's own doc
+        // comment: `cmd.exe` refuses the prefixed form outright), so the
+        // expectation here must go through the same transform, not compare
+        // against the raw canonicalized path.
         let canonical_workspace = fs::canonicalize(&workspace_dir).unwrap();
+        let expected_cwd = crate::runtime::win_spawn::win32_cwd_form(&canonical_workspace);
         assert!(
-            log_line.contains(&canonical_workspace.to_string_lossy().replace('\\', "\\\\")),
+            log_line.contains(&expected_cwd.replace('\\', "\\\\")),
             "cwd recorded by the fake CLI must be the isolated workspace: {log_line}"
         );
         let _ = fs::remove_dir_all(&workspace_dir);
@@ -1120,6 +1160,75 @@ mod tests {
         assert!(log_line.contains("acceptEdits"));
         assert!(!log_line.contains("sandbox"));
         let _ = fs::remove_dir_all(&project_dir);
+    }
+
+    #[test]
+    fn claude_review_invocation_uses_tools_read_never_permission_mode_plan() {
+        // Second re-review (Blocker 1): `--permission-mode plan` still runs
+        // with every tool enabled and only asks the model to plan first —
+        // not a technical write boundary. The reviewer invocation must use
+        // `--tools Read` (verified via real `claude --help` output: `--tools
+        // <tools...> ... Use "" to disable all tools ... or specify tool
+        // names`), which actually removes Bash/Edit/Write/NotebookEdit from
+        // what the process can invoke at all.
+        let _guard = FakeCliEnv::set(FAKE_CLI_ENV_LOCK.lock().unwrap());
+        let log_path = temp_dir("claude-review-tools-log").join("log.jsonl");
+        std::env::set_var("NOVA_FAKE_CLI_LOG", log_path.to_string_lossy().into_owned());
+        std::env::set_var(
+            "NOVA_FAKE_CLI_RESPONSE_TEXT",
+            r#"{"schema_version":1,"task_id":"task-1","result_generation":1,"round":1,"verdict":"approve","summary":"ok"}"#,
+        );
+        std::env::set_var("NOVA_FAKE_CLI_EXIT_CODE", "0");
+
+        let workspace_dir = temp_dir("claude-review-tools-workspace");
+        let package_path = workspace_dir.join("REVIEW_REQUEST_1.md");
+        fs::write(&package_path, "review package content").unwrap();
+
+        let adapter = ClaudeCliAdapter::new(fake_cli_config());
+        let request = ReviewRequest {
+            ai_kind: ToolKind::ClaudeCli,
+            isolated_workspace_dir: workspace_dir.clone(),
+            package_path,
+            timeout: Duration::from_secs(10),
+            task_id: "task-1".to_string(),
+            result_generation: 1,
+            round: 1,
+        };
+        let result = adapter.run_review(&request, CancellationToken::new());
+        assert!(matches!(result.outcome, ExecutionOutcome::Success));
+
+        let log_line = fs::read_to_string(&log_path).unwrap();
+        assert!(log_line.contains("\"args\":[\"-p\",\"--tools\",\"Read\""));
+        assert!(log_line.contains("\"--disallowedTools\""));
+        assert!(log_line.contains("\"Bash\""));
+        assert!(log_line.contains("\"Edit\""));
+        assert!(log_line.contains("\"Write\""));
+        assert!(
+            !log_line.contains("permission-mode"),
+            "must never fall back to the old permission-mode plan invocation: {log_line}"
+        );
+        assert!(
+            !log_line.contains("plan"),
+            "the literal string \"plan\" (the old, insufficient mode) must not appear at all: {log_line}"
+        );
+        let _ = fs::remove_dir_all(&workspace_dir);
+    }
+
+    #[test]
+    fn readiness_probe_confirms_claude_review_capability_when_help_mentions_tools_flag() {
+        let _guard = FakeCliEnv::set(FAKE_CLI_ENV_LOCK.lock().unwrap());
+        std::env::set_var("NOVA_FAKE_CLI_VERSION_TEXT", "2.1.197 (Claude Code)");
+        std::env::set_var(
+            "NOVA_FAKE_CLI_HELP_TEXT",
+            "Usage: claude [options]\n-p, --print  run non-interactively\n--tools <tools...>  Specify the list of available tools\n--disallowedTools <tools...>  deny tools\n",
+        );
+        let app_data_dir = temp_dir("readiness-claude-tools-confirmed");
+        let adapter = ClaudeCliAdapter::new(fake_cli_config());
+        let readiness = adapter.probe(&app_data_dir, &CancellationToken::new());
+        assert!(readiness.dev_capability_confirmed);
+        assert!(readiness.review_capability_confirmed);
+        assert!(readiness.review_ready());
+        let _ = fs::remove_dir_all(&app_data_dir);
     }
 
     #[test]

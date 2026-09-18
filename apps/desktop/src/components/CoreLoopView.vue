@@ -1,17 +1,16 @@
 <script setup lang="ts">
-// Phase 3 remediation (Major 1): the minimal Open-Local-Project Dual-AI
-// Core Loop UI. Every action here calls a real Tauri command through
-// `useCoreLoopStore` — nothing here is a static demo. Deliberately does
-// NOT implement: the full Phase 4 timeline, the evidence center, GitHub
-// import, Create Product, auto-deployment, or push/PR — those are out of
-// this round's scope.
-import { onUnmounted, ref } from 'vue'
+// Phase 3 remediation (Major 1), extended by the second re-review
+// remediation: the minimal Open-Local-Project Dual-AI Core Loop UI. Every
+// action here calls a real Tauri command through `useCoreLoopStore` —
+// nothing here is a static demo. Deliberately does NOT implement: the full
+// Phase 4 timeline, the evidence center, GitHub import, Create Product,
+// auto-deployment, or push/PR — those are out of this round's scope.
+import { onMounted, onUnmounted, ref } from 'vue'
 import { useCoreLoopStore } from '../stores/coreLoop'
 import type { Project } from '../types'
 
 const store = useCoreLoopStore()
 
-const newProjectPath = ref('')
 const newProjectName = ref('')
 const taskTitle = ref('')
 const taskGoal = ref('')
@@ -20,6 +19,13 @@ const taskNotInScope = ref('')
 const taskDoneCriteria = ref('')
 const testCommandDraft = ref('')
 const acceptNote = ref('')
+const noTestsReason = ref('')
+// No default selection: the user must actively pick one of the two
+// choices below — neither radio starts checked.
+const noTestsChoice = ref<'' | 'confirm' | 'provide-command'>('')
+
+const codexPathDraft = ref('codex')
+const claudePathDraft = ref('claude')
 
 let pollHandle: ReturnType<typeof setInterval> | null = null
 
@@ -31,25 +37,32 @@ function startPolling() {
     }
   }, 3000)
 }
+// Timer cleanup: stopped both on unmount and whenever the task leaves a
+// running state (the interval body itself is a no-op then, but this also
+// releases the underlying OS timer instead of leaving it ticking forever).
 function stopPolling() {
   if (pollHandle) {
     clearInterval(pollHandle)
     pollHandle = null
   }
 }
-startPolling()
+
+onMounted(async () => {
+  // UI restart/restore: re-load the last active project and its unfinished
+  // task (if any) so an app restart does not lose the user's place.
+  await store.restoreLastSession()
+  startPolling()
+})
 onUnmounted(stopPolling)
 
-async function handleOpenProject() {
-  if (!newProjectPath.value.trim()) return
-  await store.openProject(newProjectPath.value.trim(), newProjectName.value.trim() || newProjectPath.value.trim())
-  newProjectPath.value = ''
+async function handlePickFolder() {
+  await store.pickAndOpenProjectFolder(newProjectName.value)
   newProjectName.value = ''
 }
 
-function handleSelectProject(project: Project) {
-  store.selectProject(project)
-  store.loadTasks()
+async function handleSelectProject(project: Project) {
+  await store.selectProject(project)
+  await store.loadTasks()
 }
 
 async function handleCreateTask() {
@@ -75,11 +88,45 @@ async function handleConfirmTestCommand(source: 'auto' | 'user') {
   await store.confirmTestCommand(command, source)
 }
 
+async function handleConfirmNoTests() {
+  await store.confirmNoTestsApplicable(noTestsReason.value.trim())
+  noTestsReason.value = ''
+  noTestsChoice.value = ''
+}
+
 async function handleStart() {
   await store.checkReadiness()
   if (!store.readiness?.dev_ready || !store.readiness?.review_ready) return
   await store.startTask()
   startPolling()
+}
+
+async function handleLoadCliTrust() {
+  await store.loadCliBinaryTrust('codex_cli')
+  await store.loadCliBinaryTrust('claude_cli')
+}
+
+async function handleConfirmCodexPath() {
+  const resolved = await store.resolveCliBinaryPath(codexPathDraft.value.trim())
+  await store.confirmCliBinaryPath('codex_cli', resolved)
+}
+async function handleConfirmClaudePath() {
+  const resolved = await store.resolveCliBinaryPath(claudePathDraft.value.trim())
+  await store.confirmCliBinaryPath('claude_cli', resolved)
+}
+async function handlePickCodexFile() {
+  const picked = await store.pickCliBinaryFile()
+  if (picked) {
+    codexPathDraft.value = picked
+    await store.confirmCliBinaryPath('codex_cli', picked)
+  }
+}
+async function handlePickClaudeFile() {
+  const picked = await store.pickCliBinaryFile()
+  if (picked) {
+    claudePathDraft.value = picked
+    await store.confirmCliBinaryPath('claude_cli', picked)
+  }
 }
 
 const stateLabels: Record<string, string> = {
@@ -103,15 +150,18 @@ const stateLabels: Record<string, string> = {
 <template>
   <div class="core-loop-view">
     <h2>项目与任务（Phase 3 最小闭环）</h2>
+    <p v-if="store.restoring" class="hint">正在恢复上次会话…</p>
     <p v-if="store.lastError" class="error-banner">{{ store.lastError }}</p>
 
     <section class="block">
       <h3>1. 选择或打开本地项目</h3>
       <div class="row">
-        <input v-model="newProjectPath" placeholder="项目本地路径，例如 D:\my-project" />
         <input v-model="newProjectName" placeholder="项目名称（可选）" />
-        <button @click="handleOpenProject">打开/注册项目</button>
+        <button @click="handlePickFolder">选择文件夹…</button>
       </div>
+      <p v-if="store.currentProject" class="hint">
+        当前项目路径（只读）：<input class="readonly-path" :value="store.currentProject.local_path" readonly />
+      </p>
       <button class="link-button" @click="store.loadProjects">刷新项目列表</button>
       <ul class="project-list">
         <li v-for="project in store.projects" :key="project.id">
@@ -120,6 +170,39 @@ const stateLabels: Record<string, string> = {
           </button>
         </li>
       </ul>
+    </section>
+
+    <section class="block">
+      <h3>CLI 配置与信任确认</h3>
+      <button class="link-button" @click="handleLoadCliTrust">查看当前 Codex / Claude CLI 信任状态</button>
+      <div class="cli-trust-grid">
+        <div class="cli-trust-item">
+          <p><strong>Codex CLI</strong></p>
+          <div class="row">
+            <input v-model="codexPathDraft" placeholder="codex 或完整路径" />
+            <button @click="handleConfirmCodexPath">解析并确认</button>
+            <button @click="handlePickCodexFile">选择文件…</button>
+          </div>
+          <p v-if="store.codexTrust">
+            <span :class="store.codexTrust.trusted ? 'ok' : 'bad'">{{ store.codexTrust.trusted ? '已信任' : '未信任' }}</span>
+            — 解析路径：<code>{{ store.codexTrust.canonical_path }}</code>
+            <span v-if="store.codexTrust.mismatch_reason"> — {{ store.codexTrust.mismatch_reason }}</span>
+          </p>
+        </div>
+        <div class="cli-trust-item">
+          <p><strong>Claude CLI</strong></p>
+          <div class="row">
+            <input v-model="claudePathDraft" placeholder="claude 或完整路径" />
+            <button @click="handleConfirmClaudePath">解析并确认</button>
+            <button @click="handlePickClaudeFile">选择文件…</button>
+          </div>
+          <p v-if="store.claudeTrust">
+            <span :class="store.claudeTrust.trusted ? 'ok' : 'bad'">{{ store.claudeTrust.trusted ? '已信任' : '未信任' }}</span>
+            — 解析路径：<code>{{ store.claudeTrust.canonical_path }}</code>
+            <span v-if="store.claudeTrust.mismatch_reason"> — {{ store.claudeTrust.mismatch_reason }}</span>
+          </p>
+        </div>
+      </div>
     </section>
 
     <section v-if="store.currentProject" class="block">
@@ -153,6 +236,10 @@ const stateLabels: Record<string, string> = {
     <section v-if="store.currentTask" class="block">
       <h3>3. 确认需求与测试命令</h3>
       <p><strong>当前任务状态：</strong>{{ stateLabels[store.currentTask.state] ?? store.currentTask.state }}</p>
+      <p v-if="store.currentTask.document_sync_pending" class="hint">
+        文档同步中/失败，将自动重试。
+        <button class="link-button" @click="store.resyncDocuments">立即重试文档同步</button>
+      </p>
       <p v-if="store.currentTask.state === 'draft'">
         <button @click="store.confirmRequirement">我已确认需求，继续</button>
       </p>
@@ -171,6 +258,25 @@ const stateLabels: Record<string, string> = {
           <input v-model="testCommandDraft" placeholder="手动输入测试命令，例如 cargo test" />
           <button @click="handleConfirmTestCommand('user')">确认使用此命令</button>
         </div>
+      </div>
+    </section>
+
+    <!-- Second re-review remediation (Blocker 3): the explicit no-tests
+         confirmation card. Neither choice is pre-selected. -->
+    <section v-if="store.noTestsConfirmationNeeded" class="block no-tests-card">
+      <h3>⚠ 未检测到可运行的自动测试</h3>
+      <p>Nova 未检测到可运行的自动测试。是否确认该项目目前没有适用测试？</p>
+      <div class="row">
+        <label><input type="radio" v-model="noTestsChoice" value="confirm" /> 确认没有适用测试</label>
+        <label><input type="radio" v-model="noTestsChoice" value="provide-command" /> 返回填写测试命令</label>
+      </div>
+      <div v-if="noTestsChoice === 'confirm'" class="row">
+        <input v-model="noTestsReason" placeholder="原因（可选）" />
+        <button @click="handleConfirmNoTests">确认没有适用测试</button>
+      </div>
+      <div v-else-if="noTestsChoice === 'provide-command'" class="row">
+        <input v-model="testCommandDraft" placeholder="手动输入测试命令，例如 cargo test" />
+        <button @click="handleConfirmTestCommand('user')">确认使用此命令</button>
       </div>
     </section>
 
@@ -224,7 +330,7 @@ const stateLabels: Record<string, string> = {
       </div>
       <p v-if="store.currentTask.state === 'completed'" class="ok">任务已完成，用户已验收。</p>
       <p v-if="store.currentTask.state === 'failed'" class="bad">二次审核仍未通过，或独立测试未通过，需要用户决定下一步。</p>
-      <p v-if="store.currentTask.state === 'needs_user_action'" class="bad">需要用户处理（详见任务状态历史）。</p>
+      <p v-if="store.currentTask.state === 'needs_user_action' && !store.noTestsConfirmationNeeded" class="bad">需要用户处理（详见任务状态历史）。</p>
       <p v-if="store.currentTask.state === 'cancelled'">任务已被用户取消。</p>
     </section>
   </div>
@@ -245,6 +351,7 @@ const stateLabels: Record<string, string> = {
   gap: 8px;
   margin: 8px 0;
   flex-wrap: wrap;
+  align-items: center;
 }
 .form-grid {
   display: flex;
@@ -274,10 +381,22 @@ const stateLabels: Record<string, string> = {
   color: #d9534f;
   font-weight: bold;
 }
-.readiness .ok {
+.hint {
+  color: #999;
+  font-size: 0.9em;
+}
+.readonly-path {
+  width: 100%;
+  background: #222;
+  color: #ccc;
+  border: 1px solid #444;
+}
+.readiness .ok,
+.ok {
   color: #4caf50;
 }
-.readiness .bad {
+.readiness .bad,
+.bad {
   color: #d9534f;
 }
 .review-item {
@@ -293,5 +412,19 @@ const stateLabels: Record<string, string> = {
 .accept-block textarea {
   width: 100%;
   min-height: 60px;
+}
+.no-tests-card {
+  border: 1px solid #d9534f;
+  border-radius: 6px;
+  padding: 12px;
+}
+.cli-trust-grid {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.cli-trust-item {
+  flex: 1;
+  min-width: 260px;
 }
 </style>

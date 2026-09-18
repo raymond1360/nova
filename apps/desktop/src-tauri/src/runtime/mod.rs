@@ -3,6 +3,7 @@
 //! invocations must all go through.
 
 pub mod ai_adapter;
+pub mod binary_trust;
 pub mod detect;
 pub mod detection_slot;
 #[cfg(windows)]

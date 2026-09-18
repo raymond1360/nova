@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// Current schema version this build of Nova understands. Bump this and
 /// append a new [`Migration`] to [`MIGRATIONS`] whenever the schema changes
 /// — never edit an already-shipped migration's SQL in place.
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug)]
 pub enum MigrationError {
@@ -623,6 +623,98 @@ const V6_SQL: &str = "
     CREATE INDEX idx_test_evidence_task_gen_round ON test_evidence(task_id, result_generation, round);
 ";
 
+/// Second re-review (Major 3, continued): copies every `task_reviews` row
+/// v5's own `INNER JOIN` is about to exclude (and therefore lose forever
+/// once v5's `DROP TABLE` runs) into a permanent quarantine table first,
+/// with the specific reason it failed v5's consistency check. Must run
+/// inside the *same transaction* as v5's migration (see `run()`) so a
+/// failure anywhere in v5 rolls this back too — never a half-quarantined
+/// state. Idempotent (`CREATE TABLE IF NOT EXISTS`) so a retried migration
+/// attempt after an unrelated earlier failure does not error on the second
+/// try.
+fn quarantine_rows_v5_will_drop(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS task_reviews_migration_quarantine_v5 (
+            id TEXT PRIMARY KEY,
+            original_project_id TEXT,
+            original_task_id TEXT,
+            result_generation INTEGER,
+            round INTEGER,
+            reviewer_ai_kind TEXT,
+            verdict TEXT,
+            findings_summary TEXT,
+            original_created_at TEXT,
+            quarantine_reason TEXT NOT NULL,
+            quarantined_at TEXT NOT NULL
+        );",
+    )?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO task_reviews_migration_quarantine_v5
+            (id, original_project_id, original_task_id, result_generation, round, reviewer_ai_kind, verdict, findings_summary, original_created_at, quarantine_reason, quarantined_at)
+         SELECT tr.id, tr.project_id, tr.task_id, tr.result_generation, tr.round, tr.reviewer_ai_kind, tr.verdict, tr.findings_summary, tr.created_at,
+                CASE
+                    WHEN t.id IS NULL THEN 'no task found owning (task_id, project_id)'
+                    WHEN tr.round NOT IN (1, 2) THEN 'round not in (1, 2)'
+                    ELSE 'failed v5 consistency check for an unrecorded reason'
+                END,
+                ?1
+         FROM task_reviews tr
+         LEFT JOIN tasks t ON t.id = tr.task_id AND t.project_id = tr.project_id
+         WHERE t.id IS NULL OR tr.round NOT IN (1, 2)",
+        rusqlite::params![now],
+    )?;
+    Ok(())
+}
+
+/// Second re-review remediation:
+/// - Blocker 3: `no_tests_confirmations` — a task with no detectable test
+///   command may no longer reach `no_tests_applicable` on Nova's own say-so;
+///   a real, persisted, `Actor::User`-only confirmation row must exist for
+///   the *exact* current `(task_id, result_generation, round)` first.
+/// - Blocker 2 / executable trust: `trusted_cli_binaries` — a `binary_path`
+///   (default-discovered or user-configured) is only ever actually launched
+///   after its live file's fingerprint matches a row here that the user
+///   explicitly confirmed; `UNIQUE(kind)` means re-confirming a path for a
+///   kind replaces (via delete-then-insert in the storage layer, not SQL
+///   here) whatever was trusted before, rather than accumulating history.
+/// - Major 5: `tasks.document_sync_pending` — set when the seven documents
+///   fail to regenerate after an acceptance/rejection/completion write that
+///   itself already succeeded, so the *database* state is never rolled back
+///   just because a docs-directory write failed, and a later retry knows
+///   there is unfinished work.
+const V7_SQL: &str = "
+    CREATE TABLE no_tests_confirmations (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        result_generation INTEGER NOT NULL,
+        round INTEGER NOT NULL,
+        confirmed_by TEXT NOT NULL CHECK(confirmed_by = 'user'),
+        reason TEXT,
+        confirmed_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(task_id, result_generation, round),
+        FOREIGN KEY (task_id, project_id) REFERENCES tasks(id, project_id) ON DELETE CASCADE
+    );
+    CREATE INDEX idx_no_tests_confirmations_task ON no_tests_confirmations(task_id);
+
+    CREATE TABLE trusted_cli_binaries (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK(kind IN ('codex_cli', 'claude_cli')),
+        canonical_path TEXT NOT NULL,
+        file_size INTEGER NOT NULL,
+        modified_unix_ms INTEGER NOT NULL,
+        sha256_hex TEXT NOT NULL,
+        confirmed_by TEXT NOT NULL CHECK(confirmed_by = 'user'),
+        confirmed_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(kind)
+    );
+
+    ALTER TABLE tasks ADD COLUMN document_sync_pending INTEGER NOT NULL DEFAULT 0;
+";
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -653,6 +745,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 6,
         requires_backup: true,
         sql: V6_SQL,
+    },
+    Migration {
+        version: 7,
+        requires_backup: true,
+        sql: V7_SQL,
     },
 ];
 
@@ -688,9 +785,21 @@ pub fn run(conn: &Connection, db_path: Option<&Path>) -> Result<(), MigrationErr
         }
 
         conn.execute_batch("BEGIN IMMEDIATE;")?;
-        let apply_result = conn.execute_batch(migration.sql).and_then(|_| {
+        let apply_result = (|| -> Result<(), rusqlite::Error> {
+            if migration.version == 5 {
+                // Second re-review (Major 3, continued): v5's own SQL below
+                // is already shipped and must never be edited in place — see
+                // its doc comment. This runs *inside the same transaction*,
+                // immediately before v5's `DROP TABLE`, so every row v5 is
+                // about to discard is preserved first; if anything after
+                // this fails, the whole transaction (including this
+                // quarantine copy) rolls back together, exactly like any
+                // other migration failure.
+                quarantine_rows_v5_will_drop(conn)?;
+            }
+            conn.execute_batch(migration.sql)?;
             conn.execute_batch(&format!("PRAGMA user_version = {};", migration.version))
-        });
+        })();
 
         match apply_result {
             Ok(()) => {
@@ -981,13 +1090,13 @@ mod tests {
 
         run(&conn, Some(&path)).unwrap();
 
-        // `run()` always migrates all the way to `CURRENT_SCHEMA_VERSION`
-        // (now 6), not just to 4 — a v3 database run through today's `run()`
-        // legitimately lands on 6, cascading through the v5/v6 steps too.
+        // `run()` always migrates all the way to `CURRENT_SCHEMA_VERSION`,
+        // not just to 4 — a v3 database run through today's `run()`
+        // legitimately lands there, cascading through every later step too.
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
         // The new table must exist and enforce its CHECK/UNIQUE constraints.
         conn.query_row("SELECT COUNT(*) FROM task_reviews", [], |row| {
@@ -1100,7 +1209,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM task_reviews", [], |row| row.get(0))
@@ -1169,6 +1278,102 @@ mod tests {
             "a review row with a project_id inconsistent with its task must not survive the v5 upgrade"
         );
 
+        // Second re-review (Major 3, continued): v5 itself is unchanged
+        // (still drops the row from the live table above), but the row must
+        // not have vanished from the database entirely — it must be
+        // preserved in the quarantine table with a clear reason.
+        let (quarantined_id, reason): (String, String) = conn
+            .query_row(
+                "SELECT id, quarantine_reason FROM task_reviews_migration_quarantine_v5",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(quarantined_id, "rev-bad");
+        assert!(
+            reason.contains("no task found"),
+            "reason should explain the ownership mismatch: {reason}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v4_to_v5_upgrade_quarantines_a_review_row_with_an_out_of_range_round_instead_of_losing_it() {
+        let dir = temp_dir("v4-to-v5-quarantine-round");
+        let (conn, path) = open_file_db(&dir);
+        conn.execute_batch(BASELINE_SQL).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(PHASE2_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        conn.execute_batch(V3_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+        conn.execute_batch(V4_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
+
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, created_at, updated_at)
+             VALUES ('proj-1', 'P', 'C:/p', 'c:/p', 'local', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+             VALUES ('task-1', 'proj-1', 'T', 'draft', 0, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        // A genuinely consistent (task_id, project_id) pairing, but with a
+        // round value v5's own CHECK(round IN (1,2)) cannot accept — the
+        // *other* way a pre-v5 row could fail the upgrade's consistency
+        // check, distinct from the cross-project case above.
+        conn.execute(
+            "INSERT INTO task_reviews (id, project_id, task_id, result_generation, round, reviewer_ai_kind, verdict, findings_summary, created_at)
+             VALUES ('rev-round-3', 'proj-1', 'task-1', 1, 3, 'claude_cli', 'approve', 'ok', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+
+        run(&conn, Some(&path)).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_reviews", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let (quarantined_id, reason): (String, String) = conn
+            .query_row(
+                "SELECT id, quarantine_reason FROM task_reviews_migration_quarantine_v5",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(quarantined_id, "rev-round-3");
+        assert!(
+            reason.contains("round not in"),
+            "reason should explain the round check failure: {reason}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_database_produces_an_empty_but_present_quarantine_table() {
+        // The quarantine pre-step must be harmless (not merely "not
+        // destructive") for the overwhelmingly common case: a brand-new
+        // install with no pre-v5 data at all.
+        let dir = temp_dir("fresh-db-empty-quarantine");
+        let (conn, path) = open_file_db(&dir);
+        run(&conn, Some(&path)).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_reviews_migration_quarantine_v5",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1292,7 +1497,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
         let (status, generation, round): (String, i64, i64) = conn
             .query_row(
@@ -1385,8 +1590,8 @@ mod tests {
             .collect();
         assert_eq!(
             entries.len(),
-            5,
-            "expected exactly five backups (migrations 2, 3, 4, 5, and 6 each require one): {entries:?}"
+            6,
+            "expected exactly six backups (migrations 2, 3, 4, 5, 6, and 7 each require one): {entries:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1411,13 +1616,13 @@ mod tests {
             .collect();
         assert_eq!(
             names.len(),
-            5,
-            "migrations 2, 3, 4, 5, and 6 each produce their own backup"
+            6,
+            "migrations 2, 3, 4, 5, 6, and 7 each produce their own backup"
         );
         let unique: std::collections::HashSet<&String> = names.iter().collect();
         assert_eq!(
             unique.len(),
-            5,
+            6,
             "all backups from the same run must have distinct names, never collide"
         );
         for name in &names {
@@ -1546,8 +1751,8 @@ mod tests {
         let backups_dir = dir.join("backups");
         let count = fs::read_dir(&backups_dir).unwrap().count();
         assert_eq!(
-            count, 5,
-            "already-applied migrations must not be re-run, so no extra backups beyond the five produced by the first run"
+            count, 6,
+            "already-applied migrations must not be re-run, so no extra backups beyond the six produced by the first run"
         );
         let _ = fs::remove_dir_all(&dir);
     }

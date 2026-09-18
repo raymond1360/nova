@@ -1,13 +1,24 @@
 import { defineStore } from 'pinia'
 import { invoke } from '@tauri-apps/api/core'
-import type { CoreLoopReadiness, Project, Task, TaskReview, TaskState } from '../types'
+import { open } from '@tauri-apps/plugin-dialog'
+import type {
+  CliBinaryTrustStatus,
+  CoreLoopReadiness,
+  NoTestsConfirmation,
+  Project,
+  Task,
+  TaskReview,
+  TaskState,
+} from '../types'
 
-// Phase 3 remediation (Major 1): the minimal, real-backend-connected core
-// loop UI's store. Deliberately does not attempt the full Phase 4 timeline/
-// evidence center — only what a non-technical user needs to select a
-// project, confirm a requirement, pick a role combination, see CLI
-// readiness, confirm a test command, start/cancel a run, and accept/reject
-// the result.
+// Phase 3 remediation (Major 1), extended by the second re-review
+// remediation: the minimal, real-backend-connected core loop UI's store.
+// Deliberately does not attempt the full Phase 4 timeline/evidence center —
+// only what a non-technical user needs to select a project via a real
+// system folder picker, confirm a requirement, pick a role combination, see
+// CLI readiness and trust status, confirm a test command or explicitly
+// acknowledge there is none, start/cancel a run, and accept/reject the
+// result through one atomic backend call.
 export const useCoreLoopStore = defineStore('coreLoop', {
   state: () => ({
     projects: [] as Project[],
@@ -23,6 +34,12 @@ export const useCoreLoopStore = defineStore('coreLoop', {
     // uses for chat.
     starting: false,
     lastError: '' as string,
+    // Second re-review remediation: CLI binary configuration + trust.
+    codexBinaryPath: '' as string,
+    claudeBinaryPath: '' as string,
+    codexTrust: null as CliBinaryTrustStatus | null,
+    claudeTrust: null as CliBinaryTrustStatus | null,
+    restoring: false,
   }),
   getters: {
     reviewerAiKind(state): 'codex_cli' | 'claude_cli' {
@@ -39,10 +56,44 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       const runningStates: TaskState[] = ['queued', 'running', 'verifying', 'safe_fixing']
       return !!state.currentTask && runningStates.includes(state.currentTask.state)
     },
+    // The round a stalled `needs_user_action` task is stuck waiting on —
+    // round 1 unless a round-1 review has already been recorded, in which
+    // case it is the round-2 automatic fix pass. Mirrors
+    // `core_loop::current_pending_round`'s own logic so the confirmation the
+    // UI writes always targets the round the backend is actually stuck on.
+    pendingRound(state): number {
+      const roundOneReviewed = state.reviews.some(
+        (r) => r.result_generation === state.currentTask?.result_generation && r.round === 1,
+      )
+      return roundOneReviewed ? 2 : 1
+    },
+    // True only when the task is genuinely stuck for the "no tests
+    // detected" reason (as opposed to any other `needs_user_action` cause,
+    // e.g. an action-ledger crash-recovery uncertainty) — approximated from
+    // the frontend's own view of state, since the exact stall reason lives
+    // in `task_state_events`, not on the `Task` row itself: no command has
+    // ever been confirmed for the task, and the most recent detection also
+    // came back empty.
+    noTestsConfirmationNeeded(state): boolean {
+      return (
+        !!state.currentTask &&
+        state.currentTask.state === 'needs_user_action' &&
+        !state.currentTask.test_command_redacted &&
+        state.detectedTestCommand === null
+      )
+    },
   },
   actions: {
     async loadProjects() {
       this.projects = await invoke<Project[]>('list_projects')
+    },
+    // Second re-review remediation (Major 1): a real system folder picker
+    // — the only way an ordinary user selects a project directory now.
+    // The resulting path is only ever displayed, never hand-typed.
+    async pickAndOpenProjectFolder(name: string) {
+      const selected = await open({ directory: true, multiple: false })
+      if (!selected || Array.isArray(selected)) return
+      await this.openProject(selected, name.trim() || selected)
     },
     async openProject(localPath: string, name: string) {
       this.lastError = ''
@@ -60,6 +111,7 @@ export const useCoreLoopStore = defineStore('coreLoop', {
           },
         })
         this.currentProject = project
+        await invoke('set_last_active_project', { projectId: project.id })
         await this.loadProjects()
         await this.loadTasks()
       } catch (error) {
@@ -67,12 +119,13 @@ export const useCoreLoopStore = defineStore('coreLoop', {
         throw error
       }
     },
-    selectProject(project: Project) {
+    async selectProject(project: Project) {
       this.currentProject = project
       this.currentTask = null
       this.reviews = []
       this.readiness = null
       this.detectedTestCommand = null
+      await invoke('set_last_active_project', { projectId: project.id }).catch(() => {})
     },
     async loadTasks() {
       if (!this.currentProject) return
@@ -118,12 +171,33 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       })
     },
     async confirmTestCommand(command: string, source: 'auto' | 'user') {
-      if (!this.currentTask) return
+      if (!this.currentTask || !this.currentProject) return
       this.currentTask = await invoke<Task>('confirm_task_test_command', {
+        projectId: this.currentProject.id,
         taskId: this.currentTask.id,
         command,
         source,
       })
+    },
+    // Second re-review remediation (Blocker 3): the only way `no_tests_
+    // applicable` evidence can ever be recorded — a real, explicit user
+    // action with no default. `reason` is optional free text, never
+    // pre-filled with an assumption.
+    async confirmNoTestsApplicable(reason: string) {
+      if (!this.currentTask || !this.currentProject) return
+      this.lastError = ''
+      try {
+        await invoke<NoTestsConfirmation>('confirm_no_tests_applicable', {
+          projectId: this.currentProject.id,
+          taskId: this.currentTask.id,
+          round: this.pendingRound,
+          reason: reason || null,
+        })
+        await this.refreshCurrentTask()
+      } catch (error) {
+        this.lastError = String(error)
+        throw error
+      }
     },
     // Requirement confirmation: draft -> awaiting_confirmation -> confirmed.
     // The backend is the sole authority on whether each hop is legal; this
@@ -153,6 +227,44 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       this.readiness = await invoke<CoreLoopReadiness>('get_core_loop_readiness', {
         devAiKind: this.devAiKind,
       })
+    },
+    // --- Second re-review remediation: CLI executable trust ---
+    async resolveCliBinaryPath(name: string): Promise<string> {
+      return invoke<string>('resolve_cli_binary_path', { name })
+    },
+    async pickCliBinaryFile(): Promise<string | null> {
+      const selected = await open({ directory: false, multiple: false })
+      if (!selected || Array.isArray(selected)) return null
+      return selected
+    },
+    async loadCliBinaryTrust(kind: 'codex_cli' | 'claude_cli') {
+      const configured = kind === 'codex_cli' ? this.codexBinaryPath || 'codex' : this.claudeBinaryPath || 'claude'
+      const status = await invoke<CliBinaryTrustStatus>('get_cli_binary_trust_status', {
+        kind,
+        configuredPath: configured,
+      })
+      if (kind === 'codex_cli') this.codexTrust = status
+      else this.claudeTrust = status
+    },
+    async confirmCliBinaryPath(kind: 'codex_cli' | 'claude_cli', path: string) {
+      this.lastError = ''
+      try {
+        const status = await invoke<CliBinaryTrustStatus>('confirm_cli_binary_path', { kind, path })
+        if (kind === 'codex_cli') {
+          this.codexBinaryPath = path
+          this.codexTrust = status
+        } else {
+          this.claudeBinaryPath = path
+          this.claudeTrust = status
+        }
+        await invoke('set_setting', {
+          key: kind === 'codex_cli' ? 'codex_binary_path' : 'claude_binary_path',
+          value: path,
+        })
+      } catch (error) {
+        this.lastError = String(error)
+        throw error
+      }
     },
     async startTask() {
       if (!this.currentTask || this.starting) return
@@ -184,6 +296,9 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       const refreshed = this.tasks.find((t) => t.id === this.currentTask!.id)
       if (refreshed) this.currentTask = refreshed
       await this.loadReviews()
+      if (this.currentTask?.state === 'needs_user_action') {
+        await this.detectTestCommand().catch(() => {})
+      }
     },
     async loadReviews() {
       if (!this.currentTask || !this.currentProject) return
@@ -192,28 +307,58 @@ export const useCoreLoopStore = defineStore('coreLoop', {
         taskId: this.currentTask.id,
       })
     },
+    // Second re-review remediation (Major 5): one atomic backend call —
+    // replaces the old two-step `record_user_acceptance` +
+    // `transition_task` pattern, which never regenerated the seven
+    // documents and could leave a rejected task stuck at
+    // `awaiting_user_acceptance` with a contradictory rejection record.
     async acceptResult(accepted: boolean, note: string) {
       if (!this.currentTask || !this.currentProject) return
       this.lastError = ''
       try {
-        await invoke('record_user_acceptance', {
+        this.currentTask = await invoke<Task>('accept_task_result', {
           projectId: this.currentProject.id,
           taskId: this.currentTask.id,
           accepted,
-          userNote: note || null,
+          note: note || null,
         })
-        if (accepted) {
-          this.currentTask = await invoke<Task>('transition_task', {
-            taskId: this.currentTask.id,
-            toState: 'completed',
-            reason: '用户已验收',
-            correlationId: null,
-          })
-        }
         await this.refreshCurrentTask()
       } catch (error) {
         this.lastError = String(error)
         throw error
+      }
+    },
+    async resyncDocuments() {
+      if (!this.currentTask || !this.currentProject) return
+      this.currentTask = await invoke<Task>('resync_task_documents', {
+        projectId: this.currentProject.id,
+        taskId: this.currentTask.id,
+      })
+    },
+    // Second re-review remediation (UI restart/restore): re-loads the last
+    // active project and its current unfinished task (if any) so an app
+    // restart does not lose the user's place — polling for an in-flight
+    // task resumes automatically via `isRunning` once `currentTask` is set.
+    async restoreLastSession() {
+      this.restoring = true
+      try {
+        const project = await invoke<Project | null>('get_last_active_project')
+        if (!project) return
+        this.currentProject = project
+        await this.loadTasks()
+        const unfinished = this.tasks.find((t) =>
+          (['draft', 'awaiting_confirmation', 'confirmed', 'queued', 'running', 'verifying', 'safe_fixing', 'preview_ready', 'awaiting_user_acceptance', 'needs_user_action'] as TaskState[]).includes(
+            t.state,
+          ),
+        )
+        if (unfinished) {
+          this.currentTask = unfinished
+          await this.loadReviews()
+        }
+      } catch (error) {
+        this.lastError = String(error)
+      } finally {
+        this.restoring = false
       }
     },
   },

@@ -338,6 +338,15 @@ pub struct Task {
     /// `"auto"` or `"user"` — mirrors [`crate::core_loop::test_runner::DetectedCommand`]'s
     /// two legal sources; never anything derived from AI output.
     pub test_command_source: Option<String>,
+    /// Second re-review remediation (Major 5): set when an acceptance,
+    /// rejection, or completion write succeeded but the seven-document
+    /// regeneration that should accompany it failed (a docs-directory I/O
+    /// error, say) — the database state is never rolled back just because
+    /// that follow-up write failed, but this flag records that the
+    /// documents on disk are stale until a retry (`commands::
+    /// accept_task_result` itself retries once on its own next call; a
+    /// dedicated resync path can also drive this) succeeds.
+    pub document_sync_pending: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -598,5 +607,46 @@ pub struct TaskReview {
     pub reviewer_ai_kind: String,
     pub verdict: String,
     pub findings_summary: Option<String>,
+    pub created_at: String,
+}
+
+/// Second re-review remediation (Blocker 3): a real, persisted, `Actor::
+/// User`-only record that the user explicitly acknowledged "this project
+/// currently has no applicable automated tests" for one exact
+/// `(task_id, result_generation, round)` — never inferred, never reused
+/// across a different generation/round. `confirmed_by` is always the
+/// literal string `"user"` (schema `CHECK` constraint); there is no code
+/// path anywhere that lets the frontend or an AI-driven process write this
+/// as `"system"`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NoTestsConfirmation {
+    pub id: String,
+    pub project_id: String,
+    pub task_id: String,
+    pub result_generation: i64,
+    pub round: i64,
+    pub confirmed_by: String,
+    pub reason: Option<String>,
+    pub confirmed_at: String,
+    pub created_at: String,
+}
+
+/// Second re-review remediation (Blocker 2 / executable trust boundary):
+/// the fingerprint of a CLI binary the user has explicitly confirmed is
+/// safe to launch — see `runtime::binary_trust`. `UNIQUE(kind)` in the
+/// schema means confirming a new path for the same `kind` replaces
+/// whatever was trusted before (handled as delete-then-insert by the
+/// storage layer, not by SQL `ON CONFLICT`, so the replacement is an
+/// explicit, auditable act rather than an implicit upsert).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrustedCliBinary {
+    pub id: String,
+    pub kind: String,
+    pub canonical_path: String,
+    pub file_size: i64,
+    pub modified_unix_ms: i64,
+    pub sha256_hex: String,
+    pub confirmed_by: String,
+    pub confirmed_at: String,
     pub created_at: String,
 }

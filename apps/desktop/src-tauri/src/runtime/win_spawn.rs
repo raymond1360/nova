@@ -175,20 +175,85 @@ pub fn resolve_executable(program: &str) -> io::Result<PathBuf> {
         .filter(|ext| !ext.is_empty())
         .map(|ext| ext.to_string())
         .collect();
+    // Real bug found via re-review testing: many Windows dev-tool installs
+    // (Node.js's own included) ship a bare, extension-less POSIX shell
+    // script alongside the real `.cmd`/`.exe` (`nodejs\npm` next to
+    // `nodejs\npm.cmd` — the former only works under WSL/git-bash, and is
+    // not a valid Win32 executable at all). `cmd.exe`/`CreateProcessW`'s
+    // own real search order tries each `PATHEXT` extension before ever
+    // considering a bare literal name, so this must too — trying the bare
+    // name first (the original order here) could resolve `npm` to that
+    // shell-script stand-in and fail every launch with `ERROR_BAD_EXE_
+    // FORMAT`, even though the correct `npm.cmd` sits right next to it.
     let path_var = std::env::var_os("PATH").unwrap_or_default();
     for dir in std::env::split_paths(&path_var) {
-        let verbatim = dir.join(program);
-        if verbatim.is_file() {
-            return Ok(verbatim);
-        }
         for ext in &extensions {
             let with_ext = dir.join(format!("{program}{ext}"));
             if with_ext.is_file() {
                 return Ok(with_ext);
             }
         }
+        let verbatim = dir.join(program);
+        if verbatim.is_file() {
+            return Ok(verbatim);
+        }
     }
     Err(io::Error::from(io::ErrorKind::NotFound))
+}
+
+/// `.cmd`/`.bat` are not PE images — `CreateProcessW` cannot launch them
+/// directly via `lpApplicationName` (it fails with `ERROR_BAD_EXE_FORMAT`);
+/// only `cmd.exe` can interpret them. Many common dev-tool CLIs resolve to
+/// exactly this on Windows (`npm`/`pnpm`/`yarn` all ship as `<name>.cmd`),
+/// which is why Blocker 3's independent test runner needs this at all: a
+/// project auto-detected as an npm/pnpm/yarn project would otherwise fail
+/// to spawn its test command 100% of the time on Windows, not because the
+/// tests fail, but because the process never starts.
+fn is_batch_script(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+}
+
+/// Resolves the real `cmd.exe` to use as the interpreter for a batch-script
+/// target — `%ComSpec%` if it names a real file (the OS-provided canonical
+/// answer), otherwise the same trusted `PATH`-only search every other
+/// executable in this module goes through.
+fn resolve_cmd_exe() -> io::Result<PathBuf> {
+    if let Ok(comspec) = std::env::var("ComSpec") {
+        let candidate = PathBuf::from(comspec);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    resolve_executable("cmd.exe")
+}
+
+/// Real bug found via re-review testing: `path_guard::validate_directory_
+/// boundary`'s canonicalized paths carry Windows's `\\?\` extended-length
+/// prefix (`fs::canonicalize`'s normal output). `CreateProcessW` itself
+/// accepts that form fine for `lpCurrentDirectory`, but `cmd.exe` does
+/// not — it prints "UNC paths are not supported, defaulting to Windows
+/// directory" and silently resets its *own* working directory to
+/// `%SystemRoot%`, which every child it spawns (`npm.cmd` -> `node.exe`)
+/// then inherits. A project whose test command routes through the
+/// `cmd.exe` batch-script wrapper above would silently run "as if" `cwd`
+/// were never set at all. Stripping the prefix back to the ordinary
+/// `C:\...` form (safe: the *security* boundary check already happened
+/// against the canonical path in `path_guard`, this only changes how the
+/// already-validated directory is spelled for `CreateProcessW`) fixes
+/// this for every spawn, not just the batch-script path — cmd.exe is not
+/// the only thing on this machine liable to special-case a UNC-looking
+/// prefix.
+pub(crate) fn win32_cwd_form(cwd: &Path) -> String {
+    let text = cwd.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        text.into_owned()
+    }
 }
 
 struct OwnedHandle(HANDLE);
@@ -435,10 +500,47 @@ pub fn spawn_suspended(
 ) -> io::Result<SuspendedChild> {
     validate_process_request_strings(program, args, cwd)?;
 
-    let executable = resolve_executable(program)?;
-    if !executable.is_file() {
+    let resolved = resolve_executable(program)?;
+    if !resolved.is_file() {
         return Err(io::Error::from(io::ErrorKind::NotFound));
     }
+
+    // `resolved` is what Nova was actually asked to run (e.g. `npm` ->
+    // `...\npm.cmd`); `executable` is what `CreateProcessW` is actually
+    // told to launch — identical to `resolved` unless `resolved` is a
+    // batch script, in which case `cmd.exe` becomes the real target and
+    // `precomputed_command_line` carries the full, manually-built command
+    // line for it (see below for why this cannot reuse the generic
+    // per-argument `build_command_line` quoting).
+    let (executable, precomputed_command_line) = if is_batch_script(&resolved) {
+        if program.contains('"') || args.iter().any(|arg| arg.contains('"')) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "批处理脚本（.cmd/.bat）的程序名或参数不能包含双引号字符，已拒绝启动",
+            ));
+        }
+        let cmd_exe = resolve_cmd_exe()?;
+        // `cmd.exe /C` (even with `/S`) does not parse its own tail as a
+        // normal argv token: per `cmd /?`, with `/S` it strips exactly the
+        // first character (if a quote) and the *last* quote character
+        // anywhere in the remainder, and executes everything in between
+        // completely literally — it is never unescaped the way a normal
+        // child's argv would be. Quoting `inner_command_line` as one more
+        // token through `build_command_line` (which escapes the quotes
+        // already inside it, for a *normal* argv consumer) would leave
+        // those backslash-escapes sitting in cmd's literal text and
+        // corrupt the script path. So the outer wrapping quotes are added
+        // by hand here, around the untouched inner command line, instead.
+        let inner_command_line = build_command_line(&resolved.to_string_lossy(), args);
+        let mut full = String::new();
+        quote_windows_arg(&cmd_exe.to_string_lossy(), &mut full);
+        full.push_str(" /d /s /c \"");
+        full.push_str(&inner_command_line);
+        full.push('"');
+        (cmd_exe, Some(full))
+    } else {
+        (resolved, None)
+    };
 
     let stdout_pipe = create_inheritable_pipe()?;
     let stderr_pipe = create_inheritable_pipe()?;
@@ -464,8 +566,10 @@ pub fn spawn_suspended(
     };
 
     let app_name = to_wide_null(&executable.to_string_lossy());
-    let mut command_line = to_wide_null(&build_command_line(&executable.to_string_lossy(), args));
-    let cwd_wide = to_wide_null(&cwd.to_string_lossy());
+    let command_line_string = precomputed_command_line
+        .unwrap_or_else(|| build_command_line(&executable.to_string_lossy(), args));
+    let mut command_line = to_wide_null(&command_line_string);
+    let cwd_wide = to_wide_null(&win32_cwd_form(cwd));
 
     // Build the attribute list restricting inherited handles to exactly the
     // three the child needs.
@@ -605,6 +709,27 @@ pub fn spawn_suspended(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn win32_cwd_form_strips_the_extended_length_prefix() {
+        assert_eq!(
+            win32_cwd_form(Path::new(r"\\?\C:\Users\a\b")),
+            r"C:\Users\a\b"
+        );
+    }
+
+    #[test]
+    fn win32_cwd_form_converts_the_unc_extended_prefix_to_a_real_unc_path() {
+        assert_eq!(
+            win32_cwd_form(Path::new(r"\\?\UNC\server\share\dir")),
+            r"\\server\share\dir"
+        );
+    }
+
+    #[test]
+    fn win32_cwd_form_leaves_an_ordinary_path_unchanged() {
+        assert_eq!(win32_cwd_form(Path::new(r"C:\Users\a\b")), r"C:\Users\a\b");
+    }
 
     #[test]
     fn quotes_plain_argument_without_modification() {

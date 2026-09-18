@@ -625,13 +625,19 @@ pub fn detect_test_command(
 /// `"auto"` or `"user"` — never anything derived from AI output.
 #[tauri::command]
 pub fn confirm_task_test_command(
+    project_id: String,
     task_id: String,
     command: String,
     source: String,
     state: State<'_, AppState>,
 ) -> Result<Task, String> {
     with_db(&state, |db| {
-        db.set_task_test_command(&task_id, &command, &source)
+        db.set_task_test_command(&task_id, &command, &source)?;
+        // Second re-review remediation: if the task stalled at
+        // `needs_user_action` because the previous round's test command was
+        // missing or failed the allowlist check, providing a real command
+        // now must actually unblock a retry, not leave the loop stuck.
+        crate::core_loop::unblock_test_execution_for_retry(db, &project_id, &task_id)
     })
 }
 
@@ -689,6 +695,31 @@ fn display_name(kind: crate::runtime::types::ToolKind) -> &'static str {
     }
 }
 
+/// Second re-review (Blocker 2 / executable trust boundary): readiness must
+/// never be reported `true` purely from a working `--version`/`--help`
+/// probe — the *exact* binary that would actually be launched must also
+/// match a fingerprint the user explicitly confirmed. A binary that is
+/// technically capable but was swapped out, or never confirmed at all,
+/// must fail closed here rather than being treated as usable.
+fn binary_trust_message(
+    db: &crate::db::Database,
+    kind: crate::runtime::types::ToolKind,
+    configured_path: &str,
+) -> Option<String> {
+    let kind_str = crate::runtime::ai_adapter::ai_kind_to_str(kind);
+    match current_fingerprint_status(db, kind_str, configured_path) {
+        Ok(status) if status.trusted => None,
+        Ok(status) => Some(format!(
+            "{}：{}",
+            display_name(kind),
+            status
+                .mismatch_reason
+                .unwrap_or_else(|| "可执行文件尚未通过信任确认".to_string())
+        )),
+        Err(error) => Some(format!("{}：{error}", display_name(kind))),
+    }
+}
+
 #[tauri::command]
 pub fn get_core_loop_readiness(
     dev_ai_kind: String,
@@ -701,13 +732,40 @@ pub fn get_core_loop_readiness(
     let cancel = CancellationToken::new();
     let dev_readiness = dual.probe_dev(dev_kind, &state.app_data_dir, &cancel);
     let review_readiness = dual.probe_dev(reviewer_kind, &state.app_data_dir, &cancel);
+
+    let (codex_binary, claude_binary) = cli_binary_paths(&state);
+    let binary_for = |kind: crate::runtime::types::ToolKind| -> &str {
+        match kind {
+            crate::runtime::types::ToolKind::CodexCli => &codex_binary,
+            crate::runtime::types::ToolKind::ClaudeCli => &claude_binary,
+            crate::runtime::types::ToolKind::Git => unreachable!(),
+        }
+    };
+    let dev_trust_message = with_db(&state, |db| {
+        Ok(binary_trust_message(db, dev_kind, binary_for(dev_kind)))
+    })?;
+    let review_trust_message = with_db(&state, |db| {
+        Ok(binary_trust_message(
+            db,
+            reviewer_kind,
+            binary_for(reviewer_kind),
+        ))
+    })?;
+
+    let dev_ready = dev_readiness.dev_ready() && dev_trust_message.is_none();
+    let review_ready = review_readiness.review_ready() && review_trust_message.is_none();
+    let dev_message =
+        dev_trust_message.unwrap_or_else(|| dev_readiness.user_message(display_name(dev_kind)));
+    let review_message = review_trust_message
+        .unwrap_or_else(|| review_readiness.user_message(display_name(reviewer_kind)));
+
     Ok(CoreLoopReadiness {
         dev_kind: crate::runtime::ai_adapter::ai_kind_to_str(dev_kind).to_string(),
         reviewer_kind: crate::runtime::ai_adapter::ai_kind_to_str(reviewer_kind).to_string(),
-        dev_ready: dev_readiness.dev_ready(),
-        review_ready: review_readiness.review_ready(),
-        dev_message: dev_readiness.user_message(display_name(dev_kind)),
-        review_message: review_readiness.user_message(display_name(reviewer_kind)),
+        dev_ready,
+        review_ready,
+        dev_message,
+        review_message,
     })
 }
 
@@ -767,13 +825,39 @@ pub fn start_core_loop(
     let readiness_cancel = CancellationToken::new();
     let dev_readiness = dual.probe_dev(dev_kind, &state.app_data_dir, &readiness_cancel);
     let review_readiness = dual.probe_dev(reviewer_kind, &state.app_data_dir, &readiness_cancel);
-    if !dev_readiness.dev_ready() || !review_readiness.review_ready() {
+    let (codex_binary, claude_binary) = cli_binary_paths(&state);
+    let binary_for = |kind: crate::runtime::types::ToolKind| -> &str {
+        match kind {
+            crate::runtime::types::ToolKind::CodexCli => &codex_binary,
+            crate::runtime::types::ToolKind::ClaudeCli => &claude_binary,
+            crate::runtime::types::ToolKind::Git => unreachable!(),
+        }
+    };
+    let dev_trust_message = with_db(&state, |db| {
+        Ok(binary_trust_message(db, dev_kind, binary_for(dev_kind)))
+    })?;
+    let review_trust_message = with_db(&state, |db| {
+        Ok(binary_trust_message(
+            db,
+            reviewer_kind,
+            binary_for(reviewer_kind),
+        ))
+    })?;
+    if !dev_readiness.dev_ready()
+        || !review_readiness.review_ready()
+        || dev_trust_message.is_some()
+        || review_trust_message.is_some()
+    {
         state.core_loop_cancel.lock().unwrap().remove(&task_id);
         let mut messages = Vec::new();
-        if !dev_readiness.dev_ready() {
+        if let Some(message) = dev_trust_message {
+            messages.push(message);
+        } else if !dev_readiness.dev_ready() {
             messages.push(dev_readiness.user_message(display_name(dev_kind)));
         }
-        if !review_readiness.review_ready() {
+        if let Some(message) = review_trust_message {
+            messages.push(message);
+        } else if !review_readiness.review_ready() {
             messages.push(review_readiness.user_message(display_name(reviewer_kind)));
         }
         return Err(messages.join("；"));
@@ -862,6 +946,200 @@ pub fn list_task_reviews(
     with_db(&state, |db| db.list_task_reviews(&project_id, &task_id))
 }
 
+// --- Second re-review remediation: no-tests-applicable user confirmation,
+// executable trust boundary, and atomic acceptance/rejection ---
+
+/// Resolves `name` (a bare command name, e.g. `"codex"`) against `PATH` the
+/// same way Nova's own process boundary would, returning the concrete
+/// absolute path so the UI can show the user exactly which file it is about
+/// to ask them to trust — never silently launching whatever a bare name
+/// happens to resolve to without the user ever having seen the real path.
+#[tauri::command]
+pub fn resolve_cli_binary_path(name: String) -> Result<String, String> {
+    crate::runtime::win_spawn::resolve_executable(&name)
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| format!("无法解析可执行文件路径：{error}"))
+}
+
+#[derive(serde::Serialize)]
+pub struct CliBinaryTrustStatus {
+    pub trusted: bool,
+    pub canonical_path: Option<String>,
+    pub file_size: Option<i64>,
+    pub sha256_hex: Option<String>,
+    pub confirmed_at: Option<String>,
+    /// Present only when a trust record exists for `kind` but the live
+    /// file at `configured_path` no longer matches it (replaced, resized,
+    /// or edited since confirmation) — the concrete reason readiness must
+    /// fail closed, surfaced verbatim to the user rather than a generic
+    /// "not trusted".
+    pub mismatch_reason: Option<String>,
+}
+
+fn current_fingerprint_status(
+    db: &crate::db::Database,
+    kind: &str,
+    configured_path: &str,
+) -> Result<CliBinaryTrustStatus, String> {
+    let resolved = crate::runtime::win_spawn::resolve_executable(configured_path)
+        .map_err(|error| format!("无法解析可执行文件路径：{error}"))?;
+    let live = crate::runtime::binary_trust::compute_fingerprint(&resolved);
+    let trusted_record = db.find_trusted_cli_binary(kind).map_err(public_error)?;
+
+    match (trusted_record, live) {
+        (Some(record), Ok(live_fp)) => {
+            let recorded_fp = crate::runtime::binary_trust::BinaryFingerprint {
+                canonical_path: record.canonical_path.clone(),
+                file_size: record.file_size as u64,
+                modified_unix_ms: record.modified_unix_ms,
+                sha256_hex: record.sha256_hex.clone(),
+            };
+            let matches = crate::runtime::binary_trust::fingerprints_match(&recorded_fp, &live_fp);
+            Ok(CliBinaryTrustStatus {
+                trusted: matches,
+                canonical_path: Some(live_fp.canonical_path),
+                file_size: Some(live_fp.file_size as i64),
+                sha256_hex: Some(live_fp.sha256_hex),
+                confirmed_at: Some(record.confirmed_at),
+                mismatch_reason: if matches {
+                    None
+                } else {
+                    Some(
+                        "可执行文件自上次确认后已发生变化（路径/大小/哈希不一致），需要重新确认"
+                            .to_string(),
+                    )
+                },
+            })
+        }
+        (None, Ok(live_fp)) => Ok(CliBinaryTrustStatus {
+            trusted: false,
+            canonical_path: Some(live_fp.canonical_path),
+            file_size: Some(live_fp.file_size as i64),
+            sha256_hex: Some(live_fp.sha256_hex),
+            confirmed_at: None,
+            mismatch_reason: Some("尚未确认过该可执行文件，请先确认后再使用".to_string()),
+        }),
+        (_, Err(error)) => Ok(CliBinaryTrustStatus {
+            trusted: false,
+            canonical_path: None,
+            file_size: None,
+            sha256_hex: None,
+            confirmed_at: None,
+            mismatch_reason: Some(format!("无法验证可执行文件：{error}")),
+        }),
+    }
+}
+
+#[tauri::command]
+pub fn get_cli_binary_trust_status(
+    kind: String,
+    configured_path: String,
+    state: State<'_, AppState>,
+) -> Result<CliBinaryTrustStatus, String> {
+    with_db(&state, |db| {
+        current_fingerprint_status(db, &kind, &configured_path).map_err(NovaError::Config)
+    })
+}
+
+/// The only write path for `trusted_cli_binaries` — always `Actor::User`
+/// (hardcoded at the storage layer, see `storage::binary_trust`), called
+/// only from the explicit "确认此可执行文件" UI action. Re-resolves and
+/// re-fingerprints `path` itself rather than trusting anything the caller
+/// claims about it.
+#[tauri::command]
+pub fn confirm_cli_binary_path(
+    kind: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<CliBinaryTrustStatus, String> {
+    let resolved = crate::runtime::win_spawn::resolve_executable(&path)
+        .map_err(|error| format!("无法解析可执行文件路径：{error}"))?;
+    let fingerprint = crate::runtime::binary_trust::compute_fingerprint(&resolved)
+        .map_err(|error| error.to_string())?;
+    with_db(&state, |db| {
+        db.confirm_trusted_cli_binary(&kind, &fingerprint)
+    })?;
+    with_db(&state, |db| {
+        current_fingerprint_status(db, &kind, &path).map_err(NovaError::Config)
+    })
+}
+
+/// Second re-review (Blocker 3): the only write path for
+/// `no_tests_confirmations` — always `Actor::User` (hardcoded at the
+/// storage layer), reachable only from the explicit "确认该项目当前没有适用测试"
+/// UI action. Scoped to the task's *current* `result_generation`, so a
+/// confirmation always applies to the round the user is actually looking
+/// at, never a stale one silently carried forward.
+///
+/// Second re-review remediation (Major 5): the single atomic business entry
+/// point for a user's accept/reject decision — a thin parameter boundary
+/// around `core_loop::accept_task_result`, which does the actual
+/// record-acceptance / transition / document-regeneration work and is
+/// exercised directly by that module's own tests (see this crate's
+/// architecture note at the top of `core_loop.rs`: commands stay a
+/// permission/parameter boundary only, business logic lives in
+/// `core_loop`).
+#[tauri::command]
+pub fn accept_task_result(
+    task_id: String,
+    project_id: String,
+    accepted: bool,
+    note: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Task, String> {
+    with_db(&state, |db| {
+        crate::core_loop::accept_task_result(
+            db,
+            &project_id,
+            &task_id,
+            accepted,
+            note.as_deref(),
+            &state.app_data_dir,
+        )
+    })
+}
+
+/// Retries seven-document regeneration for a task whose
+/// `document_sync_pending` flag is set (see `accept_task_result`) — lets
+/// the UI offer an explicit "重试文档同步" action, or a future app-startup
+/// sweep, without requiring another accept/reject decision.
+#[tauri::command]
+pub fn resync_task_documents(
+    task_id: String,
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Task, String> {
+    with_db(&state, |db| {
+        crate::core_loop::resync_task_documents(db, &project_id, &task_id, &state.app_data_dir)
+    })
+}
+
+#[tauri::command]
+pub fn confirm_no_tests_applicable(
+    project_id: String,
+    task_id: String,
+    round: i64,
+    reason: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<crate::models::NoTestsConfirmation, String> {
+    with_db(&state, |db| {
+        let task = db.task(&task_id)?;
+        let confirmation = db.record_no_tests_confirmation(
+            &project_id,
+            &task_id,
+            task.result_generation,
+            round,
+            reason.as_deref(),
+        )?;
+        // Second re-review remediation: the confirmation alone does not
+        // resume the loop — without this, the task would stay stuck at
+        // `needs_user_action` forever even though the user just answered
+        // exactly what it was waiting for.
+        crate::core_loop::unblock_test_execution_for_retry(db, &project_id, &task_id)?;
+        Ok(confirmation)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -888,5 +1166,75 @@ mod tests {
         let error = detail(Some("user_canceled"), "生成已停止，已保留收到的内容", true);
         assert_eq!(stream_error_status(&error), "interrupted");
         assert_eq!(stream_error_message(&error), "生成已停止，已保留收到的内容");
+    }
+
+    fn temp_exe(name: &str, content: &[u8]) -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "nova-commands-test-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tool.exe");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn fingerprint_status_is_untrusted_before_any_confirmation() {
+        let path = temp_exe("untrusted", b"v1");
+        let db = crate::db::Database::memory().unwrap();
+        db.migrate().unwrap();
+        let status = current_fingerprint_status(&db, "codex_cli", path.to_str().unwrap()).unwrap();
+        assert!(!status.trusted);
+        assert!(status.mismatch_reason.is_some());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn fingerprint_status_is_trusted_immediately_after_confirmation() {
+        let path = temp_exe("trusted", b"v1");
+        let db = crate::db::Database::memory().unwrap();
+        db.migrate().unwrap();
+        let fingerprint = crate::runtime::binary_trust::compute_fingerprint(&path).unwrap();
+        db.confirm_trusted_cli_binary("codex_cli", &fingerprint)
+            .unwrap();
+        let status = current_fingerprint_status(&db, "codex_cli", path.to_str().unwrap()).unwrap();
+        assert!(status.trusted, "{:?}", status.mismatch_reason);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn fingerprint_status_flips_back_to_untrusted_after_the_file_changes() {
+        let path = temp_exe("drift", b"v1");
+        let db = crate::db::Database::memory().unwrap();
+        db.migrate().unwrap();
+        let fingerprint = crate::runtime::binary_trust::compute_fingerprint(&path).unwrap();
+        db.confirm_trusted_cli_binary("codex_cli", &fingerprint)
+            .unwrap();
+        std::fs::write(&path, b"v2, a completely different binary").unwrap();
+
+        let status = current_fingerprint_status(&db, "codex_cli", path.to_str().unwrap()).unwrap();
+        assert!(
+            !status.trusted,
+            "a binary replaced after confirmation must not still be trusted"
+        );
+        assert!(status.mismatch_reason.unwrap().contains("已发生变化"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn confirming_codex_trust_never_affects_claude_trust() {
+        let path = temp_exe("independent", b"v1");
+        let db = crate::db::Database::memory().unwrap();
+        db.migrate().unwrap();
+        let fingerprint = crate::runtime::binary_trust::compute_fingerprint(&path).unwrap();
+        db.confirm_trusted_cli_binary("codex_cli", &fingerprint)
+            .unwrap();
+        let claude_status =
+            current_fingerprint_status(&db, "claude_cli", path.to_str().unwrap()).unwrap();
+        assert!(!claude_status.trusted);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

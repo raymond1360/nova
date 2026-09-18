@@ -4,12 +4,17 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(),
 }))
+vi.mock('@tauri-apps/plugin-dialog', () => ({
+  open: vi.fn(),
+}))
 
 import { invoke } from '@tauri-apps/api/core'
+import { open } from '@tauri-apps/plugin-dialog'
 import { useCoreLoopStore } from './coreLoop'
 import type { Task } from '../types'
 
 const mockedInvoke = vi.mocked(invoke)
+const mockedOpen = vi.mocked(open)
 
 function routeInvoke(handlers: Record<string, (args: unknown) => unknown>) {
   mockedInvoke.mockImplementation(async (command: string, args?: unknown) => {
@@ -34,8 +39,31 @@ function fakeTask(overrides: Partial<Task> = {}): Task {
     result_generation: 0,
     test_command_redacted: null,
     test_command_source: null,
+    document_sync_pending: false,
     created_at: 'now',
     updated_at: 'now',
+    ...overrides,
+  }
+}
+
+function fakeProject(overrides: Partial<import('../types').Project> = {}): import('../types').Project {
+  return {
+    id: 'proj-1',
+    name: 'P',
+    local_path: 'C:/p',
+    normalized_path: 'c:/p',
+    source_type: 'local',
+    source_url: null,
+    current_branch: null,
+    last_head_summary: null,
+    purpose: null,
+    long_term_goal: null,
+    user_preferences: null,
+    prohibitions: null,
+    last_activity_at: null,
+    created_at: 'now',
+    updated_at: 'now',
+    last_opened_at: null,
     ...overrides,
   }
 }
@@ -44,6 +72,7 @@ describe('coreLoop store', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     mockedInvoke.mockReset()
+    mockedOpen.mockReset()
   })
 
   it('creates a task via a real backend call and stores the result', async () => {
@@ -199,5 +228,177 @@ describe('coreLoop store', () => {
     expect(store.reviewerAiKind).toBe('claude_cli')
     store.devAiKind = 'claude_cli'
     expect(store.reviewerAiKind).toBe('codex_cli')
+  })
+
+  // --- Second re-review remediation ---
+
+  it('opens a project via the real system folder picker, never a hand-typed path', async () => {
+    const store = useCoreLoopStore()
+    mockedOpen.mockResolvedValue('D:\\real\\picked\\folder')
+    routeInvoke({
+      create_project: async (args) => {
+        expect((args as { request: { local_path: string } }).request.local_path).toBe(
+          'D:\\real\\picked\\folder',
+        )
+        return fakeProject({ local_path: 'D:\\real\\picked\\folder' })
+      },
+      set_last_active_project: async () => fakeProject(),
+      list_projects: async () => [],
+      list_tasks_for_project: async () => [],
+    })
+
+    await store.pickAndOpenProjectFolder('My Project')
+
+    expect(mockedOpen).toHaveBeenCalledWith({ directory: true, multiple: false })
+    expect(store.currentProject?.local_path).toBe('D:\\real\\picked\\folder')
+  })
+
+  it('does nothing when the user cancels the folder picker (no selection)', async () => {
+    const store = useCoreLoopStore()
+    mockedOpen.mockResolvedValue(null)
+    let createCalled = false
+    routeInvoke({
+      create_project: async () => {
+        createCalled = true
+        return fakeProject()
+      },
+    })
+
+    await store.pickAndOpenProjectFolder('X')
+
+    expect(createCalled).toBe(false)
+    expect(store.currentProject).toBeNull()
+  })
+
+  it('confirmNoTestsApplicable sends no default reason and refreshes the task afterward', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ state: 'needs_user_action' })
+    let sentReason: unknown = 'unset'
+    routeInvoke({
+      confirm_no_tests_applicable: async (args) => {
+        sentReason = (args as { reason: unknown }).reason
+        return { id: 'c1', project_id: 'proj-1', task_id: 'task-1', result_generation: 0, round: 1, confirmed_by: 'user', reason: null, confirmed_at: 'now', created_at: 'now' }
+      },
+      list_tasks_for_project: async () => [fakeTask({ state: 'queued' })],
+      list_task_reviews: async () => [],
+      detect_test_command: async () => null,
+    })
+
+    await store.confirmNoTestsApplicable('')
+
+    expect(sentReason).toBeNull()
+    expect(store.currentTask?.state).toBe('queued')
+  })
+
+  it('pendingRound is 1 before any round-1 review and 2 after one is recorded', () => {
+    const store = useCoreLoopStore()
+    store.currentTask = fakeTask({ result_generation: 0 })
+    expect(store.pendingRound).toBe(1)
+    store.reviews = [
+      {
+        id: 'r1',
+        project_id: 'proj-1',
+        task_id: 'task-1',
+        result_generation: 0,
+        round: 1,
+        reviewer_ai_kind: 'claude_cli',
+        verdict: 'changes_required',
+        findings_summary: null,
+        created_at: 'now',
+      },
+    ]
+    expect(store.pendingRound).toBe(2)
+  })
+
+  it('acceptResult calls the single atomic accept_task_result command, not the old two-step pattern', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ state: 'awaiting_user_acceptance' })
+    let calledWith: unknown = null
+    routeInvoke({
+      accept_task_result: async (args) => {
+        calledWith = args
+        return fakeTask({ state: 'completed' })
+      },
+      list_tasks_for_project: async () => [fakeTask({ state: 'completed' })],
+      list_task_reviews: async () => [],
+    })
+
+    await store.acceptResult(true, 'looks good')
+
+    expect(calledWith).toMatchObject({
+      projectId: 'proj-1',
+      taskId: 'task-1',
+      accepted: true,
+      note: 'looks good',
+    })
+    expect(store.currentTask?.state).toBe('completed')
+  })
+
+  it('acceptResult(false) still goes through accept_task_result, not a bare record_user_acceptance', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ state: 'awaiting_user_acceptance' })
+    routeInvoke({
+      accept_task_result: async () => fakeTask({ state: 'needs_user_action' }),
+      list_tasks_for_project: async () => [fakeTask({ state: 'needs_user_action' })],
+      list_task_reviews: async () => [],
+    })
+
+    await store.acceptResult(false, '')
+
+    expect(store.currentTask?.state).toBe('needs_user_action')
+  })
+
+  it('confirmCliBinaryPath resolves, confirms, and persists the setting for the correct kind', async () => {
+    const store = useCoreLoopStore()
+    const calls: string[] = []
+    routeInvoke({
+      confirm_cli_binary_path: async (args) => {
+        calls.push('confirm_cli_binary_path')
+        expect(args).toMatchObject({ kind: 'codex_cli', path: 'C:\\tools\\codex.exe' })
+        return { trusted: true, canonical_path: 'C:\\tools\\codex.exe', file_size: 100, sha256_hex: 'abc', confirmed_at: 'now', mismatch_reason: null }
+      },
+      set_setting: async (args) => {
+        calls.push('set_setting')
+        expect(args).toMatchObject({ key: 'codex_binary_path', value: 'C:\\tools\\codex.exe' })
+      },
+    })
+
+    await store.confirmCliBinaryPath('codex_cli', 'C:\\tools\\codex.exe')
+
+    expect(calls).toEqual(['confirm_cli_binary_path', 'set_setting'])
+    expect(store.codexTrust?.trusted).toBe(true)
+    expect(store.claudeTrust).toBeNull()
+  })
+
+  it('restoreLastSession loads the last active project and its unfinished task', async () => {
+    const store = useCoreLoopStore()
+    routeInvoke({
+      get_last_active_project: async () => fakeProject(),
+      list_tasks_for_project: async () => [
+        fakeTask({ id: 'old-done', state: 'completed' }),
+        fakeTask({ id: 'still-going', state: 'running' }),
+      ],
+      list_task_reviews: async () => [],
+    })
+
+    await store.restoreLastSession()
+
+    expect(store.currentProject?.id).toBe('proj-1')
+    expect(store.currentTask?.id).toBe('still-going')
+  })
+
+  it('restoreLastSession leaves currentTask unset when nothing is unfinished', async () => {
+    const store = useCoreLoopStore()
+    routeInvoke({
+      get_last_active_project: async () => fakeProject(),
+      list_tasks_for_project: async () => [fakeTask({ state: 'completed' })],
+    })
+
+    await store.restoreLastSession()
+
+    expect(store.currentTask).toBeNull()
   })
 })

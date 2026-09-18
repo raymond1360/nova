@@ -45,6 +45,12 @@ pub enum VerdictParseError {
     /// The object parsed, but is missing a required field or has the wrong
     /// type for one.
     MissingOrInvalidField(String),
+    /// The object parsed as JSON but carried a field name outside the
+    /// strict schema (`#[serde(deny_unknown_fields)]`). A newer/foreign
+    /// schema, or a reviewer echoing back a mutated example, must never be
+    /// silently accepted just because the fields Nova cares about happen to
+    /// still be present.
+    UnexpectedField(String),
     UnsupportedSchemaVersion(i64),
     UnknownVerdict(String),
     TaskIdMismatch {
@@ -72,6 +78,9 @@ impl std::fmt::Display for VerdictParseError {
             Self::TrailingContent => write!(f, "JSON 结论对象周围存在非空白的额外内容"),
             Self::MissingOrInvalidField(field) => {
                 write!(f, "JSON 结论对象缺少或字段类型错误：{field}")
+            }
+            Self::UnexpectedField(detail) => {
+                write!(f, "JSON 结论对象包含未知字段，已拒绝：{detail}")
             }
             Self::UnsupportedSchemaVersion(version) => {
                 write!(f, "不支持的 schema_version：{version}")
@@ -105,6 +114,7 @@ pub struct ParsedVerdict {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawPayload {
     schema_version: i64,
     task_id: String,
@@ -128,8 +138,15 @@ pub fn parse_structured_verdict(
     let candidate = extract_single_json_candidate(text)?;
     let map = parse_object_rejecting_duplicate_keys(&candidate)
         .map_err(VerdictParseError::InvalidJson)?;
-    let payload: RawPayload = serde_json::from_value(serde_json::Value::Object(map))
-        .map_err(|error| VerdictParseError::MissingOrInvalidField(error.to_string()))?;
+    let payload: RawPayload =
+        serde_json::from_value(serde_json::Value::Object(map)).map_err(|error| {
+            let message = error.to_string();
+            if message.starts_with("unknown field") {
+                VerdictParseError::UnexpectedField(message)
+            } else {
+                VerdictParseError::MissingOrInvalidField(message)
+            }
+        })?;
 
     if payload.schema_version != SCHEMA_VERSION {
         return Err(VerdictParseError::UnsupportedSchemaVersion(
@@ -496,11 +513,16 @@ mod tests {
     }
 
     #[test]
-    fn unknown_extra_field_is_tolerated_but_verdict_still_parses() {
-        // The spec requires rejecting garbage that *replaces* the object,
-        // not every conceivable additional field a newer schema might add;
-        // `#[serde(default)]`-free required fields still gate correctness.
+    fn unknown_extra_field_is_rejected() {
+        // Phase 3 re-review (Major 2): `deny_unknown_fields` must be
+        // enforced, not just the fields Nova happens to read — a reviewer
+        // echoing back a mutated/newer-schema example with an extra field
+        // must not be silently accepted just because the required fields
+        // are still present.
         let text = valid_json("approve").replacen('}', r#","reviewer_model":"gpt-5"}"#, 1);
-        assert!(parse_structured_verdict(&text, &ctx()).is_ok());
+        assert!(matches!(
+            parse_structured_verdict(&text, &ctx()),
+            Err(VerdictParseError::UnexpectedField(_))
+        ));
     }
 }

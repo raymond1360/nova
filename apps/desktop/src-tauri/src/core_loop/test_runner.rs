@@ -370,16 +370,36 @@ mod tests {
         // A genuine end-to-end proof: run `cargo test --lib app_paths::tests::accepts_ordinary_uuid_like_components`
         // against this actual crate and confirm Nova's own parser reads a
         // real, non-zero passed count from the real output.
+        //
+        // `--target-dir` points this nested build at its own directory
+        // rather than the crate's real `target/` — without it, this inner
+        // `cargo test` tries to relink the exact `nova_lib-*.exe` the
+        // *outer* `cargo test` run is currently executing from, which
+        // fails on Windows with `LNK1104: unable to open file` (the file
+        // is locked while running) whenever this test happens to run
+        // concurrently with others in the same suite. Deliberately a
+        // *fixed* path under the OS temp directory (not a fresh
+        // `uuid`-suffixed one per run, unlike every other fixture in this
+        // file) so it doubles as a persistent build cache across repeated
+        // test-suite runs — a fresh `--target-dir` would force a full,
+        // multi-minute rebuild of this crate's entire dependency tree
+        // (`tauri`, `reqwest`, `rustls`, ...) on every single run, which
+        // both blows well past this test's own timeout and would make
+        // repeated full-suite verification runs impractically slow.
+        // Intentionally never deleted for the same reason.
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let cached_target_dir = std::env::temp_dir().join("nova-self-referential-cargo-test-cache");
         let outcome = run_tests(
             "cargo",
             &[
                 "test".to_string(),
                 "--lib".to_string(),
                 "app_paths::tests::accepts_ordinary_uuid_like_components".to_string(),
+                "--target-dir".to_string(),
+                cached_target_dir.to_string_lossy().into_owned(),
             ],
             &manifest_dir,
-            Duration::from_secs(120),
+            Duration::from_secs(300),
             CancellationToken::new(),
         );
         assert!(outcome.process_succeeded, "stderr: {}", outcome.stderr);

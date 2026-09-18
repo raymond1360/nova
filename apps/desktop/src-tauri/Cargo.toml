@@ -34,10 +34,16 @@ tauri-build = { version = "2", features = [] }
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# Already present transitively via reqwest's rustls-tls backend — declared
+# explicitly here only so `runtime::binary_trust` can use its SHA-256
+# implementation directly, without adding any new library to the actual
+# dependency tree or lockfile resolution.
+ring = "0.17"
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tokio-util = "0.7"

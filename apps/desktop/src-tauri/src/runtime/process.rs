@@ -773,6 +773,145 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn npm_resolves_past_its_own_extensionless_shell_script_stand_in() {
+        // Real bug found via re-review testing: Node.js's Windows installer
+        // ships a bare, extension-less `npm` file (a POSIX shell script for
+        // WSL/git-bash use) right next to the real `npm.cmd`. The original
+        // `resolve_executable` tried the bare name in each PATH directory
+        // *before* trying `PATHEXT` extensions, so it could resolve `npm`
+        // to that non-Win32-executable shell script and fail every launch
+        // with `ERROR_BAD_EXE_FORMAT` ("%1 is not a valid Win32
+        // application") — not a test failure, the process never started.
+        let root = temp_root("npm-resolves-real-cmd");
+        let req = request("npm", vec!["--version"], &root);
+        let result = execute_blocking(req, CancellationToken::new());
+        assert!(
+            matches!(result.outcome, ExecutionOutcome::Success),
+            "outcome: {:?}, stderr: {}",
+            result.outcome,
+            result.stderr
+        );
+        assert_eq!(result.exit_code, Some(0));
+        assert!(
+            !result.stdout.trim().is_empty(),
+            "expected npm to print a version string"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn npm_test_actually_runs_inside_the_requested_cwd_not_windows_system32() {
+        // Real bug found via re-review testing, discovered only after
+        // fixing the two bugs above: `path_guard::validate_directory_
+        // boundary`'s canonicalized `cwd` carries Windows's `\\?\`
+        // extended-length prefix. `cmd.exe` (the interpreter every batch
+        // script launch above routes through) refuses that prefix as its
+        // *own* working directory — it prints "UNC paths are not
+        // supported... defaulting to Windows directory" and silently runs
+        // every child (here, `npm test` -> `node`) from `%SystemRoot%`
+        // instead. A project's real test command would then fail with a
+        // spurious "no package.json found" even though the project
+        // directory Nova passed in was completely correct.
+        let root = temp_root("npm-test-real-cwd");
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"console.log(process.cwd())\""}}"#,
+        )
+        .unwrap();
+        let req = request("npm", vec!["test"], &root);
+        let result = execute_blocking(req, CancellationToken::new());
+        assert!(
+            matches!(result.outcome, ExecutionOutcome::Success),
+            "outcome: {:?}, stdout: {}, stderr: {}",
+            result.outcome,
+            result.stdout,
+            result.stderr
+        );
+        // `win_spawn::win32_cwd_form` deliberately strips the `\\?\`
+        // extended-length prefix `fs::canonicalize` adds before handing a
+        // directory to `CreateProcessW` (see that function's doc comment),
+        // so the real child process's own `process.cwd()` never has it
+        // either — the expectation here must go through the same
+        // transform rather than the raw canonicalized path.
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let expected_cwd = win_spawn::win32_cwd_form(&canonical_root);
+        let printed_cwd = result
+            .stdout
+            .lines()
+            .find(|line| line.contains(':') && line.contains('\\'))
+            .unwrap_or_default()
+            .trim();
+        assert_eq!(
+            printed_cwd,
+            expected_cwd,
+            "the node process must actually run inside the project directory, not %SystemRoot%; full stdout: {:?}",
+            result.stdout
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_real_windows_batch_script_actually_runs_not_just_resolves() {
+        // Real bug found while re-testing Blocker 3 against an npm-based
+        // project: `npm`/`pnpm`/`yarn` all resolve to a `.cmd` file on
+        // Windows, and `CreateProcessW` cannot launch a `.cmd` directly via
+        // `lpApplicationName` (`ERROR_BAD_EXE_FORMAT`) — every auto-detected
+        // npm/pnpm/yarn test command would fail to even start, not because
+        // the tests failed, but because the process never ran. This proves
+        // the `cmd.exe /d /s /c` routing in `win_spawn::spawn_suspended`
+        // actually executes a real `.cmd` file end to end, with a real
+        // argument reaching the script.
+        let root = temp_root("batch-script-real-run");
+        let script_path = root.join("nova_test_probe.cmd");
+        fs::write(&script_path, "@echo off\r\necho got:%1\r\n").unwrap();
+        let req = request(
+            script_path.to_str().unwrap(),
+            vec!["hello-from-nova"],
+            &root,
+        );
+        let result = execute_blocking(req, CancellationToken::new());
+        assert!(
+            matches!(result.outcome, ExecutionOutcome::Success),
+            "outcome: {:?}, stdout: {}, stderr: {}",
+            result.outcome,
+            result.stdout,
+            result.stderr
+        );
+        assert!(
+            result.stdout.contains("got:hello-from-nova"),
+            "expected the batch script's own echo of its argument, got stdout: {:?}",
+            result.stdout
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_batch_script_argument_containing_a_double_quote_is_refused_before_spawn() {
+        // Closes the residual injection surface a naive `cmd.exe /C`
+        // wrapper would otherwise open: cmd.exe's own `&`/`|`/quote-toggle
+        // parsing of the string after `/C` is a different, unrelated
+        // grammar from `CreateProcessW`'s argv quoting (this exact gap is
+        // what Node.js's CVE-2024-27980 was about). Rather than trying to
+        // reconcile the two, an embedded `"` is refused outright.
+        let root = temp_root("batch-script-quote-injection");
+        let script_path = root.join("nova_test_probe.cmd");
+        fs::write(&script_path, "@echo off\r\necho ran\r\n").unwrap();
+        let req = request(script_path.to_str().unwrap(), vec!["a\"b"], &root);
+        let result = execute_blocking(req, CancellationToken::new());
+        match result.outcome {
+            ExecutionOutcome::Failed { kind, .. } => {
+                assert_eq!(kind, ExecutionErrorKind::StartFailed)
+            }
+            other => panic!("expected a refused start, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn git_version_succeeds_and_captures_stdout() {
         let root = temp_root("git-version");

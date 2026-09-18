@@ -245,6 +245,10 @@ mod tests {
         let project = temp_dir("copy-git-safety-project");
         for args in [
             vec!["init", "-q"],
+            // See `core_loop::tests::git_project_dir`'s comment: avoids
+            // spurious "Filename too long" stderr noise from git objects
+            // under an already-long OS temp directory name.
+            vec!["config", "core.longpaths", "true"],
             vec!["config", "user.email", "test@example.com"],
             vec!["config", "user.name", "Nova Test"],
         ] {
@@ -279,6 +283,11 @@ mod tests {
         // cannot reach the real repository at all.
         StdCommand::new("git")
             .args(["init", "-q"])
+            .current_dir(&workspace.source_dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["config", "core.longpaths", "true"])
             .current_dir(&workspace.source_dir)
             .status()
             .unwrap();

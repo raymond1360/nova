@@ -143,15 +143,65 @@ pub fn safe_app_owned_dir(root: &Path, components: &[&str]) -> io::Result<PathBu
 /// written file. `path` must already be inside an app-owned directory —
 /// this function does not itself re-verify containment (callers use
 /// [`safe_app_owned_dir`] to obtain the directory first).
+///
+/// Phase 3 re-review hardening (Blocker 4 / Minor "atomic writes weaker
+/// than requested"): the temp file is opened with `create_new` (never
+/// silently reuses/truncates an existing file — a name collision is a hard
+/// error, not a silent overwrite), its bytes are `flush`ed and `sync_all`ed
+/// before the rename so the *content* is durable on disk before the rename
+/// that makes it visible, the parent directory is best-effort synced after
+/// the rename, and a symlink/junction sitting at the destination path is
+/// refused rather than followed. On any failure, only the temp file this
+/// call itself created is removed — an existing `path` is never touched
+/// unless the rename actually succeeds.
 pub fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "路径没有父目录"))?;
+
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::other(format!(
+                "拒绝：目标路径是符号链接或联接点，拒绝写入：{}",
+                path.display()
+            )));
+        }
+    }
+
     let tmp_path = parent.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
-    fs::write(&tmp_path, contents)?;
-    fs::rename(&tmp_path, path).inspect_err(|_| {
+    let write_result = (|| -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
+        file.write_all(contents)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
         let _ = fs::remove_file(&tmp_path);
-    })
+        return Err(error);
+    }
+
+    if let Err(error) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+
+    // Best-effort durability for the rename itself. Not all platforms
+    // support opening a plain directory handle for this (notably Windows,
+    // where this reliably fails) — that failure is intentionally
+    // non-fatal: the file's own content is already fsynced above, and the
+    // rename has already completed; this step only strengthens "did the
+    // rename survive a crash" where the OS actually supports it.
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+
+    Ok(())
 }
 
 /// Recursively deletes `target`, but only after verifying it is a
@@ -340,6 +390,111 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp-"))
             .collect();
         assert!(stray.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn atomic_write_refuses_to_overwrite_a_symlink_destination() {
+        let root = temp_dir("atomic-write-symlink-dest");
+        let dir = safe_app_owned_dir(&root, &["proj-1"]).unwrap();
+        let real_target = temp_dir("atomic-write-symlink-target");
+        let outside_file = real_target.join("secret.txt");
+        fs::write(&outside_file, b"outside content").unwrap();
+        let link_path = dir.join("REQUIREMENT.md");
+
+        #[cfg(windows)]
+        let link_created = std::os::windows::fs::symlink_file(&outside_file, &link_path).is_ok();
+        #[cfg(unix)]
+        let link_created = std::os::unix::fs::symlink(&outside_file, &link_path).is_ok();
+
+        if link_created {
+            let result = atomic_write(&link_path, b"HACKED");
+            assert!(
+                result.is_err(),
+                "writing through a symlink destination must be refused"
+            );
+            assert_eq!(
+                fs::read_to_string(&outside_file).unwrap(),
+                "outside content",
+                "the real file the symlink points at must be untouched"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&real_target);
+    }
+
+    #[test]
+    fn atomic_write_fails_cleanly_when_destination_is_a_directory() {
+        let root = temp_dir("atomic-write-dest-is-dir");
+        let dir = safe_app_owned_dir(&root, &["proj-1"]).unwrap();
+        let path = dir.join("REQUIREMENT.md");
+        fs::create_dir(&path).unwrap();
+
+        let result = atomic_write(&path, b"content");
+        assert!(
+            result.is_err(),
+            "rename onto an existing directory must fail, not silently succeed"
+        );
+        assert!(path.is_dir(), "the directory must survive the failed write");
+
+        let stray: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp-"))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "the temp file created for the failed attempt must be cleaned up"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn atomic_write_never_touches_the_old_file_when_the_write_step_fails() {
+        // Simulate a mid-write failure by pointing `path` at a location
+        // whose parent directory does not exist — `atomic_write` must
+        // return a clean error without panicking, and must not have
+        // fabricated any partial state at the (nonexistent) destination.
+        let root = temp_dir("atomic-write-bad-parent");
+        let missing_parent = root.join("does-not-exist");
+        let path = missing_parent.join("REQUIREMENT.md");
+        let result = atomic_write(&path, b"content");
+        assert!(result.is_err());
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_to_the_same_path_never_produce_torn_content() {
+        let root = temp_dir("atomic-write-concurrent");
+        let dir = safe_app_owned_dir(&root, &["proj-1"]).unwrap();
+        let path = Arc::new(dir.join("REQUIREMENT.md"));
+
+        // Each writer's payload is internally consistent and distinguishable
+        // from every other writer's payload, so if the final file ever
+        // contained bytes spliced from two different writes, it would fail
+        // to match *any* single expected payload below.
+        let payloads: Vec<Vec<u8>> = (0..8)
+            .map(|i| format!("writer-{i}-{}", "x".repeat(500 + i * 37)).into_bytes())
+            .collect();
+
+        let handles: Vec<_> = payloads
+            .iter()
+            .cloned()
+            .map(|payload| {
+                let path = Arc::clone(&path);
+                std::thread::spawn(move || atomic_write(&path, &payload))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let final_content = fs::read(path.as_path()).unwrap();
+        assert!(
+            payloads.iter().any(|payload| payload == &final_content),
+            "final content must be exactly one writer's full payload, never a mix"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

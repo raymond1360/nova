@@ -209,6 +209,30 @@ impl Database {
             .ok_or_else(|| NovaError::Database("动作记录在更新后丢失".to_string()))
     }
 
+    /// Second re-review remediation: an action that stopped in `failed`
+    /// specifically because it needed *user input* it did not yet have —
+    /// no test command configured (Blocker 3's no-tests-confirmation gate)
+    /// or a test command that failed the allowlist check — is retryable
+    /// once the user has supplied that input, without treating it as a
+    /// genuine crash/uncertain-outcome retry (`acknowledge_uncertain_
+    /// action`'s own domain). A no-op (not an error) if the action is not
+    /// currently `failed` — callers that always call this after writing
+    /// the user's input must not themselves have to first check whether a
+    /// prior attempt ever actually reached this action.
+    pub fn reset_failed_action_for_retry(
+        &self,
+        task_id: &str,
+        idempotency_key: &str,
+    ) -> NovaResult<()> {
+        let now = now();
+        self.conn().execute(
+            "UPDATE task_actions SET status = ?1, attempt_number = attempt_number + 1, started_at = NULL, finished_at = NULL, updated_at = ?2
+             WHERE task_id = ?3 AND idempotency_key = ?4 AND status = 'failed'",
+            params![ActionStatus::Planned.as_str(), now, task_id, idempotency_key],
+        )?;
+        Ok(())
+    }
+
     /// Crash-recovery sweep: any action still `started` (never reached a
     /// terminal status) is now `uncertain` — we cannot know whether it
     /// actually finished before the app stopped. Only rows currently

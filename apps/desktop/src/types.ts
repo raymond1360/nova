@@ -143,6 +143,7 @@ export interface Task {
   result_generation: number
   test_command_redacted: string | null
   test_command_source: 'auto' | 'user' | null
+  document_sync_pending: boolean
   created_at: string
   updated_at: string
 }
@@ -177,4 +178,27 @@ export interface CoreLoopReadiness {
   review_ready: boolean
   dev_message: string
   review_message: string
+}
+
+// --- Second re-review remediation ---
+
+export interface NoTestsConfirmation {
+  id: string
+  project_id: string
+  task_id: string
+  result_generation: number
+  round: number
+  confirmed_by: string
+  reason: string | null
+  confirmed_at: string
+  created_at: string
+}
+
+export interface CliBinaryTrustStatus {
+  trusted: boolean
+  canonical_path: string | null
+  file_size: number | null
+  sha256_hex: string | null
+  confirmed_at: string | null
+  mismatch_reason: string | null
 }

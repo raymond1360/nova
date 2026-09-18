@@ -25,7 +25,7 @@
 //! business logic, per the architecture requirement that commands stay a
 //! permission/parameter boundary only.
 
-mod documents;
+pub(crate) mod documents;
 mod review_isolation;
 pub(crate) mod test_runner;
 
@@ -294,6 +294,121 @@ fn finish_success_path(
     Ok(())
 }
 
+/// Second re-review remediation (Major 5): the single atomic business entry
+/// point for a user's accept/reject decision on a task's current result.
+/// `commands::accept_task_result` is a thin Tauri-parameter-boundary
+/// wrapper around this — kept here, not in `commands.rs`, so it can be
+/// exercised directly by this module's own tests without a `State<AppState>`.
+///
+/// Records the acceptance/rejection (bound to the task's *current*
+/// `result_generation` by `Database::record_user_acceptance` itself),
+/// transitions to `completed` (accepted) or `needs_user_action` (rejected —
+/// the state machine's legal "stopped, needs a decision" edge from
+/// `awaiting_user_acceptance`), then regenerates the seven documents so
+/// `FINAL_RESULT.md` reflects whichever actually happened instead of
+/// staying stuck on "awaiting acceptance" forever. A document-regeneration
+/// failure never undoes the already-successful database write — it only
+/// sets `tasks.document_sync_pending`, which `resync_task_documents`
+/// (or this function's own next call for the same task) can clear later.
+pub fn accept_task_result(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    accepted: bool,
+    note: Option<&str>,
+    app_data_dir: &Path,
+) -> NovaResult<Task> {
+    let task = db.task(task_id)?;
+    if task.project_id != project_id {
+        return Err(NovaError::Config(
+            "task_id 与 project_id 不匹配，已拒绝".to_string(),
+        ));
+    }
+    let target_state = if accepted {
+        TaskState::Completed
+    } else {
+        TaskState::NeedsUserAction
+    };
+    db.record_user_acceptance(project_id, task_id, accepted, note)?;
+    db.transition_task(task_id, target_state, Actor::User, note, None, false, None)?;
+
+    match documents::generate_result_documents(db, project_id, task_id, app_data_dir) {
+        Ok(()) => db.set_document_sync_pending(task_id, false)?,
+        Err(_) => {
+            // Best-effort marker only: the accept/reject decision above
+            // already committed and must stand regardless of whether this
+            // secondary write also succeeds.
+            let _ = db.set_document_sync_pending(task_id, true);
+        }
+    }
+
+    db.task(task_id)
+}
+
+/// Retries seven-document regeneration for a task whose
+/// `document_sync_pending` flag is set — lets the UI (or a future
+/// app-startup sweep) retry without requiring another accept/reject
+/// decision.
+pub fn resync_task_documents(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    app_data_dir: &Path,
+) -> NovaResult<Task> {
+    documents::generate_result_documents(db, project_id, task_id, app_data_dir)?;
+    db.set_document_sync_pending(task_id, false)?;
+    db.task(task_id)
+}
+
+/// The round a task is currently stuck on if it is sitting in
+/// `needs_user_action` because its `test-{task_id}-round-N` action needed
+/// input the user did not yet have (no detectable test command, or a
+/// rejected allowlist check) — round 1 unless a round-1 review already
+/// exists for the task's current `result_generation`, in which case it is
+/// the round-2 automatic fix pass. Only ever 1 or 2, matching the fixed
+/// "at most one automatic fix pass" product rule.
+pub fn current_pending_round(db: &Database, project_id: &str, task_id: &str) -> NovaResult<i64> {
+    let task = db.task(task_id)?;
+    let reviews = db.list_task_reviews(project_id, task_id)?;
+    let round_one_reviewed = reviews
+        .iter()
+        .any(|r| r.result_generation == task.result_generation && r.round == 1);
+    Ok(if round_one_reviewed { 2 } else { 1 })
+}
+
+/// Second re-review remediation (Blocker 3): after the user supplies what
+/// a stalled `test-{task_id}-round-N` action was waiting on (a real
+/// no-tests confirmation, or a corrected/allowlisted test command), this
+/// resets that exact action back to `planned` and, if the task is
+/// currently `needs_user_action`, returns it to `queued` — the same legal
+/// state `start_core_loop` already accepts — so the frontend's next
+/// "开始任务" actually re-attempts the round instead of the loop staying
+/// permanently stuck (a `failed`, non-`uncertain` action would otherwise
+/// never become startable again).
+pub fn unblock_test_execution_for_retry(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+) -> NovaResult<Task> {
+    let round = current_pending_round(db, project_id, task_id)?;
+    let test_key = format!("test-{task_id}-round-{round}");
+    db.reset_failed_action_for_retry(task_id, &test_key)?;
+    let task = db.task(task_id)?;
+    if task.state == TaskState::NeedsUserAction {
+        db.transition_task(
+            task_id,
+            TaskState::Queued,
+            Actor::User,
+            Some("用户已提供所需信息，重新排队等待继续"),
+            None,
+            false,
+            None,
+        )
+    } else {
+        Ok(task)
+    }
+}
+
 /// One development + review round. The caller has already transitioned the
 /// task into `running` (round 1) or `safe_fixing` (round 2) before calling.
 /// On return the task is left in `verifying` (whatever the verdict), except
@@ -416,6 +531,9 @@ fn run_one_round(
             TestRoundOutcome::Passed(summary) => Some(summary),
             TestRoundOutcome::NoTestsApplicable(summary) => Some(summary),
             TestRoundOutcome::Failed(findings) => return Ok(RoundOutcome::NeedsFix(findings)),
+            TestRoundOutcome::AwaitingNoTestsConfirmation => {
+                return Ok(RoundOutcome::ActionUncertain)
+            }
             TestRoundOutcome::ActionUncertain => return Ok(RoundOutcome::ActionUncertain),
             TestRoundOutcome::Cancelled => return Ok(RoundOutcome::Stopped),
         };
@@ -641,6 +759,13 @@ enum TestRoundOutcome {
     /// Tests ran and genuinely failed — the round goes straight to
     /// `NeedsFix` without ever invoking the reviewer.
     Failed(String),
+    /// Second re-review (Blocker 3): no test command was detected or
+    /// configured, *and* no real `no_tests_confirmations` row exists for
+    /// this exact `(task_id, result_generation, round)` — Nova refuses to
+    /// record `no_tests_applicable` on its own say-so and stops for the
+    /// user to either confirm there genuinely are no applicable tests or
+    /// provide a test command instead.
+    AwaitingNoTestsConfirmation,
     ActionUncertain,
     Cancelled,
 }
@@ -710,21 +835,56 @@ fn run_tests_for_round(
     };
 
     let Some(command) = command else {
-        let evidence = db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
-            project_id,
-            task_id,
-            result_generation,
-            round,
-            test_command_redacted: None,
-            status: "no_tests_applicable",
-            passed_count: 0,
-            failed_count: 0,
-            skipped_count: 0,
-            exit_code: None,
-            reason: Some("未检测到支持的测试框架（package.json/Cargo.toml/pyproject.toml 等），且任务未配置测试命令"),
-            stdout_ref: None,
-            stderr_ref: None,
-        })?;
+        // Second re-review (Blocker 3): a missing test command may only
+        // become `no_tests_applicable` evidence once a real, persisted user
+        // confirmation exists for *this exact* generation/round — never on
+        // Nova's own detection failure alone, and never reused from a prior
+        // round or a prior result generation (schema `UNIQUE(task_id,
+        // result_generation, round)` plus this exact-match lookup enforce
+        // that no wider reuse is even possible).
+        let confirmation =
+            db.find_no_tests_confirmation(project_id, task_id, result_generation, round)?;
+        let Some(confirmation) = confirmation else {
+            db.finish_action(
+                task_id,
+                &test_key,
+                ActionStatus::Failed,
+                None,
+                Some("no_tests_applicable requires an explicit user confirmation, none found for this generation/round"),
+            )?;
+            db.transition_task(
+                task_id,
+                TaskState::NeedsUserAction,
+                Actor::System,
+                Some(
+                    "未检测到可运行的自动测试，需要用户确认该项目当前没有适用测试，或提供测试命令",
+                ),
+                None,
+                false,
+                Some("no_tests_applicable awaiting explicit user confirmation"),
+            )?;
+            return Ok(TestRoundOutcome::AwaitingNoTestsConfirmation);
+        };
+        let reason = format!(
+            "用户已确认该项目当前没有适用测试（确认记录 {}，确认时间 {}）",
+            confirmation.id, confirmation.confirmed_at
+        );
+        let evidence =
+            db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+                project_id,
+                task_id,
+                result_generation,
+                round,
+                test_command_redacted: None,
+                status: "no_tests_applicable",
+                passed_count: 0,
+                failed_count: 0,
+                skipped_count: 0,
+                exit_code: None,
+                reason: Some(&reason),
+                stdout_ref: None,
+                stderr_ref: None,
+            })?;
         db.finish_action(task_id, &test_key, ActionStatus::Succeeded, None, None)?;
         return Ok(TestRoundOutcome::NoTestsApplicable(
             evidence.reason.unwrap_or_default(),
@@ -794,9 +954,9 @@ fn run_tests_for_round(
         db.finish_action(
             task_id,
             &test_key,
-            ActionStatus::Failed,
+            ActionStatus::Cancelled,
             None,
-            Some("cancelled"),
+            Some("user cancellation during test execution"),
         )?;
         db.transition_task(
             task_id,
@@ -976,12 +1136,26 @@ fn finish_gated_action(
     succeeded: bool,
     result: &crate::runtime::types::ExecutionResult,
 ) -> NovaResult<()> {
+    // Re-review Major 4: a user cancellation must land on the Action
+    // Ledger's own `cancelled` terminal status, never `failed` — folding
+    // the two together made a cancelled action indistinguishable from a
+    // genuine process failure in every downstream reader of evidence
+    // (recovery sweeps, the seven documents, a human auditing the ledger).
     let status = if succeeded {
         ActionStatus::Succeeded
+    } else if was_cancelled(result) {
+        ActionStatus::Cancelled
     } else {
         ActionStatus::Failed
     };
     let error_summary = match &result.outcome {
+        ExecutionOutcome::Failed {
+            detail,
+            kind: ExecutionErrorKind::Cancelled,
+        } => Some(format!(
+            "user cancellation: {}",
+            redact_sensitive_text(detail)
+        )),
         ExecutionOutcome::Failed { detail, .. } => Some(redact_sensitive_text(detail)),
         ExecutionOutcome::Success => None,
     };
@@ -1346,6 +1520,19 @@ mod tests {
         let dir = temp_dir(name);
         for args in [
             vec!["init", "-q"],
+            // Real bug found via re-review testing: OS temp directory
+            // names here are already long (`nova-core-loop-test-<name>-
+            // <pid>-<uuid>`), and a `.git/objects/<2-hex>/<38-hex>` path
+            // underneath one can exceed Windows' default 260-character
+            // `MAX_PATH`, making git itself fail with "unable to write
+            // file ... Filename too long" / "fatal: adding files failed"
+            // — noisy stderr on *every* full test-suite run, even though
+            // the specific object usually still lands (git retries/other
+            // objects succeed) so the test's own assertions rarely
+            // noticed. `core.longpaths` makes git use the `\\?\` extended-
+            // path Win32 API internally, removing the limit entirely
+            // rather than working around it by guessing at a path budget.
+            vec!["config", "core.longpaths", "true"],
             vec!["config", "user.email", "test@example.com"],
             vec!["config", "user.name", "Nova Test"],
         ] {
@@ -1421,10 +1608,33 @@ mod tests {
         (db, project.id, task.id)
     }
 
+    /// Most fixtures in this test module use a bare `git_project_dir` with
+    /// no detectable test framework at all — deliberately, so tests that
+    /// are actually about the dev/review/cancellation flow are not slowed
+    /// down by a real test run. Since the second re-review (Blocker 3), a
+    /// missing test command only ever becomes `no_tests_applicable`
+    /// evidence behind a real, persisted user confirmation (see
+    /// `core_loop::run_tests_for_round`), so every such fixture-driven test
+    /// that needs the loop to get *past* the test-execution step now calls
+    /// this first, for exactly the generation/round(s) it needs.
+    fn confirm_no_tests(
+        db: &Database,
+        project_id: &str,
+        task_id: &str,
+        generation: i64,
+        rounds: &[i64],
+    ) {
+        for round in rounds {
+            db.record_no_tests_confirmation(project_id, task_id, generation, *round, None)
+                .unwrap();
+        }
+    }
+
     #[test]
     fn main_flow_approve_reaches_awaiting_user_acceptance() {
         let dir = git_project_dir("main-flow");
-        let (db, _project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
 
         let outcome = run_core_loop(
@@ -1440,14 +1650,14 @@ mod tests {
         assert_eq!(adapter.development_call_count(), 1);
         assert_eq!(adapter.review_call_count(), 1);
 
-        let reviews = db.list_task_reviews(&_project_id, &task_id).unwrap();
+        let reviews = db.list_task_reviews(&project_id, &task_id).unwrap();
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].verdict, "approve");
         assert_eq!(reviews[0].round, 1);
 
         // The full success path also composes correctly with Phase 2's
         // existing acceptance/completion machinery.
-        db.record_user_acceptance(&_project_id, &task_id, true, None)
+        db.record_user_acceptance(&project_id, &task_id, true, None)
             .unwrap();
         let completed = db
             .transition_task(
@@ -1462,6 +1672,183 @@ mod tests {
             .unwrap();
         assert_eq!(completed.state, TaskState::Completed);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Second re-review (Major 5): accept_task_result / resync_task_documents ---
+
+    #[test]
+    fn accepting_a_result_completes_the_task_and_final_result_reflects_it() {
+        let dir = git_project_dir("accept-result-completes");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
+        let app_data_dir = test_app_data_dir();
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &app_data_dir,
+        )
+        .unwrap();
+        assert_eq!(outcome.task.state, TaskState::AwaitingUserAcceptance);
+
+        let task = accept_task_result(
+            &db,
+            &project_id,
+            &task_id,
+            true,
+            Some("looks good"),
+            &app_data_dir,
+        )
+        .unwrap();
+        assert_eq!(task.state, TaskState::Completed);
+        assert!(!task.document_sync_pending);
+
+        let final_result_path = app_data_dir
+            .join("result-documents")
+            .join(&project_id)
+            .join(&task_id)
+            .join("FINAL_RESULT.md");
+        let content =
+            fs::read_to_string(fs::canonicalize(&final_result_path).unwrap_or(final_result_path))
+                .unwrap();
+        assert!(
+            content.contains("已完成（用户已验收）"),
+            "FINAL_RESULT.md must reflect the real completed state, not stay on \"awaiting acceptance\": {content}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejecting_a_result_moves_to_needs_user_action_and_final_result_reflects_it() {
+        let dir = git_project_dir("reject-result-needs-action");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
+        let app_data_dir = test_app_data_dir();
+        run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &app_data_dir,
+        )
+        .unwrap();
+
+        let task = accept_task_result(
+            &db,
+            &project_id,
+            &task_id,
+            false,
+            Some("not quite"),
+            &app_data_dir,
+        )
+        .unwrap();
+        assert_eq!(task.state, TaskState::NeedsUserAction);
+
+        let final_result_path = app_data_dir
+            .join("result-documents")
+            .join(&project_id)
+            .join(&task_id)
+            .join("FINAL_RESULT.md");
+        let content =
+            fs::read_to_string(fs::canonicalize(&final_result_path).unwrap_or(final_result_path))
+                .unwrap();
+        assert!(
+            content.contains("需要用户处理"),
+            "FINAL_RESULT.md must reflect the rejection, not the acceptance workflow: {content}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepting_the_same_result_twice_is_refused_the_second_time_not_double_completed() {
+        let dir = git_project_dir("accept-twice");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
+        let app_data_dir = test_app_data_dir();
+        run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &app_data_dir,
+        )
+        .unwrap();
+
+        accept_task_result(&db, &project_id, &task_id, true, None, &app_data_dir).unwrap();
+        let second = accept_task_result(&db, &project_id, &task_id, true, None, &app_data_dir);
+        assert!(
+            second.is_err(),
+            "a task no longer in awaiting_user_acceptance must refuse a second acceptance, not silently re-accept"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accept_task_result_refuses_a_project_id_that_does_not_own_the_task() {
+        let dir_a = git_project_dir("accept-wrong-project-a");
+        let dir_b = git_project_dir("accept-wrong-project-b");
+        let (db, project_a, task_a) = db_with_confirmed_task(&dir_a, "codex_cli");
+        confirm_no_tests(&db, &project_a, &task_a, 0, &[1]);
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
+        let app_data_dir = test_app_data_dir();
+        run_core_loop(
+            &db,
+            &task_a,
+            &adapter,
+            &CancellationToken::new(),
+            &app_data_dir,
+        )
+        .unwrap();
+
+        let project_b = db
+            .create_project(&CreateProjectRequest {
+                name: "B".to_string(),
+                local_path: dir_b.to_string_lossy().into_owned(),
+                source_type: "local".to_string(),
+                source_url: None,
+                purpose: None,
+                long_term_goal: None,
+                user_preferences: None,
+                prohibitions: None,
+            })
+            .unwrap();
+        let result = accept_task_result(&db, &project_b.id, &task_a, true, None, &app_data_dir);
+        assert!(result.is_err());
+        let _ = fs::remove_dir_all(&dir_a);
+        let _ = fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn resync_task_documents_clears_a_pending_flag_and_regenerates() {
+        let dir = git_project_dir("resync-documents");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
+        let app_data_dir = test_app_data_dir();
+        run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &app_data_dir,
+        )
+        .unwrap();
+        accept_task_result(&db, &project_id, &task_id, true, None, &app_data_dir).unwrap();
+
+        // Simulate a prior failed sync (e.g. a transient docs-directory
+        // write error) that left the flag set despite the DB state already
+        // being correct — `resync_task_documents` must be able to clear it
+        // without requiring another accept/reject decision.
+        db.set_document_sync_pending(&task_id, true).unwrap();
+        assert!(db.task(&task_id).unwrap().document_sync_pending);
+
+        let task = resync_task_documents(&db, &project_id, &task_id, &app_data_dir).unwrap();
+        assert!(!task.document_sync_pending);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1517,7 +1904,8 @@ mod tests {
     #[test]
     fn one_fix_pass_then_still_rejected_ends_in_failed() {
         let dir = git_project_dir("one-fix-then-fail");
-        let (db, _project_id, task_id) = db_with_confirmed_task(&dir, "claude_cli");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "claude_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1, 2]);
         let adapter = MockAdapter::new(
             vec![MockOutcome::Success, MockOutcome::Success],
             vec![
@@ -1547,7 +1935,7 @@ mod tests {
             "first review plus exactly one second review"
         );
 
-        let reviews = db.list_task_reviews(&_project_id, &task_id).unwrap();
+        let reviews = db.list_task_reviews(&project_id, &task_id).unwrap();
         assert_eq!(reviews.len(), 2);
         assert_eq!(reviews[0].round, 1);
         assert_eq!(reviews[1].round, 2);
@@ -1559,7 +1947,8 @@ mod tests {
     #[test]
     fn a_second_round_approve_after_one_fix_pass_still_succeeds() {
         let dir = git_project_dir("fix-then-approve");
-        let (db, _project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1, 2]);
         let adapter = MockAdapter::new(
             vec![MockOutcome::Success, MockOutcome::Success],
             vec![ReviewVerdict::ChangesRequired, ReviewVerdict::Approve],
@@ -1651,7 +2040,8 @@ mod tests {
     #[test]
     fn reviewer_write_attempt_is_technically_detected_and_stops_the_loop() {
         let dir = git_project_dir("reviewer-writes");
-        let (db, _project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
         let violating_dir = dir.clone();
         *adapter.review_side_effect.lock().unwrap() = Some(Box::new(move |_req| {
@@ -1671,7 +2061,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome.task.state, TaskState::NeedsUserAction);
-        let reviews = db.list_task_reviews(&_project_id, &task_id).unwrap();
+        let reviews = db.list_task_reviews(&project_id, &task_id).unwrap();
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].verdict, "integrity_violation");
         let _ = fs::remove_dir_all(&dir);
@@ -1684,7 +2074,8 @@ mod tests {
         // directory — checked directly against the field the (real)
         // `RealCliAdapter` would use as the reviewer's `cwd`.
         let dir = git_project_dir("blocker1-no-real-path");
-        let (db, _project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
         let captured_workspace_dir: Arc<std::sync::Mutex<Option<PathBuf>>> =
             Arc::new(std::sync::Mutex::new(None));
@@ -1829,6 +2220,7 @@ mod tests {
         db.start_action(&task_id, &dev_key, false).unwrap();
         db.finish_action(&task_id, &dev_key, ActionStatus::Succeeded, None, None)
             .unwrap();
+        confirm_no_tests(&db, &_project_id, &task_id, 0, &[1]);
 
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
         let outcome = run_one_round(
@@ -2017,6 +2409,9 @@ mod tests {
         )
         .unwrap();
 
+        confirm_no_tests(&db, &project_a, &task_a, 0, &[1]);
+        confirm_no_tests(&db, &project_b_row.id, &task_b_row.id, 0, &[1, 2]);
+
         let adapter_a = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
         run_core_loop(
             &db,
@@ -2059,7 +2454,8 @@ mod tests {
     #[test]
     fn reviewer_findings_are_redacted_before_being_persisted() {
         let dir = git_project_dir("redact-findings-core-loop");
-        let (db, _project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1, 2]);
         let adapter = MockAdapter::new(
             vec![MockOutcome::Success],
             vec![
@@ -2084,7 +2480,7 @@ mod tests {
             "two changes_required verdicts must exhaust the one fix pass and end in failed"
         );
 
-        let reviews = db.list_task_reviews(&_project_id, &task_id).unwrap();
+        let reviews = db.list_task_reviews(&project_id, &task_id).unwrap();
         assert!(!reviews.is_empty());
         for review in &reviews {
             let findings = review.findings_summary.as_deref().unwrap_or("");
@@ -2099,7 +2495,8 @@ mod tests {
     #[test]
     fn chinese_and_space_containing_project_paths_work_end_to_end() {
         let dir = git_project_dir("中文 项目 空格 core loop");
-        let (db, _project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
 
         let outcome = run_core_loop(
@@ -2330,7 +2727,8 @@ mod tests {
     #[test]
     fn cancelling_while_the_reviewer_ai_is_running_is_recorded_as_cancelled_not_needs_fix() {
         let dir = git_project_dir("cancel-during-review");
-        let (db, _project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
         let cancel = CancellationToken::new();
         let cancel_for_effect = cancel.clone();
@@ -2341,11 +2739,18 @@ mod tests {
             run_core_loop(&db, &task_id, &adapter, &cancel, &test_app_data_dir()).unwrap();
 
         assert_eq!(outcome.task.state, TaskState::Cancelled);
-        let reviews = db.list_task_reviews(&_project_id, &task_id).unwrap();
+        let reviews = db.list_task_reviews(&project_id, &task_id).unwrap();
         assert_eq!(
             reviews.len(),
             1,
             "a cancelled review round is still recorded as evidence, not silently dropped"
+        );
+        let review_key = format!("review-{task_id}-round-1");
+        let action = db.find_action(&task_id, &review_key).unwrap().unwrap();
+        assert_eq!(
+            action.status,
+            ActionStatus::Cancelled,
+            "the review action must also land on `cancelled`, not `failed`"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2353,7 +2758,8 @@ mod tests {
     #[test]
     fn cancelling_during_the_automatic_fix_pass_is_recorded_as_cancelled() {
         let dir = git_project_dir("cancel-during-safe-fixing");
-        let (db, _project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1, 2]);
         let adapter = MockAdapter::new(
             vec![MockOutcome::Success, MockOutcome::Success],
             vec![ReviewVerdict::ChangesRequired],
@@ -2459,6 +2865,8 @@ mod tests {
         )
         .unwrap();
 
+        confirm_no_tests(&db, &project_b.id, &task_b.id, 0, &[1]);
+
         // Task A's own cancellation token, already fired *before* A's loop
         // ever starts — task B uses a completely independent, never-fired
         // token and must reach success normally.
@@ -2497,18 +2905,94 @@ mod tests {
         let action = db.find_action(&task_id, &dev_key).unwrap().unwrap();
         assert_eq!(
             action.status,
-            ActionStatus::Failed,
-            "a cancelled action must be recorded as a terminal ledger status, never left `started`"
+            ActionStatus::Cancelled,
+            "re-review Major 4: a user cancellation must land on the ledger's own \
+             `cancelled` terminal status, never be folded into `failed` alongside a \
+             genuine process failure"
         );
+        assert!(
+            action
+                .error_summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("cancellation")),
+            "the ledger's error_summary must say this was a cancellation, not a generic failure: {:?}",
+            action.error_summary
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelling_while_independent_tests_are_running_is_recorded_as_cancelled_not_failed() {
+        // Re-review Major 4: the bug this closes lived specifically in the
+        // test-execution round (`run_tests_for_round`'s cancellation branch
+        // finished the ledger action as `Failed` even though the task
+        // itself transitioned to `Cancelled`). Reaching that exact branch
+        // requires a *real* allowlisted test command that is still running
+        // when cancellation fires — `npm test` running a Node script that
+        // sleeps a few seconds is the smallest such command available on
+        // this dev machine (`node`/`npm` are already required for the
+        // frontend build).
+        let dir = git_project_dir("cancel-during-test-execution");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"setTimeout(()=>process.exit(0), 6000)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+
+        let (db, _project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
+        let cancel = CancellationToken::new();
+        let cancel_for_timer = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            cancel_for_timer.cancel();
+        });
+
+        let outcome =
+            run_core_loop(&db, &task_id, &adapter, &cancel, &test_app_data_dir()).unwrap();
+        canceller.join().unwrap();
+
+        assert_eq!(outcome.task.state, TaskState::Cancelled);
+        let test_key = format!("test-{task_id}-round-1");
+        let action = db.find_action(&task_id, &test_key).unwrap().unwrap();
+        assert_eq!(
+            action.status,
+            ActionStatus::Cancelled,
+            "the test-execution action must be `cancelled`, not `failed`, when the user \
+             cancels while the independent test run is still in progress"
+        );
+        let evidence = db
+            .list_test_evidence_for_round(&_project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].status, "cancelled");
         let _ = fs::remove_dir_all(&dir);
     }
 
     // --- Blocker 3: independent test execution --------------------------
 
     #[test]
-    fn a_project_with_no_detectable_test_framework_records_no_tests_applicable_and_still_succeeds()
-    {
-        let dir = git_project_dir("no-test-framework");
+    fn a_project_with_no_detectable_test_framework_and_no_user_confirmation_stops_for_the_user() {
+        // Second re-review (Blocker 3): this replaces the prior version of
+        // this test, which the re-review correctly called out as "proving
+        // the unacceptable no-confirmation path" — Nova recording
+        // `no_tests_applicable` and reaching `AwaitingUserAcceptance`
+        // purely on its own detection failure, with no real user decision
+        // anywhere in the loop. The corrected behavior: with no test
+        // command and no confirmation, the loop must stop at
+        // `NeedsUserAction` and must not fabricate any test evidence at
+        // all — not even a `no_tests_applicable` row.
+        let dir = git_project_dir("no-test-framework-unconfirmed");
         let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
 
@@ -2521,16 +3005,142 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(outcome.task.state, TaskState::AwaitingUserAcceptance);
-        // Round 1 always runs at `result_generation == 0` — the counter is
-        // only bumped once the task actually reaches `preview_ready`, which
-        // happens *after* this round completes.
+        assert_eq!(outcome.task.state, TaskState::NeedsUserAction);
+        let evidence = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert!(
+            evidence.is_empty(),
+            "no test evidence — not even no_tests_applicable — may be recorded without a real confirmation: {evidence:?}"
+        );
+        let test_key = format!("test-{task_id}-round-1");
+        let action = db.find_action(&task_id, &test_key).unwrap().unwrap();
+        assert_eq!(action.status, ActionStatus::Failed);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirming_no_tests_after_getting_stuck_actually_unblocks_a_resumed_run_to_success() {
+        // Second re-review remediation: proves the *whole* real-world path,
+        // not just that the confirmation record gets written — a user who
+        // gets stuck at `needs_user_action`, confirms there are no
+        // applicable tests, and clicks "start" again must actually see the
+        // task complete, not stay stuck forever because the retried
+        // `test-{task_id}-round-1` action was left in a terminal `failed`
+        // status a plain `start_action` can never leave again.
+        let dir = git_project_dir("no-test-framework-unblock-resume");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
+        let app_data_dir = test_app_data_dir();
+
+        let stuck = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &app_data_dir,
+        )
+        .unwrap();
+        assert_eq!(stuck.task.state, TaskState::NeedsUserAction);
+
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, Some("no tests yet"))
+            .unwrap();
+        let unblocked = unblock_test_execution_for_retry(&db, &project_id, &task_id).unwrap();
+        assert_eq!(unblocked.state, TaskState::Queued);
+        let test_key = format!("test-{task_id}-round-1");
+        assert_eq!(
+            db.find_action(&task_id, &test_key).unwrap().unwrap().status,
+            ActionStatus::Planned,
+            "the stalled test action must be back to planned, retryable again"
+        );
+
+        let resumed = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &app_data_dir,
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.task.state,
+            TaskState::AwaitingUserAcceptance,
+            "the resumed run must actually complete the round this time, not get stuck again"
+        );
         let evidence = db
             .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
             .unwrap();
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].status, "no_tests_applicable");
-        assert!(evidence[0].reason.is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_project_with_no_detectable_test_framework_and_a_real_confirmation_proceeds_and_succeeds() {
+        let dir = git_project_dir("no-test-framework-confirmed");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, Some("brand new project"))
+            .unwrap();
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
+
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.task.state, TaskState::AwaitingUserAcceptance);
+        let evidence = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].status, "no_tests_applicable");
+        assert!(
+            evidence[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("用户已确认")),
+            "the evidence's own reason must reference the real user confirmation: {:?}",
+            evidence[0].reason
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_no_tests_confirmation_from_a_prior_round_does_not_carry_forward_to_the_fix_pass_round() {
+        // The confirmation is scoped to round 1 only; round 2's own test
+        // execution (the automatic fix pass) must independently require its
+        // own confirmation rather than silently inheriting round 1's.
+        let dir = git_project_dir("no-test-framework-stale-confirmation");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        let adapter = MockAdapter::new(
+            vec![MockOutcome::Success, MockOutcome::Success],
+            vec![ReviewVerdict::ChangesRequired],
+        );
+
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.task.state,
+            TaskState::NeedsUserAction,
+            "round 2's test execution must stop for a fresh confirmation, not reuse round 1's"
+        );
+        let round_2_evidence = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 2)
+            .unwrap();
+        assert!(round_2_evidence.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2568,6 +3178,7 @@ mod tests {
     fn each_round_produces_its_own_independent_test_evidence_never_reusing_an_earlier_round() {
         let dir = git_project_dir("test-evidence-per-round");
         let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1, 2]);
         let adapter = MockAdapter::new(
             vec![MockOutcome::Success, MockOutcome::Success],
             vec![ReviewVerdict::ChangesRequired, ReviewVerdict::Approve],
@@ -2750,7 +3361,8 @@ mod tests {
     #[test]
     fn command_evidence_stores_a_real_redacted_stdout_and_stderr_reference_not_always_none() {
         let dir = git_project_dir("command-evidence-refs");
-        let (db, _project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
         *adapter.review_findings_text.lock().unwrap() =
             Some("distinctive review summary text".to_string());

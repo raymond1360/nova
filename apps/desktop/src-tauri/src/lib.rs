@@ -72,6 +72,7 @@ impl AppState {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
@@ -135,6 +136,12 @@ pub fn run() {
             commands::detect_test_command,
             commands::confirm_task_test_command,
             commands::list_task_reviews,
+            commands::resolve_cli_binary_path,
+            commands::get_cli_binary_trust_status,
+            commands::confirm_cli_binary_path,
+            commands::confirm_no_tests_applicable,
+            commands::accept_task_result,
+            commands::resync_task_documents,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Nova")

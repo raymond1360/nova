@@ -17,8 +17,8 @@ use rusqlite::params;
 use crate::db::Database;
 use crate::error::{NovaError, NovaResult};
 use crate::models::{
-    CommandEvidence, FileChangeEvidence, GeneratedDocument, GitEvidence, TestEvidence,
-    TimelineEvent, UserAcceptance,
+    BuildEvidence, CommandEvidence, FileChangeEvidence, GeneratedDocument, GitEvidence,
+    TestEvidence, TimelineEvent, UserAcceptance,
 };
 use crate::security::redact_sensitive_text;
 
@@ -37,6 +37,23 @@ pub struct RecordTestEvidenceRequest<'a> {
     pub passed_count: i64,
     pub failed_count: i64,
     pub skipped_count: i64,
+    pub exit_code: Option<i64>,
+    pub reason: Option<&'a str>,
+    pub stdout_ref: Option<&'a str>,
+    pub stderr_ref: Option<&'a str>,
+}
+
+/// Codex re-review remediation (Major 3): parameters for
+/// [`Database::record_build_evidence`] — mirrors
+/// [`RecordTestEvidenceRequest`] exactly, one field shorter (no
+/// pass/fail/skip counts, since a build has no such concept).
+pub struct RecordBuildEvidenceRequest<'a> {
+    pub project_id: &'a str,
+    pub task_id: &'a str,
+    pub result_generation: i64,
+    pub round: i64,
+    pub build_command_redacted: Option<&'a str>,
+    pub status: &'a str,
     pub exit_code: Option<i64>,
     pub reason: Option<&'a str>,
     pub stdout_ref: Option<&'a str>,
@@ -288,6 +305,72 @@ impl Database {
         Ok(rows)
     }
 
+    /// Codex re-review remediation (Major 3): records one independently-run
+    /// build attempt for a task's *current* `(result_generation, round)` —
+    /// mirrors [`Database::record_test_evidence`] exactly, including the
+    /// same redaction discipline for every text field.
+    pub fn record_build_evidence(
+        &self,
+        request: &RecordBuildEvidenceRequest<'_>,
+    ) -> NovaResult<BuildEvidence> {
+        self.assert_task_belongs_to_project(request.project_id, request.task_id)?;
+        let id = new_id();
+        let now = now();
+        let build_command_redacted = request.build_command_redacted.map(redact_sensitive_text);
+        let reason = request.reason.map(redact_sensitive_text);
+        let stdout_ref = request.stdout_ref.map(redact_sensitive_text);
+        let stderr_ref = request.stderr_ref.map(redact_sensitive_text);
+        self.conn().execute(
+            "INSERT INTO build_evidence (id, project_id, task_id, result_generation, round, build_command_redacted, status, exit_code, reason, stdout_ref, stderr_ref, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                id,
+                request.project_id,
+                request.task_id,
+                request.result_generation,
+                request.round,
+                build_command_redacted,
+                request.status,
+                request.exit_code,
+                reason,
+                stdout_ref,
+                stderr_ref,
+                now
+            ],
+        )?;
+        self.conn()
+            .query_row(
+                "SELECT id, project_id, task_id, result_generation, round, build_command_redacted, status, exit_code, reason, stdout_ref, stderr_ref, created_at
+                 FROM build_evidence WHERE id = ?1",
+                params![id],
+                read_build_evidence,
+            )
+            .map_err(Into::into)
+    }
+
+    /// Every build-evidence row for a task's *current* `(result_generation,
+    /// round)` — mirrors [`Database::list_test_evidence_for_round`] exactly.
+    pub fn list_build_evidence_for_round(
+        &self,
+        project_id: &str,
+        task_id: &str,
+        result_generation: i64,
+        round: i64,
+    ) -> NovaResult<Vec<BuildEvidence>> {
+        self.assert_task_belongs_to_project(project_id, task_id)?;
+        let mut stmt = self.conn().prepare(
+            "SELECT id, project_id, task_id, result_generation, round, build_command_redacted, status, exit_code, reason, stdout_ref, stderr_ref, created_at
+             FROM build_evidence WHERE task_id = ?1 AND result_generation = ?2 AND round = ?3 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![task_id, result_generation, round],
+                read_build_evidence,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Records the user's explicit accept/reject decision for a task's
     /// *current* result. This must only ever be called from the Tauri
     /// command wired to the literal "我已经看过，符合需要" confirmation
@@ -493,6 +576,23 @@ fn read_test_evidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<TestEvidence>
         stdout_ref: row.get(12)?,
         stderr_ref: row.get(13)?,
         created_at: row.get(14)?,
+    })
+}
+
+fn read_build_evidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<BuildEvidence> {
+    Ok(BuildEvidence {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        task_id: row.get(2)?,
+        result_generation: row.get(3)?,
+        round: row.get(4)?,
+        build_command_redacted: row.get(5)?,
+        status: row.get(6)?,
+        exit_code: row.get(7)?,
+        reason: row.get(8)?,
+        stdout_ref: row.get(9)?,
+        stderr_ref: row.get(10)?,
+        created_at: row.get(11)?,
     })
 }
 
@@ -816,6 +916,125 @@ mod tests {
         assert_eq!(evidence.passed_count, 125);
         assert_eq!(evidence.exit_code, Some(0));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_evidence_records_status_and_exit_code() {
+        let dir = temp_dir("build-evidence");
+        let (db, project_id, task_id) = db_with_task(&dir, "P");
+        let evidence = db
+            .record_build_evidence(&RecordBuildEvidenceRequest {
+                project_id: &project_id,
+                task_id: &task_id,
+                result_generation: 0,
+                round: 1,
+                build_command_redacted: Some("cargo build"),
+                status: "passed",
+                exit_code: Some(0),
+                reason: None,
+                stdout_ref: None,
+                stderr_ref: None,
+            })
+            .unwrap();
+        assert_eq!(evidence.status, "passed");
+        assert_eq!(evidence.exit_code, Some(0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_evidence_text_fields_are_redacted_before_storage() {
+        let dir = temp_dir("build-evidence-redact");
+        let (db, project_id, task_id) = db_with_task(&dir, "P");
+        let evidence = db
+            .record_build_evidence(&RecordBuildEvidenceRequest {
+                project_id: &project_id,
+                task_id: &task_id,
+                result_generation: 0,
+                round: 1,
+                build_command_redacted: Some("npm run build"),
+                status: "failed",
+                exit_code: Some(1),
+                reason: Some("api_key=sk-1234567890abcdef1234567890abcdef build failed"),
+                stdout_ref: Some("sk-1234567890abcdef1234567890abcdef in stdout"),
+                stderr_ref: None,
+            })
+            .unwrap();
+        assert!(!evidence
+            .reason
+            .unwrap()
+            .contains("sk-1234567890abcdef1234567890abcdef"));
+        assert!(!evidence
+            .stdout_ref
+            .unwrap()
+            .contains("sk-1234567890abcdef1234567890abcdef"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_build_evidence_for_round_is_scoped_to_the_exact_generation_and_round() {
+        let dir = temp_dir("build-evidence-scoped");
+        let (db, project_id, task_id) = db_with_task(&dir, "P");
+        db.record_build_evidence(&RecordBuildEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: Some("cargo build"),
+            status: "passed",
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        db.record_build_evidence(&RecordBuildEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 2,
+            build_command_redacted: Some("cargo build"),
+            status: "failed",
+            exit_code: Some(1),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+
+        let round1 = db
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(round1.len(), 1);
+        assert_eq!(round1[0].status, "passed");
+        let round2 = db
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 2)
+            .unwrap();
+        assert_eq!(round2.len(), 1);
+        assert_eq!(round2[0].status, "failed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_evidence_referencing_a_task_from_a_different_project_is_rejected() {
+        let dir_a = temp_dir("build-cross-a");
+        let dir_b = temp_dir("build-cross-b");
+        let (db, _project_a, task_a) = db_with_task(&dir_a, "A");
+        let (_db_unused, project_b, _task_b) = db_with_task(&dir_b, "B");
+        let result = db.record_build_evidence(&RecordBuildEvidenceRequest {
+            project_id: &project_b,
+            task_id: &task_a,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: Some("cargo build"),
+            status: "passed",
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        });
+        assert!(result.is_err());
+        let _ = fs::remove_dir_all(&dir_a);
+        let _ = fs::remove_dir_all(&dir_b);
     }
 
     #[test]

@@ -559,6 +559,35 @@ pub struct TestEvidence {
     pub created_at: String,
 }
 
+/// Codex re-review remediation (Major 3): one independently-run build
+/// attempt for a task's *current* `(result_generation, round)`, mirroring
+/// [`TestEvidence`]'s shape exactly so a round's test and build results are
+/// always readable together against the same task/generation/round tuple.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct BuildEvidence {
+    pub id: String,
+    pub project_id: String,
+    pub task_id: String,
+    pub result_generation: i64,
+    pub round: i64,
+    /// `None` only for the `no_build_applicable` status — every other
+    /// status always carries the actual command that was run.
+    pub build_command_redacted: Option<String>,
+    /// One of `passed` / `failed` / `no_build_applicable` / `timed_out` /
+    /// `cancelled` / `insufficient_evidence` (enforced by a `CHECK`
+    /// constraint) — the only field a caller may treat as "did the build
+    /// really succeed".
+    pub status: String,
+    pub exit_code: Option<i64>,
+    /// Human-readable reason, e.g. why no build command could be
+    /// determined for this project.
+    pub reason: Option<String>,
+    pub stdout_ref: Option<String>,
+    pub stderr_ref: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserAcceptance {
     pub id: String,

@@ -179,6 +179,57 @@ pub fn run_core_loop(
         }
     }
 
+    // Codex re-review remediation (Major 1, resume follow-through): if a
+    // prior invocation of this function already ran round 1 to a genuine
+    // `NeedsFix` conclusion and started round 2 — proven by a real round-2
+    // Action Ledger entry existing at all, exactly what
+    // `current_pending_round` now checks — resume directly at round 2.
+    // Re-running round 1's `run_single_ai_round` here would immediately hit
+    // `gate_action` on round 1's own already-terminal (non-`succeeded`)
+    // test/build action and incorrectly re-stall the task on an issue round
+    // 1 already resolved by handing off to the one automatic fix pass, even
+    // though the *real* stuck point (round 2) was what the user just
+    // unblocked via `unblock_test_execution_for_retry`. `prior_findings` is
+    // `None` here (not round 1's original failure text) because round 2's
+    // own developer-AI step has, by construction, already run (a round-2
+    // Action Ledger entry cannot exist otherwise) — this resume path only
+    // ever reaches `write_task_package` again in the narrow crash-recovery
+    // case where round 2's *own* dev action is still `planned`, which does
+    // not need round 1's original findings either.
+    if current_pending_round(db, &project.id, task_id)? == 2 {
+        let round2 = run_single_ai_round(
+            db,
+            task_id,
+            &project.id,
+            &project_dir,
+            dev_kind,
+            adapter,
+            cancel,
+            2,
+            None,
+            app_data_dir,
+        )?;
+        match round2 {
+            SingleAiRoundOutcome::Verified => finish_success_path(db, &project.id, task_id, 2)?,
+            SingleAiRoundOutcome::NeedsFix(_) => {
+                db.transition_task(
+                    task_id,
+                    TaskState::Failed,
+                    Actor::System,
+                    Some("修复后 Nova 独立验证仍未通过，尚未完工，由用户决定是否开始下一轮"),
+                    None,
+                    false,
+                    None,
+                )?;
+            }
+            SingleAiRoundOutcome::ActionUncertain | SingleAiRoundOutcome::Stopped => {}
+        }
+        documents::generate_result_documents(db, &project.id, task_id, app_data_dir)?;
+        return Ok(CoreLoopOutcome {
+            task: db.task(task_id)?,
+        });
+    }
+
     let round1 = run_single_ai_round(
         db,
         task_id,
@@ -452,7 +503,23 @@ fn finish_success_path(
         .any(|e| e.status == "passed" || e.status == "no_tests_applicable");
     if !test_gate_ok {
         return Err(NovaError::Config(
-            "缺少当前轮次的独立测试证据（通过或不适用），审核通过结论不能绕过测试门禁".to_string(),
+            "缺少当前轮次的独立测试证据（通过或不适用），结果不能进入验收".to_string(),
+        ));
+    }
+
+    // Codex re-review remediation (Major 3): symmetric defense-in-depth
+    // check alongside the test gate above — a round can never reach
+    // `preview_ready` without its own independent build evidence either
+    // (passed or genuinely not applicable), never merely because the
+    // caller happened to skip the build step.
+    let build_evidence =
+        db.list_build_evidence_for_round(project_id, task_id, result_generation, round)?;
+    let build_gate_ok = build_evidence
+        .iter()
+        .any(|e| e.status == "passed" || e.status == "no_build_applicable");
+    if !build_gate_ok {
+        return Err(NovaError::Config(
+            "缺少当前轮次的独立构建证据（通过或不适用），结果不能进入验收".to_string(),
         ));
     }
 
@@ -460,7 +527,7 @@ fn finish_success_path(
         task_id,
         TaskState::PreviewReady,
         Actor::System,
-        Some("审核通过，结果已就绪"),
+        Some("Nova 独立验证通过，结果已就绪"),
         None,
         false,
         None,
@@ -543,20 +610,40 @@ pub fn resync_task_documents(
     db.task(task_id)
 }
 
-/// The round a task is currently stuck on if it is sitting in
-/// `needs_user_action` because its `test-{task_id}-round-N` action needed
-/// input the user did not yet have (no detectable test command, or a
-/// rejected allowlist check) — round 1 unless a round-1 review already
-/// exists for the task's current `result_generation`, in which case it is
-/// the round-2 automatic fix pass. Only ever 1 or 2, matching the fixed
-/// "at most one automatic fix pass" product rule.
+/// Codex re-review remediation (Major 1): the round a task is currently
+/// stuck on if it is sitting in `needs_user_action` because its
+/// `{dev,test,build}-{task_id}-round-N` action needed input the user did
+/// not yet have (no detectable test command, a rejected allowlist check,
+/// ...) — round 1 unless *any* round-2 Action Ledger entry already exists
+/// for this task, in which case it is the round-2 automatic fix pass. Only
+/// ever 1 or 2, matching the fixed "at most one automatic fix pass" product
+/// rule.
+///
+/// Previously derived from whether a round-1 `task_reviews` row existed —
+/// correct for the dormant v0.2.0 dual-AI path (which always writes one),
+/// but the v0.1.0 single-AI path never writes `task_reviews` at all, so
+/// this always returned `1`, even for a task genuinely stuck in its round-2
+/// fix pass. The Action Ledger is the single source of truth both paths
+/// share unconditionally: `gate_action` always plans a round's `dev-...`
+/// action *before* anything else happens for that round (see
+/// `run_dev_and_test_round`), so a round-2 action existing at all —
+/// `dev`, `test`, or `build` — is itself sufficient, real proof round 2 has
+/// begun. Never inspects the free-text `reason` a state transition carries;
+/// that text is for humans, not for control flow.
 pub fn current_pending_round(db: &Database, project_id: &str, task_id: &str) -> NovaResult<i64> {
     let task = db.task(task_id)?;
-    let reviews = db.list_task_reviews(project_id, task_id)?;
-    let round_one_reviewed = reviews
-        .iter()
-        .any(|r| r.result_generation == task.result_generation && r.round == 1);
-    Ok(if round_one_reviewed { 2 } else { 1 })
+    if task.project_id != project_id {
+        return Err(NovaError::Config(
+            "task_id 与 project_id 不匹配，已拒绝".to_string(),
+        ));
+    }
+    for action_kind in ["dev", "test", "build"] {
+        let round2_key = format!("{action_kind}-{task_id}-round-2");
+        if db.find_action(task_id, &round2_key)?.is_some() {
+            return Ok(2);
+        }
+    }
+    Ok(1)
 }
 
 /// Second re-review remediation (Blocker 3): after the user supplies what
@@ -742,6 +829,19 @@ fn run_dev_and_test_round(
             TestRoundOutcome::ActionUncertain => return Ok(DevTestOutcome::ActionUncertain),
             TestRoundOutcome::Cancelled => return Ok(DevTestOutcome::Stopped),
         };
+
+    // Codex re-review remediation (Major 3): tests passing is not enough —
+    // "Nova 核验测试与构建" means Nova must also independently verify the
+    // project actually builds before this round can be considered
+    // verified. Never runs when the test step above already failed/stalled
+    // (those branches already returned), so a build is only ever attempted
+    // against a round whose tests are already known-good.
+    match run_build_for_round(db, project_id, task_id, project_dir, round, cancel)? {
+        BuildRoundOutcome::Passed(_) | BuildRoundOutcome::NoBuildApplicable(_) => {}
+        BuildRoundOutcome::Failed(findings) => return Ok(DevTestOutcome::NeedsFix(findings)),
+        BuildRoundOutcome::ActionUncertain => return Ok(DevTestOutcome::ActionUncertain),
+        BuildRoundOutcome::Cancelled => return Ok(DevTestOutcome::Stopped),
+    }
 
     Ok(DevTestOutcome::Verified(test_summary))
 }
@@ -1365,6 +1465,239 @@ fn test_round_outcome_from_status(evidence: &crate::models::TestEvidence) -> Tes
         }
         _ => TestRoundOutcome::Failed(format!(
             "（复用本轮已记录的测试证据）状态：{}",
+            evidence.status
+        )),
+    }
+}
+
+/// Outcome of [`run_build_for_round`] — mirrors [`TestRoundOutcome`]'s
+/// shape exactly. The `Passed`/`NoBuildApplicable` payload strings are
+/// carried for symmetry with `TestRoundOutcome` (and potential future use,
+/// e.g. embedding into a review package the way `DevTestOutcome::Verified`
+/// does) but are not currently read by `run_dev_and_test_round`'s match
+/// arms, hence `#[allow(dead_code)]`.
+#[allow(dead_code)]
+enum BuildRoundOutcome {
+    Passed(String),
+    NoBuildApplicable(String),
+    Failed(String),
+    ActionUncertain,
+    Cancelled,
+}
+
+/// Codex re-review remediation (Major 3): Nova's own independent build
+/// verification, run immediately after a round's independent tests pass (or
+/// are not applicable) — mirrors [`run_tests_for_round`]'s structure and
+/// safety discipline exactly (Action Ledger gate with its own
+/// `build-{task_id}-round-{round}` key, real allowlist check before
+/// executing anything, real `build_evidence` recorded independent of
+/// anything the developer AI claimed). A project with no recognizable build
+/// command is `no_build_applicable` — a mechanically-verified fact from
+/// `Cargo.toml`/`package.json` itself, not a heuristic detection failure —
+/// so unlike Blocker 3's `no_tests_applicable`, no separate user
+/// confirmation gate is needed here.
+fn run_build_for_round(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    project_dir: &Path,
+    round: i64,
+    cancel: &CancellationToken,
+) -> NovaResult<BuildRoundOutcome> {
+    let build_key = format!("build-{task_id}-round-{round}");
+    match gate_action(db, task_id, "build_execution", &build_key, false)? {
+        ActionGate::Uncertain => {
+            db.transition_task(
+                task_id,
+                TaskState::NeedsUserAction,
+                Actor::System,
+                Some("上一次独立构建执行结果不确定，需要用户确认后才能继续"),
+                None,
+                false,
+                Some("action ledger uncertain: build_execution"),
+            )?;
+            return Ok(BuildRoundOutcome::ActionUncertain);
+        }
+        ActionGate::AlreadySucceeded => {
+            let existing = db.list_build_evidence_for_round(
+                project_id,
+                task_id,
+                db.task(task_id)?.result_generation,
+                round,
+            )?;
+            if let Some(evidence) = existing.into_iter().next_back() {
+                return Ok(build_round_outcome_from_status(&evidence));
+            }
+            return Ok(BuildRoundOutcome::NoBuildApplicable(
+                "未找到构建证据记录".to_string(),
+            ));
+        }
+        ActionGate::Started => {}
+    }
+
+    let task = db.task(task_id)?;
+    let result_generation = task.result_generation;
+
+    let command = match test_runner::detect_build_command(project_dir) {
+        test_runner::BuildDetection::NotApplicable(reason) => {
+            let evidence =
+                db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+                    project_id,
+                    task_id,
+                    result_generation,
+                    round,
+                    build_command_redacted: None,
+                    status: "no_build_applicable",
+                    exit_code: None,
+                    reason: Some(reason),
+                    stdout_ref: None,
+                    stderr_ref: None,
+                })?;
+            db.finish_action(task_id, &build_key, ActionStatus::Succeeded, None, None)?;
+            return Ok(BuildRoundOutcome::NoBuildApplicable(
+                evidence.reason.unwrap_or_default(),
+            ));
+        }
+        test_runner::BuildDetection::Command(command) => command,
+    };
+
+    if !test_runner::is_build_allowlisted(&command.program, &command.args) {
+        db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+            project_id,
+            task_id,
+            result_generation,
+            round,
+            build_command_redacted: Some(&command.display()),
+            status: "insufficient_evidence",
+            exit_code: None,
+            reason: Some("构建命令未通过安全允许列表校验，已拒绝执行"),
+            stdout_ref: None,
+            stderr_ref: None,
+        })?;
+        db.finish_action(
+            task_id,
+            &build_key,
+            ActionStatus::Failed,
+            None,
+            Some("build command not allowlisted"),
+        )?;
+        db.transition_task(
+            task_id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            Some("检测到的构建命令未通过安全校验，需要用户确认"),
+            None,
+            false,
+            Some("build command failed allowlist check"),
+        )?;
+        return Ok(BuildRoundOutcome::ActionUncertain);
+    }
+
+    let outcome = test_runner::run_tests(
+        &command.program,
+        &command.args,
+        project_dir,
+        TEST_TIMEOUT,
+        cancel.clone(),
+    );
+
+    let command_display = command.display();
+    if outcome.cancelled {
+        db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+            project_id,
+            task_id,
+            result_generation,
+            round,
+            build_command_redacted: Some(&command_display),
+            status: "cancelled",
+            exit_code: outcome.exit_code.map(i64::from),
+            reason: Some("用户在构建阶段取消了任务"),
+            stdout_ref: None,
+            stderr_ref: None,
+        })?;
+        db.finish_action(
+            task_id,
+            &build_key,
+            ActionStatus::Cancelled,
+            None,
+            Some("user cancellation during build execution"),
+        )?;
+        db.transition_task(
+            task_id,
+            TaskState::Cancelled,
+            Actor::User,
+            Some("用户在构建阶段取消了任务"),
+            None,
+            false,
+            None,
+        )?;
+        return Ok(BuildRoundOutcome::Cancelled);
+    }
+
+    let status = if outcome.timed_out {
+        "timed_out"
+    } else if !outcome.process_succeeded {
+        "failed"
+    } else {
+        "passed"
+    };
+    let stdout_ref = redact_sensitive_text(&cap_text(&outcome.stdout, 2000));
+    let stderr_ref = redact_sensitive_text(&cap_text(&outcome.stderr, 2000));
+    db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+        project_id,
+        task_id,
+        result_generation,
+        round,
+        build_command_redacted: Some(&command_display),
+        status,
+        exit_code: outcome.exit_code.map(i64::from),
+        reason: if outcome.timed_out {
+            Some("构建执行超时")
+        } else {
+            None
+        },
+        stdout_ref: Some(&stdout_ref),
+        stderr_ref: Some(&stderr_ref),
+    })?;
+    db.finish_action(
+        task_id,
+        &build_key,
+        if status == "passed" {
+            ActionStatus::Succeeded
+        } else {
+            ActionStatus::Failed
+        },
+        None,
+        None,
+    )?;
+
+    let summary = format!(
+        "命令：{command_display}\n实际程序：{}\nargv：{:?}\n工作目录：{}\n结果：{status}\n退出码：{}",
+        outcome.program,
+        outcome.args,
+        outcome.cwd,
+        outcome
+            .exit_code
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "无".to_string()),
+    );
+    if status == "passed" {
+        Ok(BuildRoundOutcome::Passed(redact_sensitive_text(&summary)))
+    } else {
+        Ok(BuildRoundOutcome::Failed(redact_sensitive_text(&format!(
+            "独立构建执行未通过，需要在下一轮修复：\n{summary}"
+        ))))
+    }
+}
+
+fn build_round_outcome_from_status(evidence: &crate::models::BuildEvidence) -> BuildRoundOutcome {
+    match evidence.status.as_str() {
+        "passed" => BuildRoundOutcome::Passed("（复用本轮已记录的构建证据）通过".to_string()),
+        "no_build_applicable" => {
+            BuildRoundOutcome::NoBuildApplicable(evidence.reason.clone().unwrap_or_default())
+        }
+        _ => BuildRoundOutcome::Failed(format!(
+            "（复用本轮已记录的构建证据）状态：{}",
             evidence.status
         )),
     }
@@ -2257,6 +2590,261 @@ mod tests {
             reviews.len(),
             1,
             "the old row must still be safely readable"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Codex re-review remediation (Major 3): independent build gate --
+
+    /// Bounded wait for a real signal a spawned subprocess writes to disk —
+    /// used instead of a fixed-duration sleep so cancellation tests never
+    /// race against CPU-scheduling delays under full-suite parallel load
+    /// (see the Major 2 fix below for the full rationale). Panics (failing
+    /// the test loudly) rather than waiting unboundedly if the signal never
+    /// arrives.
+    fn wait_for_marker_file(path: &Path, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while !path.exists() {
+            if std::time::Instant::now() >= deadline {
+                panic!("marker file never appeared within {timeout:?}: {path:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn test_passed_and_build_passed_reaches_awaiting_user_acceptance() {
+        let dir = git_project_dir("build-gate-both-pass");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(0)\"","build":"node -e \"process.exit(0)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.task.state, TaskState::AwaitingUserAcceptance);
+        let build_evidence = db
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(build_evidence.len(), 1);
+        assert_eq!(build_evidence[0].status, "passed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn round1_build_failure_triggers_the_same_dev_ais_one_fix_pass_and_round2_build_failure_ends_in_failed(
+    ) {
+        // Tests genuinely pass in both rounds; the build script always
+        // fails — a real, independent way to exercise "tests passed but
+        // build failed" without a self-contradictory fixture (unlike Rust,
+        // an npm project's test/build scripts are genuinely independent
+        // commands).
+        let dir = git_project_dir("build-gate-always-fails");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(0)\"","build":"node -e \"process.exit(1)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let adapter = MockAdapter::new(vec![MockOutcome::Success, MockOutcome::Success], vec![]);
+
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.task.state,
+            TaskState::Failed,
+            "a build failure that persists through the one automatic fix pass must end in failed, \
+             never in awaiting_user_acceptance"
+        );
+        assert_eq!(
+            adapter.development_call_count(),
+            2,
+            "round 1's build failure must trigger exactly one automatic fix pass by the same dev AI"
+        );
+        let round1_test = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(
+            round1_test[0].status, "passed",
+            "round 1's tests genuinely passed — only the build failed"
+        );
+        let round1_build = db
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(round1_build[0].status, "failed");
+        let round2_build = db
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 2)
+            .unwrap();
+        assert_eq!(
+            round2_build[0].status, "failed",
+            "round 2 must produce its own fresh build evidence, not reuse round 1's"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelling_while_the_independent_build_is_running_is_recorded_as_cancelled_not_failed() {
+        let dir = git_project_dir("build-gate-cancel-during-build");
+        let marker = dir.join("build-started.marker");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(0)\"","build":"node -e \"require('fs').writeFileSync('build-started.marker','1');setTimeout(()=>process.exit(0), 6000)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+        let cancel = CancellationToken::new();
+        let cancel_for_timer = cancel.clone();
+        let marker_for_timer = marker.clone();
+        let canceller = std::thread::spawn(move || {
+            wait_for_marker_file(&marker_for_timer, Duration::from_secs(10));
+            cancel_for_timer.cancel();
+        });
+
+        let outcome =
+            run_core_loop(&db, &task_id, &adapter, &cancel, &test_app_data_dir()).unwrap();
+        canceller.join().unwrap();
+
+        assert_eq!(outcome.task.state, TaskState::Cancelled);
+        let build_key = format!("build-{task_id}-round-1");
+        let action = db.find_action(&task_id, &build_key).unwrap().unwrap();
+        assert_eq!(
+            action.status,
+            ActionStatus::Cancelled,
+            "the build-execution action must be `cancelled`, not `failed`"
+        );
+        let evidence = db
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].status, "cancelled");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resuming_after_a_round_1_build_already_succeeded_does_not_repeat_the_build() {
+        // Crash-recovery shape: round 1's build action already reached
+        // `succeeded` (and real build_evidence was recorded) in an earlier
+        // attempt — a resumed call must reuse that fact, never spawn a
+        // second real build process for the same round.
+        let dir = git_project_dir("build-gate-resume-no-repeat");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Verifying,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let build_key = format!("build-{task_id}-round-1");
+        db.plan_action(&task_id, "build_execution", &build_key)
+            .unwrap();
+        db.start_action(&task_id, &build_key, false).unwrap();
+        db.finish_action(&task_id, &build_key, ActionStatus::Succeeded, None, None)
+            .unwrap();
+        db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: Some("cargo build"),
+            status: "passed",
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+
+        let result = run_build_for_round(
+            &db,
+            &project_id,
+            &task_id,
+            &dir,
+            1,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        assert!(matches!(result, BuildRoundOutcome::Passed(_)));
+        let evidence = db
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(
+            evidence.len(),
+            1,
+            "resuming an already-succeeded build action must never record a second build_evidence row"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3565,10 +4153,30 @@ mod tests {
         // sleeps a few seconds is the smallest such command available on
         // this dev machine (`node`/`npm` are already required for the
         // frontend build).
+        //
+        // Codex re-review remediation (Major 2): this test used to fire
+        // cancellation from a timer thread after a fixed 800ms sleep,
+        // racing against the main thread's own real progress through the
+        // mock dev step, git evidence collection, and `gate_action`
+        // planning the `test-{task_id}-round-1` action. Under full-suite
+        // parallel CPU load, `MockAdapter::run_development` — which itself
+        // checks `cancel.is_cancelled()` and short-circuits immediately —
+        // could still be reached *after* the 800ms timer had already
+        // fired, attributing the cancellation to the *development* step
+        // instead of the intended test-execution step; the test-execution
+        // action was then never planned at all, and
+        // `db.find_action(...).unwrap().unwrap()` panicked on `None`. Fixed
+        // by waiting for a real signal the spawned test process itself
+        // writes to disk — by construction, this can only appear *after*
+        // `run_tests_for_round`'s `gate_action` call already planned the
+        // action and the real `node` child process actually started, so
+        // cancellation is now deterministically attributed to the
+        // test-execution step every time, regardless of scheduling delays.
         let dir = git_project_dir("cancel-during-test-execution");
+        let marker = dir.join("test-started.marker");
         fs::write(
             dir.join("package.json"),
-            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"setTimeout(()=>process.exit(0), 6000)\""}}"#,
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"require('fs').writeFileSync('test-started.marker','1');setTimeout(()=>process.exit(0), 6000)\""}}"#,
         )
         .unwrap();
         StdCommand::new("git")
@@ -3586,8 +4194,9 @@ mod tests {
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
         let cancel = CancellationToken::new();
         let cancel_for_timer = cancel.clone();
+        let marker_for_timer = marker.clone();
         let canceller = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(800));
+            wait_for_marker_file(&marker_for_timer, Duration::from_secs(10));
             cancel_for_timer.cancel();
         });
 
@@ -3705,6 +4314,181 @@ mod tests {
             .unwrap();
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].status, "no_tests_applicable");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Codex re-review remediation (Major 1): pending round is an
+    // Action Ledger fact, never a `task_reviews` inference ------------
+
+    #[test]
+    fn current_pending_round_is_1_while_genuinely_stuck_on_round_1s_own_no_tests_confirmation() {
+        let dir = git_project_dir("pending-round-stuck-on-round-1");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+
+        let stuck = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+        assert_eq!(stuck.task.state, TaskState::NeedsUserAction);
+
+        assert_eq!(
+            current_pending_round(&db, &project_id, &task_id).unwrap(),
+            1,
+            "no round-2 Action Ledger entry exists yet — must report round 1"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_pending_round_is_2_after_round_1_genuinely_fails_and_round_2_gets_its_own_stuck_confirmation_and_resumes_without_repeating_round_1(
+    ) {
+        // Codex re-review remediation (Major 1): the concrete bug this
+        // closes — a single-AI task whose round 1 genuinely fails (real
+        // test failure, not a stall), triggers the one automatic fix pass,
+        // and then round 2 *itself* gets stuck needing its own no-tests
+        // confirmation (the round-2 fix removed the test framework
+        // entirely). The old `task_reviews`-based logic would have reported
+        // round 1 here forever (single-AI tasks never write `task_reviews`)
+        // — confirming under that stale round would target the wrong
+        // Action Ledger key and never actually unblock the real stuck
+        // round.
+        let dir = git_project_dir("pending-round-stuck-on-round-2");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(1)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add failing package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let adapter = MockAdapter::new(vec![MockOutcome::Success, MockOutcome::Success], vec![]);
+        // Round 2's development "fix" deletes package.json entirely — a
+        // real, observable file change (not just a scripted verdict) that
+        // makes round 2's own independent test-command detection come back
+        // empty, so round 2 must stall on its *own* no-tests confirmation
+        // rather than reusing round 1's already-resolved command.
+        let call_count = std::sync::atomic::AtomicUsize::new(0);
+        let package_json = dir.join("package.json");
+        let dir_for_effect = dir.clone();
+        *adapter.development_side_effect.lock().unwrap() = Some(Box::new(move |_req| {
+            if call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                let _ = fs::remove_file(&package_json);
+                // A real developer-AI fix leaves the working tree clean
+                // (committed) — otherwise the dirty-worktree guard (which
+                // runs unconditionally on every `run_core_loop` invocation,
+                // including a resume) would itself stall the task, which
+                // is not what this test is about.
+                let _ = StdCommand::new("git")
+                    .args(["add", "-A"])
+                    .current_dir(&dir_for_effect)
+                    .status();
+                let _ = StdCommand::new("git")
+                    .args(["commit", "-q", "-m", "round 2 fix: remove package.json"])
+                    .current_dir(&dir_for_effect)
+                    .status();
+            }
+        }));
+
+        let stuck = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+        assert_eq!(
+            stuck.task.state,
+            TaskState::NeedsUserAction,
+            "round 2 must stall on its own missing test command, not silently reuse round 1's"
+        );
+        assert_eq!(
+            adapter.development_call_count(),
+            2,
+            "round 1's real test failure must have triggered exactly one automatic fix pass"
+        );
+
+        assert_eq!(
+            current_pending_round(&db, &project_id, &task_id).unwrap(),
+            2,
+            "a real round-2 dev/test Action Ledger entry already exists — must report round 2, \
+             never fall back to round 1 the way the old task_reviews-based logic did"
+        );
+
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 2, Some("removed by the fix"))
+            .unwrap();
+        let unblocked = unblock_test_execution_for_retry(&db, &project_id, &task_id).unwrap();
+        assert_eq!(unblocked.state, TaskState::Queued);
+        let round1_test_key = format!("test-{task_id}-round-1");
+        assert_eq!(
+            db.find_action(&task_id, &round1_test_key)
+                .unwrap()
+                .unwrap()
+                .status,
+            ActionStatus::Failed,
+            "unblocking round 2 must never reset round 1's own already-terminal action"
+        );
+
+        let resumed = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.task.state,
+            TaskState::AwaitingUserAcceptance,
+            "the resumed round 2 must actually complete, not get stuck again"
+        );
+        assert_eq!(
+            adapter.development_call_count(),
+            2,
+            "resuming round 2 must never repeat round 1's development or invoke a third \
+             (paid) development call"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_pending_round_ignores_a_stale_dual_ai_era_task_reviews_row() {
+        // A round-1 `task_reviews` row (old dual-AI/dormant-path data) must
+        // never, by itself, make `current_pending_round` report round 2 for
+        // a single-AI task that has not actually started a round 2 in the
+        // Action Ledger.
+        let dir = git_project_dir("pending-round-ignores-stale-review");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.record_task_review(
+            &project_id,
+            &task_id,
+            0,
+            1,
+            "claude_cli",
+            "approve",
+            Some("stale dual-AI era row"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            current_pending_round(&db, &project_id, &task_id).unwrap(),
+            1,
+            "a task_reviews row must never drive this decision for the single-AI path"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -171,6 +171,139 @@ describe('coreLoop store', () => {
     expect(startCalled).toBe(false)
   })
 
+  // --- Codex re-review remediation (Blocker 1): dev-only start gate ---
+  // (`CODEX_PHASE3_SINGLE_AI_RUNTIME_REVIEW09211520.md`, Blocker 1's
+  // required test coverage.) `canStart`/`startIfReady` must depend purely
+  // on the *selected* developer AI's own readiness — the other AI's
+  // `review_ready` (always diagnostic-only per `get_core_loop_readiness`'s
+  // own Minor 2 fix) must never participate.
+
+  it('dev_ready=true, review_ready=false still allows starting (Codex-only / Claude missing)', async () => {
+    const store = useCoreLoopStore()
+    store.currentTask = fakeTask({ state: 'confirmed' })
+    store.currentProject = fakeProject()
+    let startCalled = false
+    routeInvoke({
+      get_core_loop_readiness: async () => ({
+        dev_kind: 'codex_cli',
+        reviewer_kind: 'claude_cli',
+        dev_ready: true,
+        review_ready: false,
+        dev_message: 'Codex CLI 就绪',
+        review_message: '未检查（可选诊断，不影响启动）',
+      }),
+      start_core_loop: async () => {
+        startCalled = true
+      },
+      list_tasks_for_project: async () => [fakeTask({ state: 'queued' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+    })
+
+    const started = await store.startIfReady()
+
+    expect(store.canStart).toBe(true)
+    expect(started).toBe(true)
+    expect(startCalled).toBe(true)
+  })
+
+  it('dev_ready=false, review_ready=true still forbids starting', async () => {
+    const store = useCoreLoopStore()
+    store.currentTask = fakeTask({ state: 'confirmed' })
+    let startCalled = false
+    routeInvoke({
+      get_core_loop_readiness: async () => ({
+        dev_kind: 'codex_cli',
+        reviewer_kind: 'claude_cli',
+        dev_ready: false,
+        review_ready: true,
+        dev_message: '未检测到 Codex CLI',
+        review_message: 'Claude CLI 就绪',
+      }),
+      start_core_loop: async () => {
+        startCalled = true
+      },
+    })
+
+    const started = await store.startIfReady()
+
+    expect(store.canStart).toBe(false)
+    expect(started).toBe(false)
+    expect(startCalled).toBe(false)
+  })
+
+  it('Codex ready, Claude missing (review_ready=false) allows starting', async () => {
+    const store = useCoreLoopStore()
+    store.currentTask = fakeTask({ state: 'confirmed', ai_kind: 'codex_cli' })
+    store.currentProject = fakeProject()
+    let startCalled = false
+    routeInvoke({
+      get_core_loop_readiness: async () => ({
+        dev_kind: 'codex_cli',
+        reviewer_kind: 'claude_cli',
+        dev_ready: true,
+        review_ready: false,
+        dev_message: 'Codex CLI 就绪',
+        review_message: '未检查（可选诊断，不影响启动）',
+      }),
+      start_core_loop: async () => {
+        startCalled = true
+      },
+      list_tasks_for_project: async () => [fakeTask({ state: 'queued' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+    })
+
+    const started = await store.startIfReady()
+
+    expect(started).toBe(true)
+    expect(startCalled).toBe(true)
+  })
+
+  it('Claude ready, Codex missing allows starting when Claude is the selected dev AI', async () => {
+    const store = useCoreLoopStore()
+    store.devAiKind = 'claude_cli'
+    store.currentTask = fakeTask({ state: 'confirmed', ai_kind: 'claude_cli' })
+    store.currentProject = fakeProject()
+    let startCalled = false
+    routeInvoke({
+      get_core_loop_readiness: async () => ({
+        dev_kind: 'claude_cli',
+        reviewer_kind: 'codex_cli',
+        dev_ready: true,
+        review_ready: false,
+        dev_message: 'Claude CLI 就绪',
+        review_message: '未检查（可选诊断，不影响启动）',
+      }),
+      start_core_loop: async () => {
+        startCalled = true
+      },
+      list_tasks_for_project: async () => [fakeTask({ state: 'queued' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+    })
+
+    const started = await store.startIfReady()
+
+    expect(started).toBe(true)
+    expect(startCalled).toBe(true)
+  })
+
+  it('the unselected AIs readiness state never affects canStart, in either direction', () => {
+    const store = useCoreLoopStore()
+    store.readiness = {
+      dev_kind: 'codex_cli',
+      reviewer_kind: 'claude_cli',
+      dev_ready: true,
+      review_ready: true,
+      dev_message: 'ok',
+      review_message: 'also ok, but irrelevant',
+    }
+    expect(store.canStart).toBe(true)
+    store.readiness = { ...store.readiness, review_ready: false }
+    expect(store.canStart).toBe(true)
+  })
+
   it('prevents a duplicate concurrent start_core_loop call while one is already in flight', async () => {
     const store = useCoreLoopStore()
     store.currentTask = fakeTask({ state: 'confirmed' })
@@ -291,23 +424,42 @@ describe('coreLoop store', () => {
     expect(store.currentTask?.state).toBe('queued')
   })
 
-  it('pendingRound is 1 before any round-1 review and 2 after one is recorded', () => {
+  // Codex re-review remediation (Major 1): `pendingRound` is sourced
+  // exclusively from the backend's own Action Ledger-derived
+  // `get_pending_round` command — the frontend must never infer it from
+  // `reviews` (the exact stale logic the re-review flagged).
+  it('loadPendingRound populates pendingRound from the backend, defaulting to 1', async () => {
     const store = useCoreLoopStore()
-    store.currentTask = fakeTask({ result_generation: 0 })
     expect(store.pendingRound).toBe(1)
-    store.reviews = [
-      {
-        id: 'r1',
-        project_id: 'proj-1',
-        task_id: 'task-1',
-        result_generation: 0,
-        round: 1,
-        reviewer_ai_kind: 'claude_cli',
-        verdict: 'changes_required',
-        findings_summary: null,
-        created_at: 'now',
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ result_generation: 0 })
+    let requestedTaskId: unknown = null
+    routeInvoke({
+      get_pending_round: async (args) => {
+        requestedTaskId = (args as { taskId: string }).taskId
+        return 2
       },
-    ]
+    })
+
+    await store.loadPendingRound()
+
+    expect(store.pendingRound).toBe(2)
+    expect(requestedTaskId).toBe('task-1')
+  })
+
+  it('refreshCurrentTask loads pendingRound from the backend, not from reviews', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ id: 'task-1', state: 'needs_user_action' })
+    routeInvoke({
+      list_tasks_for_project: async () => [fakeTask({ id: 'task-1', state: 'needs_user_action' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 2,
+      detect_test_command: async () => null,
+    })
+
+    await store.refreshCurrentTask()
+
     expect(store.pendingRound).toBe(2)
   })
 

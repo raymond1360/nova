@@ -92,6 +92,85 @@ pub fn is_allowlisted(program: &str, args: &[String]) -> bool {
     }
 }
 
+/// Codex re-review remediation (Major 3): Nova's own fact-verification must
+/// distinguish "tests passed" from "the project actually builds" — a
+/// project whose tests pass but whose build fails must never be reported as
+/// fully verified. Minimal, safe scope only: `cargo build` (always
+/// applicable for a Cargo project — Rust code without a successful `cargo
+/// build` cannot meaningfully be said to work at all), or `npm run build` /
+/// `pnpm run build` / `yarn build`, but *only* when `package.json` itself
+/// declares a `build` script — checked by parsing real JSON, never by
+/// string-searching the file (a project with no `build` script has,
+/// mechanically and verifiably, no build step for Nova to run; this is a
+/// hard fact from the manifest itself, not a heuristic that could miss a
+/// real framework the way test-command auto-detection can, so no user
+/// confirmation gate is needed the way Blocker 3's `no_tests_applicable`
+/// one is).
+pub enum BuildDetection {
+    Command(DetectedCommand),
+    /// No recognizable build command for this project — carries the reason
+    /// so it can be recorded as `no_build_applicable` evidence.
+    NotApplicable(&'static str),
+}
+
+pub fn detect_build_command(project_dir: &Path) -> BuildDetection {
+    if project_dir.join("Cargo.toml").is_file() {
+        return BuildDetection::Command(DetectedCommand {
+            program: "cargo".to_string(),
+            args: vec!["build".to_string()],
+        });
+    }
+    if project_dir.join("package.json").is_file() {
+        let has_build_script = std::fs::read_to_string(project_dir.join("package.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|value| {
+                value
+                    .get("scripts")
+                    .and_then(|scripts| scripts.get("build"))
+                    .and_then(|build| build.as_str())
+                    .map(|s| !s.trim().is_empty())
+            })
+            .unwrap_or(false);
+        if !has_build_script {
+            return BuildDetection::NotApplicable(
+                "npm/pnpm/yarn 项目的 package.json 未声明 build 脚本",
+            );
+        }
+        let program = if project_dir.join("pnpm-lock.yaml").is_file() {
+            "pnpm"
+        } else if project_dir.join("yarn.lock").is_file() {
+            "yarn"
+        } else {
+            "npm"
+        };
+        let args = if program == "yarn" {
+            vec!["build".to_string()]
+        } else {
+            vec!["run".to_string(), "build".to_string()]
+        };
+        return BuildDetection::Command(DetectedCommand {
+            program: program.to_string(),
+            args,
+        });
+    }
+    BuildDetection::NotApplicable("未识别到可执行的构建命令（无 Cargo.toml 或 package.json）")
+}
+
+/// Strict allowlist for build commands — mirrors [`is_allowlisted`]'s
+/// discipline, a hard boundary independent of (and never widened by)
+/// anything an AI suggests.
+pub fn is_build_allowlisted(program: &str, args: &[String]) -> bool {
+    let first = args.first().map(String::as_str);
+    let second = args.get(1).map(String::as_str);
+    match program {
+        "cargo" => first == Some("build"),
+        "npm" | "pnpm" => first == Some("run") && second == Some("build"),
+        "yarn" => first == Some("build"),
+        _ => false,
+    }
+}
+
 pub struct TestRunOutcome {
     pub program: String,
     pub args: Vec<String>,
@@ -279,6 +358,141 @@ mod tests {
         fs::write(dir.join("README.md"), "hello").unwrap();
         assert!(detect_test_command(&dir).is_none());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Codex re-review remediation (Major 3): build detection ---------
+
+    #[test]
+    fn detects_cargo_build_for_a_cargo_project() {
+        let dir = temp_dir("build-cargo");
+        fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+        match detect_build_command(&dir) {
+            BuildDetection::Command(command) => {
+                assert_eq!(command.program, "cargo");
+                assert_eq!(command.args, vec!["build".to_string()]);
+            }
+            BuildDetection::NotApplicable(reason) => {
+                panic!("expected a detected cargo build command, got: {reason}")
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_npm_run_build_when_package_json_declares_a_build_script() {
+        let dir = temp_dir("build-npm-with-script");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","scripts":{"build":"vite build","test":"vitest run"}}"#,
+        )
+        .unwrap();
+        match detect_build_command(&dir) {
+            BuildDetection::Command(command) => {
+                assert_eq!(command.program, "npm");
+                assert_eq!(command.args, vec!["run".to_string(), "build".to_string()]);
+            }
+            BuildDetection::NotApplicable(reason) => {
+                panic!("expected a detected npm build command, got: {reason}")
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_no_build_applicable_when_package_json_has_no_build_script() {
+        let dir = temp_dir("build-npm-without-script");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        match detect_build_command(&dir) {
+            BuildDetection::Command(command) => {
+                panic!("expected no_build_applicable, got a command: {command:?}")
+            }
+            BuildDetection::NotApplicable(_) => {}
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_pnpm_run_build_via_lockfile_when_build_script_present() {
+        let dir = temp_dir("build-pnpm");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","scripts":{"build":"tsc"}}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("pnpm-lock.yaml"), "").unwrap();
+        match detect_build_command(&dir) {
+            BuildDetection::Command(command) => {
+                assert_eq!(command.program, "pnpm");
+                assert_eq!(command.args, vec!["run".to_string(), "build".to_string()]);
+            }
+            BuildDetection::NotApplicable(reason) => {
+                panic!("expected a detected pnpm build command, got: {reason}")
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_yarn_build_via_lockfile_when_build_script_present() {
+        let dir = temp_dir("build-yarn");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","scripts":{"build":"webpack"}}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("yarn.lock"), "").unwrap();
+        match detect_build_command(&dir) {
+            BuildDetection::Command(command) => {
+                assert_eq!(command.program, "yarn");
+                assert_eq!(command.args, vec!["build".to_string()]);
+            }
+            BuildDetection::NotApplicable(reason) => {
+                panic!("expected a detected yarn build command, got: {reason}")
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_no_build_applicable_for_an_unrecognized_project() {
+        let dir = temp_dir("build-unknown");
+        fs::write(dir.join("README.md"), "hello").unwrap();
+        match detect_build_command(&dir) {
+            BuildDetection::Command(command) => {
+                panic!("expected no_build_applicable, got a command: {command:?}")
+            }
+            BuildDetection::NotApplicable(_) => {}
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_allowlist_accepts_only_the_documented_shapes() {
+        assert!(is_build_allowlisted("cargo", &["build".to_string()]));
+        assert!(is_build_allowlisted(
+            "npm",
+            &["run".to_string(), "build".to_string()]
+        ));
+        assert!(is_build_allowlisted(
+            "pnpm",
+            &["run".to_string(), "build".to_string()]
+        ));
+        assert!(is_build_allowlisted("yarn", &["build".to_string()]));
+    }
+
+    #[test]
+    fn build_allowlist_rejects_an_ai_suggested_arbitrary_command() {
+        assert!(!is_build_allowlisted(
+            "bash",
+            &["-c".to_string(), "rm -rf /".to_string()]
+        ));
+        assert!(!is_build_allowlisted("cargo", &["publish".to_string()]));
+        assert!(!is_build_allowlisted("npm", &["publish".to_string()]));
+        assert!(!is_build_allowlisted("npm", &["test".to_string()]));
     }
 
     #[test]

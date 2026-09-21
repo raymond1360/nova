@@ -220,6 +220,13 @@ impl AdapterReadiness {
         !self.environment_blocks() && self.dev_capability_confirmed
     }
 
+    /// Codex re-review remediation (Minor 2): no longer called from
+    /// `commands::get_core_loop_readiness` (which stopped probing the
+    /// unselected AI at all), but kept — not deleted — for the dormant
+    /// v0.2.0 dual-AI path and its own test coverage (see this method's
+    /// callers under `#[cfg(test)]`), which will need real reviewer
+    /// readiness again once that mode is reactivated.
+    #[allow(dead_code)]
     pub fn review_ready(&self) -> bool {
         !self.environment_blocks() && self.review_capability_confirmed
     }

@@ -40,6 +40,12 @@ export const useCoreLoopStore = defineStore('coreLoop', {
     codexTrust: null as CliBinaryTrustStatus | null,
     claudeTrust: null as CliBinaryTrustStatus | null,
     restoring: false,
+    // Codex re-review remediation (Major 1): the backend is the sole
+    // source of truth for which round a stalled task is stuck on — this is
+    // never computed from `reviews` on the frontend. Populated by
+    // `loadPendingRound()`, called from `refreshCurrentTask()`. Defaults to
+    // 1, matching the backend's own default before anything has run.
+    pendingRound: 1 as number,
   }),
   getters: {
     reviewerAiKind(state): 'codex_cli' | 'claude_cli' {
@@ -56,16 +62,16 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       const runningStates: TaskState[] = ['queued', 'running', 'verifying', 'safe_fixing']
       return !!state.currentTask && runningStates.includes(state.currentTask.state)
     },
-    // The round a stalled `needs_user_action` task is stuck waiting on —
-    // round 1 unless a round-1 review has already been recorded, in which
-    // case it is the round-2 automatic fix pass. Mirrors
-    // `core_loop::current_pending_round`'s own logic so the confirmation the
-    // UI writes always targets the round the backend is actually stuck on.
-    pendingRound(state): number {
-      const roundOneReviewed = state.reviews.some(
-        (r) => r.result_generation === state.currentTask?.result_generation && r.round === 1,
-      )
-      return roundOneReviewed ? 2 : 1
+    // Codex re-review remediation (Blocker 1): the v0.1.0 start gate reads
+    // *only* the selected developer AI's own readiness — the other AI's
+    // `review_ready` (always a diagnostic-only, possibly-`false` value; see
+    // `get_core_loop_readiness`) must never participate in this decision.
+    // `starting` is intentionally not included here — that guard is applied
+    // separately by callers (`handleStart`'s disabled binding also checks
+    // `store.starting`), so `canStart` reflects purely "is the selected dev
+    // AI ready," independent of "is a start already in flight."
+    canStart(state): boolean {
+      return !!state.readiness?.dev_ready
     },
     // True only when the task is genuinely stuck for the "no tests
     // detected" reason (as opposed to any other `needs_user_action` cause,
@@ -280,6 +286,19 @@ export const useCoreLoopStore = defineStore('coreLoop', {
         this.starting = false
       }
     },
+    // Codex re-review remediation (Blocker 1): the actual v0.1.0 start
+    // decision, as a single store action the view layer calls directly —
+    // re-checks readiness, then gates purely on `canStart` (the selected
+    // dev AI's own readiness; see that getter's own comment for why the
+    // other AI's `review_ready` never participates). Returns whether a
+    // start was actually attempted, so the caller knows whether to begin
+    // polling.
+    async startIfReady(): Promise<boolean> {
+      await this.checkReadiness()
+      if (!this.canStart) return false
+      await this.startTask()
+      return true
+    },
     async cancelTask() {
       if (!this.currentTask) return
       this.lastError = ''
@@ -290,12 +309,22 @@ export const useCoreLoopStore = defineStore('coreLoop', {
         throw error
       }
     },
+    // Codex re-review remediation (Major 1): the backend's own Action
+    // Ledger-derived pending round — never inferred from `reviews` here.
+    async loadPendingRound() {
+      if (!this.currentTask || !this.currentProject) return
+      this.pendingRound = await invoke<number>('get_pending_round', {
+        projectId: this.currentProject.id,
+        taskId: this.currentTask.id,
+      })
+    },
     async refreshCurrentTask() {
       if (!this.currentTask || !this.currentProject) return
       await this.loadTasks()
       const refreshed = this.tasks.find((t) => t.id === this.currentTask!.id)
       if (refreshed) this.currentTask = refreshed
       await this.loadReviews()
+      await this.loadPendingRound().catch(() => {})
       if (this.currentTask?.state === 'needs_user_action') {
         await this.detectTestCommand().catch(() => {})
       }

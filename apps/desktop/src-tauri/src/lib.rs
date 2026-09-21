@@ -133,6 +133,7 @@ pub fn run() {
             commands::start_core_loop,
             commands::cancel_core_loop,
             commands::get_core_loop_readiness,
+            commands::get_pending_round,
             commands::detect_test_command,
             commands::confirm_task_test_command,
             commands::list_task_reviews,

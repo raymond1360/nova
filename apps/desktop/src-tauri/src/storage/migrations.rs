@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// Current schema version this build of Nova understands. Bump this and
 /// append a new [`Migration`] to [`MIGRATIONS`] whenever the schema changes
 /// — never edit an already-shipped migration's SQL in place.
-pub const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 #[derive(Debug)]
 pub enum MigrationError {
@@ -715,6 +715,37 @@ const V7_SQL: &str = "
     ALTER TABLE tasks ADD COLUMN document_sync_pending INTEGER NOT NULL DEFAULT 0;
 ";
 
+/// Codex re-review remediation (Major 3): Nova's own fact-verification must
+/// distinguish test evidence from build evidence — a project whose tests
+/// pass but whose build fails must never be reported as fully verified.
+/// `build_evidence` mirrors `test_evidence`'s exact shape (same
+/// `(task_id, result_generation, round)` scoping, same composite FK to
+/// `tasks`, same redaction discipline for text fields) so a round's test and
+/// build results are always readable together against the same task/
+/// generation/round/Git-version tuple. Purely additive — no existing table
+/// is touched, so this is safe on top of every prior schema version and old
+/// databases with no `build_evidence` rows at all remain fully readable
+/// (an empty result set, never an error).
+const V8_SQL: &str = "
+    CREATE TABLE build_evidence (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        result_generation INTEGER NOT NULL,
+        round INTEGER NOT NULL,
+        build_command_redacted TEXT,
+        status TEXT NOT NULL CHECK(status IN ('passed', 'failed', 'no_build_applicable', 'timed_out', 'cancelled', 'insufficient_evidence')),
+        exit_code INTEGER,
+        reason TEXT,
+        stdout_ref TEXT,
+        stderr_ref TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (task_id, project_id) REFERENCES tasks(id, project_id) ON DELETE CASCADE
+    );
+    CREATE INDEX idx_build_evidence_task ON build_evidence(task_id);
+    CREATE INDEX idx_build_evidence_task_gen_round ON build_evidence(task_id, result_generation, round);
+";
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -750,6 +781,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 7,
         requires_backup: true,
         sql: V7_SQL,
+    },
+    Migration {
+        version: 8,
+        requires_backup: true,
+        sql: V8_SQL,
     },
 ];
 
@@ -1572,6 +1608,150 @@ mod tests {
     }
 
     #[test]
+    fn schema_v8_passes_integrity_and_foreign_key_pragma_checks() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn, None).unwrap();
+
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            fk_violations, 0,
+            "a fresh v8 database must have zero foreign key violations"
+        );
+
+        let columns: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(build_evidence)").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        for expected in [
+            "id",
+            "project_id",
+            "task_id",
+            "result_generation",
+            "round",
+            "build_command_redacted",
+            "status",
+            "exit_code",
+            "reason",
+            "stdout_ref",
+            "stderr_ref",
+            "created_at",
+        ] {
+            assert!(
+                columns.contains(&expected.to_string()),
+                "build_evidence missing column {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn upgrades_a_v7_database_to_v8_adding_build_evidence() {
+        // Codex re-review remediation (Major 3): a purely additive
+        // migration — an old v7 database (with real project/task rows, and
+        // no `build_evidence` table at all) must upgrade cleanly to v8, end
+        // up with a real, empty, queryable `build_evidence` table, and must
+        // never lose or alter any pre-existing row in any other table.
+        let dir = temp_dir("v7-to-v8-additive");
+        let (conn, path) = open_file_db(&dir);
+        conn.execute_batch(BASELINE_SQL).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(PHASE2_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        conn.execute_batch(V3_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+        conn.execute_batch(V4_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
+        conn.execute_batch(V5_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 5;").unwrap();
+        conn.execute_batch(V6_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 6;").unwrap();
+        conn.execute_batch(V7_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 7;").unwrap();
+
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, created_at, updated_at)
+             VALUES ('proj-1', 'P', 'C:/p', 'c:/p', 'local', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+             VALUES ('task-1', 'proj-1', 'T', 'draft', 0, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+
+        run(&conn, Some(&path)).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        let build_evidence_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM build_evidence", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            build_evidence_rows, 0,
+            "an upgraded v7 database must have a real, empty build_evidence table"
+        );
+
+        conn.execute(
+            "INSERT INTO build_evidence (id, project_id, task_id, result_generation, round, status, created_at)
+             VALUES ('be-1', 'proj-1', 'task-1', 0, 1, 'passed', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        let title: String = conn
+            .query_row("SELECT title FROM tasks WHERE id = 'task-1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            title, "T",
+            "upgrading to v8 must never alter a pre-existing tasks row"
+        );
+    }
+
+    #[test]
+    fn build_evidence_rejects_an_unknown_status() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn, None).unwrap();
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, created_at, updated_at)
+             VALUES ('proj-1', 'P', 'C:/p', 'c:/p', 'local', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+             VALUES ('task-1', 'proj-1', 'T', 'draft', 0, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        let result = conn.execute(
+            "INSERT INTO build_evidence (id, project_id, task_id, result_generation, round, status, created_at)
+             VALUES ('be-1', 'proj-1', 'task-1', 0, 1, 'maybe_passed', '2026-01-01')",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "an unrecognized build_evidence.status must be rejected by the CHECK constraint"
+        );
+    }
+
+    #[test]
     fn non_trivial_migration_creates_a_backup_file() {
         let dir = temp_dir("backup-created");
         let (conn, path) = open_file_db(&dir);
@@ -1590,8 +1770,8 @@ mod tests {
             .collect();
         assert_eq!(
             entries.len(),
-            6,
-            "expected exactly six backups (migrations 2, 3, 4, 5, 6, and 7 each require one): {entries:?}"
+            7,
+            "expected exactly seven backups (migrations 2, 3, 4, 5, 6, 7, and 8 each require one): {entries:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1616,13 +1796,13 @@ mod tests {
             .collect();
         assert_eq!(
             names.len(),
-            6,
-            "migrations 2, 3, 4, 5, 6, and 7 each produce their own backup"
+            7,
+            "migrations 2, 3, 4, 5, 6, 7, and 8 each produce their own backup"
         );
         let unique: std::collections::HashSet<&String> = names.iter().collect();
         assert_eq!(
             unique.len(),
-            6,
+            7,
             "all backups from the same run must have distinct names, never collide"
         );
         for name in &names {
@@ -1751,8 +1931,8 @@ mod tests {
         let backups_dir = dir.join("backups");
         let count = fs::read_dir(&backups_dir).unwrap().count();
         assert_eq!(
-            count, 6,
-            "already-applied migrations must not be re-run, so no extra backups beyond the six produced by the first run"
+            count, 7,
+            "already-applied migrations must not be re-run, so no extra backups beyond the seven produced by the first run"
         );
         let _ = fs::remove_dir_all(&dir);
     }

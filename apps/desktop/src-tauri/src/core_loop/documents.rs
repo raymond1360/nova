@@ -234,9 +234,34 @@ fn final_result_doc(
         ok
     };
 
+    // Codex re-review remediation (Major 3): a symmetric build gate
+    // alongside the test gate above — the same generation-off-by-one
+    // handling applies (build evidence for a round is written before that
+    // round's `-> preview_ready` transition bumps `result_generation`).
+    let build_gate_ok = {
+        let mut ok = false;
+        'generations: for generation in [task.result_generation, task.result_generation - 1] {
+            if generation < 0 {
+                continue;
+            }
+            for round in [1_i64, 2] {
+                let evidence =
+                    db.list_build_evidence_for_round(project_id, task_id, generation, round)?;
+                if evidence
+                    .iter()
+                    .any(|e| e.status == "passed" || e.status == "no_build_applicable")
+                {
+                    ok = true;
+                    break 'generations;
+                }
+            }
+        }
+        ok
+    };
+
     let status_line = if task.state == TaskState::Completed && accepted_current_generation {
         "已完成（用户已验收）"
-    } else if task.state == TaskState::AwaitingUserAcceptance && test_gate_ok {
+    } else if task.state == TaskState::AwaitingUserAcceptance && test_gate_ok && build_gate_ok {
         "等待用户验收"
     } else if task.state == TaskState::Failed {
         "未通过：Nova 独立测试/构建验证未通过（已尝试一次修复）"
@@ -248,8 +273,32 @@ fn final_result_doc(
         "进行中"
     };
 
+    // Codex re-review remediation (Major 3, automated test requirement
+    // "FINAL_RESULT 能分别展示测试和构建证据"): explicit, per-round evidence
+    // breakdown so a reader can tell "tests passed but build failed" apart
+    // from "build passed but tests failed" apart from "neither has run
+    // yet" — never collapsed into a single pass/fail summary line.
+    let mut evidence_breakdown = String::from("\n## 测试与构建证据\n\n");
+    for round in [1_i64, 2] {
+        let test_status = db
+            .list_test_evidence_for_round(project_id, task_id, task.result_generation, round)?
+            .into_iter()
+            .next_back()
+            .map(|e| e.status)
+            .unwrap_or_else(|| "(尚未触发)".to_string());
+        let build_status = db
+            .list_build_evidence_for_round(project_id, task_id, task.result_generation, round)?
+            .into_iter()
+            .next_back()
+            .map(|e| e.status)
+            .unwrap_or_else(|| "(尚未触发)".to_string());
+        evidence_breakdown.push_str(&format!(
+            "- Round {round}: 测试={test_status}, 构建={build_status}\n"
+        ));
+    }
+
     Ok(format!(
-        "# FINAL_RESULT\n\ntask_id: {}\nresult_generation: {}\ncurrent_state: {}\nstatus: {status_line}\n",
+        "# FINAL_RESULT\n\ntask_id: {}\nresult_generation: {}\ncurrent_state: {}\nstatus: {status_line}\n{evidence_breakdown}",
         task.id, task.result_generation, task.state,
     ))
 }
@@ -386,6 +435,118 @@ mod tests {
             .join(&project_id)
             .join(&task_id);
         assert!(doc_dir.join("REQUIREMENT.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&app_data_dir);
+    }
+
+    #[test]
+    fn final_result_shows_test_and_build_evidence_separately() {
+        // Codex re-review remediation (Major 3): "tests passed but build
+        // failed" must be readable as two distinct facts, never collapsed
+        // into one pass/fail summary.
+        let dir = temp_dir("final-result-test-vs-build");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        let app_data_dir = temp_dir("final-result-test-vs-build-appdata");
+
+        db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            test_command_redacted: Some("cargo test"),
+            status: "passed",
+            passed_count: 3,
+            failed_count: 0,
+            skipped_count: 0,
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: Some("cargo build"),
+            status: "failed",
+            exit_code: Some(1),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+
+        generate_result_documents(&db, &project_id, &task_id, &app_data_dir).unwrap();
+
+        let doc_dir = app_data_dir
+            .join("result-documents")
+            .join(&project_id)
+            .join(&task_id);
+        let content = fs::read_to_string(doc_dir.join("FINAL_RESULT.md")).unwrap();
+        assert!(content.contains("Round 1: 测试=passed, 构建=failed"));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&app_data_dir);
+    }
+
+    #[test]
+    fn final_result_awaiting_acceptance_requires_both_test_and_build_gates() {
+        // A task sitting at `awaiting_user_acceptance` with passing test
+        // evidence but no build evidence at all must not be reported as
+        // "等待用户验收" — the build gate is symmetric with the test gate.
+        let dir = temp_dir("final-result-build-gate");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        let app_data_dir = temp_dir("final-result-build-gate-appdata");
+
+        for state in [
+            TaskState::AwaitingConfirmation,
+            TaskState::Confirmed,
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::Verifying,
+            TaskState::PreviewReady,
+            TaskState::AwaitingUserAcceptance,
+        ] {
+            db.transition_task(
+                &task_id,
+                state,
+                crate::models::Actor::System,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        }
+        db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            test_command_redacted: Some("cargo test"),
+            status: "passed",
+            passed_count: 1,
+            failed_count: 0,
+            skipped_count: 0,
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+
+        generate_result_documents(&db, &project_id, &task_id, &app_data_dir).unwrap();
+
+        let doc_dir = app_data_dir
+            .join("result-documents")
+            .join(&project_id)
+            .join(&task_id);
+        let content = fs::read_to_string(doc_dir.join("FINAL_RESULT.md")).unwrap();
+        assert!(
+            !content.contains("status: 等待用户验收"),
+            "must not report awaiting-acceptance without independent build evidence too: {content}"
+        );
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&app_data_dir);
     }

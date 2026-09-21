@@ -95,10 +95,11 @@ async function handleConfirmNoTests() {
 }
 
 async function handleStart() {
-  await store.checkReadiness()
-  if (!store.readiness?.dev_ready || !store.readiness?.review_ready) return
-  await store.startTask()
-  startPolling()
+  // Codex re-review remediation (Blocker 1): gates purely on the selected
+  // developer AI's own readiness (`store.canStart`) — the other AI's
+  // `review_ready` must never block starting a v0.1.0 single-AI task.
+  const started = await store.startIfReady()
+  if (started) startPolling()
 }
 
 async function handleLoadCliTrust() {
@@ -289,14 +290,16 @@ const stateLabels: Record<string, string> = {
           <span :class="store.readiness.dev_ready ? 'ok' : 'bad'">{{ store.readiness.dev_ready ? '就绪' : '未就绪' }}</span>
           — {{ store.readiness.dev_message }}
         </p>
-        <p>
-          <strong>审核（{{ store.readiness.reviewer_kind }}）：</strong>
-          <span :class="store.readiness.review_ready ? 'ok' : 'bad'">{{ store.readiness.review_ready ? '就绪' : '未就绪' }}</span>
-          — {{ store.readiness.review_message }}
+        <!-- Codex re-review remediation (Blocker 1 / Minor 2): the other AI
+             is never a v0.1.0 requirement — shown purely as an optional,
+             non-blocking diagnostic, never colored as a blocking "未就绪". -->
+        <p class="hint">
+          <strong>另一位 AI（{{ store.readiness.reviewer_kind }}，可选诊断，不影响启动）：</strong>
+          {{ store.readiness.review_message }}
         </p>
       </div>
       <button
-        :disabled="store.starting || !store.readiness?.dev_ready || !store.readiness?.review_ready"
+        :disabled="store.starting || !store.canStart"
         @click="handleStart"
       >
         {{ store.starting ? '启动中…' : '开始任务' }}
@@ -329,7 +332,7 @@ const stateLabels: Record<string, string> = {
         </div>
       </div>
       <p v-if="store.currentTask.state === 'completed'" class="ok">任务已完成，用户已验收。</p>
-      <p v-if="store.currentTask.state === 'failed'" class="bad">二次审核仍未通过，或独立测试未通过，需要用户决定下一步。</p>
+      <p v-if="store.currentTask.state === 'failed'" class="bad">Nova 独立测试/构建验证未通过（已尝试一次修复），需要用户决定下一步。</p>
       <p v-if="store.currentTask.state === 'needs_user_action' && !store.noTestsConfirmationNeeded" class="bad">需要用户处理（详见任务状态历史）。</p>
       <p v-if="store.currentTask.state === 'cancelled'">任务已被用户取消。</p>
     </section>

@@ -646,13 +646,20 @@ pub fn confirm_task_test_command(
 /// connected developer AI — Codex or Claude Code, user's choice. A real,
 /// just-executed probe against the *selected* developer AI's configured
 /// binary is the only thing `dev_ready` depends on. `reviewer_kind`/
-/// `review_ready`/`review_message` are still computed and returned — the
-/// UI may still show the other AI's connection state as an optional
-/// diagnostic (and this is exactly the data a future v0.2.0 dual-AI-review
-/// mode would gate on) — but nothing in the backend ever refuses to start
-/// or blocks completion because the *other* AI is missing, untrusted, or
-/// not logged in. See `start_core_loop` below, which is the actual v0.1.0
-/// gate this struct's data feeds.
+/// `review_ready`/`review_message` are still returned for frontend/type
+/// compatibility — the UI may still show the other AI's connection state as
+/// an optional diagnostic (and this is exactly the data a future v0.2.0
+/// dual-AI-review mode would gate on) — but nothing in the backend ever
+/// refuses to start or blocks completion because the *other* AI is
+/// missing, untrusted, or not logged in. See `start_core_loop` below, which
+/// is the actual v0.1.0 gate this struct's data feeds.
+///
+/// Codex re-review remediation (Minor 2): `get_core_loop_readiness` no
+/// longer actively probes the unselected AI at all (previously a real,
+/// just-executed child-process invocation purely for this diagnostic) — so
+/// `review_ready` is now always `false` and `review_message` is a constant
+/// "not checked" string, never a faked `true` and never the result of a
+/// probe the user never asked for.
 #[derive(serde::Serialize)]
 pub struct CoreLoopReadiness {
     pub dev_kind: String,
@@ -748,6 +755,17 @@ fn dev_only_start_gate(
     Ok(())
 }
 
+/// Codex re-review remediation (Minor 2): only the *selected* developer
+/// AI's binary is ever probed here. The unselected AI's readiness used to
+/// be actively probed too (a real, just-executed `--version`/`--help`
+/// child-process invocation) purely to populate an optional diagnostic
+/// field — meaning a user who only wants to use Codex could still see this
+/// call block on, or surface an error/prompt from, a Claude CLI they never
+/// configured and do not intend to use. `reviewer_kind`/`review_message`
+/// are still returned (frontend/type compatibility — see `CoreLoopReadiness`
+/// above), but `review_ready` is now always `false` and `review_message` is
+/// a constant "not checked, optional" string — never a real probe result,
+/// and never faked as `true`.
 #[tauri::command]
 pub fn get_core_loop_readiness(
     dev_ai_kind: String,
@@ -759,7 +777,6 @@ pub fn get_core_loop_readiness(
     let dual = build_dual_adapter(&state);
     let cancel = CancellationToken::new();
     let dev_readiness = dual.probe_dev(dev_kind, &state.app_data_dir, &cancel);
-    let review_readiness = dual.probe_dev(reviewer_kind, &state.app_data_dir, &cancel);
 
     let (codex_binary, claude_binary) = cli_binary_paths(&state);
     let binary_for = |kind: crate::runtime::types::ToolKind| -> &str {
@@ -772,28 +789,36 @@ pub fn get_core_loop_readiness(
     let dev_trust_message = with_db(&state, |db| {
         Ok(binary_trust_message(db, dev_kind, binary_for(dev_kind)))
     })?;
-    let review_trust_message = with_db(&state, |db| {
-        Ok(binary_trust_message(
-            db,
-            reviewer_kind,
-            binary_for(reviewer_kind),
-        ))
-    })?;
 
     let dev_ready = dev_readiness.dev_ready() && dev_trust_message.is_none();
-    let review_ready = review_readiness.review_ready() && review_trust_message.is_none();
     let dev_message =
         dev_trust_message.unwrap_or_else(|| dev_readiness.user_message(display_name(dev_kind)));
-    let review_message = review_trust_message
-        .unwrap_or_else(|| review_readiness.user_message(display_name(reviewer_kind)));
 
     Ok(CoreLoopReadiness {
         dev_kind: crate::runtime::ai_adapter::ai_kind_to_str(dev_kind).to_string(),
         reviewer_kind: crate::runtime::ai_adapter::ai_kind_to_str(reviewer_kind).to_string(),
         dev_ready,
-        review_ready,
+        review_ready: false,
         dev_message,
-        review_message,
+        review_message: "未检查（可选诊断，不影响启动）".to_string(),
+    })
+}
+
+/// Codex re-review remediation (Major 1): the single source of truth for
+/// which round (1 or 2) a stalled task's next action targets — a thin
+/// parameter-boundary wrapper around `core_loop::current_pending_round`.
+/// The frontend must call this instead of inferring the round itself from
+/// `task_reviews` (see `CoreLoopView.vue`/`coreLoop.ts`'s prior
+/// `pendingRound` getter, which mirrored the exact stale logic this audit
+/// flagged in the backend).
+#[tauri::command]
+pub fn get_pending_round(
+    project_id: String,
+    task_id: String,
+    state: State<'_, AppState>,
+) -> Result<i64, String> {
+    with_db(&state, |db| {
+        crate::core_loop::current_pending_round(db, &project_id, &task_id)
     })
 }
 

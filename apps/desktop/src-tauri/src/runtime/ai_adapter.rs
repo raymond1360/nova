@@ -788,7 +788,16 @@ pub mod mock {
             } else {
                 script.remove(0)
             };
-            Self::synthetic_result(matches!(outcome, MockOutcome::Success), "")
+            // A real developer-AI invocation always produces some stdout;
+            // an empty string here would be an unrealistic test double and
+            // would hide a real regression (see Minor 1: every command
+            // evidence-producing invocation must be able to carry a real,
+            // non-`None` `stdout_ref` — the v0.1.0 single-AI path has no
+            // review step to fall back on for this proof anymore).
+            Self::synthetic_result(
+                matches!(outcome, MockOutcome::Success),
+                "mock development output",
+            )
         }
 
         fn run_review(

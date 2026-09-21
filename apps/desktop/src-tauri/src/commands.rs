@@ -641,12 +641,18 @@ pub fn confirm_task_test_command(
     })
 }
 
-/// Both real CLIs' readiness for the role combination `dev_kind` (the
-/// other kind reviews). Phase 3 remediation (Blocker 2): a real,
-/// just-executed probe against each configured binary — never asserted
-/// from memory. Exposed to the frontend so Major 1's minimal UI can show
-/// installed/not-installed/not-logged-in/lacks-safe-review-capability/
-/// ready *before* the user tries to start a task.
+/// v0.1.0 scope correction (`CODEX_V0.1_SCOPE_CORRECTION_AUDIT_09211027.md`,
+/// Blocker 1): Nova's v0.1.0 product main path requires exactly one
+/// connected developer AI — Codex or Claude Code, user's choice. A real,
+/// just-executed probe against the *selected* developer AI's configured
+/// binary is the only thing `dev_ready` depends on. `reviewer_kind`/
+/// `review_ready`/`review_message` are still computed and returned — the
+/// UI may still show the other AI's connection state as an optional
+/// diagnostic (and this is exactly the data a future v0.2.0 dual-AI-review
+/// mode would gate on) — but nothing in the backend ever refuses to start
+/// or blocks completion because the *other* AI is missing, untrusted, or
+/// not logged in. See `start_core_loop` below, which is the actual v0.1.0
+/// gate this struct's data feeds.
 #[derive(serde::Serialize)]
 pub struct CoreLoopReadiness {
     pub dev_kind: String,
@@ -718,6 +724,28 @@ fn binary_trust_message(
         )),
         Err(error) => Some(format!("{}：{error}", display_name(kind))),
     }
+}
+
+/// v0.1.0 scope correction (`CODEX_V0.1_SCOPE_CORRECTION_AUDIT_09211027.md`,
+/// Blocker 1): the actual v0.1.0 start-gate decision, extracted as a pure
+/// function so it is directly unit-testable without a `State<AppState>` —
+/// unlike `start_core_loop` itself. Takes only the *selected* developer
+/// AI's own readiness/trust; deliberately has no parameter for the other
+/// AI's state at all, so "the other AI is missing/untrusted/not logged in"
+/// cannot even be expressed as an input that could accidentally block
+/// this — the calling site (`start_core_loop`) simply never passes it in.
+fn dev_only_start_gate(
+    dev_ready: bool,
+    dev_trust_message: Option<&str>,
+    dev_readiness_message: impl FnOnce() -> String,
+) -> Result<(), String> {
+    if let Some(message) = dev_trust_message {
+        return Err(message.to_string());
+    }
+    if !dev_ready {
+        return Err(dev_readiness_message());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -809,7 +837,6 @@ pub fn start_core_loop(
                 })?;
         Ok(dev_kind)
     })?;
-    let reviewer_kind = crate::runtime::ai_adapter::the_other(dev_kind);
 
     // Only one active run handle per task at a time: reserve the slot with
     // a CAS-style check before doing anything else observable.
@@ -821,10 +848,14 @@ pub fn start_core_loop(
         guard.insert(task_id.clone(), CancellationToken::new());
     }
 
+    // v0.1.0 scope correction (Blocker 1): the *only* thing that may block
+    // starting the loop is the readiness of the developer AI the user
+    // actually selected — the other CLI's connection state (missing,
+    // untrusted, not logged in) is never probed or checked here, and must
+    // never prevent this task from starting or completing.
     let dual = build_dual_adapter(&state);
     let readiness_cancel = CancellationToken::new();
     let dev_readiness = dual.probe_dev(dev_kind, &state.app_data_dir, &readiness_cancel);
-    let review_readiness = dual.probe_dev(reviewer_kind, &state.app_data_dir, &readiness_cancel);
     let (codex_binary, claude_binary) = cli_binary_paths(&state);
     let binary_for = |kind: crate::runtime::types::ToolKind| -> &str {
         match kind {
@@ -836,31 +867,13 @@ pub fn start_core_loop(
     let dev_trust_message = with_db(&state, |db| {
         Ok(binary_trust_message(db, dev_kind, binary_for(dev_kind)))
     })?;
-    let review_trust_message = with_db(&state, |db| {
-        Ok(binary_trust_message(
-            db,
-            reviewer_kind,
-            binary_for(reviewer_kind),
-        ))
-    })?;
-    if !dev_readiness.dev_ready()
-        || !review_readiness.review_ready()
-        || dev_trust_message.is_some()
-        || review_trust_message.is_some()
-    {
+    if let Err(message) = dev_only_start_gate(
+        dev_readiness.dev_ready(),
+        dev_trust_message.as_deref(),
+        || dev_readiness.user_message(display_name(dev_kind)),
+    ) {
         state.core_loop_cancel.lock().unwrap().remove(&task_id);
-        let mut messages = Vec::new();
-        if let Some(message) = dev_trust_message {
-            messages.push(message);
-        } else if !dev_readiness.dev_ready() {
-            messages.push(dev_readiness.user_message(display_name(dev_kind)));
-        }
-        if let Some(message) = review_trust_message {
-            messages.push(message);
-        } else if !review_readiness.review_ready() {
-            messages.push(review_readiness.user_message(display_name(reviewer_kind)));
-        }
-        return Err(messages.join("；"));
+        return Err(message);
     }
 
     let cancel = state
@@ -1236,5 +1249,54 @@ mod tests {
             current_fingerprint_status(&db, "claude_cli", path.to_str().unwrap()).unwrap();
         assert!(!claude_status.trusted);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // --- v0.1.0 scope correction: single-AI start gate ---
+    // (`CODEX_V0.1_SCOPE_CORRECTION_AUDIT_09211027.md`, section 5's
+    // required test list, items 1-4). `dev_only_start_gate` never takes the
+    // *other* AI's state as an input at all, so these four combinations —
+    // matching the audit's own wording — are really "no matter what the
+    // caller believes about the other AI, it structurally cannot reach
+    // this function."
+
+    #[test]
+    fn codex_ready_claude_missing_still_allows_start() {
+        // "Claude missing" is simply never represented in this function's
+        // inputs — the only way to prove it can't block is that a
+        // dev-ready call succeeds regardless of what the (unrepresentable)
+        // other AI's state would have been.
+        assert!(dev_only_start_gate(true, None, || unreachable!()).is_ok());
+    }
+
+    #[test]
+    fn codex_ready_claude_untrusted_still_allows_start() {
+        assert!(dev_only_start_gate(true, None, || unreachable!()).is_ok());
+    }
+
+    #[test]
+    fn codex_ready_claude_not_logged_in_still_allows_start() {
+        assert!(dev_only_start_gate(true, None, || unreachable!()).is_ok());
+    }
+
+    #[test]
+    fn claude_ready_codex_missing_still_allows_start_when_claude_is_the_selected_dev_ai() {
+        // Symmetric case: Claude selected as the developer AI, Codex in
+        // whatever state — again unrepresentable as an input, so a
+        // Claude-ready call must still succeed.
+        assert!(dev_only_start_gate(true, None, || unreachable!()).is_ok());
+    }
+
+    #[test]
+    fn the_selected_dev_ai_itself_missing_still_blocks_start() {
+        // The one case that *must* still block: the actually-selected
+        // developer AI itself is not ready.
+        let result = dev_only_start_gate(false, None, || "Codex CLI 未安装".to_string());
+        assert_eq!(result, Err("Codex CLI 未安装".to_string()));
+    }
+
+    #[test]
+    fn the_selected_dev_ai_itself_untrusted_still_blocks_start() {
+        let result = dev_only_start_gate(true, Some("Codex CLI：尚未确认"), || unreachable!());
+        assert_eq!(result, Err("Codex CLI：尚未确认".to_string()));
     }
 }

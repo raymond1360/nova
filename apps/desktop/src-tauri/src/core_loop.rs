@@ -77,6 +77,180 @@ pub struct CoreLoopOutcome {
     pub task: Task,
 }
 
+/// v0.1.0 scope correction (`CODEX_V0.1_SCOPE_CORRECTION_AUDIT_09211027.md`,
+/// Blocker 2): the real v0.1.0 product main path — **exactly one** selected
+/// developer AI (Codex or Claude Code, the user's choice), Nova's own
+/// independent verification of the real file/Git change and test/build
+/// result, at most one automatic fix pass by that *same* developer AI when
+/// verification fails, then `preview_ready`/`awaiting_user_acceptance`.
+/// There is no reviewer step anywhere in this function — a second AI is
+/// never invoked, never probed for readiness, and never required to be
+/// installed, trusted, or logged in for this to run to completion. This is
+/// the only entry point `commands::start_core_loop` calls; the dormant
+/// v0.2.0 dual-AI orchestration lives in [`run_core_loop_dual_ai_v0_2`]
+/// below, unused by any command.
+///
+/// Drives `task_id` through the loop until it reaches a stopping point:
+/// `awaiting_user_acceptance` (success), `failed` (second verification
+/// attempt still failing), `needs_user_action` (dirty worktree or an
+/// uncertain action needing user input), or `cancelled`. Returns the task's
+/// final state, whatever it is — this function never returns `Err` for a
+/// legitimate product-level stop, only for a genuine programming/
+/// precondition error (wrong starting state, missing project, bad
+/// `ai_kind`).
+pub fn run_core_loop(
+    db: &Database,
+    task_id: &str,
+    adapter: &dyn DevReviewAdapter,
+    cancel: &CancellationToken,
+    app_data_dir: &Path,
+) -> NovaResult<CoreLoopOutcome> {
+    let task = db.task(task_id)?;
+    if !matches!(task.state, TaskState::Confirmed | TaskState::Queued) {
+        return Err(NovaError::Config(format!(
+            "只能从 confirmed 或 queued 状态启动核心循环，当前状态：{}",
+            task.state
+        )));
+    }
+    let project = db.project(&task.project_id)?;
+    let project_dir = PathBuf::from(&project.local_path);
+
+    let dev_kind = ai_adapter::ai_kind_from_str(task.ai_kind.as_deref().unwrap_or(""))
+        .ok_or_else(|| NovaError::Config("任务未设置有效的开发 AI 类型（ai_kind）".to_string()))?;
+
+    if task.state == TaskState::Confirmed {
+        db.transition_task(
+            task_id,
+            TaskState::Queued,
+            Actor::System,
+            Some("核心循环已启动"),
+            None,
+            false,
+            None,
+        )?;
+    }
+
+    if cancel.is_cancelled() {
+        db.transition_task(
+            task_id,
+            TaskState::Cancelled,
+            Actor::User,
+            Some("用户在开始前取消"),
+            None,
+            false,
+            None,
+        )?;
+        documents::generate_result_documents(db, &project.id, task_id, app_data_dir)?;
+        return Ok(CoreLoopOutcome {
+            task: db.task(task_id)?,
+        });
+    }
+
+    db.transition_task(
+        task_id,
+        TaskState::Running,
+        Actor::System,
+        Some("开发 AI 开始工作"),
+        None,
+        false,
+        None,
+    )?;
+
+    // Same dirty-worktree guard as the dormant v0.2.0 path, reusing the
+    // same already-accepted Phase 2 transition edge (`running ->
+    // needs_user_action`) — no AI has been invoked yet, so this still
+    // fully protects the user's uncommitted work before any generated
+    // change.
+    if let Some(status) = git_status_porcelain(&project_dir, cancel)? {
+        if !status.trim().is_empty() {
+            db.transition_task(
+                task_id,
+                TaskState::NeedsUserAction,
+                Actor::System,
+                Some("项目工作区存在未提交的更改，需要用户先提交或清理后再开始"),
+                None,
+                false,
+                Some("dirty worktree guard blocked task start"),
+            )?;
+            documents::generate_result_documents(db, &project.id, task_id, app_data_dir)?;
+            return Ok(CoreLoopOutcome {
+                task: db.task(task_id)?,
+            });
+        }
+    }
+
+    let round1 = run_single_ai_round(
+        db,
+        task_id,
+        &project.id,
+        &project_dir,
+        dev_kind,
+        adapter,
+        cancel,
+        1,
+        None,
+        app_data_dir,
+    )?;
+    match round1 {
+        SingleAiRoundOutcome::Verified => finish_success_path(db, &project.id, task_id, 1)?,
+        SingleAiRoundOutcome::NeedsFix(findings) => {
+            db.transition_task(
+                task_id,
+                TaskState::SafeFixing,
+                Actor::System,
+                Some("Nova 独立验证未通过，开始本任务唯一一次自动修复"),
+                None,
+                false,
+                None,
+            )?;
+            let round2 = run_single_ai_round(
+                db,
+                task_id,
+                &project.id,
+                &project_dir,
+                dev_kind,
+                adapter,
+                cancel,
+                2,
+                Some(&findings),
+                app_data_dir,
+            )?;
+            match round2 {
+                SingleAiRoundOutcome::Verified => finish_success_path(db, &project.id, task_id, 2)?,
+                SingleAiRoundOutcome::NeedsFix(_) => {
+                    db.transition_task(
+                        task_id,
+                        TaskState::Failed,
+                        Actor::System,
+                        Some("修复后 Nova 独立验证仍未通过，尚未完工，由用户决定是否开始下一轮"),
+                        None,
+                        false,
+                        None,
+                    )?;
+                }
+                SingleAiRoundOutcome::ActionUncertain | SingleAiRoundOutcome::Stopped => {}
+            }
+        }
+        SingleAiRoundOutcome::ActionUncertain | SingleAiRoundOutcome::Stopped => {}
+    }
+
+    documents::generate_result_documents(db, &project.id, task_id, app_data_dir)?;
+    Ok(CoreLoopOutcome {
+        task: db.task(task_id)?,
+    })
+}
+
+/// v0.1.0 scope correction (`CODEX_V0.1_SCOPE_CORRECTION_AUDIT_09211027.md`):
+/// the dormant v0.2.0 dual-AI orchestration — developer AI -> independent
+/// evidence -> read-only reviewer -> at most one fix pass -> second review
+/// -> user acceptance. Preserved verbatim (not deleted, not weakened) for
+/// forward compatibility and for this module's own dual-AI test coverage,
+/// but **no Tauri command calls this** — `commands::start_core_loop` calls
+/// [`run_core_loop`] (the single-AI v0.1.0 path) below instead. Do not wire
+/// this back into any command without also re-establishing the v0.2.0
+/// product gating this audit explicitly deferred (mandatory second AI,
+/// role swap, FIRST/SECOND review as required artifacts).
+///
 /// Drives `task_id` through the loop until it reaches a stopping point:
 /// `awaiting_user_acceptance` (success), `failed` (second review still
 /// rejected), `needs_user_action` (dirty worktree, uncertain action, or a
@@ -84,7 +258,16 @@ pub struct CoreLoopOutcome {
 /// state, whatever it is — this function never returns `Err` for a
 /// legitimate product-level stop, only for a genuine programming/precondition
 /// error (wrong starting state, missing project, bad `ai_kind`).
-pub fn run_core_loop(
+///
+/// Not `#[cfg(test)]`-gated on purpose: a real v0.2.0 build must be able to
+/// wire this back into a command without first having to resurrect
+/// deleted/stripped code — only *this crate's own* test suite currently
+/// calls it (`#[allow(dead_code)]` covers the resulting "never constructed
+/// outside tests" warning in a non-test build), which is exactly the "kept
+/// dormant, not in the default path" shape the scope-correction audit asked
+/// for.
+#[allow(dead_code)]
+pub(crate) fn run_core_loop_dual_ai_v0_2(
     db: &Database,
     task_id: &str,
     adapter: &dyn DevReviewAdapter,
@@ -409,25 +592,47 @@ pub fn unblock_test_execution_for_retry(
     }
 }
 
-/// One development + review round. The caller has already transitioned the
-/// task into `running` (round 1) or `safe_fixing` (round 2) before calling.
-/// On return the task is left in `verifying` (whatever the verdict), except
-/// for the `ActionUncertain` case, where the task has already been moved to
-/// `needs_user_action` by this function.
+/// Outcome of [`run_dev_and_test_round`] — the developer-AI-plus-Nova's-
+/// own-fact-verification portion shared by both the v0.1.0 single-AI path
+/// ([`run_single_ai_round`]) and the dormant v0.2.0 dual-AI path
+/// ([`run_one_round`], which continues on into a reviewer round only after
+/// a [`DevTestOutcome::Verified`]).
+enum DevTestOutcome {
+    /// The developer AI ran, and Nova's own independent test/build
+    /// verification for this round passed (or the round has no applicable
+    /// tests, per a real user confirmation — see Blocker 3). Carries the
+    /// redacted test summary text, used by the dormant v0.2.0 path to embed
+    /// into the review package; the v0.1.0 path does not need it.
+    Verified(String),
+    /// Nova's own verification genuinely failed this round — never a
+    /// reviewer's verdict. Carries the failure findings text, fed to the
+    /// same developer AI as the one allowed automatic fix pass.
+    NeedsFix(String),
+    ActionUncertain,
+    Stopped,
+}
+
+/// The developer-AI-plus-Nova's-own-verification portion of one round:
+/// invoke the selected developer AI (skipped if this exact round's action
+/// already succeeded, e.g. resuming after a crash), collect real git
+/// evidence, then run Nova's own independent test/build verification
+/// (Blocker 3 — never the developer AI's own claim). Shared unchanged by
+/// both the v0.1.0 single-AI path and the dormant v0.2.0 dual-AI path, so a
+/// fix here (e.g. to the test gate itself) can never silently apply to only
+/// one of them.
 #[allow(clippy::too_many_arguments)]
-fn run_one_round(
+fn run_dev_and_test_round(
     db: &Database,
     task_id: &str,
     project_id: &str,
     project_dir: &Path,
     dev_kind: ToolKind,
-    reviewer_kind: ToolKind,
     adapter: &dyn DevReviewAdapter,
     cancel: &CancellationToken,
     round: i64,
     prior_findings: Option<&str>,
     app_data_dir: &Path,
-) -> NovaResult<RoundOutcome> {
+) -> NovaResult<DevTestOutcome> {
     let dev_key = format!("dev-{task_id}-round-{round}");
     match gate_action(db, task_id, "ai_development", &dev_key, false)? {
         ActionGate::Uncertain => {
@@ -440,7 +645,7 @@ fn run_one_round(
                 false,
                 Some("action ledger uncertain: development"),
             )?;
-            return Ok(RoundOutcome::ActionUncertain);
+            return Ok(DevTestOutcome::ActionUncertain);
         }
         ActionGate::AlreadySucceeded => {
             // A prior attempt already completed this exact round's
@@ -488,7 +693,7 @@ fn run_one_round(
                         None,
                     )?;
                 }
-                return Ok(RoundOutcome::Stopped);
+                return Ok(DevTestOutcome::Stopped);
             }
         }
     }
@@ -528,16 +733,37 @@ fn run_one_round(
     // even asked, so its verdict can never "approve past" a real failure.
     let test_summary =
         match run_tests_for_round(db, project_id, task_id, project_dir, round, cancel)? {
-            TestRoundOutcome::Passed(summary) => Some(summary),
-            TestRoundOutcome::NoTestsApplicable(summary) => Some(summary),
-            TestRoundOutcome::Failed(findings) => return Ok(RoundOutcome::NeedsFix(findings)),
+            TestRoundOutcome::Passed(summary) => summary,
+            TestRoundOutcome::NoTestsApplicable(summary) => summary,
+            TestRoundOutcome::Failed(findings) => return Ok(DevTestOutcome::NeedsFix(findings)),
             TestRoundOutcome::AwaitingNoTestsConfirmation => {
-                return Ok(RoundOutcome::ActionUncertain)
+                return Ok(DevTestOutcome::ActionUncertain)
             }
-            TestRoundOutcome::ActionUncertain => return Ok(RoundOutcome::ActionUncertain),
-            TestRoundOutcome::Cancelled => return Ok(RoundOutcome::Stopped),
+            TestRoundOutcome::ActionUncertain => return Ok(DevTestOutcome::ActionUncertain),
+            TestRoundOutcome::Cancelled => return Ok(DevTestOutcome::Stopped),
         };
 
+    Ok(DevTestOutcome::Verified(test_summary))
+}
+
+/// The reviewer-round continuation of one dormant v0.2.0 dual-AI round —
+/// only ever reached via [`run_one_round`] after
+/// [`run_dev_and_test_round`] returns [`DevTestOutcome::Verified`]. Kept as
+/// a separate function purely so [`run_one_round`] itself stays a thin
+/// "run dev+test, then if verified run review" dispatcher.
+#[allow(clippy::too_many_arguments)]
+fn run_review_round(
+    db: &Database,
+    task_id: &str,
+    project_id: &str,
+    project_dir: &Path,
+    reviewer_kind: ToolKind,
+    adapter: &dyn DevReviewAdapter,
+    cancel: &CancellationToken,
+    round: i64,
+    app_data_dir: &Path,
+    test_summary: &str,
+) -> NovaResult<RoundOutcome> {
     let review_key = format!("review-{task_id}-round-{round}");
     match gate_action(db, task_id, "ai_review", &review_key, true)? {
         ActionGate::Uncertain => {
@@ -564,7 +790,7 @@ fn run_one_round(
         project_id,
         round,
         app_data_dir,
-        test_summary.as_deref(),
+        Some(test_summary),
     )?;
 
     // Blocker 1: the reviewer is never pointed at the real project. Nova
@@ -741,6 +967,105 @@ fn run_one_round(
         ReviewVerdict::ChangesRequired | ReviewVerdict::InsufficientEvidence => {
             Ok(RoundOutcome::NeedsFix(findings))
         }
+    }
+}
+
+/// Dormant v0.2.0 dual-AI round: developer AI + Nova verification, then (if
+/// verified) a read-only reviewer round. Only reachable via
+/// [`run_core_loop_dual_ai_v0_2`] — see that function's own doc comment for
+/// why this is preserved but not wired into any command.
+#[allow(clippy::too_many_arguments)]
+fn run_one_round(
+    db: &Database,
+    task_id: &str,
+    project_id: &str,
+    project_dir: &Path,
+    dev_kind: ToolKind,
+    reviewer_kind: ToolKind,
+    adapter: &dyn DevReviewAdapter,
+    cancel: &CancellationToken,
+    round: i64,
+    prior_findings: Option<&str>,
+    app_data_dir: &Path,
+) -> NovaResult<RoundOutcome> {
+    match run_dev_and_test_round(
+        db,
+        task_id,
+        project_id,
+        project_dir,
+        dev_kind,
+        adapter,
+        cancel,
+        round,
+        prior_findings,
+        app_data_dir,
+    )? {
+        DevTestOutcome::Verified(test_summary) => run_review_round(
+            db,
+            task_id,
+            project_id,
+            project_dir,
+            reviewer_kind,
+            adapter,
+            cancel,
+            round,
+            app_data_dir,
+            &test_summary,
+        ),
+        DevTestOutcome::NeedsFix(findings) => Ok(RoundOutcome::NeedsFix(findings)),
+        DevTestOutcome::ActionUncertain => Ok(RoundOutcome::ActionUncertain),
+        DevTestOutcome::Stopped => Ok(RoundOutcome::Stopped),
+    }
+}
+
+/// v0.1.0 single-AI round outcome — deliberately has no `Approved` verdict
+/// concept at all: `Verified` means exactly "the selected developer AI ran,
+/// and Nova's own independent test/build verification passed (or has a
+/// real no-tests confirmation)" — never a second AI's opinion.
+enum SingleAiRoundOutcome {
+    Verified,
+    NeedsFix(String),
+    ActionUncertain,
+    Stopped,
+}
+
+/// v0.1.0 scope correction: one development-AI-plus-Nova-verification
+/// round with **no reviewer step at all** — the actual v0.1.0 product main
+/// path (`导入项目 -> ... -> 一个开发 AI 修改代码 -> Nova 核验文件和 Git 变化
+/// -> Nova 核验测试与构建 -> ... -> 效果预览 -> 用户验收`). Reuses
+/// [`run_dev_and_test_round`] unchanged — the same developer-AI invocation,
+/// Action Ledger gating, git evidence collection, and independent test/
+/// build verification the dormant v0.2.0 dual-AI path uses — so this is
+/// never a weaker or differently-verified path, only a shorter one.
+#[allow(clippy::too_many_arguments)]
+fn run_single_ai_round(
+    db: &Database,
+    task_id: &str,
+    project_id: &str,
+    project_dir: &Path,
+    dev_kind: ToolKind,
+    adapter: &dyn DevReviewAdapter,
+    cancel: &CancellationToken,
+    round: i64,
+    prior_findings: Option<&str>,
+    app_data_dir: &Path,
+) -> NovaResult<SingleAiRoundOutcome> {
+    match run_dev_and_test_round(
+        db,
+        task_id,
+        project_id,
+        project_dir,
+        dev_kind,
+        adapter,
+        cancel,
+        round,
+        prior_findings,
+        app_data_dir,
+    )? {
+        DevTestOutcome::Verified(_test_summary) => Ok(SingleAiRoundOutcome::Verified),
+        DevTestOutcome::NeedsFix(findings) => Ok(SingleAiRoundOutcome::NeedsFix(findings)),
+        DevTestOutcome::ActionUncertain => Ok(SingleAiRoundOutcome::ActionUncertain),
+        DevTestOutcome::Stopped => Ok(SingleAiRoundOutcome::Stopped),
     }
 }
 
@@ -1630,6 +1955,312 @@ mod tests {
         }
     }
 
+    // --- v0.1.0 scope correction (`CODEX_V0.1_SCOPE_CORRECTION_AUDIT_09211027.md`):
+    // single-AI main path tests. `run_core_loop` (unlike the dormant
+    // `run_core_loop_dual_ai_v0_2` the tests further below call) never
+    // invokes a reviewer at all — these prove the real v0.1.0 product path:
+    // one developer AI -> Nova's own independent verification -> at most
+    // one same-AI fix pass -> preview_ready/awaiting_user_acceptance, with
+    // no second AI ever probed, invoked, or required.
+
+    #[test]
+    fn single_ai_main_flow_reaches_awaiting_user_acceptance_with_no_reviewer_ever_invoked() {
+        let dir = git_project_dir("single-ai-main-flow");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
+        // Even though the mock *would* approve if asked, `run_core_loop`
+        // must never ask — see the assertion on `review_call_count()`
+        // below.
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
+        let app_data_dir = test_app_data_dir();
+
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &app_data_dir,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.task.state, TaskState::AwaitingUserAcceptance);
+        assert_eq!(adapter.development_call_count(), 1);
+        assert_eq!(
+            adapter.review_call_count(),
+            0,
+            "the v0.1.0 single-AI main path must never invoke a reviewer, ready or not"
+        );
+        let reviews = db.list_task_reviews(&project_id, &task_id).unwrap();
+        assert!(
+            reviews.is_empty(),
+            "no task_reviews row may exist for a task that completed via the single-AI path"
+        );
+
+        let final_result_path = app_data_dir
+            .join("result-documents")
+            .join(&project_id)
+            .join(&task_id)
+            .join("FINAL_RESULT.md");
+        let content = fs::read_to_string(&final_result_path).unwrap();
+        assert!(
+            content.contains("等待用户验收"),
+            "FINAL_RESULT.md must show ready-for-acceptance from Nova's own verification alone, \
+             never gated on a reviewer row that does not exist: {content}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_ai_one_fix_pass_by_the_same_developer_ai_then_success() {
+        // A genuine, real independent test failure — never a reviewer
+        // verdict — triggers the one allowed automatic fix pass, run by
+        // the *same* developer AI, then Nova re-verifies for real.
+        let dir = git_project_dir("single-ai-fix-then-pass");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(1)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add failing test"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        // Round 1's real `npm test` genuinely fails (exit 1); round 2's dev
+        // side effect rewrites `package.json` so the *same* command
+        // genuinely passes — simulating the same developer AI's fix,
+        // re-verified for real by Nova, never assumed.
+        let dir_for_fix = dir.clone();
+        let adapter = MockAdapter::new(vec![MockOutcome::Success, MockOutcome::Success], vec![]);
+        let call_count = std::sync::atomic::AtomicUsize::new(0);
+        *adapter.development_side_effect.lock().unwrap() = Some(Box::new(move |_req| {
+            if call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                fs::write(
+                    dir_for_fix.join("package.json"),
+                    r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(0)\""}}"#,
+                )
+                .unwrap();
+            }
+        }));
+
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.task.state,
+            TaskState::AwaitingUserAcceptance,
+            "round 2's genuinely-passing re-verification must succeed the task"
+        );
+        assert_eq!(
+            adapter.development_call_count(),
+            2,
+            "exactly one fix pass means exactly two development invocations, by the same AI"
+        );
+        assert_eq!(adapter.review_call_count(), 0);
+        let round1 = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        let round2 = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 2)
+            .unwrap();
+        assert_eq!(round1.len(), 1);
+        assert_eq!(round1[0].status, "failed");
+        assert_eq!(round2.len(), 1);
+        assert_eq!(round2[0].status, "passed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_ai_second_verification_still_failing_stops_at_failed() {
+        // Same real-failing-test setup as above, but round 2's dev side
+        // effect changes nothing — the same command genuinely fails again,
+        // and the task must stop at `failed`, never silently retry a third
+        // time.
+        let dir = git_project_dir("single-ai-fix-still-fails");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(1)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add failing test"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let adapter = MockAdapter::new(vec![MockOutcome::Success, MockOutcome::Success], vec![]);
+        let app_data_dir = test_app_data_dir();
+
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &app_data_dir,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.task.state, TaskState::Failed);
+        assert_eq!(
+            adapter.development_call_count(),
+            2,
+            "still exactly one fix pass — never a second automatic retry"
+        );
+        assert_eq!(adapter.review_call_count(), 0);
+        let final_result_path = app_data_dir
+            .join("result-documents")
+            .join(&project_id)
+            .join(&task_id)
+            .join("FINAL_RESULT.md");
+        let content = fs::read_to_string(&final_result_path).unwrap();
+        assert!(content.contains("未通过"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_ai_resume_after_dev_already_succeeded_does_not_repeat_development() {
+        // "应用恢复单 AI 任务时不重复开发" — pre-seed the ledger as if round
+        // 1's development already completed successfully in an earlier,
+        // uninterrupted attempt (the crash-recovery shape), then resume via
+        // the real single-AI `run_core_loop` entry point and confirm the
+        // developer AI is never invoked again for that round.
+        let dir = git_project_dir("single-ai-resume-no-repeat-dev");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let dev_key = format!("dev-{task_id}-round-1");
+        db.plan_action(&task_id, "ai_development", &dev_key)
+            .unwrap();
+        db.start_action(&task_id, &dev_key, false).unwrap();
+        db.finish_action(&task_id, &dev_key, ActionStatus::Succeeded, None, None)
+            .unwrap();
+        // Simulate the real crash-recovery shape: `running -> interrupted`
+        // (what `Database::interrupt_all_in_flight_tasks` does on startup),
+        // then `interrupted -> queued` (the real "user resumes" edge) —
+        // matching the actual legal state machine rather than skipping
+        // straight from `running` to `queued`, which is not a legal edge.
+        db.transition_task(
+            &task_id,
+            TaskState::Interrupted,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.task.state, TaskState::AwaitingUserAcceptance);
+        assert_eq!(
+            adapter.development_call_count(),
+            0,
+            "development already succeeded before the crash — resuming must not repeat it, \
+             let alone re-invoke a paid AI call"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_dual_ai_task_reviews_rows_are_read_safely_and_never_required_by_the_single_ai_path() {
+        // "旧双 AI 任务记录可以被安全读取" — a `task_reviews` row written under
+        // the old (or dormant v0.2.0) dual-AI path must not crash anything
+        // when read back, and must not become a hidden requirement for a
+        // single-AI task's own completion.
+        let dir = git_project_dir("old-dual-ai-data-compat");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
+        db.record_task_review(
+            &project_id,
+            &task_id,
+            0,
+            1,
+            "claude_cli",
+            "changes_required",
+            Some("old dual-AI era finding"),
+        )
+        .unwrap();
+
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.task.state,
+            TaskState::AwaitingUserAcceptance,
+            "a stale changes_required review row must never block a single-AI task's own \
+             completion — the single-AI path does not even look at it"
+        );
+        let reviews = db.list_task_reviews(&project_id, &task_id).unwrap();
+        assert_eq!(
+            reviews.len(),
+            1,
+            "the old row must still be safely readable"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn main_flow_approve_reaches_awaiting_user_acceptance() {
         let dir = git_project_dir("main-flow");
@@ -1637,7 +2268,7 @@ mod tests {
         confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
 
-        let outcome = run_core_loop(
+        let outcome = run_core_loop_dual_ai_v0_2(
             &db,
             &task_id,
             &adapter,
@@ -1914,7 +2545,7 @@ mod tests {
             ],
         );
 
-        let outcome = run_core_loop(
+        let outcome = run_core_loop_dual_ai_v0_2(
             &db,
             &task_id,
             &adapter,
@@ -2051,7 +2682,7 @@ mod tests {
             );
         }));
 
-        let outcome = run_core_loop(
+        let outcome = run_core_loop_dual_ai_v0_2(
             &db,
             &task_id,
             &adapter,
@@ -2086,7 +2717,7 @@ mod tests {
         }));
 
         let app_data_dir = test_app_data_dir();
-        run_core_loop(
+        run_core_loop_dual_ai_v0_2(
             &db,
             &task_id,
             &adapter,
@@ -2413,7 +3044,7 @@ mod tests {
         confirm_no_tests(&db, &project_b_row.id, &task_b_row.id, 0, &[1, 2]);
 
         let adapter_a = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
-        run_core_loop(
+        run_core_loop_dual_ai_v0_2(
             &db,
             &task_a,
             &adapter_a,
@@ -2425,7 +3056,7 @@ mod tests {
             vec![MockOutcome::Success],
             vec![ReviewVerdict::ChangesRequired],
         );
-        run_core_loop(
+        run_core_loop_dual_ai_v0_2(
             &db,
             &task_b_row.id,
             &adapter_b,
@@ -2466,7 +3097,7 @@ mod tests {
         *adapter.review_findings_text.lock().unwrap() =
             Some("Found an issue: Authorization: Bearer sk-fake-secret-1234567890".to_string());
 
-        let outcome = run_core_loop(
+        let outcome = run_core_loop_dual_ai_v0_2(
             &db,
             &task_id,
             &adapter,
@@ -2736,7 +3367,8 @@ mod tests {
             Some(Box::new(move |_req| cancel_for_effect.cancel()));
 
         let outcome =
-            run_core_loop(&db, &task_id, &adapter, &cancel, &test_app_data_dir()).unwrap();
+            run_core_loop_dual_ai_v0_2(&db, &task_id, &adapter, &cancel, &test_app_data_dir())
+                .unwrap();
 
         assert_eq!(outcome.task.state, TaskState::Cancelled);
         let reviews = db.list_task_reviews(&project_id, &task_id).unwrap();
@@ -2778,7 +3410,8 @@ mod tests {
         }));
 
         let outcome =
-            run_core_loop(&db, &task_id, &adapter, &cancel, &test_app_data_dir()).unwrap();
+            run_core_loop_dual_ai_v0_2(&db, &task_id, &adapter, &cancel, &test_app_data_dir())
+                .unwrap();
 
         assert_eq!(outcome.task.state, TaskState::Cancelled);
         assert_eq!(adapter.development_call_count(), 2);
@@ -3123,7 +3756,7 @@ mod tests {
             vec![ReviewVerdict::ChangesRequired],
         );
 
-        let outcome = run_core_loop(
+        let outcome = run_core_loop_dual_ai_v0_2(
             &db,
             &task_id,
             &adapter,
@@ -3184,7 +3817,7 @@ mod tests {
             vec![ReviewVerdict::ChangesRequired, ReviewVerdict::Approve],
         );
 
-        let outcome = run_core_loop(
+        let outcome = run_core_loop_dual_ai_v0_2(
             &db,
             &task_id,
             &adapter,
@@ -3360,12 +3993,14 @@ mod tests {
 
     #[test]
     fn command_evidence_stores_a_real_redacted_stdout_and_stderr_reference_not_always_none() {
+        // v0.1.0 single-AI path: the only command-evidence-producing step
+        // is the developer AI's own invocation (there is no reviewer step
+        // to fall back on) — see the matching change to `MockAdapter::
+        // run_development`'s synthetic stdout.
         let dir = git_project_dir("command-evidence-refs");
         let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
         confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
-        *adapter.review_findings_text.lock().unwrap() =
-            Some("distinctive review summary text".to_string());
 
         run_core_loop(
             &db,

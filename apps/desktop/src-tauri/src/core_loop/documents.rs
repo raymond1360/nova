@@ -193,37 +193,53 @@ fn final_result_doc(
         .as_ref()
         .is_some_and(|a| a.result_generation == task.result_generation && a.accepted);
 
-    // Never fabricate a passing round that never happened: the review gate
-    // is satisfied only by a real `approve` row for the task's *current*
-    // (result_generation, round-that-actually-produced-this-result) pair —
-    // never assumed from the task's state alone.
-    let reviews = db.list_task_reviews(project_id, task_id)?;
-    let review_gate_ok = reviews
-        .iter()
-        .any(|r| r.result_generation == task.result_generation && r.verdict == "approve");
-    let round_that_approved = reviews
-        .iter()
-        .find(|r| r.result_generation == task.result_generation && r.verdict == "approve")
-        .map(|r| r.round)
-        .unwrap_or(1);
+    // v0.1.0 scope correction (`CODEX_V0.1_SCOPE_CORRECTION_AUDIT_09211027.md`,
+    // Blocker 4): completion is gated on Nova's own independent test/build
+    // verification for the current result generation — never on a reviewer
+    // `approve` row. The dormant v0.2.0 dual-AI path may still write real
+    // `task_reviews` rows (kept as supplementary evidence, surfaced in
+    // FIRST_REVIEW.md/SECOND_REVIEW.md below when present), but their
+    // absence must never block a v0.1.0 single-AI result from being shown
+    // as ready for user acceptance. Checks both rounds (1 and 2, the fixed
+    // "at most one automatic fix pass" product rule) since either could be
+    // the one that actually produced the current result.
+    //
+    // Real bug found via testing: `tasks.result_generation` is bumped on
+    // the `-> preview_ready` transition, which happens *after* the round's
+    // test evidence was already recorded against the *pre-bump* generation
+    // — so a task that has just reached `awaiting_user_acceptance` for the
+    // first time always has its real, passing test evidence one generation
+    // behind `task.result_generation` as read here. Checking both
+    // `task.result_generation` and `task.result_generation - 1` covers
+    // both that case and the (harmless, already-correct) case of
+    // re-checking an older, already-superseded generation.
     let test_gate_ok = {
-        let evidence = db.list_test_evidence_for_round(
-            project_id,
-            task_id,
-            task.result_generation,
-            round_that_approved,
-        )?;
-        evidence
-            .iter()
-            .any(|e| e.status == "passed" || e.status == "no_tests_applicable")
+        let mut ok = false;
+        'generations: for generation in [task.result_generation, task.result_generation - 1] {
+            if generation < 0 {
+                continue;
+            }
+            for round in [1_i64, 2] {
+                let evidence =
+                    db.list_test_evidence_for_round(project_id, task_id, generation, round)?;
+                if evidence
+                    .iter()
+                    .any(|e| e.status == "passed" || e.status == "no_tests_applicable")
+                {
+                    ok = true;
+                    break 'generations;
+                }
+            }
+        }
+        ok
     };
 
     let status_line = if task.state == TaskState::Completed && accepted_current_generation {
         "已完成（用户已验收）"
-    } else if task.state == TaskState::AwaitingUserAcceptance && review_gate_ok && test_gate_ok {
+    } else if task.state == TaskState::AwaitingUserAcceptance && test_gate_ok {
         "等待用户验收"
     } else if task.state == TaskState::Failed {
-        "未通过：二次审核仍未通过，或独立测试未通过"
+        "未通过：Nova 独立测试/构建验证未通过（已尝试一次修复）"
     } else if task.state == TaskState::Cancelled {
         "已取消"
     } else if task.state == TaskState::NeedsUserAction {

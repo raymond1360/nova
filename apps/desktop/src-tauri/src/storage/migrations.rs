@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// Current schema version this build of Nova understands. Bump this and
 /// append a new [`Migration`] to [`MIGRATIONS`] whenever the schema changes
 /// — never edit an already-shipped migration's SQL in place.
-pub const CURRENT_SCHEMA_VERSION: i64 = 8;
+pub const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 #[derive(Debug)]
 pub enum MigrationError {
@@ -746,6 +746,33 @@ const V8_SQL: &str = "
     CREATE INDEX idx_build_evidence_task_gen_round ON build_evidence(task_id, result_generation, round);
 ";
 
+/// Codex re-review remediation (Major 2): the build-gate equivalent of
+/// `no_tests_confirmations` (v7) — a persisted, explicit user confirmation
+/// that build detection could not be reliably resolved (unreadable/
+/// malformed `package.json`, or an unrecognized project type) and the user
+/// has confirmed no build step actually applies. Same shape, same
+/// `(task_id, result_generation, round)` uniqueness, same composite FK to
+/// `tasks` as `no_tests_confirmations` — a deliberate structural mirror of
+/// an already-accepted pattern, kept as its own table (not folded into
+/// `no_tests_confirmations`) since it records a distinct fact. Purely
+/// additive.
+const V9_SQL: &str = "
+    CREATE TABLE no_build_confirmations (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        result_generation INTEGER NOT NULL,
+        round INTEGER NOT NULL,
+        confirmed_by TEXT NOT NULL CHECK(confirmed_by = 'user'),
+        reason TEXT,
+        confirmed_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(task_id, result_generation, round),
+        FOREIGN KEY (task_id, project_id) REFERENCES tasks(id, project_id) ON DELETE CASCADE
+    );
+    CREATE INDEX idx_no_build_confirmations_task ON no_build_confirmations(task_id);
+";
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -786,6 +813,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 8,
         requires_backup: true,
         sql: V8_SQL,
+    },
+    Migration {
+        version: 9,
+        requires_backup: true,
+        sql: V9_SQL,
     },
 ];
 
@@ -1752,6 +1784,148 @@ mod tests {
     }
 
     #[test]
+    fn schema_v9_passes_integrity_and_foreign_key_pragma_checks() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn, None).unwrap();
+
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            fk_violations, 0,
+            "a fresh v9 database must have zero foreign key violations"
+        );
+
+        let columns: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(no_build_confirmations)")
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        for expected in [
+            "id",
+            "project_id",
+            "task_id",
+            "result_generation",
+            "round",
+            "confirmed_by",
+            "reason",
+            "confirmed_at",
+            "created_at",
+        ] {
+            assert!(
+                columns.contains(&expected.to_string()),
+                "no_build_confirmations missing column {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn upgrades_a_v8_database_to_v9_adding_no_build_confirmations() {
+        let dir = temp_dir("v8-to-v9-additive");
+        let (conn, path) = open_file_db(&dir);
+        conn.execute_batch(BASELINE_SQL).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(PHASE2_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        conn.execute_batch(V3_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+        conn.execute_batch(V4_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
+        conn.execute_batch(V5_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 5;").unwrap();
+        conn.execute_batch(V6_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 6;").unwrap();
+        conn.execute_batch(V7_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 7;").unwrap();
+        conn.execute_batch(V8_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 8;").unwrap();
+
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, created_at, updated_at)
+             VALUES ('proj-1', 'P', 'C:/p', 'c:/p', 'local', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+             VALUES ('task-1', 'proj-1', 'T', 'draft', 0, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+
+        run(&conn, Some(&path)).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        let confirmation_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM no_build_confirmations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            confirmation_rows, 0,
+            "an upgraded v8 database must have a real, empty no_build_confirmations table"
+        );
+
+        conn.execute(
+            "INSERT INTO no_build_confirmations (id, project_id, task_id, result_generation, round, confirmed_by, confirmed_at, created_at)
+             VALUES ('nbc-1', 'proj-1', 'task-1', 0, 1, 'user', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        let title: String = conn
+            .query_row("SELECT title FROM tasks WHERE id = 'task-1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            title, "T",
+            "upgrading to v9 must never alter a pre-existing tasks row"
+        );
+    }
+
+    #[test]
+    fn no_build_confirmations_rejects_a_non_user_confirmed_by() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn, None).unwrap();
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, created_at, updated_at)
+             VALUES ('proj-1', 'P', 'C:/p', 'c:/p', 'local', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+             VALUES ('task-1', 'proj-1', 'T', 'draft', 0, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        let result = conn.execute(
+            "INSERT INTO no_build_confirmations (id, project_id, task_id, result_generation, round, confirmed_by, confirmed_at, created_at)
+             VALUES ('nbc-1', 'proj-1', 'task-1', 0, 1, 'system', '2026-01-01', '2026-01-01')",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "confirmed_by must be rejected by the CHECK constraint unless it is exactly 'user'"
+        );
+    }
+
+    #[test]
     fn non_trivial_migration_creates_a_backup_file() {
         let dir = temp_dir("backup-created");
         let (conn, path) = open_file_db(&dir);
@@ -1770,8 +1944,8 @@ mod tests {
             .collect();
         assert_eq!(
             entries.len(),
-            7,
-            "expected exactly seven backups (migrations 2, 3, 4, 5, 6, 7, and 8 each require one): {entries:?}"
+            8,
+            "expected exactly eight backups (migrations 2, 3, 4, 5, 6, 7, 8, and 9 each require one): {entries:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1796,13 +1970,13 @@ mod tests {
             .collect();
         assert_eq!(
             names.len(),
-            7,
-            "migrations 2, 3, 4, 5, 6, 7, and 8 each produce their own backup"
+            8,
+            "migrations 2, 3, 4, 5, 6, 7, 8, and 9 each produce their own backup"
         );
         let unique: std::collections::HashSet<&String> = names.iter().collect();
         assert_eq!(
             unique.len(),
-            7,
+            8,
             "all backups from the same run must have distinct names, never collide"
         );
         for name in &names {
@@ -1931,8 +2105,8 @@ mod tests {
         let backups_dir = dir.join("backups");
         let count = fs::read_dir(&backups_dir).unwrap().count();
         assert_eq!(
-            count, 7,
-            "already-applied migrations must not be re-run, so no extra backups beyond the seven produced by the first run"
+            count, 8,
+            "already-applied migrations must not be re-run, so no extra backups beyond the eight produced by the first run"
         );
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1369,6 +1369,49 @@ mod tests {
         }
     }
 
+    /// Codex re-review remediation (Major 4): bounded, polling wait for the
+    /// grandchild's PID file to appear *with real, parseable content* —
+    /// used instead of a fixed-duration sleep so cancellation is always
+    /// fired strictly after the grandchild has demonstrably started and
+    /// recorded its own PID, never before. Root cause of the flake this
+    /// closes: the previous version fired cancellation from a timer thread
+    /// after a fixed 150ms sleep, racing against the real wall-clock time
+    /// needed for the OS to schedule the test process, spawn the helper,
+    /// have the helper spawn its grandchild, and have the grandchild write
+    /// its PID to disk — all of which can legitimately take longer than
+    /// 150ms under full-suite parallel CPU contention (many other tests
+    /// concurrently spawning real processes). When cancellation fired
+    /// before the grandchild ever reached its own `fs::write` call, the
+    /// entire process tree (including the not-yet-pid-file-writing
+    /// grandchild) was correctly terminated by the Job Object — but the
+    /// test then tried to read a PID file that could never have been
+    /// written, producing `pid file missing: 系统找不到指定的文件` on an
+    /// otherwise fully correct cancellation. Nothing in the production Job
+    /// Object containment logic needed to change: Windows automatically
+    /// (and atomically, at `CreateProcess` time) adds any child a job
+    /// member spawns to the same job — `runtime::win_spawn`/`job_object`
+    /// set no `JOB_OBJECT_LIMIT_BREAKAWAY_OK`/silent-breakaway flag
+    /// anywhere, so a grandchild that was ever actually created is always
+    /// reliably captured and killed regardless of timing. This is a test
+    /// synchronization fix only.
+    fn wait_for_readable_pid_file(path: &Path, timeout: Duration) -> u32 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(text) = fs::read_to_string(path) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    if let Ok(pid) = trimmed.parse::<u32>() {
+                        return pid;
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("grandchild pid file never became ready within {timeout:?}: {path:?}");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     #[cfg(windows)]
     fn immediate_grandchild_cancel_terminates_parent_and_grandchild_repeated() {
@@ -1383,9 +1426,18 @@ mod tests {
             req.timeout = Duration::from_secs(30);
             let cancel = CancellationToken::new();
             let cancel_for_thread = cancel.clone();
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(150));
+            let pid_file_for_thread = pid_file.clone();
+            // The canceller thread itself discovers the grandchild's real
+            // PID (waiting as long as it genuinely takes, up to a generous
+            // bounded timeout) before firing cancellation, and hands that
+            // same PID back via the join handle — the main thread never
+            // needs to re-read the PID file after the fact, so there is no
+            // window in which "the grandchild hadn't written it yet" can
+            // be misread as "the file is missing".
+            let canceller = thread::spawn(move || {
+                let pid = wait_for_readable_pid_file(&pid_file_for_thread, Duration::from_secs(10));
                 cancel_for_thread.cancel();
+                pid
             });
             let result = execute_blocking(req, cancel);
             match result.outcome {
@@ -1394,9 +1446,7 @@ mod tests {
                 }
                 other => panic!("iteration {i}: expected Cancelled, got {other:?}"),
             }
-            let pid_text = fs::read_to_string(&pid_file)
-                .unwrap_or_else(|e| panic!("iteration {i}: pid file missing: {e}"));
-            let grandchild_pid: u32 = pid_text.trim().parse().expect("valid pid");
+            let grandchild_pid = canceller.join().expect("canceller thread panicked");
             let still_running = wait_until_not_running(grandchild_pid, 30);
             assert!(
                 !still_running,

@@ -5,6 +5,7 @@ mod concurrency_tests;
 pub mod evidence;
 pub mod memory;
 pub mod migrations;
+pub mod no_build_confirmation;
 pub mod no_tests_confirmation;
 pub mod projects;
 pub mod recovery;

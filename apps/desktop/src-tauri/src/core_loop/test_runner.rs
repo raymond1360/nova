@@ -92,50 +92,103 @@ pub fn is_allowlisted(program: &str, args: &[String]) -> bool {
     }
 }
 
-/// Codex re-review remediation (Major 3): Nova's own fact-verification must
-/// distinguish "tests passed" from "the project actually builds" — a
-/// project whose tests pass but whose build fails must never be reported as
-/// fully verified. Minimal, safe scope only: `cargo build` (always
-/// applicable for a Cargo project — Rust code without a successful `cargo
-/// build` cannot meaningfully be said to work at all), or `npm run build` /
-/// `pnpm run build` / `yarn build`, but *only* when `package.json` itself
-/// declares a `build` script — checked by parsing real JSON, never by
-/// string-searching the file (a project with no `build` script has,
-/// mechanically and verifiably, no build step for Nova to run; this is a
-/// hard fact from the manifest itself, not a heuristic that could miss a
-/// real framework the way test-command auto-detection can, so no user
-/// confirmation gate is needed the way Blocker 3's `no_tests_applicable`
-/// one is).
+/// Codex re-review remediation (Major 3 in the first re-review, Major 2 in
+/// the second): Nova's own fact-verification must distinguish "tests
+/// passed" from "the project actually builds" — a project whose tests pass
+/// but whose build fails must never be reported as fully verified.
+///
+/// Three distinct outcomes, deliberately never collapsed into a boolean
+/// "has a build command or not" — the second re-review's own Major 2
+/// finding was precisely that a detection *failure* (unreadable file,
+/// malformed JSON, an unrecognized project structure) was being folded
+/// into the same `NotApplicable` case as a genuine, positively-confirmed
+/// "this project has no build step," letting Nova silently wave a task
+/// through to user acceptance when it had, in fact, never been able to
+/// determine whether a build was needed at all.
+#[derive(Debug)]
 pub enum BuildDetection {
-    Command(DetectedCommand),
-    /// No recognizable build command for this project — carries the reason
-    /// so it can be recorded as `no_build_applicable` evidence.
-    NotApplicable(&'static str),
+    /// A real, executable build command was determined.
+    Detected(DetectedCommand),
+    /// Nova can *positively confirm*, from readable and well-formed
+    /// project metadata, that this project genuinely has no build step
+    /// (e.g. `package.json` exists, parses cleanly, and its `scripts`
+    /// object simply has no `build` entry). Never produced merely because
+    /// detection *failed* — see [`BuildDetection::Insufficient`] for that.
+    NotApplicable(String),
+    /// Nova could not reliably determine whether a build step exists:
+    /// `package.json` exists but could not be read, could not be parsed as
+    /// JSON, or has a structurally unexpected shape (`scripts` not an
+    /// object, `scripts.build` present but not a string); or the project
+    /// type is not one Nova recognizes at all (neither `Cargo.toml` nor
+    /// `package.json`). The caller must fail closed: never treat this as
+    /// "no build needed," and never proceed past it without an explicit,
+    /// persisted user confirmation (see
+    /// `Database::record_no_build_confirmation`).
+    Insufficient(String),
 }
 
 pub fn detect_build_command(project_dir: &Path) -> BuildDetection {
     if project_dir.join("Cargo.toml").is_file() {
-        return BuildDetection::Command(DetectedCommand {
+        return BuildDetection::Detected(DetectedCommand {
             program: "cargo".to_string(),
             args: vec!["build".to_string()],
         });
     }
     if project_dir.join("package.json").is_file() {
-        let has_build_script = std::fs::read_to_string(project_dir.join("package.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .and_then(|value| {
-                value
-                    .get("scripts")
-                    .and_then(|scripts| scripts.get("build"))
-                    .and_then(|build| build.as_str())
-                    .map(|s| !s.trim().is_empty())
-            })
-            .unwrap_or(false);
-        if !has_build_script {
-            return BuildDetection::NotApplicable(
-                "npm/pnpm/yarn 项目的 package.json 未声明 build 脚本",
+        let text = match std::fs::read_to_string(project_dir.join("package.json")) {
+            Ok(text) => text,
+            Err(error) => {
+                return BuildDetection::Insufficient(format!(
+                    "package.json 存在但读取失败，无法可靠判断是否需要构建：{error}"
+                ));
+            }
+        };
+        let value: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(value) => value,
+            Err(error) => {
+                return BuildDetection::Insufficient(format!(
+                    "package.json 存在但 JSON 解析失败，无法可靠判断是否需要构建：{error}"
+                ));
+            }
+        };
+        let Some(object) = value.as_object() else {
+            return BuildDetection::Insufficient(
+                "package.json 顶层结构不是一个 JSON 对象，无法可靠判断是否需要构建".to_string(),
             );
+        };
+        let build_field = match object.get("scripts") {
+            None => {
+                // No `scripts` field at all is a normal, valid manifest
+                // shape (common for a plain library) — a reliable fact,
+                // not a detection failure.
+                return BuildDetection::NotApplicable(
+                    "package.json 未声明 scripts，视为未声明 build 脚本".to_string(),
+                );
+            }
+            Some(serde_json::Value::Object(scripts)) => scripts.get("build"),
+            Some(_) => {
+                return BuildDetection::Insufficient(
+                    "package.json 的 scripts 字段不是一个 JSON 对象，无法可靠判断是否需要构建"
+                        .to_string(),
+                );
+            }
+        };
+        match build_field {
+            None => {
+                return BuildDetection::NotApplicable("package.json 未声明 build 脚本".to_string());
+            }
+            Some(serde_json::Value::String(script)) => {
+                if script.trim().is_empty() {
+                    return BuildDetection::NotApplicable(
+                        "package.json 声明了 build 脚本但内容为空".to_string(),
+                    );
+                }
+            }
+            Some(_) => {
+                return BuildDetection::Insufficient(
+                    "package.json 的 scripts.build 不是字符串，无法可靠判断构建命令".to_string(),
+                );
+            }
         }
         let program = if project_dir.join("pnpm-lock.yaml").is_file() {
             "pnpm"
@@ -149,26 +202,67 @@ pub fn detect_build_command(project_dir: &Path) -> BuildDetection {
         } else {
             vec!["run".to_string(), "build".to_string()]
         };
-        return BuildDetection::Command(DetectedCommand {
+        return BuildDetection::Detected(DetectedCommand {
             program: program.to_string(),
             args,
         });
     }
-    BuildDetection::NotApplicable("未识别到可执行的构建命令（无 Cargo.toml 或 package.json）")
+    // Neither Cargo.toml nor package.json — Nova does not recognize this
+    // project's type at all. This is "cannot determine," not "confirmed no
+    // build needed" (Codex re-review Major 2's central distinction).
+    BuildDetection::Insufficient(
+        "未识别到已知的项目类型（无 Cargo.toml 或 package.json），无法确定是否需要构建".to_string(),
+    )
 }
 
-/// Strict allowlist for build commands — mirrors [`is_allowlisted`]'s
-/// discipline, a hard boundary independent of (and never widened by)
-/// anything an AI suggests.
+/// Codex re-review findings (Major 1): unlike [`is_allowlisted`] (test
+/// commands, which a user may explicitly type/confirm and therefore
+/// legitimately customize — `cargo test --release`, `npm test --
+/// --coverage`, ...), a build command is *never* user-supplied — it is
+/// always exactly what [`detect_build_command`] mechanically produced, one
+/// of exactly four fixed invocations. There is no legitimate reason for a
+/// build command to ever carry an extra flag, so this checks the *entire*
+/// argv, not just a prefix: `cargo build --release`, `npm run build --
+/// --flag`, and similar must all be rejected, not merely `args[0..2]`
+/// matching. `program` is normalized (lowercased, `.exe`/`.cmd`/`.bat`
+/// stripped, directory prefix stripped) before comparison so a resolved
+/// absolute path or Windows-native suffix (`cargo.exe`, `npm.cmd`) is
+/// still recognized — [`detect_build_command`] itself never produces such
+/// a form today, but this keeps the check correct if a future caller
+/// (e.g. a resolved executable path) ever does.
 pub fn is_build_allowlisted(program: &str, args: &[String]) -> bool {
-    let first = args.first().map(String::as_str);
-    let second = args.get(1).map(String::as_str);
-    match program {
-        "cargo" => first == Some("build"),
-        "npm" | "pnpm" => first == Some("run") && second == Some("build"),
-        "yarn" => first == Some("build"),
+    match normalize_executable_name(program).as_str() {
+        "cargo" => args_exactly(args, &["build"]),
+        "npm" | "pnpm" => args_exactly(args, &["run", "build"]),
+        "yarn" => args_exactly(args, &["build"]),
         _ => false,
     }
+}
+
+/// Strips a directory prefix and a known Windows executable suffix
+/// (`.exe`/`.cmd`/`.bat`), then lowercases — so `cargo`, `cargo.exe`,
+/// `C:\tools\Cargo.EXE`, and `npm.cmd` all normalize to the same bare,
+/// lowercase name for allowlist comparison.
+fn normalize_executable_name(program: &str) -> String {
+    let file_name = Path::new(program)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program);
+    let lower = file_name.to_ascii_lowercase();
+    for ext in [".exe", ".cmd", ".bat"] {
+        if let Some(stripped) = lower.strip_suffix(ext) {
+            return stripped.to_string();
+        }
+    }
+    lower
+}
+
+/// Exact-length, exact-content argv comparison — deliberately not a prefix
+/// or `starts_with` check, so a caller can never smuggle extra arguments
+/// (`--release`, `--manifest-path`, `--`, shell metacharacters, ...) past
+/// this by matching only the first one or two elements.
+fn args_exactly(args: &[String], expected: &[&str]) -> bool {
+    args.len() == expected.len() && args.iter().zip(expected).all(|(a, e)| a == e)
 }
 
 pub struct TestRunOutcome {
@@ -367,13 +461,11 @@ mod tests {
         let dir = temp_dir("build-cargo");
         fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
         match detect_build_command(&dir) {
-            BuildDetection::Command(command) => {
+            BuildDetection::Detected(command) => {
                 assert_eq!(command.program, "cargo");
                 assert_eq!(command.args, vec!["build".to_string()]);
             }
-            BuildDetection::NotApplicable(reason) => {
-                panic!("expected a detected cargo build command, got: {reason}")
-            }
+            other => panic!("expected a detected cargo build command, got: {other:?}"),
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -387,19 +479,20 @@ mod tests {
         )
         .unwrap();
         match detect_build_command(&dir) {
-            BuildDetection::Command(command) => {
+            BuildDetection::Detected(command) => {
                 assert_eq!(command.program, "npm");
                 assert_eq!(command.args, vec!["run".to_string(), "build".to_string()]);
             }
-            BuildDetection::NotApplicable(reason) => {
-                panic!("expected a detected npm build command, got: {reason}")
-            }
+            other => panic!("expected a detected npm build command, got: {other:?}"),
         }
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn detects_no_build_applicable_when_package_json_has_no_build_script() {
+        // A valid, readable package.json whose `scripts` object simply has
+        // no `build` entry is a *reliable, positive* fact — this is
+        // `NotApplicable`, never `Insufficient`.
         let dir = temp_dir("build-npm-without-script");
         fs::write(
             dir.join("package.json"),
@@ -407,10 +500,36 @@ mod tests {
         )
         .unwrap();
         match detect_build_command(&dir) {
-            BuildDetection::Command(command) => {
-                panic!("expected no_build_applicable, got a command: {command:?}")
+            BuildDetection::NotApplicable(reason) => {
+                assert!(reason.contains("未声明 build 脚本"));
             }
+            other => panic!("expected NotApplicable, got: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_no_build_applicable_when_scripts_field_is_entirely_absent() {
+        let dir = temp_dir("build-npm-no-scripts-field");
+        fs::write(dir.join("package.json"), r#"{"name":"x"}"#).unwrap();
+        match detect_build_command(&dir) {
             BuildDetection::NotApplicable(_) => {}
+            other => panic!("expected NotApplicable, got: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_no_build_applicable_when_build_script_is_an_empty_string() {
+        let dir = temp_dir("build-npm-empty-script");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","scripts":{"build":"   "}}"#,
+        )
+        .unwrap();
+        match detect_build_command(&dir) {
+            BuildDetection::NotApplicable(_) => {}
+            other => panic!("expected NotApplicable, got: {other:?}"),
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -425,13 +544,11 @@ mod tests {
         .unwrap();
         fs::write(dir.join("pnpm-lock.yaml"), "").unwrap();
         match detect_build_command(&dir) {
-            BuildDetection::Command(command) => {
+            BuildDetection::Detected(command) => {
                 assert_eq!(command.program, "pnpm");
                 assert_eq!(command.args, vec!["run".to_string(), "build".to_string()]);
             }
-            BuildDetection::NotApplicable(reason) => {
-                panic!("expected a detected pnpm build command, got: {reason}")
-            }
+            other => panic!("expected a detected pnpm build command, got: {other:?}"),
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -446,26 +563,115 @@ mod tests {
         .unwrap();
         fs::write(dir.join("yarn.lock"), "").unwrap();
         match detect_build_command(&dir) {
-            BuildDetection::Command(command) => {
+            BuildDetection::Detected(command) => {
                 assert_eq!(command.program, "yarn");
                 assert_eq!(command.args, vec!["build".to_string()]);
             }
-            BuildDetection::NotApplicable(reason) => {
-                panic!("expected a detected yarn build command, got: {reason}")
+            other => panic!("expected a detected yarn build command, got: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Codex re-review remediation (Major 2): detection failure must
+    // never be silently folded into "no build needed" ---------------------
+
+    #[test]
+    fn unrecognized_project_type_is_insufficient_not_not_applicable() {
+        // Codex re-review Major 2's central finding: no Cargo.toml and no
+        // package.json means Nova *cannot determine* whether a build is
+        // needed — this must never be confused with a positive "confirmed
+        // no build" fact.
+        let dir = temp_dir("build-unknown");
+        fs::write(dir.join("README.md"), "hello").unwrap();
+        match detect_build_command(&dir) {
+            BuildDetection::Insufficient(reason) => {
+                assert!(reason.contains("未识别到已知的项目类型"));
             }
+            other => panic!("expected Insufficient, got: {other:?}"),
         }
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn detects_no_build_applicable_for_an_unrecognized_project() {
-        let dir = temp_dir("build-unknown");
-        fs::write(dir.join("README.md"), "hello").unwrap();
+    fn unreadable_package_json_is_insufficient() {
+        // Nova is Windows-only: hold the file open with an exclusive (no
+        // sharing) handle so a concurrent read fails with a real, OS-level
+        // sharing violation — a deterministic, real read failure, not a
+        // simulated one.
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = temp_dir("build-package-json-unreadable");
+        fs::write(dir.join("package.json"), r#"{"name":"x"}"#).unwrap();
+        let _locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(dir.join("package.json"))
+            .unwrap();
         match detect_build_command(&dir) {
-            BuildDetection::Command(command) => {
-                panic!("expected no_build_applicable, got a command: {command:?}")
+            BuildDetection::Insufficient(reason) => {
+                assert!(reason.contains("读取失败"));
             }
-            BuildDetection::NotApplicable(_) => {}
+            other => panic!("expected Insufficient, got: {other:?}"),
+        }
+        drop(_locked);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_json_in_package_json_is_insufficient() {
+        let dir = temp_dir("build-package-json-malformed");
+        fs::write(dir.join("package.json"), "{ not valid json ").unwrap();
+        match detect_build_command(&dir) {
+            BuildDetection::Insufficient(reason) => {
+                assert!(reason.contains("JSON 解析失败"));
+            }
+            other => panic!("expected Insufficient, got: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn package_json_that_is_not_a_json_object_is_insufficient() {
+        let dir = temp_dir("build-package-json-not-object");
+        fs::write(dir.join("package.json"), "[1, 2, 3]").unwrap();
+        match detect_build_command(&dir) {
+            BuildDetection::Insufficient(reason) => {
+                assert!(reason.contains("不是一个 JSON 对象"));
+            }
+            other => panic!("expected Insufficient, got: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scripts_field_that_is_not_an_object_is_insufficient() {
+        let dir = temp_dir("build-scripts-not-object");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","scripts":"build everything"}"#,
+        )
+        .unwrap();
+        match detect_build_command(&dir) {
+            BuildDetection::Insufficient(reason) => {
+                assert!(reason.contains("scripts 字段不是一个 JSON 对象"));
+            }
+            other => panic!("expected Insufficient, got: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_script_with_a_non_string_type_is_insufficient() {
+        let dir = temp_dir("build-script-not-string");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","scripts":{"build":true}}"#,
+        )
+        .unwrap();
+        match detect_build_command(&dir) {
+            BuildDetection::Insufficient(reason) => {
+                assert!(reason.contains("scripts.build 不是字符串"));
+            }
+            other => panic!("expected Insufficient, got: {other:?}"),
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -493,6 +699,158 @@ mod tests {
         assert!(!is_build_allowlisted("cargo", &["publish".to_string()]));
         assert!(!is_build_allowlisted("npm", &["publish".to_string()]));
         assert!(!is_build_allowlisted("npm", &["test".to_string()]));
+    }
+
+    // --- Codex re-review remediation (Major 1): the allowlist must match
+    // the *entire* argv, never just a prefix — every one of these shapes
+    // reached `false` under a naive `args[0] == "build"`/`args[0..2] ==
+    // ["run", "build"]` prefix check, which is exactly the gap Codex
+    // flagged. ---
+
+    #[test]
+    fn build_allowlist_rejects_cargo_build_with_an_extra_flag() {
+        assert!(!is_build_allowlisted(
+            "cargo",
+            &["build".to_string(), "--release".to_string()]
+        ));
+    }
+
+    #[test]
+    fn build_allowlist_rejects_cargo_build_with_a_manifest_path_override() {
+        assert!(!is_build_allowlisted(
+            "cargo",
+            &[
+                "build".to_string(),
+                "--manifest-path".to_string(),
+                "other/Cargo.toml".to_string()
+            ]
+        ));
+    }
+
+    #[test]
+    fn build_allowlist_rejects_npm_run_build_with_trailing_flags() {
+        assert!(!is_build_allowlisted(
+            "npm",
+            &[
+                "run".to_string(),
+                "build".to_string(),
+                "--".to_string(),
+                "--flag".to_string()
+            ]
+        ));
+    }
+
+    #[test]
+    fn build_allowlist_rejects_pnpm_run_build_with_trailing_flags() {
+        assert!(!is_build_allowlisted(
+            "pnpm",
+            &[
+                "run".to_string(),
+                "build".to_string(),
+                "--".to_string(),
+                "--flag".to_string()
+            ]
+        ));
+    }
+
+    #[test]
+    fn build_allowlist_rejects_yarn_build_with_trailing_flags() {
+        assert!(!is_build_allowlisted(
+            "yarn",
+            &["build".to_string(), "--flag".to_string()]
+        ));
+    }
+
+    #[test]
+    fn build_allowlist_rejects_empty_args() {
+        assert!(!is_build_allowlisted("cargo", &[]));
+        assert!(!is_build_allowlisted("npm", &[]));
+        assert!(!is_build_allowlisted("yarn", &[]));
+    }
+
+    #[test]
+    fn build_allowlist_rejects_a_script_other_than_build() {
+        assert!(!is_build_allowlisted(
+            "npm",
+            &["run".to_string(), "start".to_string()]
+        ));
+        assert!(!is_build_allowlisted(
+            "npm",
+            &["run".to_string(), "build:prod".to_string()]
+        ));
+    }
+
+    #[test]
+    fn build_allowlist_rejects_shell_metacharacters_smuggled_as_arguments() {
+        assert!(!is_build_allowlisted(
+            "cargo",
+            &[
+                "build".to_string(),
+                "&&".to_string(),
+                "rm -rf /".to_string()
+            ]
+        ));
+        assert!(!is_build_allowlisted(
+            "npm",
+            &[
+                "run".to_string(),
+                "build".to_string(),
+                "|".to_string(),
+                "curl evil.example.com".to_string()
+            ]
+        ));
+        assert!(!is_build_allowlisted(
+            "yarn",
+            &["build".to_string(), ";".to_string(), "whoami".to_string()]
+        ));
+        assert!(!is_build_allowlisted(
+            "cargo",
+            &["build".to_string(), ">".to_string(), "out.txt".to_string()]
+        ));
+    }
+
+    #[test]
+    fn build_allowlist_rejects_case_or_whitespace_variations_that_are_not_exact() {
+        // The allowlist compares argv elements exactly — "Build" (capital
+        // B) and " build" (leading space) are not the same string as
+        // "build", and must not be silently accepted.
+        assert!(!is_build_allowlisted("cargo", &["Build".to_string()]));
+        assert!(!is_build_allowlisted("cargo", &[" build".to_string()]));
+        assert!(!is_build_allowlisted("cargo", &["build ".to_string()]));
+    }
+
+    #[test]
+    fn build_allowlist_normalizes_windows_executable_suffixes_and_case() {
+        // `program` normalization (lowercase, strip .exe/.cmd/.bat, strip
+        // directory prefix) is about the *executable name* only — argv
+        // matching after that remains exact.
+        assert!(is_build_allowlisted("cargo.exe", &["build".to_string()]));
+        assert!(is_build_allowlisted(
+            "C:\\tools\\Cargo.EXE",
+            &["build".to_string()]
+        ));
+        assert!(is_build_allowlisted(
+            "npm.cmd",
+            &["run".to_string(), "build".to_string()]
+        ));
+        assert!(!is_build_allowlisted(
+            "cargo.exe",
+            &["build".to_string(), "--release".to_string()]
+        ));
+    }
+
+    #[test]
+    fn build_allowlist_accepts_exactly_the_four_documented_commands_and_nothing_else() {
+        assert!(is_build_allowlisted("cargo", &["build".to_string()]));
+        assert!(is_build_allowlisted(
+            "npm",
+            &["run".to_string(), "build".to_string()]
+        ));
+        assert!(is_build_allowlisted(
+            "pnpm",
+            &["run".to_string(), "build".to_string()]
+        ));
+        assert!(is_build_allowlisted("yarn", &["build".to_string()]));
     }
 
     #[test]

@@ -660,6 +660,32 @@ pub struct NoTestsConfirmation {
     pub created_at: String,
 }
 
+/// Codex re-review remediation (Major 2): the build-gate equivalent of
+/// [`NoTestsConfirmation`] — persisted, explicit user confirmation that a
+/// task's build detection genuinely could not be resolved (unreadable/
+/// malformed `package.json`, or an unrecognized project type) and the user
+/// has confirmed no build step actually applies. Deliberately a *separate*
+/// table from `no_tests_confirmations` rather than folding a second,
+/// distinct fact ("no build needed") into a table whose name and existing
+/// semantics mean "no tests needed" — but the exact same shape, scoping
+/// discipline, and write/read pattern are reused unchanged. Same
+/// `(task_id, result_generation, round)` scoping as
+/// [`NoTestsConfirmation`] — never inferred, never reused across a
+/// different generation/round. `confirmed_by` is always the literal string
+/// `"user"`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NoBuildConfirmation {
+    pub id: String,
+    pub project_id: String,
+    pub task_id: String,
+    pub result_generation: i64,
+    pub round: i64,
+    pub confirmed_by: String,
+    pub reason: Option<String>,
+    pub confirmed_at: String,
+    pub created_at: String,
+}
+
 /// Second re-review remediation (Blocker 2 / executable trust boundary):
 /// the fingerprint of a CLI binary the user has explicitly confirmed is
 /// safe to launch — see `runtime::binary_trust`. `UNIQUE(kind)` in the

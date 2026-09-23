@@ -1178,6 +1178,34 @@ pub fn confirm_no_tests_applicable(
     })
 }
 
+/// Codex re-review remediation (Major 2): the build-gate equivalent of
+/// `confirm_no_tests_applicable` — the only write path for
+/// `no_build_confirmations`, always `Actor::User` (hardcoded at the
+/// storage layer), reachable only from an explicit "确认该项目当前无需构建"
+/// UI action. Scoped to the task's *current* `result_generation`, exactly
+/// mirroring the no-tests confirmation's scoping discipline.
+#[tauri::command]
+pub fn confirm_no_build_applicable(
+    project_id: String,
+    task_id: String,
+    round: i64,
+    reason: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<crate::models::NoBuildConfirmation, String> {
+    with_db(&state, |db| {
+        let task = db.task(&task_id)?;
+        let confirmation = db.record_no_build_confirmation(
+            &project_id,
+            &task_id,
+            task.result_generation,
+            round,
+            reason.as_deref(),
+        )?;
+        crate::core_loop::unblock_test_execution_for_retry(db, &project_id, &task_id)?;
+        Ok(confirmation)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

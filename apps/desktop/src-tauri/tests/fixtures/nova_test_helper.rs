@@ -117,9 +117,14 @@ fn main() {
                 .expect("spawn grandchild");
             let grandchild_pid = grandchild.id();
             // Only now, after the grandchild already exists, do anything
-            // else.
+            // else. Written atomically (temp file, then rename into place)
+            // so a concurrent reader can never observe a partially-written
+            // file — matches Nova's own `atomic_write` discipline used
+            // elsewhere in the real product for exactly the same reason.
             if let Some(pid_file) = args.next() {
-                fs::write(&pid_file, grandchild_pid.to_string()).expect("write pid file");
+                let tmp_path = format!("{pid_file}.tmp");
+                fs::write(&tmp_path, grandchild_pid.to_string()).expect("write pid file tmp");
+                fs::rename(&tmp_path, &pid_file).expect("rename pid file into place");
             }
             thread::sleep(Duration::from_secs(SLEEP_SECONDS));
         }

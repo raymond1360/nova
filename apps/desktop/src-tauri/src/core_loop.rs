@@ -612,10 +612,10 @@ pub fn resync_task_documents(
 
 /// Codex re-review remediation (Major 1): the round a task is currently
 /// stuck on if it is sitting in `needs_user_action` because its
-/// `{dev,test,build}-{task_id}-round-N` action needed input the user did
-/// not yet have (no detectable test command, a rejected allowlist check,
-/// ...) — round 1 unless *any* round-2 Action Ledger entry already exists
-/// for this task, in which case it is the round-2 automatic fix pass. Only
+/// `dev`/`test`-`{task_id}-round-N` action needed input the user did not
+/// yet have (no detectable test command, a rejected allowlist check, ...)
+/// — round 1 unless *any* round-2 Action Ledger entry already exists for
+/// this task, in which case it is the round-2 automatic fix pass. Only
 /// ever 1 or 2, matching the fixed "at most one automatic fix pass" product
 /// rule.
 ///
@@ -626,10 +626,17 @@ pub fn resync_task_documents(
 /// fix pass. The Action Ledger is the single source of truth both paths
 /// share unconditionally: `gate_action` always plans a round's `dev-...`
 /// action *before* anything else happens for that round (see
-/// `run_dev_and_test_round`), so a round-2 action existing at all —
-/// `dev`, `test`, or `build` — is itself sufficient, real proof round 2 has
-/// begun. Never inspects the free-text `reason` a state transition carries;
-/// that text is for humans, not for control flow.
+/// `run_dev_and_test_round`), so a round-2 `dev`/`test` action existing at
+/// all is itself sufficient, real proof round 2 has begun. Deliberately
+/// does *not* check a `build-...` key: since Codex re-review Major 3, the
+/// build action key is generation-aware
+/// (`build-{task_id}-generation-{result_generation}-round-{round}`, see
+/// [`build_action_key`]) and this function has no generation to plug in —
+/// but that is not a gap, because `dev`/`test` for round 2 are *always*
+/// planned strictly before build ever runs (see `run_dev_and_test_round`),
+/// so checking them alone is already a complete, sufficient signal. Never
+/// inspects the free-text `reason` a state transition carries; that text
+/// is for humans, not for control flow.
 pub fn current_pending_round(db: &Database, project_id: &str, task_id: &str) -> NovaResult<i64> {
     let task = db.task(task_id)?;
     if task.project_id != project_id {
@@ -637,7 +644,7 @@ pub fn current_pending_round(db: &Database, project_id: &str, task_id: &str) -> 
             "task_id 与 project_id 不匹配，已拒绝".to_string(),
         ));
     }
-    for action_kind in ["dev", "test", "build"] {
+    for action_kind in ["dev", "test"] {
         let round2_key = format!("{action_kind}-{task_id}-round-2");
         if db.find_action(task_id, &round2_key)?.is_some() {
             return Ok(2);
@@ -655,6 +662,14 @@ pub fn current_pending_round(db: &Database, project_id: &str, task_id: &str) -> 
 /// "开始任务" actually re-attempts the round instead of the loop staying
 /// permanently stuck (a `failed`, non-`uncertain` action would otherwise
 /// never become startable again).
+/// Codex re-review remediation (Major 2 + Major 3): also resets the
+/// *current* pending round's generation-aware build action
+/// (`build-{task_id}-generation-{result_generation}-round-{round}`) so a
+/// task stalled specifically on build detection/allowlist/evidence — not
+/// just a stalled test action — can also be resumed. `reset_failed_action_
+/// for_retry`'s own `WHERE status = 'failed'` condition makes this a safe
+/// no-op for whichever of the two (test or build) was not actually the one
+/// that stalled.
 pub fn unblock_test_execution_for_retry(
     db: &Database,
     project_id: &str,
@@ -663,6 +678,9 @@ pub fn unblock_test_execution_for_retry(
     let round = current_pending_round(db, project_id, task_id)?;
     let test_key = format!("test-{task_id}-round-{round}");
     db.reset_failed_action_for_retry(task_id, &test_key)?;
+    let result_generation = db.task(task_id)?.result_generation;
+    let build_key = build_action_key(task_id, result_generation, round);
+    db.reset_failed_action_for_retry(task_id, &build_key)?;
     let task = db.task(task_id)?;
     if task.state == TaskState::NeedsUserAction {
         db.transition_task(
@@ -1485,17 +1503,35 @@ enum BuildRoundOutcome {
     Cancelled,
 }
 
-/// Codex re-review remediation (Major 3): Nova's own independent build
-/// verification, run immediately after a round's independent tests pass (or
-/// are not applicable) — mirrors [`run_tests_for_round`]'s structure and
-/// safety discipline exactly (Action Ledger gate with its own
-/// `build-{task_id}-round-{round}` key, real allowlist check before
-/// executing anything, real `build_evidence` recorded independent of
-/// anything the developer AI claimed). A project with no recognizable build
-/// command is `no_build_applicable` — a mechanically-verified fact from
-/// `Cargo.toml`/`package.json` itself, not a heuristic detection failure —
-/// so unlike Blocker 3's `no_tests_applicable`, no separate user
-/// confirmation gate is needed here.
+/// Codex re-review remediation (Major 3, second re-review): the build
+/// Action Ledger key must be bound to `result_generation`, not just
+/// `task_id`/`round` — otherwise a stale `succeeded` action from an
+/// earlier generation could be mistaken for proof the *current*
+/// generation's build already ran.
+fn build_action_key(task_id: &str, result_generation: i64, round: i64) -> String {
+    format!("build-{task_id}-generation-{result_generation}-round-{round}")
+}
+
+/// Codex re-review remediation (Major 3, first re-review): Nova's own
+/// independent build verification, run immediately after a round's
+/// independent tests pass (or are not applicable) — mirrors
+/// [`run_tests_for_round`]'s structure and safety discipline exactly
+/// (Action Ledger gate, real allowlist check before executing anything,
+/// real `build_evidence` recorded independent of anything the developer AI
+/// claimed).
+///
+/// Second re-review remediation (Major 2 + Major 3): the Action Ledger key
+/// is now generation-aware (see [`build_action_key`]), and a genuine
+/// `AlreadySucceeded` gate result is no longer trusted on its own — it must
+/// be corroborated by a real `build_evidence` row for the *exact same*
+/// `(result_generation, round)`, or this fails closed rather than silently
+/// reporting `NoBuildApplicable`. Detection failure (`BuildDetection::
+/// Insufficient`) is handled distinctly from a positively-confirmed
+/// `NotApplicable`: the former requires a real, persisted user confirmation
+/// (mirroring Blocker 3's `no_tests_applicable` confirmation mechanism)
+/// before it may be treated as "no build needed"; the latter is a
+/// mechanically-verified fact from `Cargo.toml`/`package.json` itself and
+/// needs no confirmation.
 fn run_build_for_round(
     db: &Database,
     project_id: &str,
@@ -1504,7 +1540,8 @@ fn run_build_for_round(
     round: i64,
     cancel: &CancellationToken,
 ) -> NovaResult<BuildRoundOutcome> {
-    let build_key = format!("build-{task_id}-round-{round}");
+    let result_generation = db.task(task_id)?.result_generation;
+    let build_key = build_action_key(task_id, result_generation, round);
     match gate_action(db, task_id, "build_execution", &build_key, false)? {
         ActionGate::Uncertain => {
             db.transition_task(
@@ -1519,24 +1556,46 @@ fn run_build_for_round(
             return Ok(BuildRoundOutcome::ActionUncertain);
         }
         ActionGate::AlreadySucceeded => {
-            let existing = db.list_build_evidence_for_round(
-                project_id,
-                task_id,
-                db.task(task_id)?.result_generation,
-                round,
-            )?;
+            // Codex re-review remediation (Major 3): an `AlreadySucceeded`
+            // action alone is not sufficient proof — it must be
+            // corroborated by a real build_evidence row for this *exact*
+            // (result_generation, round). Since the key itself is now
+            // generation-aware, a mismatch here would mean the Action
+            // Ledger and evidence tables have drifted out of sync (should
+            // not happen under normal operation) — fail closed rather than
+            // ever reporting `NoBuildApplicable` on missing evidence.
+            let existing =
+                db.list_build_evidence_for_round(project_id, task_id, result_generation, round)?;
             if let Some(evidence) = existing.into_iter().next_back() {
                 return Ok(build_round_outcome_from_status(&evidence));
             }
-            return Ok(BuildRoundOutcome::NoBuildApplicable(
-                "未找到构建证据记录".to_string(),
-            ));
+            db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+                project_id,
+                task_id,
+                result_generation,
+                round,
+                build_command_redacted: None,
+                status: "insufficient_evidence",
+                exit_code: None,
+                reason: Some(
+                    "构建动作已记录为成功，但找不到对应 generation/round 的构建证据，已按不确定处理",
+                ),
+                stdout_ref: None,
+                stderr_ref: None,
+            })?;
+            db.transition_task(
+                task_id,
+                TaskState::NeedsUserAction,
+                Actor::System,
+                Some("构建证据缺失，无法确认本轮构建结果，需要用户处理"),
+                None,
+                false,
+                Some("build action succeeded but no matching build_evidence found"),
+            )?;
+            return Ok(BuildRoundOutcome::ActionUncertain);
         }
         ActionGate::Started => {}
     }
-
-    let task = db.task(task_id)?;
-    let result_generation = task.result_generation;
 
     let command = match test_runner::detect_build_command(project_dir) {
         test_runner::BuildDetection::NotApplicable(reason) => {
@@ -1549,7 +1608,7 @@ fn run_build_for_round(
                     build_command_redacted: None,
                     status: "no_build_applicable",
                     exit_code: None,
-                    reason: Some(reason),
+                    reason: Some(&reason),
                     stdout_ref: None,
                     stderr_ref: None,
                 })?;
@@ -1558,7 +1617,70 @@ fn run_build_for_round(
                 evidence.reason.unwrap_or_default(),
             ));
         }
-        test_runner::BuildDetection::Command(command) => command,
+        test_runner::BuildDetection::Insufficient(reason) => {
+            // Codex re-review remediation (Major 2): detection failure must
+            // never be treated as "no build needed" on its own — only a
+            // real, persisted user confirmation (mirroring Blocker 3's
+            // no-tests-applicable mechanism) may unblock this.
+            if let Some(confirmation) =
+                db.find_no_build_confirmation(project_id, task_id, result_generation, round)?
+            {
+                let confirmed_reason = format!(
+                    "用户已确认该项目当前无需构建（确认记录 {}，确认时间 {}）",
+                    confirmation.id, confirmation.confirmed_at
+                );
+                let evidence = db.record_build_evidence(
+                    &crate::storage::evidence::RecordBuildEvidenceRequest {
+                        project_id,
+                        task_id,
+                        result_generation,
+                        round,
+                        build_command_redacted: None,
+                        status: "no_build_applicable",
+                        exit_code: None,
+                        reason: Some(&confirmed_reason),
+                        stdout_ref: None,
+                        stderr_ref: None,
+                    },
+                )?;
+                db.finish_action(task_id, &build_key, ActionStatus::Succeeded, None, None)?;
+                return Ok(BuildRoundOutcome::NoBuildApplicable(
+                    evidence.reason.unwrap_or_default(),
+                ));
+            }
+            db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+                project_id,
+                task_id,
+                result_generation,
+                round,
+                build_command_redacted: None,
+                status: "insufficient_evidence",
+                exit_code: None,
+                reason: Some(&reason),
+                stdout_ref: None,
+                stderr_ref: None,
+            })?;
+            db.finish_action(
+                task_id,
+                &build_key,
+                ActionStatus::Failed,
+                None,
+                Some("build detection insufficient, awaiting user confirmation"),
+            )?;
+            db.transition_task(
+                task_id,
+                TaskState::NeedsUserAction,
+                Actor::System,
+                Some(
+                    "无法可靠判断该项目是否需要构建，需要用户确认该项目当前无需构建，或提供受支持的构建方式",
+                ),
+                None,
+                false,
+                Some("no_build_applicable requires an explicit user confirmation, none found for this generation/round"),
+            )?;
+            return Ok(BuildRoundOutcome::ActionUncertain);
+        }
+        test_runner::BuildDetection::Detected(command) => command,
     };
 
     if !test_runner::is_build_allowlisted(&command.program, &command.args) {
@@ -2275,6 +2397,15 @@ mod tests {
     /// `core_loop::run_tests_for_round`), so every such fixture-driven test
     /// that needs the loop to get *past* the test-execution step now calls
     /// this first, for exactly the generation/round(s) it needs.
+    ///
+    /// Codex re-review remediation (Major 2): a bare `git_project_dir` has
+    /// neither `Cargo.toml` nor `package.json`, which `detect_build_command`
+    /// now correctly classifies as `Insufficient` (Nova cannot determine
+    /// whether a build applies), not `NotApplicable` — so getting *past*
+    /// the build step for the same fixture also now requires a real,
+    /// persisted `no_build_confirmation` for the same generation/round(s).
+    /// This helper records both in one call, since every existing caller
+    /// needs both together.
     fn confirm_no_tests(
         db: &Database,
         project_id: &str,
@@ -2284,6 +2415,8 @@ mod tests {
     ) {
         for round in rounds {
             db.record_no_tests_confirmation(project_id, task_id, generation, *round, None)
+                .unwrap();
+            db.record_no_build_confirmation(project_id, task_id, generation, *round, None)
                 .unwrap();
         }
     }
@@ -2753,7 +2886,7 @@ mod tests {
         canceller.join().unwrap();
 
         assert_eq!(outcome.task.state, TaskState::Cancelled);
-        let build_key = format!("build-{task_id}-round-1");
+        let build_key = build_action_key(&task_id, 0, 1);
         let action = db.find_action(&task_id, &build_key).unwrap().unwrap();
         assert_eq!(
             action.status,
@@ -2807,7 +2940,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let build_key = format!("build-{task_id}-round-1");
+        let build_key = build_action_key(&task_id, 0, 1);
         db.plan_action(&task_id, "build_execution", &build_key)
             .unwrap();
         db.start_action(&task_id, &build_key, false).unwrap();
@@ -2845,6 +2978,356 @@ mod tests {
             evidence.len(),
             1,
             "resuming an already-succeeded build action must never record a second build_evidence row"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Codex re-review remediation (Major 2): unknown/unreadable build
+    // detection must fail closed, never auto-pass -----------------------
+
+    #[test]
+    fn unrecognized_project_type_stalls_at_needs_user_action_without_confirmation() {
+        let dir = git_project_dir("build-insufficient-no-confirmation");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        // Only confirm no-tests, deliberately not no-build — proves the
+        // build gate's own confirmation requirement is independent of the
+        // test gate's.
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.task.state,
+            TaskState::NeedsUserAction,
+            "an unrecognized project type must never auto-pass the build gate"
+        );
+        assert_ne!(outcome.task.state, TaskState::PreviewReady);
+        assert_ne!(outcome.task.state, TaskState::AwaitingUserAcceptance);
+        let evidence = db
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].status, "insufficient_evidence");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_confirming_no_build_applicable_unblocks_the_stalled_task_to_success() {
+        let dir = git_project_dir("build-insufficient-then-confirmed");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+        let app_data_dir = test_app_data_dir();
+
+        let stuck = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &app_data_dir,
+        )
+        .unwrap();
+        assert_eq!(stuck.task.state, TaskState::NeedsUserAction);
+
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("confirmed by user"))
+            .unwrap();
+        let unblocked = unblock_test_execution_for_retry(&db, &project_id, &task_id).unwrap();
+        assert_eq!(unblocked.state, TaskState::Queued);
+
+        let resumed = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &app_data_dir,
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.task.state,
+            TaskState::AwaitingUserAcceptance,
+            "after a real no-build confirmation, the task must actually complete"
+        );
+        let evidence = db
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        // Two real rows are expected here: the first stalled attempt
+        // recorded `insufficient_evidence`, and the resumed attempt (after
+        // the real confirmation) recorded `no_build_applicable` — both are
+        // genuine, independently-recorded facts, never collapsed into one.
+        assert_eq!(evidence.len(), 2);
+        let latest = evidence.last().unwrap();
+        assert_eq!(latest.status, "no_build_applicable");
+        assert!(
+            latest
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("用户已确认")),
+            "the evidence must reference the real user confirmation, never just say passed: {:?}",
+            latest.reason
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_no_build_confirmation_persists_across_a_fresh_database_connection_to_the_same_file() {
+        // "重启仍有效" — the confirmation is a real SQL row committed to the
+        // database file, not frontend in-memory state; re-opening a brand
+        // new `Database` handle against the same file (simulating an app
+        // restart) must still see it.
+        let dir = temp_dir("build-confirmation-restart");
+        let db_path = dir.join("nova.sqlite3");
+        let db1 = Database::open(&db_path).unwrap();
+        db1.migrate().unwrap();
+        let project = db1
+            .create_project(&CreateProjectRequest {
+                name: "P".to_string(),
+                local_path: dir.to_string_lossy().into_owned(),
+                source_type: "local".to_string(),
+                source_url: None,
+                purpose: None,
+                long_term_goal: None,
+                user_preferences: None,
+                prohibitions: None,
+            })
+            .unwrap();
+        let task = db1
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "T".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: Some("codex_cli".to_string()),
+                },
+                Actor::User,
+            )
+            .unwrap();
+        db1.record_no_build_confirmation(&project.id, &task.id, 0, 1, Some("restart test"))
+            .unwrap();
+        drop(db1);
+
+        let db2 = Database::open(&db_path).unwrap();
+        let found = db2
+            .find_no_build_confirmation(&project.id, &task.id, 0, 1)
+            .unwrap();
+        assert!(
+            found.is_some(),
+            "a no-build confirmation must survive a fresh connection to the same database file"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_no_build_confirmation_does_not_carry_forward_to_a_different_generation() {
+        let dir = git_project_dir("build-confirmation-wrong-generation");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        let found = db
+            .find_no_build_confirmation(&project_id, &task_id, 1, 1)
+            .unwrap();
+        assert!(
+            found.is_none(),
+            "a generation-0 no-build confirmation must never silently cover generation 1"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Codex re-review remediation (Major 3): generation-aware build
+    // action key -----------------------------------------------------------
+
+    #[test]
+    fn build_action_key_differs_across_generations_for_the_same_task_and_round() {
+        let key_gen0 = build_action_key("task-1", 0, 1);
+        let key_gen1 = build_action_key("task-1", 1, 1);
+        assert_ne!(
+            key_gen0, key_gen1,
+            "a generation-1 build action must never collide with generation 0's key"
+        );
+    }
+
+    #[test]
+    fn generation_1_build_succeeded_never_lets_generation_2_pass_without_its_own_evidence() {
+        // Directly proves Major 3's core fix: an `AlreadySucceeded` action
+        // gate result for the *current* generation, with no matching
+        // build_evidence row, must fail closed — never `NoBuildApplicable`.
+        let dir = git_project_dir("build-gen-mismatch-fail-closed");
+        // A real, readable package.json with no build script — generation
+        // 0's own detection is a clean, positively-confirmed
+        // `NotApplicable`, so this test's outcome is not entangled with
+        // Major 2's Insufficient/confirmation path.
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","scripts":{"test":"echo ok"}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+
+        // Simulate generation 1's build action already marked succeeded
+        // (e.g. by a prior, now-stale code path or a hand-crafted DB
+        // state), but with NO corresponding build_evidence row for
+        // generation 1.
+        let stale_key = build_action_key(&task_id, 1, 1);
+        db.plan_action(&task_id, "build_execution", &stale_key)
+            .unwrap();
+        db.start_action(&task_id, &stale_key, false).unwrap();
+        db.finish_action(&task_id, &stale_key, ActionStatus::Succeeded, None, None)
+            .unwrap();
+        // Deliberately no `record_build_evidence` call for generation 1.
+
+        // The task's *actual* current result_generation is still 0 (no
+        // `preview_ready` transition has ever happened) — so a call for
+        // generation 0 must go through the normal `Started` path (a fresh
+        // key), completely unaffected by generation 1's stale, evidence-less
+        // succeeded action. This proves the two generations' keys never
+        // collide or interfere with each other.
+        let result = run_build_for_round(
+            &db,
+            &project_id,
+            &task_id,
+            &dir,
+            1,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(
+            matches!(result, BuildRoundOutcome::NoBuildApplicable(_)),
+            "generation 0's own real build detection must run unaffected by generation 1's \
+             unrelated stale action"
+        );
+        let gen0_evidence = db
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(
+            gen0_evidence.len(),
+            1,
+            "generation 0 must have gotten its own real build evidence, not reused generation 1's"
+        );
+        let gen1_evidence = db
+            .list_build_evidence_for_round(&project_id, &task_id, 1, 1)
+            .unwrap();
+        assert!(
+            gen1_evidence.is_empty(),
+            "generation 1's stale succeeded action must never have produced build evidence"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn already_succeeded_build_action_with_no_matching_evidence_fails_closed() {
+        // Directly exercises the `AlreadySucceeded` + missing-evidence
+        // branch: the action ledger says generation 0/round 1's build
+        // succeeded, but no build_evidence row exists for that exact pair
+        // — must record `insufficient_evidence`, transition to
+        // `NeedsUserAction`, and never report `NoBuildApplicable`.
+        let dir = git_project_dir("build-already-succeeded-no-evidence");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Verifying,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let key = build_action_key(&task_id, 0, 1);
+        db.plan_action(&task_id, "build_execution", &key).unwrap();
+        db.start_action(&task_id, &key, false).unwrap();
+        db.finish_action(&task_id, &key, ActionStatus::Succeeded, None, None)
+            .unwrap();
+
+        let result = run_build_for_round(
+            &db,
+            &project_id,
+            &task_id,
+            &dir,
+            1,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(result, BuildRoundOutcome::ActionUncertain),
+            "a succeeded action with no matching evidence must fail closed, not report \
+             NoBuildApplicable"
+        );
+        let evidence = db
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].status, "insufficient_evidence");
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::NeedsUserAction);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn round_1_build_evidence_never_substitutes_for_round_2() {
+        let dir = git_project_dir("build-round-1-not-round-2");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: None,
+            status: "no_build_applicable",
+            exit_code: None,
+            reason: Some("round 1 result"),
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+
+        let round2_evidence = db
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 2)
+            .unwrap();
+        assert!(
+            round2_evidence.is_empty(),
+            "round 1's build evidence must never be visible when querying round 2"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4287,6 +4770,8 @@ mod tests {
 
         db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, Some("no tests yet"))
             .unwrap();
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("no build yet"))
+            .unwrap();
         let unblocked = unblock_test_execution_for_retry(&db, &project_id, &task_id).unwrap();
         assert_eq!(unblocked.state, TaskState::Queued);
         let test_key = format!("test-{task_id}-round-1");
@@ -4431,6 +4916,8 @@ mod tests {
 
         db.record_no_tests_confirmation(&project_id, &task_id, 0, 2, Some("removed by the fix"))
             .unwrap();
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 2, Some("removed by the fix"))
+            .unwrap();
         let unblocked = unblock_test_execution_for_retry(&db, &project_id, &task_id).unwrap();
         assert_eq!(unblocked.state, TaskState::Queued);
         let round1_test_key = format!("test-{task_id}-round-1");
@@ -4497,6 +4984,8 @@ mod tests {
         let dir = git_project_dir("no-test-framework-confirmed");
         let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
         db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, Some("brand new project"))
+            .unwrap();
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("brand new project"))
             .unwrap();
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
 

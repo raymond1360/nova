@@ -92,9 +92,15 @@ async function handleConfirmTestCommand(source: 'auto' | 'user') {
 }
 
 async function handleConfirmNoTests() {
-  await store.confirmNoTestsApplicable(noTestsReason.value.trim())
-  noTestsReason.value = ''
-  noTestsChoice.value = ''
+  try {
+    await store.confirmNoTestsApplicable(noTestsReason.value.trim())
+    noTestsReason.value = ''
+    noTestsChoice.value = ''
+  } catch {
+    // `lastError` is already set by the store (unless this call turned
+    // out to be stale, in which case nothing was touched at all) — keep
+    // the user's draft reason so a retry never requires retyping it.
+  }
 }
 
 async function handleConfirmNoBuild() {
@@ -279,8 +285,15 @@ const stateLabels: Record<string, string> = {
       </div>
     </section>
 
-    <!-- Second re-review remediation (Blocker 3): the explicit no-tests
-         confirmation card. Neither choice is pre-selected. -->
+    <!-- Second re-review remediation (Blocker 3), backend-authoritative
+         source per Work Package 3 final review remediation (Major 1): the
+         explicit no-tests confirmation card. Neither choice is
+         pre-selected. Only ever shown when the backend itself has
+         confirmed the task is genuinely stalled on "no detectable test
+         command", never guessed from the frontend alone. Also doubles as
+         the recovery UI for a half-success confirmation: calling this
+         again after a prior partial failure safely completes the
+         reconciliation. -->
     <section v-if="store.noTestsConfirmationNeeded" class="block no-tests-card">
       <h3>⚠ 未检测到可运行的自动测试</h3>
       <p>Nova 未检测到可运行的自动测试。是否确认该项目目前没有适用测试？</p>
@@ -289,8 +302,10 @@ const stateLabels: Record<string, string> = {
         <label><input type="radio" v-model="noTestsChoice" value="provide-command" /> 返回填写测试命令</label>
       </div>
       <div v-if="noTestsChoice === 'confirm'" class="row">
-        <input v-model="noTestsReason" placeholder="原因（可选）" />
-        <button @click="handleConfirmNoTests">确认没有适用测试</button>
+        <input v-model="noTestsReason" placeholder="原因（可选）" :disabled="store.confirmingNoTests" />
+        <button :disabled="store.confirmingNoTests" @click="handleConfirmNoTests">
+          {{ store.confirmingNoTests ? '确认中…' : '确认没有适用测试' }}
+        </button>
       </div>
       <div v-else-if="noTestsChoice === 'provide-command'" class="row">
         <input v-model="testCommandDraft" placeholder="手动输入测试命令，例如 cargo test" />

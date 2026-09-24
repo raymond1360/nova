@@ -29,6 +29,27 @@ export const useCoreLoopStore = defineStore('coreLoop', {
     reviews: [] as TaskReview[],
     readiness: null as CoreLoopReadiness | null,
     detectedTestCommand: null as string | null,
+    // Work Package 3 final review remediation (Major 1): whether the
+    // backend has confirmed the current task is genuinely stalled on "no
+    // detectable test command, awaiting an explicit no-tests confirmation"
+    // — populated from the real, authoritative `get_no_tests_confirmation_
+    // needed` backend query, never guessed on the frontend from local
+    // heuristics (the old `test_command_redacted`/`detectedTestCommand`
+    // approximation could show/hide the card based on stale or approximate
+    // state — the command itself must be the final authority, exactly like
+    // `noBuildConfirmationNeeded` already is for the no-build case).
+    noTestsConfirmationNeeded: false as boolean,
+    // Work Package 3 final review remediation (Major 1): mirrors
+    // `noBuildConfirmationRequestToken` exactly — a monotonically
+    // increasing token guarding `loadNoTestsConfirmationNeeded` against a
+    // stale response from a prior project/task/state applying after the
+    // user has since navigated away.
+    noTestsConfirmationRequestToken: 0 as number,
+    // Work Package 3 final review remediation (Major 1): mirrors
+    // `confirmingNoBuild` exactly — in-flight guard for
+    // `confirmNoTestsApplicable` so a duplicate click (or any other
+    // duplicate trigger) can never fire a second `invoke`.
+    confirmingNoTests: false as boolean,
     // v0.1.0 scope correction (Work Package 2): whether the backend has
     // confirmed the current task is genuinely stalled on build detection
     // being unable to determine whether a build applies — populated from
@@ -101,21 +122,6 @@ export const useCoreLoopStore = defineStore('coreLoop', {
     canStart(state): boolean {
       return !!state.readiness?.dev_ready
     },
-    // True only when the task is genuinely stuck for the "no tests
-    // detected" reason (as opposed to any other `needs_user_action` cause,
-    // e.g. an action-ledger crash-recovery uncertainty) — approximated from
-    // the frontend's own view of state, since the exact stall reason lives
-    // in `task_state_events`, not on the `Task` row itself: no command has
-    // ever been confirmed for the task, and the most recent detection also
-    // came back empty.
-    noTestsConfirmationNeeded(state): boolean {
-      return (
-        !!state.currentTask &&
-        state.currentTask.state === 'needs_user_action' &&
-        !state.currentTask.test_command_redacted &&
-        state.detectedTestCommand === null
-      )
-    },
   },
   actions: {
     async loadProjects() {
@@ -160,11 +166,14 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       this.readiness = null
       this.detectedTestCommand = null
       this.noBuildConfirmationNeeded = false
-      // v0.1.0 scope correction (Work Package 2 remediation, Major 1):
-      // invalidates any in-flight no-build query from whatever project was
+      this.noTestsConfirmationNeeded = false
+      // v0.1.0 scope correction (Work Package 2 remediation, Major 1) /
+      // Work Package 3 final review remediation (Major 1): invalidates any
+      // in-flight no-build/no-tests query from whatever project was
       // previously selected — its eventual answer, however it resolves,
       // can never apply to this new project/task pair.
       this.noBuildConfirmationRequestToken += 1
+      this.noTestsConfirmationRequestToken += 1
       await invoke('set_last_active_project', { projectId: project.id }).catch(() => {})
     },
     async loadTasks() {
@@ -204,23 +213,26 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       this.currentTask = task
       this.reviews = []
       this.noBuildConfirmationNeeded = false
-      // v0.1.0 scope correction (Work Package 2 remediation, Major 1):
-      // invalidates any no-build query still in flight for whatever task
-      // was previously selected, *before* possibly starting a new one
-      // below — a slow response for task A must never be applied once the
-      // user has moved on to task B, even if B itself never triggers a
-      // new query (e.g. B is not `needs_user_action`).
+      this.noTestsConfirmationNeeded = false
+      // v0.1.0 scope correction (Work Package 2 remediation, Major 1) /
+      // Work Package 3 final review remediation (Major 1): invalidates any
+      // no-build/no-tests query still in flight for whatever task was
+      // previously selected, *before* possibly starting a new one below —
+      // a slow response for task A must never be applied once the user has
+      // moved on to task B, even if B itself never triggers a new query
+      // (e.g. B is not `needs_user_action`).
       this.noBuildConfirmationRequestToken += 1
-      // Unlike `noTestsConfirmationNeeded` (a synchronous getter over
-      // fields already present on `task`), `noBuildConfirmationNeeded`
-      // requires a real backend query — selecting a task that is already
-      // sitting at `needs_user_action` (e.g. after reopening the project)
-      // must still surface the prompt without waiting for the next
-      // poll/refresh. Deliberately not awaited: `selectTask` itself stays
-      // synchronous for its existing callers, and a failed query here just
-      // leaves the prompt hidden rather than blocking task selection.
+      this.noTestsConfirmationRequestToken += 1
+      // Both require a real backend query — selecting a task that is
+      // already sitting at `needs_user_action` (e.g. after reopening the
+      // project) must still surface the right prompt without waiting for
+      // the next poll/refresh. Deliberately not awaited: `selectTask`
+      // itself stays synchronous for its existing callers, and a failed
+      // query here just leaves the prompt hidden rather than blocking task
+      // selection.
       if (task.state === 'needs_user_action') {
         this.loadNoBuildConfirmationNeeded().catch(() => {})
+        this.loadNoTestsConfirmationNeeded().catch(() => {})
       }
     },
     async detectTestCommand() {
@@ -242,20 +254,80 @@ export const useCoreLoopStore = defineStore('coreLoop', {
     // applicable` evidence can ever be recorded — a real, explicit user
     // action with no default. `reason` is optional free text, never
     // pre-filled with an assumption.
+    //
+    // Work Package 3 final review remediation (Major 1): deliberately
+    // never sends `round` (or any generation) — `confirm_no_tests_
+    // applicable` on the backend derives the generation/round itself from
+    // the task's own real state, exactly like `confirmNoBuildApplicable`
+    // already trusts the backend for the state/action/evidence gate. Also
+    // re-entrant: if a prior attempt already wrote the confirmation but the
+    // task did not yet resume (a half-success crash), calling this again
+    // still completes the recovery — the frontend never needs to
+    // distinguish "first call" from "retry".
+    //
+    // Mirrors `confirmNoBuildApplicable`'s two safeguards exactly: first,
+    // `confirmingNoTests` makes a second overlapping call (e.g. a double
+    // click) a pure no-op — it never fires a second `invoke`. Second, the
+    // project/task this call was actually submitted for is captured up
+    // front; if the user has since selected a different task or project by
+    // the time the backend responds, this call's outcome — success or
+    // failure — is applied only where doing so is still meaningful, never
+    // onto whatever the user has since navigated to.
     async confirmNoTestsApplicable(reason: string) {
-      if (!this.currentTask || !this.currentProject) return
+      if (!this.currentTask || !this.currentProject || this.confirmingNoTests) return
       this.lastError = ''
+      this.confirmingNoTests = true
+      const projectId = this.currentProject.id
+      const taskId = this.currentTask.id
       try {
         await invoke<NoTestsConfirmation>('confirm_no_tests_applicable', {
-          projectId: this.currentProject.id,
-          taskId: this.currentTask.id,
-          round: this.pendingRound,
+          projectId,
+          taskId,
           reason: reason || null,
         })
-        await this.refreshCurrentTask()
+        if (this.currentProject?.id === projectId && this.currentTask?.id === taskId) {
+          await this.refreshCurrentTask()
+        }
       } catch (error) {
-        this.lastError = String(error)
+        if (this.currentProject?.id === projectId && this.currentTask?.id === taskId) {
+          this.lastError = String(error)
+        }
         throw error
+      } finally {
+        this.confirmingNoTests = false
+      }
+    },
+    // Work Package 3 final review remediation (Major 1 / Suggestion 2): the
+    // real, backend-authoritative check for whether the current task is
+    // genuinely stalled on "no detectable test command, awaiting an
+    // explicit no-tests confirmation" — never inferred from any
+    // frontend-only signal. Safe to call whenever a task is
+    // `needs_user_action`; returns `false` for every other reason a task
+    // can be stuck there. Mirrors `loadNoBuildConfirmationNeeded`'s
+    // stale-response guard exactly: the result is only ever written if, at
+    // resolution time, the token is still the latest one issued, the
+    // selected project and task are still the ones this call started for,
+    // and the task is still genuinely `needs_user_action`.
+    async loadNoTestsConfirmationNeeded() {
+      if (!this.currentTask || !this.currentProject) {
+        this.noTestsConfirmationNeeded = false
+        return
+      }
+      this.noTestsConfirmationRequestToken += 1
+      const requestToken = this.noTestsConfirmationRequestToken
+      const projectId = this.currentProject.id
+      const taskId = this.currentTask.id
+      const needed = await invoke<boolean>('get_no_tests_confirmation_needed', {
+        projectId,
+        taskId,
+      })
+      if (
+        this.noTestsConfirmationRequestToken === requestToken &&
+        this.currentProject?.id === projectId &&
+        this.currentTask?.id === taskId &&
+        this.currentTask?.state === 'needs_user_action'
+      ) {
+        this.noTestsConfirmationNeeded = needed
       }
     },
     // v0.1.0 scope correction (Work Package 2): the real, backend-
@@ -469,13 +541,17 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       if (this.currentTask?.state === 'needs_user_action') {
         await this.detectTestCommand().catch(() => {})
         await this.loadNoBuildConfirmationNeeded().catch(() => {})
+        await this.loadNoTestsConfirmationNeeded().catch(() => {})
       } else {
         this.noBuildConfirmationNeeded = false
-        // v0.1.0 scope correction (Work Package 2 remediation, Major 1):
-        // the task just left `needs_user_action` (or there is no current
-        // task) — invalidate any no-build query still in flight for it so
+        this.noTestsConfirmationNeeded = false
+        // v0.1.0 scope correction (Work Package 2 remediation, Major 1) /
+        // Work Package 3 final review remediation (Major 1): the task just
+        // left `needs_user_action` (or there is no current task) —
+        // invalidate any no-build/no-tests query still in flight for it so
         // a late response cannot resurrect the prompt.
         this.noBuildConfirmationRequestToken += 1
+        this.noTestsConfirmationRequestToken += 1
       }
     },
     async loadReviews() {
@@ -534,6 +610,7 @@ export const useCoreLoopStore = defineStore('coreLoop', {
           await this.loadReviews()
           if (unfinished.state === 'needs_user_action') {
             await this.loadNoBuildConfirmationNeeded().catch(() => {})
+            await this.loadNoTestsConfirmationNeeded().catch(() => {})
           }
         }
       } catch (error) {

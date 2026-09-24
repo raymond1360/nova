@@ -664,8 +664,10 @@ pub fn current_pending_round(db: &Database, project_id: &str, task_id: &str) -> 
 
 /// Second re-review remediation (Blocker 3): after the user supplies what
 /// a stalled generation-aware test action (see [`test_action_key`]) was
-/// waiting on (a real no-tests confirmation, or a corrected/allowlisted
-/// test command), this
+/// waiting on — a corrected/allowlisted test command via
+/// `confirm_task_test_command` (a genuine no-tests confirmation now goes
+/// through [`confirm_no_tests_applicable`]'s own dedicated, coordinated
+/// reset-and-resume instead, mirroring the no-build boundary) — this
 /// resets that exact action back to `planned` and, if the task is
 /// currently `needs_user_action`, returns it to `queued` — the same legal
 /// state `start_core_loop` already accepts — so the frontend's next
@@ -724,6 +726,30 @@ pub fn unblock_test_execution_for_retry(
 /// every other stop reason — see [`confirm_no_build_applicable`].
 const BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER: &str =
     "build detection insufficient, awaiting user confirmation";
+
+/// Work Package 3 final review remediation (Major 1): the stable internal
+/// signal [`run_tests_for_round`] writes to a test action's `error_summary`
+/// when it stops specifically because no test command could be detected
+/// and no real no-tests confirmation exists yet for the exact current
+/// generation/round — the *only* stop reason that ever produces this exact
+/// string. Every other way a test action can end up `Failed` writes a
+/// different, distinct `error_summary` (allowlist rejection: `"test
+/// command not allowlisted"`; a genuine test failure/timeout: redacted
+/// real process output; `None` is never written for a `Failed` status by
+/// this function) — so checking this exact string is sufficient on its own
+/// to distinguish "awaiting no-tests confirmation" from every other stop
+/// reason. Deliberately, this stall — unlike a genuine build-detection
+/// stall — never writes any `test_evidence` row (Blocker 3's "no test
+/// evidence, not even no_tests_applicable, may be recorded without a real
+/// confirmation"); [`reconcile_no_tests_confirmation_attempt`]'s
+/// authorization gate uses that real invariant (an *empty* evidence list
+/// for the exact generation/round) as its evidence-side check, rather than
+/// requiring a specific evidence row the way no-build's gate does — a
+/// genuine test failure, timeout, cancellation, or allowlist rejection
+/// always leaves a real `test_evidence` row behind, so an empty list is
+/// itself a meaningful, unforgeable signal that no such outcome happened.
+const NO_TESTS_AWAITING_CONFIRMATION_MARKER: &str =
+    "no_tests_applicable requires an explicit user confirmation, none found for this generation/round";
 
 /// Maximum length (in bytes) Nova will store for a no-build confirmation's
 /// free-text `reason` — a short user note, not a command-output dump (see
@@ -1102,6 +1128,304 @@ pub fn no_build_confirmation_needed(
         .iter()
         .any(|e| e.status == "insufficient_evidence");
     Ok(evidence_ok)
+}
+
+/// Maximum length (in bytes) Nova will store for a no-tests confirmation's
+/// free-text `reason` — mirrors [`MAX_NO_BUILD_REASON_LEN`].
+const MAX_NO_TESTS_REASON_LEN: usize = 500;
+
+/// Work Package 3 final review remediation (Major 1): the full
+/// authorization/state/round/idempotency boundary for recording a no-tests
+/// confirmation — a structural mirror of [`confirm_no_build_applicable`]
+/// for the no-tests stall instead of the no-build one. The backend is the
+/// *sole* authority for which `result_generation`/`round` this
+/// confirmation applies to and for whether the task is genuinely,
+/// structurally stalled on "no detectable test command" — nothing here
+/// trusts any caller-supplied generation, round, task state, action key,
+/// or evidence status (the Tauri command wrapper in `commands.rs` no
+/// longer accepts a `round` parameter at all).
+///
+/// Previously, `commands::confirm_no_tests_applicable` called
+/// `Database::record_no_tests_confirmation` directly (a plain, non-CAS
+/// `INSERT`) followed by [`unblock_test_execution_for_retry`] — two
+/// separate steps with no coordination between them, so a crash between
+/// the insert and the unblock left the task stuck at `needs_user_action`
+/// forever despite a confirmation already existing, and two concurrent
+/// requests could both attempt the insert and have the loser surface a raw
+/// SQLite `UNIQUE` constraint error instead of converging. This function
+/// replaces both call sites with the same re-entrant, fail-closed-by-
+/// default coordination [`confirm_no_build_applicable`] already
+/// established: every call — the genuine first request *and* every retry
+/// after a crash or a concurrent race — starts by asking "how much of this
+/// operation has already happened?" rather than assuming a found
+/// confirmation row means the whole operation is done.
+pub fn confirm_no_tests_applicable(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    reason: Option<&str>,
+) -> NovaResult<crate::models::NoTestsConfirmation> {
+    reconcile_no_tests_confirmation(db, project_id, task_id, reason)
+}
+
+/// v0.1.0 scope correction (mirrors [`reconcile_no_build_confirmation`]):
+/// wraps [`reconcile_no_tests_confirmation_attempt`] in a bounded retry
+/// loop so two (or more) genuinely concurrent, legitimate calls converge on
+/// the same terminal outcome instead of one surfacing a raw error merely
+/// because the other's write landed first. See that function's doc comment
+/// for the two real race windows this closes (both proven for no-build by
+/// repeated stress testing; the no-tests attempt below has the identical
+/// shape, so the identical windows apply): both calls reading "no
+/// confirmation yet" before either has inserted, and both calls reaching
+/// `transition_task` with the task still `needs_user_action` where only one
+/// can win the CAS. Retries only when [`no_tests_confirmation_likely_
+/// converging`] finds direct evidence — a confirmation row that now exists
+/// for the freshly recomputed `(result_generation, round)` — that a
+/// concurrent, legitimate call already advanced this exact operation; any
+/// other failure (wrong project, no genuine stall, a real marker/evidence
+/// mismatch, or a structurally-impossible task state) fails closed
+/// immediately, exactly as a single, non-retrying call always has.
+fn reconcile_no_tests_confirmation(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    reason: Option<&str>,
+) -> NovaResult<crate::models::NoTestsConfirmation> {
+    const MAX_CONCURRENT_CONVERGENCE_ATTEMPTS: u32 = 8;
+    let mut last_err =
+        NovaError::Config("无需测试确认协调未能在有限次重试内收敛，请人工检查".to_string());
+    for attempt in 0..MAX_CONCURRENT_CONVERGENCE_ATTEMPTS {
+        match reconcile_no_tests_confirmation_attempt(db, project_id, task_id, reason) {
+            Ok(confirmation) => return Ok(confirmation),
+            Err(err) => {
+                let is_last_attempt = attempt + 1 == MAX_CONCURRENT_CONVERGENCE_ATTEMPTS;
+                last_err = err;
+                if is_last_attempt {
+                    break;
+                }
+                if !no_tests_confirmation_likely_converging(db, project_id, task_id)? {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// Mirrors [`no_build_confirmation_likely_converging`] exactly, for the
+/// no-tests confirmation retry wrapper.
+fn no_tests_confirmation_likely_converging(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+) -> NovaResult<bool> {
+    let task = match db.task(task_id) {
+        Ok(task) => task,
+        Err(_) => return Ok(false),
+    };
+    if task.project_id != project_id
+        || matches!(
+            task.state,
+            TaskState::Draft | TaskState::AwaitingConfirmation | TaskState::Confirmed
+        )
+    {
+        return Ok(false);
+    }
+    let result_generation = task.result_generation;
+    let round = current_pending_round(db, project_id, task_id)?;
+    Ok(db
+        .find_no_tests_confirmation(project_id, task_id, result_generation, round)?
+        .is_some())
+}
+
+/// The single, non-retrying reconciliation attempt driven by
+/// [`reconcile_no_tests_confirmation`] — see that function's doc comment
+/// for why a single attempt is not, by itself, safe under true
+/// concurrency, and [`confirm_no_tests_applicable`]'s doc comment for the
+/// half-success recovery design this attempt itself implements. A
+/// structural mirror of [`reconcile_no_build_confirmation_attempt`], with
+/// one deliberate difference in the first-request gate's evidence check —
+/// see [`NO_TESTS_AWAITING_CONFIRMATION_MARKER`]'s doc comment for why an
+/// *empty* `test_evidence` list (not a specific evidence row) is the
+/// correct signal here.
+fn reconcile_no_tests_confirmation_attempt(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    reason: Option<&str>,
+) -> NovaResult<crate::models::NoTestsConfirmation> {
+    let task = db.task(task_id)?;
+    if task.project_id != project_id {
+        return Err(NovaError::Config(
+            "task_id 与 project_id 不匹配，已拒绝".to_string(),
+        ));
+    }
+    let result_generation = task.result_generation;
+    let round = current_pending_round(db, project_id, task_id)?;
+    let test_key = test_action_key(task_id, result_generation, round);
+
+    let confirmation = match db.find_no_tests_confirmation(
+        project_id,
+        task_id,
+        result_generation,
+        round,
+    )? {
+        Some(existing) => existing,
+        None => {
+            // Case A (first genuine request): the full gate — must hold
+            // before a confirmation is ever written for the first time.
+            if task.state != TaskState::NeedsUserAction {
+                return Err(NovaError::Config(format!(
+                    "只有任务处于 needs_user_action 状态时才能确认当前没有适用测试，当前状态：{}",
+                    task.state
+                )));
+            }
+            let action = db.find_action(task_id, &test_key)?.ok_or_else(|| {
+                NovaError::Config("当前不存在待确认的无测试停滞，拒绝记录确认".to_string())
+            })?;
+            if action.status != ActionStatus::Failed
+                || action.error_summary.as_deref() != Some(NO_TESTS_AWAITING_CONFIRMATION_MARKER)
+            {
+                return Err(NovaError::Config(
+                    "当前卡点不是无可用测试命令等待确认，拒绝记录无需测试确认".to_string(),
+                ));
+            }
+            // A genuine test failure, timeout, cancellation, or
+            // allowlist rejection always leaves a real `test_evidence`
+            // row for this exact (result_generation, round) — the
+            // no-tests stall this gate authorizes never does (see the
+            // marker constant's doc comment). An empty list here is
+            // therefore real, unforgeable proof this is genuinely the
+            // no-tests stall and not one of those other outcomes.
+            let evidence_ok = db
+                .list_test_evidence_for_round(project_id, task_id, result_generation, round)?
+                .is_empty();
+            if !evidence_ok {
+                return Err(NovaError::Config(
+                        "已存在该 generation/round 的测试证据，当前卡点并非无可用测试命令，拒绝记录无需测试确认".to_string(),
+                    ));
+            }
+            let effective_reason = match reason.map(str::trim) {
+                Some(text) if !text.is_empty() => cap_text(text, MAX_NO_TESTS_REASON_LEN),
+                _ => "用户确认该项目当前没有适用测试（未提供具体原因）".to_string(),
+            };
+            db.record_no_tests_confirmation(
+                project_id,
+                task_id,
+                result_generation,
+                round,
+                Some(&effective_reason),
+            )?
+        }
+    };
+
+    // From here on, whether this call just wrote the confirmation (case A)
+    // or found one already sitting there (cases B–F), the rest is the exact
+    // same "finish whatever is left" coordination — re-inspecting the real,
+    // current test action and task state rather than assuming anything
+    // about how far a prior attempt got.
+    if let Some(action) = db.find_action(task_id, &test_key)? {
+        if action.status == ActionStatus::Failed {
+            // Case B: the confirmation exists but the test action was never
+            // reset — a prior attempt crashed between writing the
+            // confirmation and resetting the action. Fail closed if the
+            // action's own marker no longer matches what this confirmation
+            // is supposed to be answering for.
+            if action.error_summary.as_deref() != Some(NO_TESTS_AWAITING_CONFIRMATION_MARKER) {
+                return Err(NovaError::Config(
+                    "测试动作当前状态与已记录的无需测试确认不一致，拒绝继续，请人工检查"
+                        .to_string(),
+                ));
+            }
+            db.reset_failed_action_for_retry(task_id, &test_key)?;
+        }
+        // Any other status (Planned/Started/Succeeded/Cancelled/Uncertain)
+        // means the reset already happened (case C/D/E) or is not this
+        // function's concern anymore — nothing further to do to the action
+        // itself.
+    }
+
+    let task = db.task(task_id)?;
+    match task.state {
+        TaskState::NeedsUserAction => {
+            // Case B (just reset above) or Case C: the action side is
+            // settled: resume the task exactly the same way a single,
+            // uninterrupted first call always has.
+            db.transition_task(
+                task_id,
+                TaskState::Queued,
+                Actor::User,
+                Some("用户已确认该项目当前没有适用测试，重新排队等待继续"),
+                None,
+                false,
+                None,
+            )?;
+        }
+        TaskState::Draft | TaskState::AwaitingConfirmation | TaskState::Confirmed => {
+            // Case F: a task that has ever reached a genuine no-tests stall
+            // (and therefore could ever have a real no-tests confirmation
+            // for it) can never legally be sitting in one of these three
+            // *earlier-than-ever-started* states — fail closed rather than
+            // silently pretending everything is fine.
+            return Err(NovaError::Config(
+                "任务当前状态与已存在的无需测试确认不一致（该状态不可能晚于确认发生），拒绝继续"
+                    .to_string(),
+            ));
+        }
+        _ => {
+            // Cases D/E: Queued/Running/Verifying/SafeFixing/PreviewReady/
+            // AwaitingUserAcceptance/Completed/Interrupted/Failed/Cancelled
+            // — the task has already legitimately continued (or
+            // terminated) past the point this confirmation unblocked.
+            // Never roll it back, never reset anything, never repeat any
+            // work.
+        }
+    }
+
+    Ok(confirmation)
+}
+
+/// Work Package 3 final review remediation (Major 1 / Suggestion 2): a
+/// read-only counterpart to [`current_pending_round`] the frontend uses to
+/// decide whether to show the "confirm this project currently has no
+/// applicable tests" prompt for a `needs_user_action` task — mirrors
+/// [`no_build_confirmation_needed`] exactly, but for the no-tests stall.
+/// Mirrors exactly the same real signals [`reconcile_no_tests_confirmation`]'s
+/// Case A gate requires before ever accepting a confirmation (task
+/// ownership, `NeedsUserAction`, the current generation/round's test action
+/// genuinely `Failed` with the internal no-tests-awaiting-confirmation
+/// marker, and an empty test-evidence list for that exact generation/round),
+/// but never writes anything and never mutates task/action/evidence state.
+/// Returns `Ok(false)` for every other combination (wrong project, wrong
+/// task state, no matching action, a genuine test failure/timeout/
+/// cancellation/allowlist rejection, or a build stall instead) rather than
+/// erroring, since this is meant to be polled freely by the UI without the
+/// caller having to pre-validate anything itself. Never returns or leaks
+/// the internal marker string itself — only the boolean fact.
+pub fn no_tests_confirmation_needed(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+) -> NovaResult<bool> {
+    let task = db.task(task_id)?;
+    if task.project_id != project_id || task.state != TaskState::NeedsUserAction {
+        return Ok(false);
+    }
+    let result_generation = task.result_generation;
+    let round = current_pending_round(db, project_id, task_id)?;
+    let test_key = test_action_key(task_id, result_generation, round);
+    let action = match db.find_action(task_id, &test_key)? {
+        Some(action) => action,
+        None => return Ok(false),
+    };
+    if action.status != ActionStatus::Failed
+        || action.error_summary.as_deref() != Some(NO_TESTS_AWAITING_CONFIRMATION_MARKER)
+    {
+        return Ok(false);
+    }
+    Ok(db
+        .list_test_evidence_for_round(project_id, task_id, result_generation, round)?
+        .is_empty())
 }
 
 /// Outcome of [`run_dev_and_test_round`] — the developer-AI-plus-Nova's-
@@ -1745,7 +2069,7 @@ fn run_tests_for_round(
                 &test_key,
                 ActionStatus::Failed,
                 None,
-                Some("no_tests_applicable requires an explicit user confirmation, none found for this generation/round"),
+                Some(NO_TESTS_AWAITING_CONFIRMATION_MARKER),
             )?;
             db.transition_task(
                 task_id,
@@ -6617,20 +6941,17 @@ mod tests {
     // --- Work Package 3: additional concurrency/idempotency coverage -----
 
     #[test]
-    fn two_concurrent_no_tests_confirmations_for_the_same_generation_round_never_duplicate_or_corrupt_state(
+    fn two_concurrent_no_tests_confirmations_for_the_same_generation_round_converge_via_the_real_production_entry_point(
     ) {
-        // Mirrors `confirm_no_tests_applicable`'s real two-step production
-        // path (`Database::record_no_tests_confirmation` then
-        // `unblock_test_execution_for_retry`) under genuine two-OS-thread,
-        // barrier-synchronized concurrency, against a real file-backed
-        // database. Unlike no-build's confirmation (which has a dedicated
-        // bounded-retry convergence wrapper), no-tests confirmation relies
-        // on the table's own `UNIQUE(task_id, result_generation, round)`
-        // constraint as its sole concurrency backstop — this proves that
-        // backstop is sufficient: never two rows, never a corrupted final
-        // task/action state, and the losing caller's error (if any) is a
-        // plain, contained `Err`, never a panic or a wrong task's data
-        // getting touched.
+        // Work Package 3 final review remediation (Major 1): calls the real
+        // `confirm_no_tests_applicable` production entry point (not the raw
+        // storage function) from two real OS threads, released from a
+        // `Barrier` at the exact same instant, against a real file-backed
+        // database — the same technique already used for no-build's own
+        // barrier-synchronized race test. Both callers must either succeed
+        // with the *same* confirmation row or receive a clean, contained
+        // `Err` — never a raw SQLite `UNIQUE` violation, never a panic,
+        // never two rows, never a corrupted final task/action state.
         for i in 0..10 {
             let dir = git_project_dir(&format!("no-tests-concurrent-{i}"));
             let db_dir = temp_dir(&format!("no-tests-concurrent-{i}-db"));
@@ -6669,36 +6990,23 @@ mod tests {
                 let task_id = task_id.clone();
                 thread::spawn(move || {
                     let db = Database::open(&db_path).unwrap();
-                    let generation = db.task(&task_id).unwrap().result_generation;
                     barrier.wait();
-                    let confirmation = db
-                        .record_no_tests_confirmation(
-                            &project_id,
-                            &task_id,
-                            generation,
-                            1,
-                            Some(label),
-                        )
-                        .ok();
-                    // Only the winning caller (whose insert actually
-                    // committed) calls the resume step — mirrors
-                    // `confirm_no_tests_applicable`'s real sequencing,
-                    // where the second call's `?` on the insert error
-                    // would already have returned before ever reaching
-                    // this line in the real Tauri command.
-                    if confirmation.is_some() {
-                        let _ = unblock_test_execution_for_retry(&db, &project_id, &task_id);
-                    }
-                    confirmation
+                    confirm_no_tests_applicable(&db, &project_id, &task_id, Some(label))
                 })
             };
             let handle_a = run("A");
             let handle_b = run("B");
             let result_a = handle_a.join().unwrap();
             let result_b = handle_b.join().unwrap();
-            assert!(
-                result_a.is_some() || result_b.is_some(),
-                "iteration {i}: at least one of the two racing confirmations must succeed"
+            let confirmation_a = result_a.unwrap_or_else(|e| {
+                panic!("iteration {i}: thread A must not surface a raw concurrency error: {e}")
+            });
+            let confirmation_b = result_b.unwrap_or_else(|e| {
+                panic!("iteration {i}: thread B must not surface a raw concurrency error: {e}")
+            });
+            assert_eq!(
+                confirmation_a.id, confirmation_b.id,
+                "iteration {i}: both threads must converge on the same confirmation row"
             );
 
             let db_check = Database::open(&db_path).unwrap();
@@ -6713,7 +7021,7 @@ mod tests {
             assert_eq!(
                 count, 1,
                 "iteration {i}: exactly one confirmation row must exist, regardless of which \
-                 thread's insert won the race"
+                 thread's attempt won the race"
             );
             let final_task = db_check.task(&task_id).unwrap();
             assert_eq!(
@@ -6721,6 +7029,13 @@ mod tests {
                 TaskState::Queued,
                 "iteration {i}: the task must converge to queued exactly once, not error out or \
                  get stuck"
+            );
+            let test_key = test_action_key(&task_id, 0, 1);
+            let action_after = db_check.find_action(&task_id, &test_key).unwrap().unwrap();
+            assert_eq!(
+                action_after.status,
+                ActionStatus::Planned,
+                "iteration {i}: test action must have converged to planned"
             );
             let _ = fs::remove_dir_all(&dir);
             let _ = fs::remove_dir_all(&db_dir);
@@ -9057,13 +9372,16 @@ mod tests {
 
     #[test]
     fn confirming_no_tests_after_getting_stuck_actually_unblocks_a_resumed_run_to_success() {
-        // Second re-review remediation: proves the *whole* real-world path,
-        // not just that the confirmation record gets written — a user who
-        // gets stuck at `needs_user_action`, confirms there are no
-        // applicable tests, and clicks "start" again must actually see the
-        // task complete, not stay stuck forever because the retried
-        // `test-{task_id}-round-1` action was left in a terminal `failed`
-        // status a plain `start_action` can never leave again.
+        // Second re-review remediation, updated for Work Package 3's final
+        // review remediation to go through the real production entry point
+        // (`confirm_no_tests_applicable`, not a manual storage+unblock
+        // sequence): proves the *whole* real-world path, not just that the
+        // confirmation record gets written — a user who gets stuck at
+        // `needs_user_action`, confirms there are no applicable tests, and
+        // clicks "start" again must actually see the task complete, not
+        // stay stuck forever because the retried test action was left in a
+        // terminal `failed` status a plain `start_action` can never leave
+        // again.
         let dir = git_project_dir("no-test-framework-unblock-resume");
         let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
@@ -9079,18 +9397,16 @@ mod tests {
         .unwrap();
         assert_eq!(stuck.task.state, TaskState::NeedsUserAction);
 
-        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, Some("no tests yet"))
-            .unwrap();
+        confirm_no_tests_applicable(&db, &project_id, &task_id, Some("no tests yet")).unwrap();
         db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("no build yet"))
             .unwrap();
-        let unblocked = unblock_test_execution_for_retry(&db, &project_id, &task_id).unwrap();
-        assert_eq!(unblocked.state, TaskState::Queued);
         let test_key = test_action_key(&task_id, 0, 1);
         assert_eq!(
             db.find_action(&task_id, &test_key).unwrap().unwrap().status,
             ActionStatus::Planned,
             "the stalled test action must be back to planned, retryable again"
         );
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::Queued);
 
         let resumed = run_core_loop(
             &db,
@@ -9110,6 +9426,1063 @@ mod tests {
             .unwrap();
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].status, "no_tests_applicable");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Work Package 3 final review remediation (Major 1):
+    // `confirm_no_tests_applicable`'s full authorization/state/round/
+    // idempotency/half-success-recovery boundary, brought to parity with
+    // `confirm_no_build_applicable`. --------------------------------------
+
+    /// A real, genuine round-1 no-tests stall: bare git fixture (no
+    /// `Cargo.toml`/`package.json`/any detectable test command), run to
+    /// completion via the real `run_core_loop` entry point so the task
+    /// genuinely lands on `needs_user_action` with the test action
+    /// carrying the real `NO_TESTS_AWAITING_CONFIRMATION_MARKER` — never
+    /// fabricated directly.
+    fn stall_task_at_round_1_no_tests(
+        name: &str,
+        dev_kind: &str,
+    ) -> (PathBuf, Database, String, String) {
+        let dir = git_project_dir(name);
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, dev_kind);
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+        assert_eq!(outcome.task.state, TaskState::NeedsUserAction);
+        (dir, db, project_id, task_id)
+    }
+
+    #[test]
+    fn confirm_no_tests_applicable_derives_round_from_the_backend_not_a_caller_value() {
+        // Item 1/2: the function signature itself carries no `round`
+        // parameter at all (see `confirm_no_tests_applicable`'s signature
+        // above) — this test proves the backend-derived round is also
+        // *correct* for a genuine round-2 fix-pass stall, not just that no
+        // parameter exists to forge.
+        let dir = git_project_dir("no-tests-round-from-backend");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(1)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add failing test"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let dir_for_fix = dir.clone();
+        let adapter = MockAdapter::new(vec![MockOutcome::Success, MockOutcome::Success], vec![]);
+        let dev_call_count = std::sync::atomic::AtomicUsize::new(0);
+        *adapter.development_side_effect.lock().unwrap() = Some(Box::new(move |_req| {
+            // Only round 2's dev call (the second overall development
+            // invocation) removes `package.json` entirely — `detect_test_
+            // command` only checks for the file's existence (not whether
+            // it has a `scripts.test` entry), so this is what's actually
+            // needed to make round 2 genuinely stall on "no test command
+            // detected", distinct from round 1's real failure. Round 1's
+            // own dev call must leave the real failing test script intact.
+            if dev_call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                let _ = fs::remove_file(dir_for_fix.join("package.json"));
+                let _ = StdCommand::new("git")
+                    .args(["add", "-A"])
+                    .current_dir(&dir_for_fix)
+                    .status();
+                let _ = StdCommand::new("git")
+                    .args(["commit", "-q", "-m", "round 2: remove package.json"])
+                    .current_dir(&dir_for_fix)
+                    .status();
+            }
+        }));
+        let stuck = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+        assert_eq!(stuck.task.state, TaskState::NeedsUserAction);
+        assert_eq!(
+            current_pending_round(&db, &project_id, &task_id).unwrap(),
+            2,
+            "must genuinely be stuck on round 2, not round 1"
+        );
+
+        let confirmation =
+            confirm_no_tests_applicable(&db, &project_id, &task_id, Some("removed in fix"))
+                .unwrap();
+        assert_eq!(
+            confirmation.round, 2,
+            "the backend must derive round 2, never trust or default to round 1"
+        );
+        let round1_test_key = test_action_key(&task_id, 0, 1);
+        assert_eq!(
+            db.find_action(&task_id, &round1_test_key)
+                .unwrap()
+                .unwrap()
+                .status,
+            ActionStatus::Failed,
+            "round 1's own already-terminal action must never be touched by round 2's confirmation"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_tests_applicable_rejects_a_project_id_that_does_not_own_the_task() {
+        let (dir, db, _project_id, task_id) =
+            stall_task_at_round_1_no_tests("no-tests-wrong-project", "codex_cli");
+        let other_dir = temp_dir("no-tests-wrong-project-other");
+        let other_project = db
+            .create_project(&CreateProjectRequest {
+                name: "Other".to_string(),
+                local_path: other_dir.to_string_lossy().into_owned(),
+                source_type: "local".to_string(),
+                source_url: None,
+                purpose: None,
+                long_term_goal: None,
+                user_preferences: None,
+                prohibitions: None,
+            })
+            .unwrap();
+        let result = confirm_no_tests_applicable(&db, &other_project.id, &task_id, None);
+        assert!(result.is_err());
+        assert!(db
+            .find_no_tests_confirmation(&other_project.id, &task_id, 0, 1)
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&other_dir);
+    }
+
+    #[test]
+    fn confirm_no_tests_applicable_rejects_a_task_not_in_needs_user_action() {
+        let dir = git_project_dir("no-tests-not-needs-user-action");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        // Still `confirmed` — never reached a genuine stall at all.
+        let result = confirm_no_tests_applicable(&db, &project_id, &task_id, None);
+        assert!(result.is_err());
+        assert!(db
+            .find_no_tests_confirmation(&project_id, &task_id, 0, 1)
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_tests_applicable_rejects_a_genuine_test_failure() {
+        // Constructed directly at the Action Ledger/evidence level (real
+        // `record_test_evidence` + `finish_action`, real
+        // `transition_task`), rather than run through the full one-fix-pass
+        // orchestration, so this test isolates the authorization check
+        // itself from `run_core_loop`'s automatic-retry behavior — a task
+        // genuinely `needs_user_action` with real `failed` evidence for its
+        // own current generation/round is a state the full loop does not
+        // actually leave a task in on its own (a genuine failure routes
+        // through the one-fix-pass cycle instead), but is nonetheless a
+        // state the authorization gate itself must still refuse.
+        let dir = git_project_dir("no-tests-genuine-failure");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let test_key = test_action_key(&task_id, 0, 1);
+        db.plan_action(&task_id, "test_execution", &test_key)
+            .unwrap();
+        db.start_action(&task_id, &test_key, false).unwrap();
+        db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            test_command_redacted: Some("npm test"),
+            status: "failed",
+            passed_count: 0,
+            failed_count: 1,
+            skipped_count: 0,
+            exit_code: Some(1),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        db.finish_action(&task_id, &test_key, ActionStatus::Failed, None, None)
+            .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let result = confirm_no_tests_applicable(&db, &project_id, &task_id, None);
+        assert!(
+            result.is_err(),
+            "a genuine test failure (real, non-empty evidence) must never be confirmable as \
+             no-tests: {result:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_tests_applicable_rejects_when_evidence_exists_even_if_the_marker_is_spoofed() {
+        // Defense in depth: even if a test action's `error_summary`
+        // happens to exactly match the no-tests marker (e.g. a future bug
+        // elsewhere, or direct tampering), a real, non-empty test_evidence
+        // row for the exact generation/round must still fail the gate —
+        // the marker check alone is not trusted as sufficient on its own.
+        let dir = git_project_dir("no-tests-spoofed-marker-with-evidence");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let test_key = test_action_key(&task_id, 0, 1);
+        db.plan_action(&task_id, "test_execution", &test_key)
+            .unwrap();
+        db.start_action(&task_id, &test_key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &test_key,
+            ActionStatus::Failed,
+            None,
+            Some(NO_TESTS_AWAITING_CONFIRMATION_MARKER),
+        )
+        .unwrap();
+        db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            test_command_redacted: Some("npm test"),
+            status: "timed_out",
+            passed_count: 0,
+            failed_count: 0,
+            skipped_count: 0,
+            exit_code: None,
+            reason: Some("测试执行超时"),
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let result = confirm_no_tests_applicable(&db, &project_id, &task_id, None);
+        assert!(
+            result.is_err(),
+            "a real evidence row (timed_out) must reject the confirmation even with a matching \
+             marker: {result:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_tests_applicable_rejects_an_uncertain_test_action() {
+        let dir = git_project_dir("no-tests-uncertain-action");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let test_key = test_action_key(&task_id, 0, 1);
+        db.plan_action(&task_id, "test_execution", &test_key)
+            .unwrap();
+        db.start_action(&task_id, &test_key, false).unwrap();
+        db.mark_started_actions_uncertain().unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let result = confirm_no_tests_applicable(&db, &project_id, &task_id, None);
+        assert!(
+            result.is_err(),
+            "an uncertain (crash-recovery) action status must never be confirmable as no-tests: \
+             {result:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_tests_applicable_rejects_a_wrong_marker() {
+        let dir = git_project_dir("no-tests-wrong-marker");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let test_key = test_action_key(&task_id, 0, 1);
+        db.plan_action(&task_id, "test_execution", &test_key)
+            .unwrap();
+        db.start_action(&task_id, &test_key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &test_key,
+            ActionStatus::Failed,
+            None,
+            Some("test command not allowlisted"),
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let result = confirm_no_tests_applicable(&db, &project_id, &task_id, None);
+        assert!(
+            result.is_err(),
+            "an allowlist rejection must never be confirmable as no-tests: {result:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_tests_applicable_rejects_when_no_test_action_exists_at_all() {
+        let dir = git_project_dir("no-tests-missing-action");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let result = confirm_no_tests_applicable(&db, &project_id, &task_id, None);
+        assert!(
+            result.is_err(),
+            "needs_user_action with no test action ever planned must never be confirmable: \
+             {result:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_tests_applicable_is_unaffected_by_a_prior_generations_real_evidence() {
+        let dir = git_project_dir("no-tests-prior-generation-evidence");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(1)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add failing test"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        // Generation 0 gets real, genuine failure evidence.
+        db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            test_command_redacted: Some("npm test"),
+            status: "failed",
+            passed_count: 0,
+            failed_count: 1,
+            skipped_count: 0,
+            exit_code: Some(1),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        bump_result_generation_via_real_transitions(&db, &task_id, 1);
+        db.transition_task(
+            &task_id,
+            TaskState::SafeFixing,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Verifying,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        // Remove the test script entirely so generation 1's own round 1
+        // genuinely stalls on no-tests, independent of generation 0.
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "generation 1: remove test script"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        let test_key_gen1 = test_action_key(&task_id, 1, 1);
+        db.plan_action(&task_id, "test_execution", &test_key_gen1)
+            .unwrap();
+        db.start_action(&task_id, &test_key_gen1, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &test_key_gen1,
+            ActionStatus::Failed,
+            None,
+            Some(NO_TESTS_AWAITING_CONFIRMATION_MARKER),
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let confirmation =
+            confirm_no_tests_applicable(&db, &project_id, &task_id, Some("gen 1 no tests"))
+                .unwrap();
+        assert_eq!(confirmation.result_generation, 1);
+        assert_eq!(
+            db.task(&task_id).unwrap().state,
+            TaskState::Queued,
+            "generation 0's unrelated real failure evidence must never block generation 1's \
+             own genuine no-tests confirmation"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_tests_applicable_is_unaffected_by_a_prior_rounds_real_evidence() {
+        let dir = git_project_dir("no-tests-prior-round-evidence");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            test_command_redacted: Some("npm test"),
+            status: "failed",
+            passed_count: 0,
+            failed_count: 1,
+            skipped_count: 0,
+            exit_code: Some(1),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        let round2_dev_key = format!("dev-{task_id}-round-2");
+        db.plan_action(&task_id, "ai_development", &round2_dev_key)
+            .unwrap();
+        db.start_action(&task_id, &round2_dev_key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &round2_dev_key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+        )
+        .unwrap();
+        let test_key_round2 = test_action_key(&task_id, 0, 2);
+        db.plan_action(&task_id, "test_execution", &test_key_round2)
+            .unwrap();
+        db.start_action(&task_id, &test_key_round2, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &test_key_round2,
+            ActionStatus::Failed,
+            None,
+            Some(NO_TESTS_AWAITING_CONFIRMATION_MARKER),
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            current_pending_round(&db, &project_id, &task_id).unwrap(),
+            2
+        );
+
+        let confirmation =
+            confirm_no_tests_applicable(&db, &project_id, &task_id, Some("round 2 no tests"))
+                .unwrap();
+        assert_eq!(
+            confirmation.round, 2,
+            "round 1's unrelated real failure evidence must never block round 2's own genuine \
+             no-tests confirmation"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_tests_applicable_rejects_completed_cancelled_failed_and_awaiting_acceptance_states(
+    ) {
+        for (label, setup_states) in [
+            (
+                "completed",
+                vec![TaskState::PreviewReady, TaskState::AwaitingUserAcceptance],
+            ),
+            ("cancelled", vec![TaskState::Cancelled]),
+            ("failed", vec![TaskState::Failed]),
+            (
+                "awaiting_user_acceptance",
+                vec![TaskState::PreviewReady, TaskState::AwaitingUserAcceptance],
+            ),
+        ] {
+            let dir = git_project_dir(&format!("no-tests-late-state-{label}"));
+            let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+            db.transition_task(
+                &task_id,
+                TaskState::Queued,
+                Actor::System,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            db.transition_task(
+                &task_id,
+                TaskState::Running,
+                Actor::System,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            db.transition_task(
+                &task_id,
+                TaskState::Verifying,
+                Actor::System,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            for state in setup_states {
+                db.transition_task(&task_id, state, Actor::System, None, None, false, None)
+                    .unwrap();
+            }
+            if label == "completed" {
+                db.record_user_acceptance(&project_id, &task_id, true, None)
+                    .unwrap();
+                db.transition_task(
+                    &task_id,
+                    TaskState::Completed,
+                    Actor::User,
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap();
+            }
+
+            let result = confirm_no_tests_applicable(&db, &project_id, &task_id, None);
+            assert!(
+                result.is_err(),
+                "{label}: must never be able to pre-write a no-tests confirmation from this \
+                 state: {result:?}"
+            );
+            assert!(
+                db.find_no_tests_confirmation(&project_id, &task_id, 0, 1)
+                    .unwrap()
+                    .is_none()
+                    || db
+                        .list_actions_for_task(&task_id)
+                        .unwrap()
+                        .iter()
+                        .all(|a| !a.idempotency_key.starts_with(&format!("test-{task_id}"))),
+                "{label}: no confirmation may be created for a state that never had a genuine \
+                 stall"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    // --- Storage-level idempotency ----------------------------------------
+
+    #[test]
+    fn record_no_tests_confirmation_first_call_writes_exactly_one_row() {
+        let dir = temp_dir("no-tests-storage-first-write");
+        let db = Database::memory().unwrap();
+        db.migrate().unwrap();
+        let project = db
+            .create_project(&CreateProjectRequest {
+                name: "P".to_string(),
+                local_path: dir.to_string_lossy().into_owned(),
+                source_type: "local".to_string(),
+                source_url: None,
+                purpose: None,
+                long_term_goal: None,
+                user_preferences: None,
+                prohibitions: None,
+            })
+            .unwrap();
+        let task = db
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "T".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: None,
+                },
+                Actor::User,
+            )
+            .unwrap();
+        db.record_no_tests_confirmation(&project.id, &task.id, 0, 1, Some("first"))
+            .unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM no_tests_confirmations WHERE task_id = ?1",
+                rusqlite::params![task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_no_tests_confirmation_repeated_call_returns_the_same_row_and_never_a_raw_unique_error(
+    ) {
+        let dir = temp_dir("no-tests-storage-repeat-write");
+        let db = Database::memory().unwrap();
+        db.migrate().unwrap();
+        let project = db
+            .create_project(&CreateProjectRequest {
+                name: "P".to_string(),
+                local_path: dir.to_string_lossy().into_owned(),
+                source_type: "local".to_string(),
+                source_url: None,
+                purpose: None,
+                long_term_goal: None,
+                user_preferences: None,
+                prohibitions: None,
+            })
+            .unwrap();
+        let task = db
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "T".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: None,
+                },
+                Actor::User,
+            )
+            .unwrap();
+        let first = db
+            .record_no_tests_confirmation(&project.id, &task.id, 0, 1, Some("first reason"))
+            .unwrap();
+        let second = db
+            .record_no_tests_confirmation(&project.id, &task.id, 0, 1, Some("second reason"))
+            .unwrap();
+        assert_eq!(
+            first.id, second.id,
+            "must return the exact same row, not a new one"
+        );
+        assert_eq!(
+            second.reason.as_deref(),
+            Some("first reason"),
+            "the original reason must never be overwritten by a later duplicate call"
+        );
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM no_tests_confirmations WHERE task_id = ?1",
+                rusqlite::params![task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "a duplicate insert must never create a second row"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Half-success recovery matrix --------------------------------------
+
+    #[test]
+    fn confirm_no_tests_applicable_recovers_after_a_crash_right_after_the_insert() {
+        // Case B: a confirmation row already exists (simulating a crash
+        // right after the insert committed), the test action is still
+        // `Failed` with the real marker, and the task is still
+        // `needs_user_action` — a retry must finish the reset and the
+        // transition, not error out or create a second confirmation.
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_no_tests("no-tests-recover-after-insert-crash", "codex_cli");
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, Some("pre-seeded"))
+            .unwrap();
+
+        let confirmation =
+            confirm_no_tests_applicable(&db, &project_id, &task_id, Some("retry")).unwrap();
+        assert_eq!(confirmation.reason.as_deref(), Some("pre-seeded"));
+        let test_key = test_action_key(&task_id, 0, 1);
+        assert_eq!(
+            db.find_action(&task_id, &test_key).unwrap().unwrap().status,
+            ActionStatus::Planned
+        );
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::Queued);
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM no_tests_confirmations WHERE task_id = ?1",
+                rusqlite::params![task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_tests_applicable_recovers_after_a_crash_right_after_the_reset() {
+        // Case C: confirmation exists, the test action was already reset
+        // to `planned` (simulating a crash right after that step), but the
+        // task is still `needs_user_action` — a retry must only complete
+        // the transition, never repeat the reset.
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_no_tests("no-tests-recover-after-reset-crash", "codex_cli");
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        let test_key = test_action_key(&task_id, 0, 1);
+        db.reset_failed_action_for_retry(&task_id, &test_key)
+            .unwrap();
+        assert_eq!(
+            db.find_action(&task_id, &test_key).unwrap().unwrap().status,
+            ActionStatus::Planned
+        );
+
+        let confirmation = confirm_no_tests_applicable(&db, &project_id, &task_id, None).unwrap();
+        assert_eq!(confirmation.round, 1);
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::Queued);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_tests_applicable_on_an_already_queued_task_is_a_no_op_success() {
+        // Case D: confirmation exists, test action already `planned`, task
+        // already `queued` — a repeated call must succeed idempotently
+        // without re-transitioning or erroring.
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_no_tests("no-tests-already-queued-noop", "codex_cli");
+        let confirmation = confirm_no_tests_applicable(&db, &project_id, &task_id, None).unwrap();
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::Queued);
+
+        let second = confirm_no_tests_applicable(&db, &project_id, &task_id, None).unwrap();
+        assert_eq!(confirmation.id, second.id);
+        assert_eq!(
+            db.task(&task_id).unwrap().state,
+            TaskState::Queued,
+            "a repeated call on an already-queued task must remain a safe no-op"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_tests_applicable_recovers_after_a_real_file_database_reopen() {
+        // Item 22: must use a real file-backed database, not memory.
+        let dir = git_project_dir("no-tests-file-db-reopen");
+        let db_dir = temp_dir("no-tests-file-db-reopen-db");
+        let db_path = db_dir.join("nova.sqlite3");
+        let project_id;
+        let task_id;
+        {
+            let db = Database::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let (pid, tid) = create_confirmed_task_in(&db, &dir, "codex_cli");
+            project_id = pid;
+            task_id = tid;
+            let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+            let outcome = run_core_loop(
+                &db,
+                &task_id,
+                &adapter,
+                &CancellationToken::new(),
+                &test_app_data_dir(),
+            )
+            .unwrap();
+            assert_eq!(outcome.task.state, TaskState::NeedsUserAction);
+            db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, Some("pre-reopen"))
+                .unwrap();
+        } // connection closed here — simulates a real process restart.
+
+        let db = Database::open(&db_path).unwrap();
+        let confirmation =
+            confirm_no_tests_applicable(&db, &project_id, &task_id, Some("post-reopen")).unwrap();
+        assert_eq!(confirmation.reason.as_deref(), Some("pre-reopen"));
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::Queued);
+        let test_key = test_action_key(&task_id, 0, 1);
+        assert_eq!(
+            db.find_action(&task_id, &test_key).unwrap().unwrap().status,
+            ActionStatus::Planned
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&db_dir);
+    }
+
+    #[test]
+    fn confirm_no_tests_applicable_never_resets_the_dev_or_build_actions() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_no_tests("no-tests-preserve-dev-and-build", "codex_cli");
+        let dev_key = format!("dev-{task_id}-round-1");
+        let dev_before = db.find_action(&task_id, &dev_key).unwrap().unwrap();
+        assert_eq!(dev_before.status, ActionStatus::Succeeded);
+        // Seed an unrelated, already-succeeded build action for a *later*
+        // round to prove it is never touched either.
+        let build_key = build_action_key(&task_id, 0, 5);
+        db.plan_action(&task_id, "build_execution", &build_key)
+            .unwrap();
+        db.start_action(&task_id, &build_key, false).unwrap();
+        db.finish_action(&task_id, &build_key, ActionStatus::Succeeded, None, None)
+            .unwrap();
+
+        confirm_no_tests_applicable(&db, &project_id, &task_id, None).unwrap();
+
+        let dev_after = db.find_action(&task_id, &dev_key).unwrap().unwrap();
+        assert_eq!(
+            dev_after.status,
+            ActionStatus::Succeeded,
+            "the dev action must never be reset by a no-tests confirmation"
+        );
+        assert_eq!(dev_after.attempt_number, dev_before.attempt_number);
+        let build_after = db.find_action(&task_id, &build_key).unwrap().unwrap();
+        assert_eq!(
+            build_after.status,
+            ActionStatus::Succeeded,
+            "an unrelated build action must never be reset by a no-tests confirmation"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirming_no_tests_and_resuming_never_repeats_development_or_runs_a_third_time() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_no_tests("no-tests-resume-no-repeat-dev", "codex_cli");
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
+        confirm_no_tests_applicable(&db, &project_id, &task_id, None).unwrap();
+
+        let resumed = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+        // The bare fixture has no `Cargo.toml`/`package.json` either, so
+        // after the no-tests confirmation resumes the task, it genuinely
+        // stalls again at the (separate) build-detection gate — this test
+        // is specifically about development never repeating, not about
+        // reaching a final success state.
+        assert_eq!(resumed.task.state, TaskState::NeedsUserAction);
+        assert_eq!(
+            adapter.development_call_count(),
+            0,
+            "round 1's already-succeeded development step must never repeat after a no-tests \
+             confirmation resumes the task"
+        );
+        assert_eq!(adapter.review_call_count(), 0);
+        let evidence = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].status, "no_tests_applicable");
+
+        // Confirming no-build too must then genuinely complete the task.
+        confirm_no_build_applicable(&db, &project_id, &task_id, None).unwrap();
+        let final_outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+        assert_eq!(final_outcome.task.state, TaskState::AwaitingUserAcceptance);
+        assert_eq!(
+            adapter.development_call_count(),
+            0,
+            "development must still never repeat, even after the second (build) confirmation"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

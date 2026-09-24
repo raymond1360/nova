@@ -1152,29 +1152,55 @@ pub fn resync_task_documents(
     })
 }
 
+/// Work Package 3 final review remediation (Major 1): the no-tests
+/// equivalent of `confirm_no_build_applicable` below — the only write path
+/// for `no_tests_confirmations`, always `Actor::User` (hardcoded at the
+/// storage layer), reachable only from an explicit "确认该项目当前没有适用测试" UI
+/// action.
+///
+/// Deliberately no longer accepts a caller-supplied `round` at all — the
+/// previous signature let any frontend (or a compromised/buggy one)
+/// pre-write a no-tests confirmation for an arbitrary generation/round the
+/// task was not actually stalled on, wrote the confirmation via a plain,
+/// non-idempotent `INSERT` before ever verifying a real stall existed, and
+/// left a second, uncoordinated call (`unblock_test_execution_for_retry`)
+/// to resume the task — a crash between the two, or two concurrent
+/// requests racing the insert, could leave the task stuck or surface a raw
+/// storage error. `core_loop::confirm_no_tests_applicable` is now the sole
+/// authority for the generation/round (derived from the task's own real
+/// `result_generation` and `core_loop::current_pending_round`) and for the
+/// full state/action/evidence authorization and half-success recovery
+/// boundary — this command is purely a parameter pass-through, exactly
+/// matching this codebase's "commands stay a permission/parameter boundary
+/// only" architecture rule.
 #[tauri::command]
 pub fn confirm_no_tests_applicable(
     project_id: String,
     task_id: String,
-    round: i64,
     reason: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<crate::models::NoTestsConfirmation, String> {
     with_db(&state, |db| {
-        let task = db.task(&task_id)?;
-        let confirmation = db.record_no_tests_confirmation(
-            &project_id,
-            &task_id,
-            task.result_generation,
-            round,
-            reason.as_deref(),
-        )?;
-        // Second re-review remediation: the confirmation alone does not
-        // resume the loop — without this, the task would stay stuck at
-        // `needs_user_action` forever even though the user just answered
-        // exactly what it was waiting for.
-        crate::core_loop::unblock_test_execution_for_retry(db, &project_id, &task_id)?;
-        Ok(confirmation)
+        crate::core_loop::confirm_no_tests_applicable(db, &project_id, &task_id, reason.as_deref())
+    })
+}
+
+/// Work Package 3 final review remediation (Major 1 / Suggestion 2): a
+/// read-only parameter pass-through to [`crate::core_loop::no_tests_
+/// confirmation_needed`] — the no-tests equivalent of
+/// `get_no_build_confirmation_needed` below. The frontend polls this to
+/// decide whether to show the "confirm this project currently has no
+/// applicable tests" prompt for a `needs_user_action` task. Never accepts a
+/// caller-supplied round or generation; the backend remains the sole
+/// authority for both.
+#[tauri::command]
+pub fn get_no_tests_confirmation_needed(
+    project_id: String,
+    task_id: String,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    with_db(&state, |db| {
+        crate::core_loop::no_tests_confirmation_needed(db, &project_id, &task_id)
     })
 }
 

@@ -49,4 +49,15 @@ describe('CoreLoopView.vue single-AI copy', () => {
     // v0.1.0 scope correction (Work Package 2 remediation, Minor 1).
     expect(source).toContain(':disabled="store.confirmingNoBuild"')
   })
+
+  it('renders the no-tests confirmation prompt gated on the real backend query', () => {
+    // Work Package 3 final review remediation (Major 1).
+    expect(source).toContain('store.noTestsConfirmationNeeded')
+    expect(source).toContain('handleConfirmNoTests')
+  })
+
+  it('disables the no-tests confirm button and input while a request is in flight', () => {
+    // Work Package 3 final review remediation (Major 1).
+    expect(source).toContain(':disabled="store.confirmingNoTests"')
+  })
 })

@@ -1003,6 +1003,415 @@ describe('coreLoop store', () => {
     }
   })
 
+  // --- Work Package 3 final review remediation (Major 1): the no-tests
+  // confirmation prompt and its backend-authoritative "is it needed"
+  // query, mirroring the no-build block above exactly. ------------------
+
+  it('loadNoTestsConfirmationNeeded reflects the real backend query', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ state: 'needs_user_action' })
+    routeInvoke({
+      get_no_tests_confirmation_needed: async () => true,
+    })
+
+    await store.loadNoTestsConfirmationNeeded()
+
+    expect(store.noTestsConfirmationNeeded).toBe(true)
+  })
+
+  it('refreshCurrentTask loads noTestsConfirmationNeeded only while needs_user_action', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ id: 'task-1', state: 'needs_user_action' })
+    let queried = false
+    routeInvoke({
+      list_tasks_for_project: async () => [fakeTask({ id: 'task-1', state: 'needs_user_action' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+      detect_test_command: async () => null,
+      get_no_build_confirmation_needed: async () => false,
+      get_no_tests_confirmation_needed: async () => {
+        queried = true
+        return true
+      },
+    })
+
+    await store.refreshCurrentTask()
+
+    expect(queried).toBe(true)
+    expect(store.noTestsConfirmationNeeded).toBe(true)
+  })
+
+  it('refreshCurrentTask resets noTestsConfirmationNeeded once the task leaves needs_user_action', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ id: 'task-1', state: 'needs_user_action' })
+    store.noTestsConfirmationNeeded = true
+    routeInvoke({
+      list_tasks_for_project: async () => [fakeTask({ id: 'task-1', state: 'queued' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+    })
+
+    await store.refreshCurrentTask()
+
+    expect(store.noTestsConfirmationNeeded).toBe(false)
+  })
+
+  it('selectTask itself queries noTestsConfirmationNeeded for an already-needs_user_action task', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    let queried = false
+    routeInvoke({
+      get_no_build_confirmation_needed: async () => false,
+      get_no_tests_confirmation_needed: async () => {
+        queried = true
+        return true
+      },
+    })
+
+    store.selectTask(fakeTask({ state: 'needs_user_action' }))
+    await vi.waitFor(() => expect(store.noTestsConfirmationNeeded).toBe(true))
+
+    expect(queried).toBe(true)
+  })
+
+  it('selectTask does not query noTestsConfirmationNeeded for a task in any other state', () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    routeInvoke({
+      get_no_tests_confirmation_needed: async () => {
+        throw new Error('must not be called for a non-needs_user_action task')
+      },
+    })
+
+    expect(() => store.selectTask(fakeTask({ state: 'running' }))).not.toThrow()
+    expect(store.noTestsConfirmationNeeded).toBe(false)
+  })
+
+  // Required test coverage item 27: the frontend must never be able to
+  // forge a `round`/`result_generation` for the no-tests confirmation call
+  // — the backend (`confirm_no_tests_applicable`) derives both itself.
+  it('confirmNoTestsApplicable never sends round or result_generation, even on retry', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ state: 'needs_user_action' })
+    const sentArgsPerCall: unknown[] = []
+    routeInvoke({
+      confirm_no_tests_applicable: async (args) => {
+        sentArgsPerCall.push(args)
+        return {
+          id: 'nt1',
+          project_id: 'proj-1',
+          task_id: 'task-1',
+          result_generation: 0,
+          round: 1,
+          confirmed_by: 'user',
+          reason: null,
+          confirmed_at: 'now',
+          created_at: 'now',
+        }
+      },
+      list_tasks_for_project: async () => [fakeTask({ state: 'queued' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+    })
+
+    await store.confirmNoTestsApplicable('first attempt')
+    store.currentTask = fakeTask({ state: 'needs_user_action' })
+    await store.confirmNoTestsApplicable('retry')
+
+    expect(sentArgsPerCall).toHaveLength(2)
+    for (const args of sentArgsPerCall) {
+      expect(args).not.toHaveProperty('round')
+      expect(args).not.toHaveProperty('result_generation')
+      expect(args).not.toHaveProperty('resultGeneration')
+    }
+  })
+
+  // --- deterministic stale-response races for
+  // `loadNoTestsConfirmationNeeded` — every scenario controls response
+  // ordering explicitly via `deferred()`, never real timers or
+  // `setTimeout`, mirroring the no-build scenarios A-E exactly. ----------
+
+  it('Major 1 (no-tests) scenario A: a slow response for task A never applies after switching to task B', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    const taskA = fakeTask({ id: 'task-a', state: 'needs_user_action' })
+    const taskB = fakeTask({ id: 'task-b', state: 'running' })
+    const responseA = deferred<boolean>()
+    routeInvoke({
+      get_no_tests_confirmation_needed: async (args) => {
+        const taskId = (args as { taskId: string }).taskId
+        if (taskId === 'task-a') return responseA.promise
+        throw new Error(`unexpected task id: ${taskId}`)
+      },
+    })
+
+    store.selectTask(taskA)
+    store.selectTask(taskB)
+
+    responseA.resolve(true)
+    await flushMicrotasks()
+
+    expect(store.currentTask?.id).toBe('task-b')
+    expect(store.noTestsConfirmationNeeded).toBe(false)
+  })
+
+  it('Major 1 (no-tests) scenario B: a fast true result for B is never overwritten by a slower false result for A', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    const taskA = fakeTask({ id: 'task-a', state: 'needs_user_action' })
+    const taskB = fakeTask({ id: 'task-b', state: 'needs_user_action' })
+    const responseA = deferred<boolean>()
+    const responseB = deferred<boolean>()
+    routeInvoke({
+      get_no_tests_confirmation_needed: async (args) => {
+        const taskId = (args as { taskId: string }).taskId
+        if (taskId === 'task-a') return responseA.promise
+        if (taskId === 'task-b') return responseB.promise
+        throw new Error(`unexpected task id: ${taskId}`)
+      },
+    })
+
+    store.selectTask(taskA)
+    store.selectTask(taskB)
+
+    responseB.resolve(true)
+    await flushMicrotasks()
+    expect(store.noTestsConfirmationNeeded).toBe(true)
+
+    responseA.resolve(false)
+    await flushMicrotasks()
+
+    expect(store.currentTask?.id).toBe('task-b')
+    expect(store.noTestsConfirmationNeeded).toBe(true)
+  })
+
+  it('Major 1 (no-tests) scenario C: for the same task, only the latest of two overlapping queries is ever applied', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    const task = fakeTask({ id: 'task-a', state: 'needs_user_action' })
+    store.currentTask = task
+    const firstCall = deferred<boolean>()
+    const secondCall = deferred<boolean>()
+    let callCount = 0
+    routeInvoke({
+      get_no_tests_confirmation_needed: async () => {
+        callCount += 1
+        return callCount === 1 ? firstCall.promise : secondCall.promise
+      },
+    })
+
+    const firstQuery = store.loadNoTestsConfirmationNeeded()
+    const secondQuery = store.loadNoTestsConfirmationNeeded()
+
+    secondCall.resolve(true)
+    await flushMicrotasks()
+    expect(store.noTestsConfirmationNeeded).toBe(true)
+
+    firstCall.resolve(false)
+    await flushMicrotasks()
+    await Promise.all([firstQuery, secondQuery])
+
+    expect(store.noTestsConfirmationNeeded).toBe(true)
+  })
+
+  it('Major 1 (no-tests) scenario D: a stale true response is discarded once the task has left needs_user_action', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    const task = fakeTask({ id: 'task-a', state: 'needs_user_action' })
+    store.currentTask = task
+    const response = deferred<boolean>()
+    routeInvoke({
+      get_no_tests_confirmation_needed: async () => response.promise,
+    })
+
+    store.loadNoTestsConfirmationNeeded().catch(() => {})
+    store.currentTask = { ...task, state: 'queued' }
+
+    response.resolve(true)
+    await flushMicrotasks()
+
+    expect(store.noTestsConfirmationNeeded).toBe(false)
+  })
+
+  it('Major 1 (no-tests) scenario E: a failed request for task A never sets an error or state for task B', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    const taskA = fakeTask({ id: 'task-a', state: 'needs_user_action' })
+    const taskB = fakeTask({ id: 'task-b', state: 'needs_user_action' })
+    const responseA = deferred<boolean>()
+    routeInvoke({
+      get_no_tests_confirmation_needed: async (args) => {
+        const taskId = (args as { taskId: string }).taskId
+        if (taskId === 'task-a') return responseA.promise
+        if (taskId === 'task-b') return true
+        throw new Error(`unexpected task id: ${taskId}`)
+      },
+    })
+
+    store.selectTask(taskA)
+    store.selectTask(taskB)
+    await flushMicrotasks()
+    expect(store.noTestsConfirmationNeeded).toBe(true)
+    expect(store.lastError).toBe('')
+
+    responseA.reject(new Error('A failed'))
+    await flushMicrotasks()
+
+    expect(store.currentTask?.id).toBe('task-b')
+    expect(store.noTestsConfirmationNeeded).toBe(true)
+    expect(store.lastError).toBe('')
+  })
+
+  // --- `confirmNoTestsApplicable` in-flight/duplicate-submit protection,
+  // mirroring `confirmNoBuildApplicable`'s block exactly. ----------------
+
+  it('confirmNoTestsApplicable: a rapid double click only invokes the backend once', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ state: 'needs_user_action' })
+    let callCount = 0
+    const response = deferred<NonNullable<unknown>>()
+    routeInvoke({
+      confirm_no_tests_applicable: async () => {
+        callCount += 1
+        return response.promise
+      },
+      list_tasks_for_project: async () => [fakeTask({ state: 'queued' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+    })
+
+    const first = store.confirmNoTestsApplicable('reason')
+    const second = store.confirmNoTestsApplicable('reason') // the "double click"
+
+    expect(callCount).toBe(1)
+    response.resolve({
+      id: 'nt1',
+      project_id: 'proj-1',
+      task_id: 'task-1',
+      result_generation: 0,
+      round: 1,
+      confirmed_by: 'user',
+      reason: null,
+      confirmed_at: 'now',
+      created_at: 'now',
+    })
+    await Promise.all([first, second])
+
+    expect(callCount).toBe(1)
+  })
+
+  it('confirmNoTestsApplicable: store.confirmingNoTests is true only while the request is in flight', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ state: 'needs_user_action' })
+    const response = deferred<NonNullable<unknown>>()
+    routeInvoke({
+      confirm_no_tests_applicable: async () => response.promise,
+      list_tasks_for_project: async () => [fakeTask({ state: 'queued' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+    })
+
+    expect(store.confirmingNoTests).toBe(false)
+    const call = store.confirmNoTestsApplicable('reason')
+    expect(store.confirmingNoTests).toBe(true)
+
+    response.resolve({
+      id: 'nt1',
+      project_id: 'proj-1',
+      task_id: 'task-1',
+      result_generation: 0,
+      round: 1,
+      confirmed_by: 'user',
+      reason: null,
+      confirmed_at: 'now',
+      created_at: 'now',
+    })
+    await call
+
+    expect(store.confirmingNoTests).toBe(false)
+  })
+
+  it('confirmNoTestsApplicable: releases the in-flight guard after a failure, allowing a retry', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ state: 'needs_user_action' })
+    let callCount = 0
+    routeInvoke({
+      confirm_no_tests_applicable: async () => {
+        callCount += 1
+        if (callCount === 1) throw new Error('backend rejected')
+        return {
+          id: 'nt1',
+          project_id: 'proj-1',
+          task_id: 'task-1',
+          result_generation: 0,
+          round: 1,
+          confirmed_by: 'user',
+          reason: null,
+          confirmed_at: 'now',
+          created_at: 'now',
+        }
+      },
+      list_tasks_for_project: async () => [fakeTask({ state: 'queued' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+    })
+
+    await expect(store.confirmNoTestsApplicable('reason')).rejects.toThrow()
+    expect(store.confirmingNoTests).toBe(false)
+    expect(store.lastError).not.toBe('')
+
+    await store.confirmNoTestsApplicable('reason') // retry
+    expect(callCount).toBe(2)
+    expect(store.currentTask?.state).toBe('queued')
+  })
+
+  it('confirmNoTestsApplicable: switching tasks mid-request does not refresh or overwrite the new task', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    const taskA = fakeTask({ id: 'task-a', state: 'needs_user_action' })
+    const taskB = fakeTask({ id: 'task-b', state: 'needs_user_action' })
+    store.currentTask = taskA
+    const response = deferred<NonNullable<unknown>>()
+    let listTasksCallCount = 0
+    routeInvoke({
+      confirm_no_tests_applicable: async () => response.promise,
+      list_tasks_for_project: async () => {
+        listTasksCallCount += 1
+        return [taskB]
+      },
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+    })
+
+    const call = store.confirmNoTestsApplicable('reason for A').catch(() => {})
+    store.selectTask(taskB)
+
+    response.resolve({
+      id: 'nt1',
+      project_id: 'proj-1',
+      task_id: 'task-a',
+      result_generation: 0,
+      round: 1,
+      confirmed_by: 'user',
+      reason: null,
+      confirmed_at: 'now',
+      created_at: 'now',
+    })
+    await call
+    await flushMicrotasks()
+
+    expect(store.currentTask?.id).toBe('task-b')
+    expect(store.currentTask?.state).toBe('needs_user_action')
+    expect(listTasksCallCount).toBe(0)
+  })
+
   // Codex re-review remediation (Major 1): `pendingRound` is sourced
   // exclusively from the backend's own Action Ledger-derived
   // `get_pending_round` command — the frontend must never infer it from

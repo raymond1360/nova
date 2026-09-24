@@ -644,18 +644,28 @@ pub fn current_pending_round(db: &Database, project_id: &str, task_id: &str) -> 
             "task_id 与 project_id 不匹配，已拒绝".to_string(),
         ));
     }
-    for action_kind in ["dev", "test"] {
-        let round2_key = format!("{action_kind}-{task_id}-round-2");
-        if db.find_action(task_id, &round2_key)?.is_some() {
-            return Ok(2);
-        }
+    let round2_dev_key = format!("dev-{task_id}-round-2");
+    if db.find_action(task_id, &round2_dev_key)?.is_some() {
+        return Ok(2);
+    }
+    // Work Package 3 remediation: the test key is generation-aware (see
+    // [`test_action_key`]), so round 2's detection must look it up under
+    // the task's *current* `result_generation` — checking the dev key
+    // above alone would already be sufficient (`run_dev_and_test_round`
+    // always plans a round's `dev-...` action strictly before its
+    // `test-...` action), but this keeps both signals consistent and
+    // auditable rather than leaving a check that can never match anything.
+    let round2_test_key = test_action_key(task_id, task.result_generation, 2);
+    if db.find_action(task_id, &round2_test_key)?.is_some() {
+        return Ok(2);
     }
     Ok(1)
 }
 
 /// Second re-review remediation (Blocker 3): after the user supplies what
-/// a stalled `test-{task_id}-round-N` action was waiting on (a real
-/// no-tests confirmation, or a corrected/allowlisted test command), this
+/// a stalled generation-aware test action (see [`test_action_key`]) was
+/// waiting on (a real no-tests confirmation, or a corrected/allowlisted
+/// test command), this
 /// resets that exact action back to `planned` and, if the task is
 /// currently `needs_user_action`, returns it to `queued` — the same legal
 /// state `start_core_loop` already accepts — so the frontend's next
@@ -676,9 +686,9 @@ pub fn unblock_test_execution_for_retry(
     task_id: &str,
 ) -> NovaResult<Task> {
     let round = current_pending_round(db, project_id, task_id)?;
-    let test_key = format!("test-{task_id}-round-{round}");
-    db.reset_failed_action_for_retry(task_id, &test_key)?;
     let result_generation = db.task(task_id)?.result_generation;
+    let test_key = test_action_key(task_id, result_generation, round);
+    db.reset_failed_action_for_retry(task_id, &test_key)?;
     let build_key = build_action_key(task_id, result_generation, round);
     db.reset_failed_action_for_retry(task_id, &build_key)?;
     let task = db.task(task_id)?;
@@ -1585,6 +1595,7 @@ fn run_single_ai_round(
 }
 
 /// Outcome of [`run_tests_for_round`], driving `run_one_round`'s next step.
+#[derive(Debug)]
 enum TestRoundOutcome {
     /// Tests ran and passed (or Nova could not determine an applicable test
     /// command at all — see the `NoTestsApplicable` case below for that
@@ -1610,16 +1621,32 @@ enum TestRoundOutcome {
     Cancelled,
 }
 
+/// Work Package 3 remediation (Minor 3 carried from the build-cancellation
+/// stability re-review): the test Action Ledger key must be bound to
+/// `result_generation`, not just `task_id`/`round` — mirrors
+/// [`build_action_key`] exactly, for the same reason. Before this fix, a
+/// task that completed round 1 (bumping `result_generation`), was rejected,
+/// and was requeued for a fresh round 1 at the *new* generation would find
+/// `gate_action` reporting `AlreadySucceeded` against the *old* generation's
+/// identically-keyed row — the old generation's test never actually ran
+/// again, and [`run_tests_for_round`]'s evidence lookup (already
+/// generation/round-scoped) would then find nothing for the new generation
+/// and silently mis-report `NoTestsApplicable`.
+fn test_action_key(task_id: &str, result_generation: i64, round: i64) -> String {
+    format!("test-{task_id}-generation-{result_generation}-round-{round}")
+}
+
 /// Blocker 3: determines a safe test command (the task's own confirmed
 /// command if set, otherwise a fresh auto-detection attempt — always
 /// re-validated against [`test_runner::is_allowlisted`] before ever
 /// executing anything), runs it through Phase 1's safe process boundary,
 /// and records the outcome as independent `test_evidence` — never trusting
 /// anything the developer AI claimed. Gated through the Action Ledger with
-/// its own `test-{task_id}-round-{round}` key, exactly like the
-/// development/review steps, so a crash mid-run is never silently re-run
-/// and each round always gets its own fresh key (never reusing an earlier
-/// round's evidence).
+/// its own generation-aware [`test_action_key`], exactly like the build
+/// step, so a crash mid-run is never silently re-run, each round always
+/// gets its own fresh key, and a stale `succeeded` action from an earlier
+/// generation can never be mistaken for proof the *current* generation's
+/// test already ran.
 fn run_tests_for_round(
     db: &Database,
     project_id: &str,
@@ -1628,7 +1655,8 @@ fn run_tests_for_round(
     round: i64,
     cancel: &CancellationToken,
 ) -> NovaResult<TestRoundOutcome> {
-    let test_key = format!("test-{task_id}-round-{round}");
+    let result_generation = db.task(task_id)?.result_generation;
+    let test_key = test_action_key(task_id, result_generation, round);
     match gate_action(db, task_id, "test_execution", &test_key, false)? {
         ActionGate::Uncertain => {
             db.transition_task(
@@ -1648,26 +1676,53 @@ fn run_tests_for_round(
             // re-running, but only ever for *this* round's own key, never
             // an earlier round's (Blocker 3's "第二轮必须重新运行测试" is
             // satisfied structurally: round 2 always uses a different key).
-            let existing = db.list_test_evidence_for_round(
-                project_id,
-                task_id,
-                db.task(task_id)?.result_generation,
-                round,
-            )?;
+            //
+            // Work Package 3 remediation: an `AlreadySucceeded` action alone
+            // is not sufficient proof — it must be corroborated by a real
+            // `test_evidence` row for this *exact* (result_generation,
+            // round). Since the key itself is now generation-aware, a
+            // mismatch here would mean the Action Ledger and evidence
+            // tables have drifted out of sync (should not happen under
+            // normal operation) — fail closed rather than ever reporting
+            // `NoTestsApplicable` on missing evidence (mirrors
+            // `run_build_for_round`'s identical fix).
+            let existing =
+                db.list_test_evidence_for_round(project_id, task_id, result_generation, round)?;
             if let Some(evidence) = existing.into_iter().next_back() {
                 return Ok(test_round_outcome_from_status(&evidence));
             }
-            // Ledger says succeeded but no evidence row exists (should not
-            // happen; defensive fallback) — treat as no evidence collected.
-            return Ok(TestRoundOutcome::NoTestsApplicable(
-                "未找到测试证据记录".to_string(),
-            ));
+            db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+                project_id,
+                task_id,
+                result_generation,
+                round,
+                test_command_redacted: None,
+                status: "insufficient_evidence",
+                passed_count: 0,
+                failed_count: 0,
+                skipped_count: 0,
+                exit_code: None,
+                reason: Some(
+                    "测试动作已记录为成功，但找不到对应 generation/round 的测试证据，已按不确定处理",
+                ),
+                stdout_ref: None,
+                stderr_ref: None,
+            })?;
+            db.transition_task(
+                task_id,
+                TaskState::NeedsUserAction,
+                Actor::System,
+                Some("测试证据缺失，无法确认本轮测试结果，需要用户处理"),
+                None,
+                false,
+                Some("test action succeeded but no matching test_evidence found"),
+            )?;
+            return Ok(TestRoundOutcome::ActionUncertain);
         }
         ActionGate::Started => {}
     }
 
     let task = db.task(task_id)?;
-    let result_generation = task.result_generation;
 
     let command = match (&task.test_command_redacted, &task.test_command_source) {
         (Some(command_text), Some(_source)) => parse_stored_command(command_text),
@@ -2734,9 +2789,12 @@ mod tests {
         dir
     }
 
-    fn db_with_confirmed_task(dir: &Path, dev_ai_kind: &str) -> (Database, String, String) {
-        let db = Database::memory().unwrap();
-        db.migrate().unwrap();
+    /// Creates a real project + confirmed task against an *already-open*
+    /// `Database` — shared by [`db_with_confirmed_task`] (fresh in-memory
+    /// database) and any test that instead needs a real file-backed
+    /// database it can close and reopen (e.g. to prove a completed task's
+    /// memory/evidence survive a genuine process restart).
+    fn create_confirmed_task_in(db: &Database, dir: &Path, dev_ai_kind: &str) -> (String, String) {
         let project = db
             .create_project(&CreateProjectRequest {
                 name: "P".to_string(),
@@ -2783,7 +2841,14 @@ mod tests {
             None,
         )
         .unwrap();
-        (db, project.id, task.id)
+        (project.id, task.id)
+    }
+
+    fn db_with_confirmed_task(dir: &Path, dev_ai_kind: &str) -> (Database, String, String) {
+        let db = Database::memory().unwrap();
+        db.migrate().unwrap();
+        let (project_id, task_id) = create_confirmed_task_in(&db, dir, dev_ai_kind);
+        (db, project_id, task_id)
     }
 
     /// Most fixtures in this test module use a bare `git_project_dir` with
@@ -2817,6 +2882,162 @@ mod tests {
             db.record_no_build_confirmation(project_id, task_id, generation, *round, None)
                 .unwrap();
         }
+    }
+
+    // --- Work Package 3: full single-AI closed loop, either developer AI --
+    //
+    // `CODEX_V0.1_SCOPE_CORRECTION_AUDIT_09211027.md` 工作包 3 / `docs/
+    // release-v0.1.0/09_V0.1_SCOPE_CORRECTION09241121.md`: proves the
+    // *entire* v0.1.0 P0 main path end to end for a single connected
+    // developer AI — real git project, real `npm test`/`npm run build`
+    // fixture commands (through Phase 1's real process boundary, not
+    // faked), real Action Ledger/evidence/document generation, real
+    // acceptance, real `Completed`, and a real file-backed database
+    // close+reopen to prove the result survives an actual process
+    // restart. Only the AI CLI process itself is a test double
+    // (`MockAdapter`, implementing the same real `DevReviewAdapter`
+    // boundary a real Codex/Claude adapter does) — every other boundary
+    // (storage, git, test/build execution, document generation) is real
+    // production code.
+    fn codex_or_claude_only_full_closed_loop_reaches_completed_and_survives_reopen(
+        dev_ai_kind: &str,
+        fixture_name: &str,
+    ) {
+        let dir = git_project_dir(fixture_name);
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(0)\"","build":"node -e \"process.exit(0)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add passing test+build scripts"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+
+        let db_dir = temp_dir(&format!("{fixture_name}-db"));
+        let db_path = db_dir.join("nova.sqlite3");
+        let app_data_dir = db_dir.join("app-data");
+
+        let (project_id, task_id) = {
+            let db = Database::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let (project_id, task_id) = create_confirmed_task_in(&db, &dir, dev_ai_kind);
+
+            // The unselected AI is never referenced anywhere in this test
+            // at all — no readiness probe, no binary path, nothing —
+            // which is itself the strongest possible proof that it cannot
+            // block this closed loop: there is nothing here *to* block.
+            let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+
+            let outcome = run_core_loop(
+                &db,
+                &task_id,
+                &adapter,
+                &CancellationToken::new(),
+                &app_data_dir,
+            )
+            .unwrap();
+            assert_eq!(
+                outcome.task.state,
+                TaskState::AwaitingUserAcceptance,
+                "real dev + real test + real build must reach awaiting_user_acceptance"
+            );
+            assert_eq!(
+                adapter.development_call_count(),
+                1,
+                "exactly one development invocation for a clean first round"
+            );
+            assert_eq!(
+                adapter.review_call_count(),
+                0,
+                "the v0.1.0 single-AI main path must never invoke a reviewer"
+            );
+            assert!(
+                db.list_task_reviews(&project_id, &task_id)
+                    .unwrap()
+                    .is_empty(),
+                "no task_reviews row may exist for a task completed via the single-AI path"
+            );
+
+            let accepted = accept_task_result(
+                &db,
+                &project_id,
+                &task_id,
+                true,
+                Some("looks good"),
+                &app_data_dir,
+            )
+            .unwrap();
+            assert_eq!(accepted.state, TaskState::Completed);
+
+            let final_result_path = app_data_dir
+                .join("result-documents")
+                .join(&project_id)
+                .join(&task_id)
+                .join("FINAL_RESULT.md");
+            let content = fs::read_to_string(&final_result_path).unwrap();
+            assert!(
+                content.contains("已完成（用户已验收）"),
+                "FINAL_RESULT.md must show Completed from Nova's own verification and a real \
+                 user acceptance alone: {content}"
+            );
+
+            (project_id, task_id)
+        }; // `db` (and its one real sqlite connection) is dropped here.
+
+        // Real process-restart proof: open a brand new `Database` against
+        // the same file and confirm the task's final state, evidence, and
+        // acceptance are all still there — nothing lived only in memory.
+        let reopened = Database::open(&db_path).unwrap();
+        let task = reopened.task(&task_id).unwrap();
+        assert_eq!(task.state, TaskState::Completed);
+        assert_eq!(task.result_generation, 1);
+        let test_evidence = reopened
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(test_evidence.len(), 1);
+        assert_eq!(test_evidence[0].status, "passed");
+        let build_evidence = reopened
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(build_evidence.len(), 1);
+        assert_eq!(build_evidence[0].status, "passed");
+        assert!(reopened
+            .list_task_reviews(&project_id, &task_id)
+            .unwrap()
+            .is_empty());
+        let final_result_path = app_data_dir
+            .join("result-documents")
+            .join(&project_id)
+            .join(&task_id)
+            .join("FINAL_RESULT.md");
+        let content_after_reopen = fs::read_to_string(&final_result_path).unwrap();
+        assert!(content_after_reopen.contains("已完成（用户已验收）"));
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&db_dir);
+    }
+
+    #[test]
+    fn codex_only_full_closed_loop_reaches_completed_and_survives_a_real_database_reopen() {
+        codex_or_claude_only_full_closed_loop_reaches_completed_and_survives_reopen(
+            "codex_cli",
+            "codex-only-full-closed-loop",
+        );
+    }
+
+    #[test]
+    fn claude_only_full_closed_loop_reaches_completed_and_survives_a_real_database_reopen() {
+        codex_or_claude_only_full_closed_loop_reaches_completed_and_survives_reopen(
+            "claude_cli",
+            "claude-only-full-closed-loop",
+        );
     }
 
     // --- v0.1.0 scope correction (`CODEX_V0.1_SCOPE_CORRECTION_AUDIT_09211027.md`):
@@ -2947,6 +3168,71 @@ mod tests {
     }
 
     #[test]
+    fn single_ai_one_fix_pass_by_claude_code_as_the_developer_ai_then_success() {
+        // Work Package 3: the same one-fix-pass-then-pass proof as above,
+        // but with Claude Code selected as the developer AI instead of
+        // Codex — proves the fix-pass behavior is not accidentally
+        // specific to one CLI kind.
+        let dir = git_project_dir("single-ai-fix-then-pass-claude");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(1)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add failing test"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "claude_cli");
+        let dir_for_fix = dir.clone();
+        let adapter = MockAdapter::new(vec![MockOutcome::Success, MockOutcome::Success], vec![]);
+        let call_count = std::sync::atomic::AtomicUsize::new(0);
+        *adapter.development_side_effect.lock().unwrap() = Some(Box::new(move |_req| {
+            if call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                fs::write(
+                    dir_for_fix.join("package.json"),
+                    r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(0)\""}}"#,
+                )
+                .unwrap();
+            }
+        }));
+
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.task.state,
+            TaskState::AwaitingUserAcceptance,
+            "round 2's genuinely-passing re-verification must succeed the task"
+        );
+        assert_eq!(adapter.development_call_count(), 2);
+        assert_eq!(adapter.review_call_count(), 0);
+        let round1 = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        let round2 = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 2)
+            .unwrap();
+        assert_eq!(round1.len(), 1);
+        assert_eq!(round1[0].status, "failed");
+        assert_eq!(round2.len(), 1);
+        assert_eq!(round2[0].status, "passed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn single_ai_second_verification_still_failing_stops_at_failed() {
         // Same real-failing-test setup as above, but round 2's dev side
         // effect changes nothing — the same command genuinely fails again,
@@ -2969,6 +3255,57 @@ mod tests {
             .status()
             .unwrap();
         let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let adapter = MockAdapter::new(vec![MockOutcome::Success, MockOutcome::Success], vec![]);
+        let app_data_dir = test_app_data_dir();
+
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &app_data_dir,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.task.state, TaskState::Failed);
+        assert_eq!(
+            adapter.development_call_count(),
+            2,
+            "still exactly one fix pass — never a second automatic retry"
+        );
+        assert_eq!(adapter.review_call_count(), 0);
+        let final_result_path = app_data_dir
+            .join("result-documents")
+            .join(&project_id)
+            .join(&task_id)
+            .join("FINAL_RESULT.md");
+        let content = fs::read_to_string(&final_result_path).unwrap();
+        assert!(content.contains("未通过"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_ai_second_verification_still_failing_stops_at_failed_with_claude_code_as_developer() {
+        // Work Package 3: the same "second attempt still genuinely fails,
+        // never a third automatic try" proof, with Claude Code as the
+        // developer AI.
+        let dir = git_project_dir("single-ai-fix-still-fails-claude");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(1)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add failing test"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "claude_cli");
         let adapter = MockAdapter::new(vec![MockOutcome::Success, MockOutcome::Success], vec![]);
         let app_data_dir = test_app_data_dir();
 
@@ -3853,7 +4190,7 @@ mod tests {
 
         for (kind, key) in [
             ("ai_development", format!("dev-{task_id}-round-1")),
-            ("test_execution", format!("test-{task_id}-round-1")),
+            ("test_execution", test_action_key(&task_id, 0, 1)),
         ] {
             db.plan_action(&task_id, kind, &key).unwrap();
             db.start_action(&task_id, &key, false).unwrap();
@@ -3898,7 +4235,7 @@ mod tests {
 
         for (kind, key) in [
             ("ai_development", format!("dev-{task_id}-round-2")),
-            ("test_execution", format!("test-{task_id}-round-2")),
+            ("test_execution", test_action_key(&task_id, 0, 2)),
         ] {
             db.plan_action(&task_id, kind, &key).unwrap();
             db.start_action(&task_id, &key, false).unwrap();
@@ -4956,7 +5293,7 @@ mod tests {
     fn confirm_no_build_applicable_does_not_reset_a_successful_test_action() {
         let (dir, db, project_id, task_id) =
             stall_task_at_round_1_build_insufficient("cb-preserve-test-action", "codex_cli");
-        let test_key = format!("test-{task_id}-round-1");
+        let test_key = test_action_key(&task_id, 0, 1);
         let test_action_before = db.find_action(&task_id, &test_key).unwrap().unwrap();
         assert_eq!(test_action_before.status, ActionStatus::Succeeded);
 
@@ -5565,7 +5902,7 @@ mod tests {
     fn confirm_no_build_applicable_retry_never_resets_the_test_action() {
         let (dir, db, project_id, task_id) =
             stall_task_at_round_1_build_insufficient("nr-no-reset-test-action", "codex_cli");
-        let test_key = format!("test-{task_id}-round-1");
+        let test_key = test_action_key(&task_id, 0, 1);
         db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
             .unwrap();
         let test_action_before = db.find_action(&task_id, &test_key).unwrap().unwrap();
@@ -6275,6 +6612,248 @@ mod tests {
             );
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    // --- Work Package 3: additional concurrency/idempotency coverage -----
+
+    #[test]
+    fn two_concurrent_no_tests_confirmations_for_the_same_generation_round_never_duplicate_or_corrupt_state(
+    ) {
+        // Mirrors `confirm_no_tests_applicable`'s real two-step production
+        // path (`Database::record_no_tests_confirmation` then
+        // `unblock_test_execution_for_retry`) under genuine two-OS-thread,
+        // barrier-synchronized concurrency, against a real file-backed
+        // database. Unlike no-build's confirmation (which has a dedicated
+        // bounded-retry convergence wrapper), no-tests confirmation relies
+        // on the table's own `UNIQUE(task_id, result_generation, round)`
+        // constraint as its sole concurrency backstop — this proves that
+        // backstop is sufficient: never two rows, never a corrupted final
+        // task/action state, and the losing caller's error (if any) is a
+        // plain, contained `Err`, never a panic or a wrong task's data
+        // getting touched.
+        for i in 0..10 {
+            let dir = git_project_dir(&format!("no-tests-concurrent-{i}"));
+            let db_dir = temp_dir(&format!("no-tests-concurrent-{i}-db"));
+            let db_path = db_dir.join("nova.sqlite3");
+            let project_id;
+            let task_id;
+            {
+                let db = Database::open(&db_path).unwrap();
+                db.migrate().unwrap();
+                let (pid, tid) = create_confirmed_task_in(&db, &dir, "codex_cli");
+                project_id = pid;
+                task_id = tid;
+                let adapter =
+                    MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
+                let outcome = run_core_loop(
+                    &db,
+                    &task_id,
+                    &adapter,
+                    &CancellationToken::new(),
+                    &test_app_data_dir(),
+                )
+                .unwrap();
+                assert_eq!(
+                    outcome.task.state,
+                    TaskState::NeedsUserAction,
+                    "iteration {i}: a bare project with no test command must stall for a real \
+                     no-tests confirmation before this race begins"
+                );
+            }
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let run = |label: &'static str| {
+                let barrier = barrier.clone();
+                let db_path = db_path.clone();
+                let project_id = project_id.clone();
+                let task_id = task_id.clone();
+                thread::spawn(move || {
+                    let db = Database::open(&db_path).unwrap();
+                    let generation = db.task(&task_id).unwrap().result_generation;
+                    barrier.wait();
+                    let confirmation = db
+                        .record_no_tests_confirmation(
+                            &project_id,
+                            &task_id,
+                            generation,
+                            1,
+                            Some(label),
+                        )
+                        .ok();
+                    // Only the winning caller (whose insert actually
+                    // committed) calls the resume step — mirrors
+                    // `confirm_no_tests_applicable`'s real sequencing,
+                    // where the second call's `?` on the insert error
+                    // would already have returned before ever reaching
+                    // this line in the real Tauri command.
+                    if confirmation.is_some() {
+                        let _ = unblock_test_execution_for_retry(&db, &project_id, &task_id);
+                    }
+                    confirmation
+                })
+            };
+            let handle_a = run("A");
+            let handle_b = run("B");
+            let result_a = handle_a.join().unwrap();
+            let result_b = handle_b.join().unwrap();
+            assert!(
+                result_a.is_some() || result_b.is_some(),
+                "iteration {i}: at least one of the two racing confirmations must succeed"
+            );
+
+            let db_check = Database::open(&db_path).unwrap();
+            let count: i64 = db_check
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM no_tests_confirmations WHERE task_id = ?1",
+                    rusqlite::params![task_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "iteration {i}: exactly one confirmation row must exist, regardless of which \
+                 thread's insert won the race"
+            );
+            let final_task = db_check.task(&task_id).unwrap();
+            assert_eq!(
+                final_task.state,
+                TaskState::Queued,
+                "iteration {i}: the task must converge to queued exactly once, not error out or \
+                 get stuck"
+            );
+            let _ = fs::remove_dir_all(&dir);
+            let _ = fs::remove_dir_all(&db_dir);
+        }
+    }
+
+    #[test]
+    fn two_threads_racing_different_generations_test_actions_for_the_same_round_never_cross_contaminate(
+    ) {
+        // Real two-OS-thread, barrier-synchronized concurrency: one thread
+        // drives generation 0's round 1 test action, the other drives a
+        // *different* generation's (1) round 1 test action for the *same*
+        // task, at the same instant. The generation-aware key
+        // (`test_action_key`) must keep the two completely independent —
+        // no shared idempotency key, no cross-generation evidence
+        // adoption, no panic from a unique-constraint collision that
+        // should never happen because the keys genuinely differ.
+        let dir = git_project_dir("test-action-parallel-generations");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(0)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add passing test"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        let db_dir = temp_dir("test-action-parallel-generations-db");
+        let db_path = db_dir.join("nova.sqlite3");
+        let project_id;
+        let task_id;
+        {
+            let db = Database::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let (pid, tid) = create_confirmed_task_in(&db, &dir, "codex_cli");
+            project_id = pid;
+            task_id = tid;
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let barrier_a = barrier.clone();
+        let db_path_a = db_path.clone();
+        let project_id_a = project_id.clone();
+        let task_id_a = task_id.clone();
+        let dir_a = dir.clone();
+        let handle_a = thread::spawn(move || {
+            let db = Database::open(&db_path_a).unwrap();
+            barrier_a.wait();
+            run_tests_for_round(
+                &db,
+                &project_id_a,
+                &task_id_a,
+                &dir_a,
+                1,
+                &CancellationToken::new(),
+            )
+        });
+        let barrier_b = barrier.clone();
+        let db_path_b = db_path.clone();
+        let project_id_b = project_id.clone();
+        let task_id_b = task_id.clone();
+        let dir_b = dir.clone();
+        let handle_b = thread::spawn(move || {
+            let db = Database::open(&db_path_b).unwrap();
+            // Simulate generation 1 already being under way for this same
+            // task/round by planning its action directly — a real
+            // production key, just for a generation this task has not
+            // actually reached yet (the point is purely key isolation,
+            // not a realistic generation-2 product flow).
+            let key = test_action_key(&task_id_b, 1, 1);
+            db.plan_action(&task_id_b, "test_execution", &key).unwrap();
+            db.start_action(&task_id_b, &key, false).unwrap();
+            barrier_b.wait();
+            let outcome = test_runner::run_tests(
+                "node",
+                &["-e".to_string(), "process.exit(0)".to_string()],
+                &dir_b,
+                TEST_TIMEOUT,
+                CancellationToken::new(),
+            );
+            db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+                project_id: &project_id_b,
+                task_id: &task_id_b,
+                result_generation: 1,
+                round: 1,
+                test_command_redacted: Some("node -e ..."),
+                status: if outcome.process_succeeded {
+                    "passed"
+                } else {
+                    "failed"
+                },
+                passed_count: outcome.passed.unwrap_or(0),
+                failed_count: outcome.failed.unwrap_or(0),
+                skipped_count: outcome.skipped.unwrap_or(0),
+                exit_code: outcome.exit_code.map(i64::from),
+                reason: None,
+                stdout_ref: None,
+                stderr_ref: None,
+            })
+            .unwrap();
+            db.finish_action(&task_id_b, &key, ActionStatus::Succeeded, None, None)
+                .unwrap();
+        });
+
+        let result_a = handle_a.join().unwrap().unwrap();
+        handle_b.join().unwrap();
+
+        assert!(
+            matches!(result_a, TestRoundOutcome::Passed(_)),
+            "generation 0's real test run must succeed on its own, unaffected by generation 1's \
+             concurrent activity: {result_a:?}"
+        );
+        let db_check = Database::open(&db_path).unwrap();
+        let gen0_evidence = db_check
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        let gen1_evidence = db_check
+            .list_test_evidence_for_round(&project_id, &task_id, 1, 1)
+            .unwrap();
+        assert_eq!(gen0_evidence.len(), 1);
+        assert_eq!(gen1_evidence.len(), 1);
+        assert_ne!(
+            gen0_evidence[0].id, gen1_evidence[0].id,
+            "the two generations must never share or overwrite each other's evidence"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&db_dir);
     }
 
     #[test]
@@ -7144,6 +7723,477 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // --- Work Package 3: recovery/restart matrix on a real file-backed DB -
+    //
+    // The tests above (and Phase 2's own recovery suite) already prove
+    // `run_startup_recovery`'s core sweep against an in-memory database.
+    // These specifically use a real on-disk SQLite file, closed and
+    // reopened as a fresh `Database` connection (simulating a genuine
+    // process restart, not just a fresh struct), and call the real
+    // `Database::run_startup_recovery` entry point `lib.rs` itself invokes
+    // before any command is dispatched.
+
+    #[test]
+    fn a_real_process_restart_recovers_a_crashed_test_action_and_resumes_to_success() {
+        let dir = git_project_dir("restart-recover-test-action");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(0)\"","build":"node -e \"process.exit(0)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add passing scripts"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+
+        let db_dir = temp_dir("restart-recover-test-action-db");
+        let db_path = db_dir.join("nova.sqlite3");
+        let app_data_dir = db_dir.join("app-data");
+        let task_id;
+        let project_id;
+        {
+            let db = Database::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let (pid, tid) = create_confirmed_task_in(&db, &dir, "codex_cli");
+            project_id = pid;
+            task_id = tid;
+            db.transition_task(
+                &task_id,
+                TaskState::Queued,
+                Actor::System,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            db.transition_task(
+                &task_id,
+                TaskState::Running,
+                Actor::System,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            db.transition_task(
+                &task_id,
+                TaskState::Verifying,
+                Actor::System,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            let dev_key = format!("dev-{task_id}-round-1");
+            db.plan_action(&task_id, "ai_development", &dev_key)
+                .unwrap();
+            db.start_action(&task_id, &dev_key, false).unwrap();
+            db.finish_action(&task_id, &dev_key, ActionStatus::Succeeded, None, None)
+                .unwrap();
+            // Simulate the crash: the test-execution action (generation-
+            // aware key) was planned and started, but the process died
+            // before it could ever finish — no test_evidence row exists.
+            let test_key = test_action_key(&task_id, 0, 1);
+            db.plan_action(&task_id, "test_execution", &test_key)
+                .unwrap();
+            db.start_action(&task_id, &test_key, false).unwrap();
+        } // real connection closed here.
+
+        let db = Database::open(&db_path).unwrap();
+        // Note: `run_startup_recovery`'s returned `Option<RecoverySummary>`
+        // is purely a UI convenience keyed off `last_active_project` (not
+        // set by this fixture) — the actual data-repair sweep this test
+        // cares about (`interrupt_all_in_flight_tasks` +
+        // `mark_started_actions_uncertain`) runs unconditionally before
+        // that, regardless of the return value.
+        db.run_startup_recovery().unwrap();
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::Interrupted);
+        let test_key = test_action_key(&task_id, 0, 1);
+        assert_eq!(
+            db.find_action(&task_id, &test_key).unwrap().unwrap().status,
+            ActionStatus::Uncertain,
+            "a started-but-never-finished test action must never be left looking like it is \
+             still running"
+        );
+
+        // The user reviews and chooses to continue: acknowledge the
+        // uncertain test action (never an automatic retry) and requeue.
+        db.acknowledge_uncertain_action(&task_id, &test_key)
+            .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &app_data_dir,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.task.state,
+            TaskState::AwaitingUserAcceptance,
+            "the resumed run must actually complete for real, not get stuck again"
+        );
+        assert_eq!(
+            adapter.development_call_count(),
+            0,
+            "round 1's already-succeeded development step must never repeat after recovery"
+        );
+        let evidence = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].status, "passed");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&db_dir);
+    }
+
+    #[test]
+    fn a_real_process_restart_recovers_a_crashed_build_action_and_resumes_to_success() {
+        let dir = git_project_dir("restart-recover-build-action");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(0)\"","build":"node -e \"process.exit(0)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add passing scripts"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+
+        let db_dir = temp_dir("restart-recover-build-action-db");
+        let db_path = db_dir.join("nova.sqlite3");
+        let app_data_dir = db_dir.join("app-data");
+        let task_id;
+        let project_id;
+        {
+            let db = Database::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let (pid, tid) = create_confirmed_task_in(&db, &dir, "codex_cli");
+            project_id = pid;
+            task_id = tid;
+            db.transition_task(
+                &task_id,
+                TaskState::Queued,
+                Actor::System,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            db.transition_task(
+                &task_id,
+                TaskState::Running,
+                Actor::System,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            db.transition_task(
+                &task_id,
+                TaskState::Verifying,
+                Actor::System,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            let dev_key = format!("dev-{task_id}-round-1");
+            db.plan_action(&task_id, "ai_development", &dev_key)
+                .unwrap();
+            db.start_action(&task_id, &dev_key, false).unwrap();
+            db.finish_action(&task_id, &dev_key, ActionStatus::Succeeded, None, None)
+                .unwrap();
+            let test_key = test_action_key(&task_id, 0, 1);
+            db.plan_action(&task_id, "test_execution", &test_key)
+                .unwrap();
+            db.start_action(&task_id, &test_key, false).unwrap();
+            db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+                project_id: &project_id,
+                task_id: &task_id,
+                result_generation: 0,
+                round: 1,
+                test_command_redacted: Some("npm test"),
+                status: "passed",
+                passed_count: 1,
+                failed_count: 0,
+                skipped_count: 0,
+                exit_code: Some(0),
+                reason: None,
+                stdout_ref: None,
+                stderr_ref: None,
+            })
+            .unwrap();
+            db.finish_action(&task_id, &test_key, ActionStatus::Succeeded, None, None)
+                .unwrap();
+            // Crash exactly while the build action was in flight.
+            let build_key = build_action_key(&task_id, 0, 1);
+            db.plan_action(&task_id, "build_execution", &build_key)
+                .unwrap();
+            db.start_action(&task_id, &build_key, false).unwrap();
+        }
+
+        let db = Database::open(&db_path).unwrap();
+        db.run_startup_recovery().unwrap();
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::Interrupted);
+        let build_key = build_action_key(&task_id, 0, 1);
+        assert_eq!(
+            db.find_action(&task_id, &build_key)
+                .unwrap()
+                .unwrap()
+                .status,
+            ActionStatus::Uncertain
+        );
+        db.acknowledge_uncertain_action(&task_id, &build_key)
+            .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &app_data_dir,
+        )
+        .unwrap();
+        assert_eq!(outcome.task.state, TaskState::AwaitingUserAcceptance);
+        assert_eq!(
+            adapter.development_call_count(),
+            0,
+            "development must never repeat"
+        );
+        let test_evidence = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(
+            test_evidence.len(),
+            1,
+            "the already-passed test evidence must never be duplicated by a repeated run"
+        );
+        let build_evidence = db
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(build_evidence.len(), 1);
+        assert_eq!(build_evidence[0].status, "passed");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&db_dir);
+    }
+
+    #[test]
+    fn a_real_process_restart_never_touches_preview_ready_awaiting_acceptance_or_needs_user_action()
+    {
+        // `run_startup_recovery`'s sweep only ever force-interrupts
+        // `running`/`verifying`/`safe_fixing` — a task already resting at
+        // `preview_ready`, `awaiting_user_acceptance`, or
+        // `needs_user_action` must survive a real restart completely
+        // untouched, not be reset or reinterpreted.
+        for (state_name, target) in [
+            ("preview_ready", TaskState::PreviewReady),
+            (
+                "awaiting_user_acceptance",
+                TaskState::AwaitingUserAcceptance,
+            ),
+            ("needs_user_action", TaskState::NeedsUserAction),
+        ] {
+            let dir = git_project_dir(&format!("restart-untouched-{state_name}"));
+            let db_dir = temp_dir(&format!("restart-untouched-{state_name}-db"));
+            let db_path = db_dir.join("nova.sqlite3");
+            let task_id;
+            {
+                let db = Database::open(&db_path).unwrap();
+                db.migrate().unwrap();
+                let (_project_id, tid) = create_confirmed_task_in(&db, &dir, "codex_cli");
+                task_id = tid;
+                db.transition_task(
+                    &task_id,
+                    TaskState::Queued,
+                    Actor::System,
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap();
+                db.transition_task(
+                    &task_id,
+                    TaskState::Running,
+                    Actor::System,
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap();
+                db.transition_task(
+                    &task_id,
+                    TaskState::Verifying,
+                    Actor::System,
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap();
+                if target == TaskState::NeedsUserAction {
+                    db.transition_task(
+                        &task_id,
+                        TaskState::NeedsUserAction,
+                        Actor::System,
+                        None,
+                        None,
+                        false,
+                        None,
+                    )
+                    .unwrap();
+                } else {
+                    db.transition_task(
+                        &task_id,
+                        TaskState::PreviewReady,
+                        Actor::System,
+                        None,
+                        None,
+                        false,
+                        None,
+                    )
+                    .unwrap();
+                    if target == TaskState::AwaitingUserAcceptance {
+                        db.transition_task(
+                            &task_id,
+                            TaskState::AwaitingUserAcceptance,
+                            Actor::User,
+                            None,
+                            None,
+                            false,
+                            None,
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+
+            let db = Database::open(&db_path).unwrap();
+            db.run_startup_recovery().unwrap();
+            assert_eq!(
+                db.task(&task_id).unwrap().state,
+                target,
+                "a real restart must never move a task resting in {state_name} anywhere else"
+            );
+            let _ = fs::remove_dir_all(&dir);
+            let _ = fs::remove_dir_all(&db_dir);
+        }
+    }
+
+    #[test]
+    fn a_real_process_restart_recovers_a_pending_document_resync() {
+        // Simulates `accept_task_result`'s own best-effort-marker branch:
+        // the accept/reject decision already committed, but seven-document
+        // regeneration failed and left `document_sync_pending` set. A real
+        // restart must not lose this fact, and `resync_task_documents`
+        // (the real production retry path) must be able to clear it and
+        // regenerate the documents for real.
+        let dir = git_project_dir("restart-recover-doc-resync");
+        let db_dir = temp_dir("restart-recover-doc-resync-db");
+        let db_path = db_dir.join("nova.sqlite3");
+        let app_data_dir = db_dir.join("app-data");
+        let task_id;
+        let project_id;
+        {
+            let db = Database::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let (pid, tid) = create_confirmed_task_in(&db, &dir, "codex_cli");
+            project_id = pid;
+            task_id = tid;
+            for to in [
+                TaskState::Queued,
+                TaskState::Running,
+                TaskState::Verifying,
+                TaskState::PreviewReady,
+                TaskState::AwaitingUserAcceptance,
+            ] {
+                db.transition_task(&task_id, to, Actor::System, None, None, false, None)
+                    .unwrap();
+            }
+            db.record_user_acceptance(&project_id, &task_id, true, None)
+                .unwrap();
+            db.transition_task(
+                &task_id,
+                TaskState::Completed,
+                Actor::User,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            db.set_document_sync_pending(&task_id, true).unwrap();
+        }
+
+        let db = Database::open(&db_path).unwrap();
+        db.run_startup_recovery().unwrap();
+        let task = db.task(&task_id).unwrap();
+        assert_eq!(
+            task.state,
+            TaskState::Completed,
+            "a completed task must never be reinterpreted by the recovery sweep"
+        );
+        assert!(
+            task.document_sync_pending,
+            "the pending-resync fact itself must survive a real restart"
+        );
+
+        let resynced = resync_task_documents(&db, &project_id, &task_id, &app_data_dir).unwrap();
+        assert!(!resynced.document_sync_pending);
+        let final_result_path = app_data_dir
+            .join("result-documents")
+            .join(&project_id)
+            .join(&task_id)
+            .join("FINAL_RESULT.md");
+        let content = fs::read_to_string(&final_result_path).unwrap();
+        assert!(content.contains("已完成（用户已验收）"));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&db_dir);
+    }
+
     #[test]
     fn resuming_after_the_developer_step_already_succeeded_does_not_repeat_it() {
         let dir = git_project_dir("resume-after-dev-succeeded");
@@ -7934,7 +8984,7 @@ mod tests {
             .unwrap();
 
         let (db, _project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
-        let test_key = format!("test-{task_id}-round-1");
+        let test_key = test_action_key(&task_id, 0, 1);
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
         let cancel = CancellationToken::new();
         let cancel_for_timer = cancel.clone();
@@ -7999,7 +9049,7 @@ mod tests {
             evidence.is_empty(),
             "no test evidence — not even no_tests_applicable — may be recorded without a real confirmation: {evidence:?}"
         );
-        let test_key = format!("test-{task_id}-round-1");
+        let test_key = test_action_key(&task_id, 0, 1);
         let action = db.find_action(&task_id, &test_key).unwrap().unwrap();
         assert_eq!(action.status, ActionStatus::Failed);
         let _ = fs::remove_dir_all(&dir);
@@ -8035,7 +9085,7 @@ mod tests {
             .unwrap();
         let unblocked = unblock_test_execution_for_retry(&db, &project_id, &task_id).unwrap();
         assert_eq!(unblocked.state, TaskState::Queued);
-        let test_key = format!("test-{task_id}-round-1");
+        let test_key = test_action_key(&task_id, 0, 1);
         assert_eq!(
             db.find_action(&task_id, &test_key).unwrap().unwrap().status,
             ActionStatus::Planned,
@@ -8181,7 +9231,7 @@ mod tests {
             .unwrap();
         let unblocked = unblock_test_execution_for_retry(&db, &project_id, &task_id).unwrap();
         assert_eq!(unblocked.state, TaskState::Queued);
-        let round1_test_key = format!("test-{task_id}-round-1");
+        let round1_test_key = test_action_key(&task_id, 0, 1);
         assert_eq!(
             db.find_action(&task_id, &round1_test_key)
                 .unwrap()
@@ -8372,6 +9422,642 @@ mod tests {
         assert_ne!(
             round1_evidence[0].id, round2_evidence[0].id,
             "round 2 must produce a fresh test-evidence row, never reuse round 1's"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Work Package 3: generation-aware test action key isolation ------
+    //
+    // `CODEX_PHASE3_SINGLE_AI_UI_REPORT_SCOPE_CORRECTION_REMEDIATION_
+    // REREVIEW09241542.md` Minor 2 / `CODEX_PHASE3_BUILD_CANCELLATION_
+    // STABILITY_FINAL_REVIEW09241759.md` Minor 3: the test Action Ledger
+    // key is now generation-aware (`test_action_key`), mirroring
+    // `build_action_key`'s own Major 3 remediation. The tests below prove
+    // the full required matrix: distinct keys per generation/round, a
+    // succeeded-but-evidence-less action always fails closed (never
+    // `NoTestsApplicable`), a terminal action from a foreign generation
+    // never pollutes the current one, historical non-generation-aware keys
+    // are read safely without crashing, a new generation genuinely
+    // re-executes tests, and `Completed` remains bound to the task's
+    // *current* `result_generation`.
+
+    #[test]
+    fn test_action_key_differs_across_generations_for_the_same_task_and_round() {
+        let key_gen0 = test_action_key("task-1", 0, 1);
+        let key_gen1 = test_action_key("task-1", 1, 1);
+        assert_ne!(
+            key_gen0, key_gen1,
+            "a generation-1 test action must never collide with generation 0's key"
+        );
+    }
+
+    #[test]
+    fn test_action_key_differs_across_rounds_for_the_same_task_and_generation() {
+        let key_round1 = test_action_key("task-1", 0, 1);
+        let key_round2 = test_action_key("task-1", 0, 2);
+        assert_ne!(
+            key_round1, key_round2,
+            "round 2 must never collide with round 1's key under the same generation"
+        );
+    }
+
+    /// Drives a freshly `confirmed` task's `result_generation` up to
+    /// `target` using only real, legal [`Database::transition_task`] calls
+    /// — `Verifying -> PreviewReady` is the *only* edge that ever bumps
+    /// `result_generation` (see the inline comment on that `UPDATE` in
+    /// `storage::tasks`), so this never writes to the column directly, the
+    /// same discipline `documents.rs`'s own generation tests already
+    /// follow. `Actor::User` is used throughout (including the
+    /// `SafeFixing` hop a second bump needs) purely so this setup helper
+    /// is never itself constrained by the automatic-fix-cycle cap that
+    /// only applies to non-`User` actors.
+    fn bump_result_generation_via_real_transitions(db: &Database, task_id: &str, target: i64) {
+        let mut current = db.task(task_id).unwrap().result_generation;
+        assert!(
+            current <= target,
+            "helper only ever moves a task's generation forward"
+        );
+        if current < target {
+            for to in [
+                TaskState::Queued,
+                TaskState::Running,
+                TaskState::Verifying,
+                TaskState::PreviewReady,
+            ] {
+                db.transition_task(task_id, to, Actor::User, None, None, false, None)
+                    .unwrap();
+            }
+            current += 1;
+        }
+        while current < target {
+            for to in [
+                TaskState::SafeFixing,
+                TaskState::Verifying,
+                TaskState::PreviewReady,
+            ] {
+                db.transition_task(task_id, to, Actor::User, None, None, false, None)
+                    .unwrap();
+            }
+            current += 1;
+        }
+    }
+
+    #[test]
+    fn generation_1_test_action_succeeded_never_lets_generation_0_pass_without_its_own_evidence() {
+        // Mirrors `generation_1_build_succeeded_never_lets_generation_2_
+        // pass_without_its_own_evidence` for the test action key.
+        let dir = git_project_dir("test-gen-mismatch-fail-closed");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
+
+        // Simulate generation 1's test action already marked succeeded,
+        // with no corresponding test_evidence row for generation 1.
+        let stale_key = test_action_key(&task_id, 1, 1);
+        db.plan_action(&task_id, "test_execution", &stale_key)
+            .unwrap();
+        db.start_action(&task_id, &stale_key, false).unwrap();
+        db.finish_action(&task_id, &stale_key, ActionStatus::Succeeded, None, None)
+            .unwrap();
+        // Deliberately no `record_test_evidence` call for generation 1.
+
+        // The task's actual current `result_generation` is still 0 — a
+        // call for generation 0 must go through the normal `Started` path
+        // (a fresh key), completely unaffected by generation 1's stale,
+        // evidence-less succeeded action.
+        let result = run_tests_for_round(
+            &db,
+            &project_id,
+            &task_id,
+            &dir,
+            1,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(
+            matches!(result, TestRoundOutcome::NoTestsApplicable(_)),
+            "generation 0's own real no-tests confirmation must apply unaffected by generation \
+             1's unrelated stale action"
+        );
+        let gen0_evidence = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(
+            gen0_evidence.len(),
+            1,
+            "generation 0 must have gotten its own evidence, not reused generation 1's"
+        );
+        let gen1_evidence = db
+            .list_test_evidence_for_round(&project_id, &task_id, 1, 1)
+            .unwrap();
+        assert!(
+            gen1_evidence.is_empty(),
+            "generation 1's stale succeeded action must never have produced test evidence"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn already_succeeded_test_action_with_no_matching_evidence_fails_closed() {
+        // Directly exercises the `AlreadySucceeded` + missing-evidence
+        // branch: the action ledger says generation 0/round 1's test
+        // succeeded, but no test_evidence row exists for that exact pair
+        // — must record `insufficient_evidence`, transition to
+        // `NeedsUserAction`, and never report `NoTestsApplicable`.
+        let dir = git_project_dir("test-already-succeeded-no-evidence");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let key = test_action_key(&task_id, 0, 1);
+        db.plan_action(&task_id, "test_execution", &key).unwrap();
+        db.start_action(&task_id, &key, false).unwrap();
+        db.finish_action(&task_id, &key, ActionStatus::Succeeded, None, None)
+            .unwrap();
+
+        let result = run_tests_for_round(
+            &db,
+            &project_id,
+            &task_id,
+            &dir,
+            1,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(result, TestRoundOutcome::ActionUncertain),
+            "a succeeded test action with no matching evidence must fail closed, not report \
+             NoTestsApplicable"
+        );
+        let evidence = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].status, "insufficient_evidence");
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::NeedsUserAction);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn already_succeeded_test_action_with_only_a_prior_generations_evidence_fails_closed() {
+        // Distinct from the mismatch test above: here real, genuine
+        // `passed` evidence *does* exist — just for the wrong generation
+        // (0), while the action ledger and the call are both for
+        // generation 1. A prior generation's real evidence must never
+        // substitute for the current one's.
+        let dir = git_project_dir("test-only-prior-generation-evidence");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            test_command_redacted: Some("cargo test"),
+            status: "passed",
+            passed_count: 1,
+            failed_count: 0,
+            skipped_count: 0,
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        bump_result_generation_via_real_transitions(&db, &task_id, 1);
+        assert_eq!(db.task(&task_id).unwrap().result_generation, 1);
+        // The fail-closed branch below transitions to `needs_user_action`,
+        // which is only legal from `running`/`verifying`/`safe_fixing`/
+        // `awaiting_user_acceptance` — move off `preview_ready` first via
+        // the same real, legal edges a genuine "request more changes"
+        // flow would use.
+        db.transition_task(
+            &task_id,
+            TaskState::SafeFixing,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Verifying,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let key = test_action_key(&task_id, 1, 1);
+        db.plan_action(&task_id, "test_execution", &key).unwrap();
+        db.start_action(&task_id, &key, false).unwrap();
+        db.finish_action(&task_id, &key, ActionStatus::Succeeded, None, None)
+            .unwrap();
+
+        let result = run_tests_for_round(
+            &db,
+            &project_id,
+            &task_id,
+            &dir,
+            1,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(
+            matches!(result, TestRoundOutcome::ActionUncertain),
+            "generation 0's real passed evidence must never satisfy generation 1's own gate"
+        );
+        let gen1_evidence = db
+            .list_test_evidence_for_round(&project_id, &task_id, 1, 1)
+            .unwrap();
+        assert_eq!(gen1_evidence.len(), 1);
+        assert_eq!(gen1_evidence[0].status, "insufficient_evidence");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn already_succeeded_test_action_with_only_a_prior_rounds_evidence_fails_closed() {
+        // Same shape as the generation test above, but across rounds
+        // within the same generation: round 1's real `passed` evidence
+        // must never satisfy round 2's own gate.
+        let dir = git_project_dir("test-only-prior-round-evidence");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            test_command_redacted: Some("cargo test"),
+            status: "passed",
+            passed_count: 1,
+            failed_count: 0,
+            skipped_count: 0,
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let key = test_action_key(&task_id, 0, 2);
+        db.plan_action(&task_id, "test_execution", &key).unwrap();
+        db.start_action(&task_id, &key, false).unwrap();
+        db.finish_action(&task_id, &key, ActionStatus::Succeeded, None, None)
+            .unwrap();
+
+        let result = run_tests_for_round(
+            &db,
+            &project_id,
+            &task_id,
+            &dir,
+            2,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(
+            matches!(result, TestRoundOutcome::ActionUncertain),
+            "round 1's real passed evidence must never satisfy round 2's own gate"
+        );
+        let round2_evidence = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 2)
+            .unwrap();
+        assert_eq!(round2_evidence.len(), 1);
+        assert_eq!(round2_evidence[0].status, "insufficient_evidence");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_cancelled_or_uncertain_test_action_from_a_foreign_generation_never_blocks_a_fresh_action(
+    ) {
+        let dir = git_project_dir("test-foreign-generation-terminal-status");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
+
+        // Foreign generation 1: a genuine test failure.
+        let failed_key = test_action_key(&task_id, 1, 1);
+        db.plan_action(&task_id, "test_execution", &failed_key)
+            .unwrap();
+        db.start_action(&task_id, &failed_key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &failed_key,
+            ActionStatus::Failed,
+            None,
+            Some("unrelated failure"),
+        )
+        .unwrap();
+
+        // Foreign generation 2: a user cancellation.
+        let cancelled_key = test_action_key(&task_id, 2, 1);
+        db.plan_action(&task_id, "test_execution", &cancelled_key)
+            .unwrap();
+        db.start_action(&task_id, &cancelled_key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &cancelled_key,
+            ActionStatus::Cancelled,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Foreign generation 3: a crash-recovery sweep leaves it uncertain.
+        let uncertain_key = test_action_key(&task_id, 3, 1);
+        db.plan_action(&task_id, "test_execution", &uncertain_key)
+            .unwrap();
+        db.start_action(&task_id, &uncertain_key, false).unwrap();
+        db.mark_started_actions_uncertain().unwrap();
+        assert_eq!(
+            db.find_action(&task_id, &uncertain_key)
+                .unwrap()
+                .unwrap()
+                .status,
+            ActionStatus::Uncertain
+        );
+
+        // The task's real, current generation is still 0 — none of the
+        // three foreign-generation terminal statuses above may affect it.
+        let result = run_tests_for_round(
+            &db,
+            &project_id,
+            &task_id,
+            &dir,
+            1,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(
+            matches!(result, TestRoundOutcome::NoTestsApplicable(_)),
+            "generation 0's own fresh action must plan/start normally regardless of any \
+             unrelated foreign generation's failed/cancelled/uncertain action: {result:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pre_remediation_non_generation_aware_test_action_key_is_read_safely_and_never_reused() {
+        // Work Package 3 backward-compatibility requirement: a historical
+        // Action Ledger row written before this remediation (key shape
+        // `test-{task_id}-round-{round}`, no `-generation-` segment) must
+        // never crash the loop and must never be mistaken for the current
+        // generation-aware key — the two are simply different strings
+        // under the same `UNIQUE(task_id, idempotency_key)` constraint, so
+        // no explicit migration or parsing of the old shape is needed.
+        let dir = git_project_dir("test-legacy-key-compat");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        confirm_no_tests(&db, &project_id, &task_id, 0, &[1]);
+
+        let legacy_key = format!("test-{task_id}-round-1");
+        db.plan_action(&task_id, "test_execution", &legacy_key)
+            .unwrap();
+        db.start_action(&task_id, &legacy_key, false).unwrap();
+        db.finish_action(&task_id, &legacy_key, ActionStatus::Succeeded, None, None)
+            .unwrap();
+
+        let result = run_tests_for_round(
+            &db,
+            &project_id,
+            &task_id,
+            &dir,
+            1,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(
+            matches!(result, TestRoundOutcome::NoTestsApplicable(_)),
+            "the current generation-aware key must plan/start fresh, never reusing the legacy \
+             row's status: {result:?}"
+        );
+
+        let all_actions = db.list_actions_for_task(&task_id).unwrap();
+        assert_eq!(
+            all_actions.len(),
+            2,
+            "both the legacy row and the new generation-aware row must remain independently \
+             readable, not merged or dropped: {all_actions:?}"
+        );
+        let new_key = test_action_key(&task_id, 0, 1);
+        assert!(all_actions.iter().any(|a| a.idempotency_key == legacy_key));
+        assert!(all_actions.iter().any(|a| a.idempotency_key == new_key));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_generation_genuinely_re_executes_tests_and_produces_independent_passed_evidence() {
+        let dir = git_project_dir("test-new-generation-reexecutes");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(0)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add passing test"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+
+        let gen0_result = run_tests_for_round(
+            &db,
+            &project_id,
+            &task_id,
+            &dir,
+            1,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(matches!(gen0_result, TestRoundOutcome::Passed(_)));
+
+        bump_result_generation_via_real_transitions(&db, &task_id, 1);
+        assert_eq!(db.task(&task_id).unwrap().result_generation, 1);
+
+        let gen1_result = run_tests_for_round(
+            &db,
+            &project_id,
+            &task_id,
+            &dir,
+            1,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(
+            matches!(gen1_result, TestRoundOutcome::Passed(_)),
+            "generation 1's own round 1 must genuinely re-execute the real test command, not \
+             short-circuit on generation 0's unrelated key: {gen1_result:?}"
+        );
+
+        let gen0_evidence = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        let gen1_evidence = db
+            .list_test_evidence_for_round(&project_id, &task_id, 1, 1)
+            .unwrap();
+        assert_eq!(gen0_evidence.len(), 1);
+        assert_eq!(gen1_evidence.len(), 1);
+        assert_eq!(gen0_evidence[0].status, "passed");
+        assert_eq!(gen1_evidence[0].status, "passed");
+        assert_ne!(
+            gen0_evidence[0].id, gen1_evidence[0].id,
+            "generation 1 must produce its own fresh evidence row, never reuse generation 0's"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completed_transition_requires_acceptance_for_the_tasks_current_generation_not_an_earlier_one(
+    ) {
+        // Items 15/16 of the Work Package 3 generation matrix: user
+        // acceptance must bind to `result_generation`, and a fresh
+        // generation invalidates an earlier one's acceptance. Uses only
+        // real `Database::transition_task`/`record_user_acceptance` calls
+        // — the same completion gate Blocker 1 already bound to
+        // `result_generation` (`storage::tasks::transition_task`'s
+        // `completed` `WHERE` clause), exercised here specifically through
+        // a *second* generation produced after the first was accepted.
+        let dir = git_project_dir("test-generation-acceptance-binding");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+
+        bump_result_generation_via_real_transitions(&db, &task_id, 1);
+        assert_eq!(db.task(&task_id).unwrap().result_generation, 1);
+        db.transition_task(
+            &task_id,
+            TaskState::AwaitingUserAcceptance,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.record_user_acceptance(&project_id, &task_id, true, None)
+            .unwrap();
+
+        // A second generation is produced (e.g. the user asked for more
+        // changes after all) without ever completing generation 1's
+        // acceptance into `completed`.
+        db.transition_task(
+            &task_id,
+            TaskState::SafeFixing,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Verifying,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::PreviewReady,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.task(&task_id).unwrap().result_generation, 2);
+        db.transition_task(
+            &task_id,
+            TaskState::AwaitingUserAcceptance,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let rejected = db.transition_task(
+            &task_id,
+            TaskState::Completed,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(
+            rejected.is_err(),
+            "generation 1's old acceptance must never authorize generation 2's completion: \
+             {rejected:?}"
+        );
+        assert_eq!(
+            db.task(&task_id).unwrap().state,
+            TaskState::AwaitingUserAcceptance,
+            "a refused completion must leave the task exactly where it was"
+        );
+
+        db.record_user_acceptance(&project_id, &task_id, true, None)
+            .unwrap();
+        let completed = db
+            .transition_task(
+                &task_id,
+                TaskState::Completed,
+                Actor::User,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            completed.state,
+            TaskState::Completed,
+            "a real, current-generation acceptance must authorize completion"
         );
         let _ = fs::remove_dir_all(&dir);
     }

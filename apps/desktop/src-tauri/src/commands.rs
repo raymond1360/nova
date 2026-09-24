@@ -1208,6 +1208,24 @@ pub fn confirm_no_build_applicable(
     })
 }
 
+/// v0.1.0 scope correction (Work Package 2): a read-only parameter
+/// pass-through to [`crate::core_loop::no_build_confirmation_needed`] — the
+/// frontend polls this (alongside `detect_test_command`) to decide whether
+/// to show the "confirm this project currently needs no build" prompt for
+/// a `needs_user_action` task. Never accepts a caller-supplied round or
+/// generation; the backend remains the sole authority for both, exactly as
+/// `confirm_no_build_applicable` already requires.
+#[tauri::command]
+pub fn get_no_build_confirmation_needed(
+    project_id: String,
+    task_id: String,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    with_db(&state, |db| {
+        crate::core_loop::no_build_confirmation_needed(db, &project_id, &task_id)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

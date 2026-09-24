@@ -23,6 +23,9 @@ const noTestsReason = ref('')
 // No default selection: the user must actively pick one of the two
 // choices below — neither radio starts checked.
 const noTestsChoice = ref<'' | 'confirm' | 'provide-command'>('')
+// v0.1.0 scope correction (Work Package 2): mirrors `noTestsReason` for
+// the "confirm this project currently needs no build" prompt.
+const noBuildReason = ref('')
 
 const codexPathDraft = ref('codex')
 const claudePathDraft = ref('claude')
@@ -92,6 +95,11 @@ async function handleConfirmNoTests() {
   await store.confirmNoTestsApplicable(noTestsReason.value.trim())
   noTestsReason.value = ''
   noTestsChoice.value = ''
+}
+
+async function handleConfirmNoBuild() {
+  await store.confirmNoBuildApplicable(noBuildReason.value.trim())
+  noBuildReason.value = ''
 }
 
 async function handleStart() {
@@ -175,6 +183,9 @@ const stateLabels: Record<string, string> = {
 
     <section class="block">
       <h3>CLI 配置与信任确认</h3>
+      <p class="hint">
+        只需配置你选择使用的开发 AI 对应的 CLI；未选用的另一个 CLI 未安装或未登录不影响任务启动。
+      </p>
       <button class="link-button" @click="handleLoadCliTrust">查看当前 Codex / Claude CLI 信任状态</button>
       <div class="cli-trust-grid">
         <div class="cli-trust-item">
@@ -219,8 +230,8 @@ const stateLabels: Record<string, string> = {
         <label>
           开发 AI：
           <select v-model="store.devAiKind" :disabled="!store.canChangeRoles">
-            <option value="codex_cli">Codex（Codex 开发 / Claude 审核）</option>
-            <option value="claude_cli">Claude（Claude 开发 / Codex 审核）</option>
+            <option value="codex_cli">Codex</option>
+            <option value="claude_cli">Claude Code</option>
           </select>
         </label>
         <button @click="handleCreateTask">创建任务</button>
@@ -281,6 +292,24 @@ const stateLabels: Record<string, string> = {
       </div>
     </section>
 
+    <!-- v0.1.0 scope correction (Work Package 2): the explicit no-build
+         confirmation card — the frontend counterpart to the backend's
+         already-existing `confirm_no_build_applicable`/
+         `no_build_confirmation_needed`. Only ever shown when the backend
+         itself has confirmed the task is genuinely stalled on build
+         detection, never guessed from the frontend alone. Also doubles as
+         the recovery UI for a half-success confirmation: calling this
+         again after a prior partial failure safely completes the
+         reconciliation. -->
+    <section v-if="store.noBuildConfirmationNeeded" class="block no-tests-card">
+      <h3>⚠ 无法判断该项目是否需要构建</h3>
+      <p>Nova 无法自动判断这个项目是否需要构建步骤。是否确认该项目当前无需构建？</p>
+      <div class="row">
+        <input v-model="noBuildReason" placeholder="原因（可选）" />
+        <button @click="handleConfirmNoBuild">确认当前无需构建</button>
+      </div>
+    </section>
+
     <section v-if="store.currentTask && store.currentTask.state === 'confirmed'" class="block">
       <h3>4. CLI 就绪检查与启动</h3>
       <button @click="store.checkReadiness">检查 Codex / Claude CLI 就绪状态</button>
@@ -317,12 +346,20 @@ const stateLabels: Record<string, string> = {
       v-if="store.currentTask && ['preview_ready', 'awaiting_user_acceptance', 'failed', 'needs_user_action', 'cancelled', 'completed'].includes(store.currentTask.state)"
       class="block"
     >
-      <h3>6. 审核结论与结果</h3>
-      <button class="link-button" @click="store.loadReviews">加载审核记录</button>
-      <div v-for="review in store.reviews" :key="review.id" class="review-item">
-        <p><strong>第 {{ review.round }} 轮 · {{ review.reviewer_ai_kind }}：</strong>{{ review.verdict }}</p>
-        <p class="findings">{{ review.findings_summary }}</p>
-      </div>
+      <h3>6. 结果与验收</h3>
+      <!-- v0.1.0 scope correction (Work Package 2): review records are an
+           optional diagnostic — v0.1.0's result and completion never
+           depend on them, so this section is framed around Nova's own
+           verification and the user's acceptance, not a review verdict. -->
+      <details class="reviews-diagnostic">
+        <summary>审核记录（可选诊断信息，v0.2.0 双 AI 审核能力，不影响本次结果）</summary>
+        <button class="link-button" @click="store.loadReviews">加载审核记录</button>
+        <div v-for="review in store.reviews" :key="review.id" class="review-item">
+          <p><strong>第 {{ review.round }} 轮 · {{ review.reviewer_ai_kind }}：</strong>{{ review.verdict }}</p>
+          <p class="findings">{{ review.findings_summary }}</p>
+        </div>
+        <p v-if="store.reviews.length === 0" class="hint">暂无审核记录。</p>
+      </details>
 
       <div v-if="store.currentTask.state === 'awaiting_user_acceptance'" class="accept-block">
         <textarea v-model="acceptNote" placeholder="验收备注（可选）"></textarea>
@@ -333,7 +370,12 @@ const stateLabels: Record<string, string> = {
       </div>
       <p v-if="store.currentTask.state === 'completed'" class="ok">任务已完成，用户已验收。</p>
       <p v-if="store.currentTask.state === 'failed'" class="bad">Nova 独立测试/构建验证未通过（已尝试一次修复），需要用户决定下一步。</p>
-      <p v-if="store.currentTask.state === 'needs_user_action' && !store.noTestsConfirmationNeeded" class="bad">需要用户处理（详见任务状态历史）。</p>
+      <p
+        v-if="store.currentTask.state === 'needs_user_action' && !store.noTestsConfirmationNeeded && !store.noBuildConfirmationNeeded"
+        class="bad"
+      >
+        需要用户处理（详见任务状态历史）。
+      </p>
       <p v-if="store.currentTask.state === 'cancelled'">任务已被用户取消。</p>
     </section>
   </div>

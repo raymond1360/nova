@@ -194,6 +194,18 @@ export interface NoTestsConfirmation {
   created_at: string
 }
 
+export interface NoBuildConfirmation {
+  id: string
+  project_id: string
+  task_id: string
+  result_generation: number
+  round: number
+  confirmed_by: string
+  reason: string | null
+  confirmed_at: string
+  created_at: string
+}
+
 export interface CliBinaryTrustStatus {
   trusted: boolean
   canonical_path: string | null

@@ -1,12 +1,27 @@
-//! Phase 3 remediation (Major 5): the seven-document set Nova generates
-//! for a task, regenerated in full from the database's *current* truth
-//! every time it is called — never incrementally patched — so the on-disk
-//! documents can never drift out of sync with (or contradict) a later state
-//! change. Every value written comes from Nova's own independently-recorded
-//! evidence (the Action Ledger, `task_reviews`, `test_evidence`,
-//! `user_acceptance`) — never from anything an AI merely claimed. A
-//! document for a step that has not happened yet still exists, with an
-//! explicit "not yet triggered" status, rather than being silently absent.
+//! Phase 3 remediation (Major 5), reframed by the v0.1.0 scope correction
+//! (Work Package 2, `CODEX_V0.1_SCOPE_CORRECTION_AUDIT_09211027.md`): the
+//! seven documents Nova generates for a task, regenerated in full from the
+//! database's *current* truth every time it is called — never
+//! incrementally patched — so the on-disk documents can never drift out of
+//! sync with (or contradict) a later state change. Every value written
+//! comes from Nova's own independently-recorded evidence (the Action
+//! Ledger, `task_reviews`, `test_evidence`, `user_acceptance`) — never from
+//! anything an AI merely claimed. A document for a step that has not
+//! happened yet still exists, with an explicit "not yet triggered" status,
+//! rather than being silently absent.
+//!
+//! Of the seven, only four are v0.1.0's *required* result set:
+//! `REQUIREMENT.md`, `DEVELOPMENT_REPORT.md`, `TEST_REPORT.md`, and
+//! `FINAL_RESULT.md`. `FIRST_REVIEW.md`/`SECOND_REVIEW.md` (and, by
+//! extension, `FIX_REPORT.md`'s relationship to a second review round) are
+//! the dormant v0.2.0 dual-AI reviewer's output — kept here purely as
+//! optional diagnostic material for backward/forward compatibility with any
+//! `task_reviews` rows that do exist (including historical ones from
+//! before this correction), never deleted, and still generated
+//! unconditionally so existing tooling and older projects keep reading a
+//! stable seven-file shape. [`final_result_doc`] is the actual v0.1.0
+//! completion authority, and it never reads a review verdict to decide
+//! anything — see its own doc comment.
 
 use std::path::{Path, PathBuf};
 
@@ -49,7 +64,14 @@ pub fn generate_result_documents(
     write_doc(
         &dir,
         "FIRST_REVIEW.md",
-        &review_doc(db, project_id, task_id, &task, 1, "First review")?,
+        &review_doc(
+            db,
+            project_id,
+            task_id,
+            &task,
+            1,
+            "First review (optional diagnostic — v0.2.0 dual-AI reviewer, not required for v0.1.0)",
+        )?,
     )?;
     write_doc(&dir, "FIX_REPORT.md", &fix_report_doc(db, task_id)?)?;
     write_doc(
@@ -61,7 +83,7 @@ pub fn generate_result_documents(
             task_id,
             &task,
             2,
-            "Second review (automatic fix pass)",
+            "Second review (optional diagnostic — v0.2.0 dual-AI reviewer, not required for v0.1.0)",
         )?,
     )?;
     write_doc(
@@ -877,6 +899,164 @@ mod tests {
         let content = fs::read_to_string(doc_dir.join("FIRST_REVIEW.md")).unwrap();
         assert!(content.contains("approve"));
         assert!(!content.contains(NOT_TRIGGERED_ZH));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&app_data_dir);
+    }
+
+    // --- v0.1.0 scope correction (Work Package 2): FINAL_RESULT must never
+    // depend on FIRST_REVIEW/SECOND_REVIEW or any `task_reviews` verdict —
+    // those remain optional diagnostic material only. --------------------
+
+    #[test]
+    fn final_result_reaches_awaiting_acceptance_and_completed_with_zero_task_reviews_ever_recorded()
+    {
+        // The real v0.1.0 single-AI path: no reviewer is ever invoked, so
+        // `task_reviews` never receives a single row for this task. Both
+        // `awaiting_user_acceptance` and, after a real user acceptance,
+        // `completed` must still be reported correctly by FINAL_RESULT —
+        // and FIRST_REVIEW.md/SECOND_REVIEW.md must still just say
+        // "not yet triggered" rather than blocking anything.
+        let dir = temp_dir("final-result-zero-reviews");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        let app_data_dir = temp_dir("final-result-zero-reviews-appdata");
+
+        db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            test_command_redacted: Some("cargo test"),
+            status: "passed",
+            passed_count: 1,
+            failed_count: 0,
+            skipped_count: 0,
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: Some("cargo build"),
+            status: "passed",
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        drive_to_awaiting_user_acceptance_at_generation_zero(&db, &task_id);
+        assert!(
+            db.list_task_reviews(&project_id, &task_id)
+                .unwrap()
+                .is_empty(),
+            "sanity check: this task must genuinely have zero task_reviews rows"
+        );
+
+        generate_result_documents(&db, &project_id, &task_id, &app_data_dir).unwrap();
+        let doc_dir = app_data_dir
+            .join("result-documents")
+            .join(&project_id)
+            .join(&task_id);
+        let final_result = fs::read_to_string(doc_dir.join("FINAL_RESULT.md")).unwrap();
+        assert!(final_result.contains("status: 等待用户验收"));
+        let first_review = fs::read_to_string(doc_dir.join("FIRST_REVIEW.md")).unwrap();
+        assert!(first_review.contains(NOT_TRIGGERED_ZH));
+        let second_review = fs::read_to_string(doc_dir.join("SECOND_REVIEW.md")).unwrap();
+        assert!(second_review.contains(NOT_TRIGGERED_ZH));
+
+        db.record_user_acceptance(&project_id, &task_id, true, Some("looks good"))
+            .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Completed,
+            crate::models::Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        generate_result_documents(&db, &project_id, &task_id, &app_data_dir).unwrap();
+        let final_result_after_completion =
+            fs::read_to_string(doc_dir.join("FINAL_RESULT.md")).unwrap();
+        assert!(final_result_after_completion.contains("status: 已完成（用户已验收）"));
+        assert!(
+            db.list_task_reviews(&project_id, &task_id)
+                .unwrap()
+                .is_empty(),
+            "must reach completed without ever recording a single review"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&app_data_dir);
+    }
+
+    #[test]
+    fn final_result_ignores_a_negative_historical_review_verdict() {
+        // A `changes_required` review row on file (e.g. from an earlier
+        // dormant v0.2.0 dual-AI attempt, or simply historical data) must
+        // never block v0.1.0's own independent test/build/acceptance gate
+        // — FINAL_RESULT is not a function of any review verdict, positive
+        // or negative.
+        let dir = temp_dir("final-result-negative-historical-review");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        let app_data_dir = temp_dir("final-result-negative-historical-review-appdata");
+
+        db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            test_command_redacted: Some("cargo test"),
+            status: "passed",
+            passed_count: 1,
+            failed_count: 0,
+            skipped_count: 0,
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: Some("cargo build"),
+            status: "passed",
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        db.record_task_review(
+            &project_id,
+            &task_id,
+            0,
+            1,
+            "claude_cli",
+            "changes_required",
+            Some("historical negative verdict, must not gate v0.1.0"),
+        )
+        .unwrap();
+        drive_to_awaiting_user_acceptance_at_generation_zero(&db, &task_id);
+
+        generate_result_documents(&db, &project_id, &task_id, &app_data_dir).unwrap();
+        let doc_dir = app_data_dir
+            .join("result-documents")
+            .join(&project_id)
+            .join(&task_id);
+        let content = fs::read_to_string(doc_dir.join("FINAL_RESULT.md")).unwrap();
+        assert!(
+            content.contains("status: 等待用户验收"),
+            "a negative historical review verdict must never block the v0.1.0 test/build gate: {content}"
+        );
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&app_data_dir);
     }

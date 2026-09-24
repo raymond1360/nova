@@ -3,6 +3,24 @@
 Generated: 2026-09-09
 Repository: `D:\nova`
 
+> **Scope correction notice (2026-09-24, Work Package 2)**
+>
+> "Phase 3" below is titled "Open Local Project **Dual-AI** Core Loop" and
+> its local tests/gates assume a mandatory reviewer AI. This has been
+> superseded: the real v0.1.0 production entry point
+> (`core_loop::run_core_loop`) is a single-developer-AI loop — Nova's own
+> independent file/Git/test/build verification stands in for the second
+> AI's review, and the dormant dual-AI orchestration
+> (`run_core_loop_dual_ai_v0_2`) is not reachable from any Tauri command in
+> v0.1.0. Mandatory second-AI review, role swap as a main-path capability,
+> and `FIRST_REVIEW.md`/`SECOND_REVIEW.md` as required deliverables are
+> deferred to v0.2.0. The current, authoritative scope is
+> `docs/release-v0.1.0/09_V0.1_SCOPE_CORRECTION09241121.md` and
+> `docs/release-v0.1.0/CODEX_V0.1_SCOPE_CORRECTION_AUDIT_09211027.md`. This
+> map is preserved as historical record of the phase sequencing and rollback
+> milestone names, which remain otherwise useful, but its dual-AI framing of
+> Phase 3 no longer reflects the current effective scope.
+
 This map is based on the current code, not only on product documents. Work packages are intentionally small enough to test, commit, roll back, and review independently.
 
 ## Milestone Naming Convention

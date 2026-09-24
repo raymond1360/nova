@@ -142,6 +142,7 @@ pub fn run() {
             commands::confirm_cli_binary_path,
             commands::confirm_no_tests_applicable,
             commands::confirm_no_build_applicable,
+            commands::get_no_build_confirmation_needed,
             commands::accept_task_result,
             commands::resync_task_documents,
         ])

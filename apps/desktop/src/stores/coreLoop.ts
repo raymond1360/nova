@@ -4,6 +4,7 @@ import { open } from '@tauri-apps/plugin-dialog'
 import type {
   CliBinaryTrustStatus,
   CoreLoopReadiness,
+  NoBuildConfirmation,
   NoTestsConfirmation,
   Project,
   Task,
@@ -28,6 +29,13 @@ export const useCoreLoopStore = defineStore('coreLoop', {
     reviews: [] as TaskReview[],
     readiness: null as CoreLoopReadiness | null,
     detectedTestCommand: null as string | null,
+    // v0.1.0 scope correction (Work Package 2): whether the backend has
+    // confirmed the current task is genuinely stalled on build detection
+    // being unable to determine whether a build applies — populated from
+    // the real, authoritative `get_no_build_confirmation_needed` backend
+    // query (never guessed on the frontend), mirroring the same pattern
+    // `noTestsConfirmationNeeded` already uses for the no-tests case.
+    noBuildConfirmationNeeded: false as boolean,
     devAiKind: 'codex_cli' as 'codex_cli' | 'claude_cli',
     // Reentrancy guard against duplicate-click starting the loop twice for
     // the same task — mirrors the same pattern `nova.ts`'s `sending` guard
@@ -131,6 +139,7 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       this.reviews = []
       this.readiness = null
       this.detectedTestCommand = null
+      this.noBuildConfirmationNeeded = false
       await invoke('set_last_active_project', { projectId: project.id }).catch(() => {})
     },
     async loadTasks() {
@@ -169,6 +178,19 @@ export const useCoreLoopStore = defineStore('coreLoop', {
     selectTask(task: Task) {
       this.currentTask = task
       this.reviews = []
+      this.noBuildConfirmationNeeded = false
+      // v0.1.0 scope correction (Work Package 2): unlike
+      // `noTestsConfirmationNeeded` (a synchronous getter over fields
+      // already present on `task`), `noBuildConfirmationNeeded` requires a
+      // real backend query — selecting a task that is already sitting at
+      // `needs_user_action` (e.g. after reopening the project) must still
+      // surface the prompt without waiting for the next poll/refresh.
+      // Deliberately not awaited: `selectTask` itself stays synchronous
+      // for its existing callers, and a failed query here just leaves the
+      // prompt hidden rather than blocking task selection.
+      if (task.state === 'needs_user_action') {
+        this.loadNoBuildConfirmationNeeded().catch(() => {})
+      }
     },
     async detectTestCommand() {
       if (!this.currentProject) return
@@ -197,6 +219,47 @@ export const useCoreLoopStore = defineStore('coreLoop', {
           projectId: this.currentProject.id,
           taskId: this.currentTask.id,
           round: this.pendingRound,
+          reason: reason || null,
+        })
+        await this.refreshCurrentTask()
+      } catch (error) {
+        this.lastError = String(error)
+        throw error
+      }
+    },
+    // v0.1.0 scope correction (Work Package 2): the real, backend-
+    // authoritative check for whether the current task is genuinely
+    // stalled on "cannot determine whether this project needs a build" —
+    // never inferred from any frontend-only signal. Safe to call whenever
+    // a task is `needs_user_action`; returns `false` for every other
+    // reason a task can be stuck there.
+    async loadNoBuildConfirmationNeeded() {
+      if (!this.currentTask || !this.currentProject) {
+        this.noBuildConfirmationNeeded = false
+        return
+      }
+      this.noBuildConfirmationNeeded = await invoke<boolean>('get_no_build_confirmation_needed', {
+        projectId: this.currentProject.id,
+        taskId: this.currentTask.id,
+      })
+    },
+    // v0.1.0 scope correction (Work Package 2): the only way a no-build
+    // confirmation can ever be recorded — a real, explicit user action.
+    // Deliberately never sends a `round`: `confirm_no_build_applicable` on
+    // the backend derives the generation/round itself from the task's own
+    // real state, exactly like `confirmNoTestsApplicable` already trusts
+    // the backend for the state/action/evidence gate. Also re-entrant: if
+    // a prior attempt already wrote the confirmation but the task did not
+    // yet resume (a half-success crash), calling this again still
+    // completes the recovery — the frontend never needs to distinguish
+    // "first call" from "retry".
+    async confirmNoBuildApplicable(reason: string) {
+      if (!this.currentTask || !this.currentProject) return
+      this.lastError = ''
+      try {
+        await invoke<NoBuildConfirmation>('confirm_no_build_applicable', {
+          projectId: this.currentProject.id,
+          taskId: this.currentTask.id,
           reason: reason || null,
         })
         await this.refreshCurrentTask()
@@ -327,6 +390,9 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       await this.loadPendingRound().catch(() => {})
       if (this.currentTask?.state === 'needs_user_action') {
         await this.detectTestCommand().catch(() => {})
+        await this.loadNoBuildConfirmationNeeded().catch(() => {})
+      } else {
+        this.noBuildConfirmationNeeded = false
       }
     },
     async loadReviews() {
@@ -383,6 +449,9 @@ export const useCoreLoopStore = defineStore('coreLoop', {
         if (unfinished) {
           this.currentTask = unfinished
           await this.loadReviews()
+          if (unfinished.state === 'needs_user_action') {
+            await this.loadNoBuildConfirmationNeeded().catch(() => {})
+          }
         }
       } catch (error) {
         this.lastError = String(error)

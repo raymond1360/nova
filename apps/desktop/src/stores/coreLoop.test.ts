@@ -289,6 +289,67 @@ describe('coreLoop store', () => {
     expect(startCalled).toBe(true)
   })
 
+  // v0.1.0 scope correction (Work Package 2, required test coverage items
+  // 2 and 3): the specific *reason* the unselected AI is unavailable
+  // (missing vs. untrusted vs. not logged in) must never matter — only
+  // `dev_ready` for the *selected* AI ever participates in `canStart`.
+
+  it('Codex ready, Claude untrusted (review_ready=false) allows starting', async () => {
+    const store = useCoreLoopStore()
+    store.currentTask = fakeTask({ state: 'confirmed', ai_kind: 'codex_cli' })
+    store.currentProject = fakeProject()
+    let startCalled = false
+    routeInvoke({
+      get_core_loop_readiness: async () => ({
+        dev_kind: 'codex_cli',
+        reviewer_kind: 'claude_cli',
+        dev_ready: true,
+        review_ready: false,
+        dev_message: 'Codex CLI 就绪',
+        review_message: '未检查（可选诊断，不影响启动）',
+      }),
+      start_core_loop: async () => {
+        startCalled = true
+      },
+      list_tasks_for_project: async () => [fakeTask({ state: 'queued' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+    })
+
+    const started = await store.startIfReady()
+
+    expect(started).toBe(true)
+    expect(startCalled).toBe(true)
+  })
+
+  it('Codex ready, Claude not logged in (review_ready=false) allows starting', async () => {
+    const store = useCoreLoopStore()
+    store.currentTask = fakeTask({ state: 'confirmed', ai_kind: 'codex_cli' })
+    store.currentProject = fakeProject()
+    let startCalled = false
+    routeInvoke({
+      get_core_loop_readiness: async () => ({
+        dev_kind: 'codex_cli',
+        reviewer_kind: 'claude_cli',
+        dev_ready: true,
+        review_ready: false,
+        dev_message: 'Codex CLI 就绪',
+        review_message: '未检查（可选诊断，不影响启动）',
+      }),
+      start_core_loop: async () => {
+        startCalled = true
+      },
+      list_tasks_for_project: async () => [fakeTask({ state: 'queued' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+    })
+
+    const started = await store.startIfReady()
+
+    expect(started).toBe(true)
+    expect(startCalled).toBe(true)
+  })
+
   it('the unselected AIs readiness state never affects canStart, in either direction', () => {
     const store = useCoreLoopStore()
     store.readiness = {
@@ -422,6 +483,167 @@ describe('coreLoop store', () => {
 
     expect(sentReason).toBeNull()
     expect(store.currentTask?.state).toBe('queued')
+  })
+
+  // v0.1.0 scope correction (Work Package 2): the no-build confirmation
+  // prompt and its backend-authoritative "is it needed" query.
+
+  it('loadNoBuildConfirmationNeeded reflects the real backend query', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ state: 'needs_user_action' })
+    routeInvoke({
+      get_no_build_confirmation_needed: async () => true,
+    })
+
+    await store.loadNoBuildConfirmationNeeded()
+
+    expect(store.noBuildConfirmationNeeded).toBe(true)
+  })
+
+  it('refreshCurrentTask loads noBuildConfirmationNeeded only while needs_user_action', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ id: 'task-1', state: 'needs_user_action' })
+    let queried = false
+    routeInvoke({
+      list_tasks_for_project: async () => [fakeTask({ id: 'task-1', state: 'needs_user_action' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+      detect_test_command: async () => null,
+      get_no_build_confirmation_needed: async () => {
+        queried = true
+        return true
+      },
+    })
+
+    await store.refreshCurrentTask()
+
+    expect(queried).toBe(true)
+    expect(store.noBuildConfirmationNeeded).toBe(true)
+  })
+
+  it('refreshCurrentTask resets noBuildConfirmationNeeded once the task leaves needs_user_action', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ id: 'task-1', state: 'needs_user_action' })
+    store.noBuildConfirmationNeeded = true
+    routeInvoke({
+      list_tasks_for_project: async () => [fakeTask({ id: 'task-1', state: 'queued' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+    })
+
+    await store.refreshCurrentTask()
+
+    expect(store.noBuildConfirmationNeeded).toBe(false)
+  })
+
+  // Manual verification (Work Package 2) found this gap in a live preview:
+  // `selectTask` (used when a user clicks a task straight from the task
+  // list, e.g. right after reopening a project) never called
+  // `refreshCurrentTask`, so a task already sitting at `needs_user_action`
+  // for a build-insufficient stall never got its no-build prompt queried
+  // until the next poll — unlike the no-tests card, which is a synchronous
+  // getter over fields already on `task` and so appeared immediately.
+  it('selectTask itself queries noBuildConfirmationNeeded for an already-needs_user_action task', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    let queried = false
+    routeInvoke({
+      get_no_build_confirmation_needed: async () => {
+        queried = true
+        return true
+      },
+    })
+
+    store.selectTask(fakeTask({ state: 'needs_user_action' }))
+    await vi.waitFor(() => expect(store.noBuildConfirmationNeeded).toBe(true))
+
+    expect(queried).toBe(true)
+  })
+
+  it('selectTask does not query noBuildConfirmationNeeded for a task in any other state', () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    routeInvoke({
+      get_no_build_confirmation_needed: async () => {
+        throw new Error('must not be called for a non-needs_user_action task')
+      },
+    })
+
+    expect(() => store.selectTask(fakeTask({ state: 'running' }))).not.toThrow()
+    expect(store.noBuildConfirmationNeeded).toBe(false)
+  })
+
+  // Required test coverage item 12: the frontend must never be able to
+  // forge a `round` for the no-build confirmation call — the backend
+  // (`confirm_no_build_applicable`) derives it itself, exactly like
+  // `confirmNoTestsApplicable` is intentionally *not* mirrored here.
+  it('confirmNoBuildApplicable never sends a round, only project/task/reason', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ state: 'needs_user_action' })
+    let sentArgs: unknown = null
+    routeInvoke({
+      confirm_no_build_applicable: async (args) => {
+        sentArgs = args
+        return {
+          id: 'nb1',
+          project_id: 'proj-1',
+          task_id: 'task-1',
+          result_generation: 0,
+          round: 1,
+          confirmed_by: 'user',
+          reason: null,
+          confirmed_at: 'now',
+          created_at: 'now',
+        }
+      },
+      list_tasks_for_project: async () => [fakeTask({ state: 'queued' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+    })
+
+    await store.confirmNoBuildApplicable('no build needed')
+
+    expect(sentArgs).toMatchObject({
+      projectId: 'proj-1',
+      taskId: 'task-1',
+      reason: 'no build needed',
+    })
+    expect(sentArgs).not.toHaveProperty('round')
+    expect(store.currentTask?.state).toBe('queued')
+  })
+
+  it('confirmNoBuildApplicable sends no default reason for an empty string', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ state: 'needs_user_action' })
+    let sentReason: unknown = 'unset'
+    routeInvoke({
+      confirm_no_build_applicable: async (args) => {
+        sentReason = (args as { reason: unknown }).reason
+        return {
+          id: 'nb1',
+          project_id: 'proj-1',
+          task_id: 'task-1',
+          result_generation: 0,
+          round: 1,
+          confirmed_by: 'user',
+          reason: null,
+          confirmed_at: 'now',
+          created_at: 'now',
+        }
+      },
+      list_tasks_for_project: async () => [fakeTask({ state: 'queued' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+    })
+
+    await store.confirmNoBuildApplicable('')
+
+    expect(sentReason).toBeNull()
   })
 
   // Codex re-review remediation (Major 1): `pendingRound` is sourced

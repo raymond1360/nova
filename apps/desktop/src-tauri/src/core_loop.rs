@@ -937,6 +937,50 @@ fn reconcile_no_build_confirmation(
     Ok(confirmation)
 }
 
+/// v0.1.0 scope correction (Work Package 2, `CODEX_V0.1_SCOPE_CORRECTION_
+/// AUDIT_09211027.md`): a read-only counterpart to [`current_pending_
+/// round`] the frontend uses to decide whether to show the "confirm this
+/// project currently needs no build" prompt for a `needs_user_action`
+/// task — mirrors exactly the same real signals
+/// [`reconcile_no_build_confirmation`]'s Case A gate requires before ever
+/// accepting a confirmation (task ownership, `NeedsUserAction`, the
+/// current generation/round's build action genuinely `Failed` with the
+/// internal build-insufficient marker, and matching `insufficient_
+/// evidence` build evidence), but never writes anything and never mutates
+/// task/action/evidence state. Returns `Ok(false)` for every other
+/// combination (wrong project, wrong task state, no matching action, a
+/// genuine build failure/timeout/allowlist rejection, or a no-tests
+/// stall instead) rather than erroring, since this is meant to be polled
+/// freely by the UI alongside `detect_test_command` without the caller
+/// having to pre-validate anything itself.
+pub fn no_build_confirmation_needed(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+) -> NovaResult<bool> {
+    let task = db.task(task_id)?;
+    if task.project_id != project_id || task.state != TaskState::NeedsUserAction {
+        return Ok(false);
+    }
+    let result_generation = task.result_generation;
+    let round = current_pending_round(db, project_id, task_id)?;
+    let build_key = build_action_key(task_id, result_generation, round);
+    let action = match db.find_action(task_id, &build_key)? {
+        Some(action) => action,
+        None => return Ok(false),
+    };
+    if action.status != ActionStatus::Failed
+        || action.error_summary.as_deref() != Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER)
+    {
+        return Ok(false);
+    }
+    let evidence_ok = db
+        .list_build_evidence_for_round(project_id, task_id, result_generation, round)?
+        .iter()
+        .any(|e| e.status == "insufficient_evidence");
+    Ok(evidence_ok)
+}
+
 /// Outcome of [`run_dev_and_test_round`] — the developer-AI-plus-Nova's-
 /// own-fact-verification portion shared by both the v0.1.0 single-AI path
 /// ([`run_single_ai_round`]) and the dormant v0.2.0 dual-AI path
@@ -3561,6 +3605,137 @@ mod tests {
             "sanity check: this fixture must genuinely compute round 2"
         );
         (dir, db, project_id, task_id)
+    }
+
+    // --- v0.1.0 scope correction (Work Package 2): the read-only
+    // `no_build_confirmation_needed` query the frontend uses to decide
+    // whether to show the "confirm no build applies" prompt. ---------------
+
+    #[test]
+    fn no_build_confirmation_needed_is_true_for_a_genuine_build_insufficient_stall() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nbc-needed-true", "codex_cli");
+        assert!(no_build_confirmation_needed(&db, &project_id, &task_id).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_build_confirmation_needed_is_false_before_any_stall() {
+        let dir = git_project_dir("nbc-needed-false-fresh");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        assert!(!no_build_confirmation_needed(&db, &project_id, &task_id).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_build_confirmation_needed_is_false_for_a_no_tests_stall() {
+        let dir = git_project_dir("nbc-needed-false-no-tests");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        // No build action was ever planned for this task — a genuine
+        // no-tests stall (or any other `needs_user_action` reason) must
+        // never be mistaken for a build-insufficient stall.
+        assert!(!no_build_confirmation_needed(&db, &project_id, &task_id).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_build_confirmation_needed_is_false_once_a_confirmation_resumed_the_task() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nbc-needed-false-resumed", "codex_cli");
+        confirm_no_build_applicable(&db, &project_id, &task_id, None).unwrap();
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::Queued);
+        assert!(!no_build_confirmation_needed(&db, &project_id, &task_id).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_build_confirmation_needed_is_true_again_for_a_half_success_state() {
+        // The exact half-success window closed by the fourth re-review: a
+        // confirmation row exists but the build action was never reset and
+        // the task never left `needs_user_action` — the UI must still be
+        // able to detect that a (retry) confirmation is what is needed.
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nbc-needed-true-half-success", "codex_cli");
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::NeedsUserAction);
+        assert!(no_build_confirmation_needed(&db, &project_id, &task_id).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_build_confirmation_needed_is_false_for_a_genuine_build_failure() {
+        let dir = git_project_dir("nbc-needed-false-genuine-failure");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(0)\"","build":"node -e \"process.exit(1)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let adapter = MockAdapter::new(vec![MockOutcome::Success, MockOutcome::Success], vec![]);
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.task.state,
+            TaskState::Failed,
+            "sanity check: a genuine, persistent build failure must exhaust the one fix pass"
+        );
+        assert!(!no_build_confirmation_needed(&db, &project_id, &task_id).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_build_confirmation_needed_rejects_a_project_id_that_does_not_own_the_task() {
+        let (dir, db, _project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nbc-needed-wrong-project", "codex_cli");
+        assert!(!no_build_confirmation_needed(&db, "some-other-project", &task_id).unwrap());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

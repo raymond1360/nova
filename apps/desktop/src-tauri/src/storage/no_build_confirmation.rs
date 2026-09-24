@@ -28,6 +28,20 @@ use crate::security::redact_sensitive_text;
 use super::{new_id, now};
 
 impl Database {
+    /// Codex re-review remediation (final Major closing Work Package 1):
+    /// idempotent at the SQL level, not just the caller's — `ON
+    /// CONFLICT(task_id, result_generation, round) DO NOTHING` means a
+    /// second write attempt for the same natural key (a genuine duplicate
+    /// request, or two concurrent requests racing each other) can never
+    /// surface a `UNIQUE` constraint error and can never create a second
+    /// row. The row is always re-read by the natural key afterward — never
+    /// by the freshly-generated `id` — so both the request that actually
+    /// inserted and any request that lost the race to an existing row
+    /// return the exact same, real, persisted confirmation. This is a
+    /// second line of defense beneath `core_loop::confirm_no_build_
+    /// applicable`'s own app-level idempotent lookup (itself sufficient
+    /// under Nova's single-mutex-serialized `AppState.db`), kept in case a
+    /// future refactor ever removes that serialization.
     pub fn record_no_build_confirmation(
         &self,
         project_id: &str,
@@ -42,14 +56,15 @@ impl Database {
         let reason = reason.map(redact_sensitive_text);
         self.conn().execute(
             "INSERT INTO no_build_confirmations (id, project_id, task_id, result_generation, round, confirmed_by, reason, confirmed_at, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'user', ?6, ?7, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, 'user', ?6, ?7, ?7)
+             ON CONFLICT(task_id, result_generation, round) DO NOTHING",
             params![id, project_id, task_id, result_generation, round, reason, now],
         )?;
         self.conn()
             .query_row(
                 "SELECT id, project_id, task_id, result_generation, round, confirmed_by, reason, confirmed_at, created_at
-                 FROM no_build_confirmations WHERE id = ?1",
-                params![id],
+                 FROM no_build_confirmations WHERE task_id = ?1 AND result_generation = ?2 AND round = ?3",
+                params![task_id, result_generation, round],
                 read_confirmation,
             )
             .map_err(Into::into)

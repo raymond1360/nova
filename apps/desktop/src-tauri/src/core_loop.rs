@@ -697,6 +697,158 @@ pub fn unblock_test_execution_for_retry(
     }
 }
 
+/// Codex re-review remediation (final Major closing Work Package 1): a
+/// minimal, build-only counterpart to [`unblock_test_execution_for_retry`]
+/// — resets *only* the given `(result_generation, round)`'s generation-
+/// aware build action, never the test action, never the dev action, never
+/// any other round's action, never any evidence row. Used exclusively by
+/// [`confirm_no_build_applicable`], which has already independently
+/// verified (before calling this) that the task is genuinely, structurally
+/// stalled on this exact build action — this function trusts that check
+/// and does no re-validation of its own, so it must never be called from
+/// anywhere else.
+fn unblock_build_execution_for_retry(
+    db: &Database,
+    task_id: &str,
+    result_generation: i64,
+    round: i64,
+) -> NovaResult<Task> {
+    let build_key = build_action_key(task_id, result_generation, round);
+    db.reset_failed_action_for_retry(task_id, &build_key)?;
+    let task = db.task(task_id)?;
+    if task.state == TaskState::NeedsUserAction {
+        db.transition_task(
+            task_id,
+            TaskState::Queued,
+            Actor::User,
+            Some("用户已确认该项目当前无需构建，重新排队等待继续"),
+            None,
+            false,
+            None,
+        )
+    } else {
+        Ok(task)
+    }
+}
+
+/// Codex re-review remediation (final Major closing Work Package 1): the
+/// exact, structured marker [`run_build_for_round`] writes to a build
+/// action's `error_summary` when — and only when — the round is genuinely
+/// stalled on build detection being unable to determine whether a build
+/// applies (`test_runner::BuildDetection::Insufficient` with no
+/// confirmation yet found). This is a code-controlled constant, never
+/// derived from user input, AI output, or a free-text status message meant
+/// for a human reader — checking it by exact string equality below is
+/// checking a stable internal signal, not "parsing free text" in the sense
+/// that would be fragile or spoofable. A *different*, distinct marker is
+/// written for every other way a build action can end up `Failed`
+/// (allowlist rejection: `"build command not allowlisted"`; a genuine
+/// build failure/timeout: `None`), so checking this exact string is
+/// sufficient on its own to distinguish "detection insufficient" from
+/// every other stop reason — see [`confirm_no_build_applicable`].
+const BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER: &str =
+    "build detection insufficient, awaiting user confirmation";
+
+/// Maximum length (in bytes) Nova will store for a no-build confirmation's
+/// free-text `reason` — a short user note, not a command-output dump (see
+/// `cap_text`'s own 2000-byte cap used for real process stdout/stderr
+/// elsewhere in this file).
+const MAX_NO_BUILD_REASON_LEN: usize = 500;
+
+/// Codex re-review remediation (final Major closing Work Package 1): the
+/// full authorization/state/round/idempotency boundary for recording a
+/// no-build confirmation. The backend is the *sole* authority for which
+/// `result_generation`/`round` this confirmation applies to and for
+/// whether the task is genuinely, structurally stalled on build detection
+/// being unable to determine an answer — nothing here trusts any
+/// caller-supplied generation, round, task state, action key, or evidence
+/// status (the Tauri command wrapper in `commands.rs` no longer even
+/// accepts a `round` parameter at all).
+///
+/// Ordering matters here and is deliberate: the idempotent existing-
+/// confirmation lookup runs *before* the state/action/evidence gate, not
+/// after — a second, genuinely-duplicate confirmation request arriving
+/// after the first one already resumed the task (moving it away from
+/// `needs_user_action`) must still succeed by returning the same real
+/// confirmation, not fail on "task is not needs_user_action anymore". Only
+/// when no confirmation exists yet does this enforce the full gate before
+/// ever writing one.
+pub fn confirm_no_build_applicable(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    reason: Option<&str>,
+) -> NovaResult<crate::models::NoBuildConfirmation> {
+    let task = db.task(task_id)?;
+    if task.project_id != project_id {
+        return Err(NovaError::Config(
+            "task_id 与 project_id 不匹配，已拒绝".to_string(),
+        ));
+    }
+    let result_generation = task.result_generation;
+    let round = current_pending_round(db, project_id, task_id)?;
+
+    // Idempotent fast path: a real, already-recorded confirmation for this
+    // exact (task_id, result_generation, round) is returned as-is, with no
+    // further state mutation — repeated confirmations (including two
+    // concurrent requests racing each other under `AppState.db`'s mutex)
+    // never create a second row, never re-transition the task, and never
+    // reset the build action a second time.
+    if let Some(existing) =
+        db.find_no_build_confirmation(project_id, task_id, result_generation, round)?
+    {
+        return Ok(existing);
+    }
+
+    if task.state != TaskState::NeedsUserAction {
+        return Err(NovaError::Config(format!(
+            "只有任务处于 needs_user_action 状态时才能确认无需构建，当前状态：{}",
+            task.state
+        )));
+    }
+
+    // The current stall must genuinely, structurally be "build detection
+    // could not determine an answer" — never a real build failure,
+    // timeout, cancellation, or allowlist rejection wearing the same
+    // `insufficient_evidence` evidence status.
+    let build_key = build_action_key(task_id, result_generation, round);
+    let action = db.find_action(task_id, &build_key)?.ok_or_else(|| {
+        NovaError::Config("当前不存在待确认的构建检测停滞，拒绝记录确认".to_string())
+    })?;
+    if action.status != ActionStatus::Failed
+        || action.error_summary.as_deref() != Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER)
+    {
+        return Err(NovaError::Config(
+            "当前卡点不是构建检测无法判断，拒绝记录无需构建确认".to_string(),
+        ));
+    }
+    // Defense in depth: the independently-recorded build evidence for this
+    // exact generation/round must also agree.
+    let evidence_ok = db
+        .list_build_evidence_for_round(project_id, task_id, result_generation, round)?
+        .iter()
+        .any(|e| e.status == "insufficient_evidence");
+    if !evidence_ok {
+        return Err(NovaError::Config(
+            "找不到匹配的构建证据不足记录，拒绝记录无需构建确认".to_string(),
+        ));
+    }
+
+    let effective_reason = match reason.map(str::trim) {
+        Some(text) if !text.is_empty() => cap_text(text, MAX_NO_BUILD_REASON_LEN),
+        _ => "用户确认该项目当前无需构建（未提供具体原因）".to_string(),
+    };
+    let confirmation = db.record_no_build_confirmation(
+        project_id,
+        task_id,
+        result_generation,
+        round,
+        Some(&effective_reason),
+    )?;
+    unblock_build_execution_for_retry(db, task_id, result_generation, round)?;
+    Ok(confirmation)
+}
+
 /// Outcome of [`run_dev_and_test_round`] — the developer-AI-plus-Nova's-
 /// own-fact-verification portion shared by both the v0.1.0 single-AI path
 /// ([`run_single_ai_round`]) and the dormant v0.2.0 dual-AI path
@@ -2274,6 +2426,7 @@ mod tests {
     use crate::runtime::ai_adapter::mock::{MockAdapter, MockOutcome};
     use std::process::Command as StdCommand;
     use std::sync::Arc;
+    use std::thread;
 
     fn temp_dir(name: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
@@ -3039,10 +3192,19 @@ mod tests {
         .unwrap();
         assert_eq!(stuck.task.state, TaskState::NeedsUserAction);
 
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("confirmed by user"))
-            .unwrap();
-        let unblocked = unblock_test_execution_for_retry(&db, &project_id, &task_id).unwrap();
-        assert_eq!(unblocked.state, TaskState::Queued);
+        // Codex re-review remediation (final Major): the real, secured
+        // entry point — never the raw storage function plus a manual
+        // unblock call.
+        let confirmation =
+            confirm_no_build_applicable(&db, &project_id, &task_id, Some("confirmed by user"))
+                .unwrap();
+        assert_eq!(confirmation.round, 1);
+        assert_eq!(confirmation.result_generation, 0);
+        assert_eq!(
+            db.task(&task_id).unwrap().state,
+            TaskState::Queued,
+            "confirm_no_build_applicable must itself resume the task, not merely record the row"
+        );
 
         let resumed = run_core_loop(
             &db,
@@ -3141,6 +3303,1254 @@ mod tests {
         assert!(
             found.is_none(),
             "a generation-0 no-build confirmation must never silently cover generation 1"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Codex re-review remediation (final Major closing Work Package 1):
+    // `confirm_no_build_applicable`'s full authorization/state/round/
+    // idempotency boundary. -------------------------------------------
+
+    /// A real, genuine round-1 build-insufficient stall: bare git fixture
+    /// (no `Cargo.toml`/`package.json`), no-tests confirmed for round 1 so
+    /// the loop actually reaches the build step, then run to completion —
+    /// mirrors `unrecognized_project_type_stalls_at_needs_user_action_
+    /// without_confirmation` exactly.
+    fn stall_task_at_round_1_build_insufficient(
+        name: &str,
+        dev_kind: &str,
+    ) -> (PathBuf, Database, String, String) {
+        let dir = git_project_dir(name);
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, dev_kind);
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+        assert_eq!(outcome.task.state, TaskState::NeedsUserAction);
+        (dir, db, project_id, task_id)
+    }
+
+    /// A real, genuine round-2 build-insufficient stall, constructed
+    /// directly at the Action Ledger level (round 1 fully succeeded — dev,
+    /// test, and build, each a real terminal `Succeeded` action with
+    /// matching evidence — round 2's dev and test also already succeeded)
+    /// then a real call to `run_build_for_round(round=2)` against the same
+    /// bare fixture (no `Cargo.toml`/`package.json` ever existed) so
+    /// `detect_build_command` genuinely returns `Insufficient` for round 2
+    /// specifically. Avoids re-running the full two-round core loop
+    /// orchestration end to end (already covered by other tests) while
+    /// still exercising a real, non-fabricated stall for the authorization
+    /// boundary tests to target.
+    fn stall_task_at_round_2_build_insufficient(
+        name: &str,
+        dev_kind: &str,
+    ) -> (PathBuf, Database, String, String) {
+        let dir = git_project_dir(name);
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, dev_kind);
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        for (kind, key) in [
+            ("ai_development", format!("dev-{task_id}-round-1")),
+            ("test_execution", format!("test-{task_id}-round-1")),
+        ] {
+            db.plan_action(&task_id, kind, &key).unwrap();
+            db.start_action(&task_id, &key, false).unwrap();
+            db.finish_action(&task_id, &key, ActionStatus::Succeeded, None, None)
+                .unwrap();
+        }
+        db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            test_command_redacted: Some("cargo test"),
+            status: "passed",
+            passed_count: 1,
+            failed_count: 0,
+            skipped_count: 0,
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        let build_key_r1 = build_action_key(&task_id, 0, 1);
+        db.plan_action(&task_id, "build_execution", &build_key_r1)
+            .unwrap();
+        db.start_action(&task_id, &build_key_r1, false).unwrap();
+        db.finish_action(&task_id, &build_key_r1, ActionStatus::Succeeded, None, None)
+            .unwrap();
+        db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: Some("cargo build"),
+            status: "passed",
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+
+        for (kind, key) in [
+            ("ai_development", format!("dev-{task_id}-round-2")),
+            ("test_execution", format!("test-{task_id}-round-2")),
+        ] {
+            db.plan_action(&task_id, kind, &key).unwrap();
+            db.start_action(&task_id, &key, false).unwrap();
+            db.finish_action(&task_id, &key, ActionStatus::Succeeded, None, None)
+                .unwrap();
+        }
+        db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 2,
+            test_command_redacted: Some("cargo test"),
+            status: "passed",
+            passed_count: 1,
+            failed_count: 0,
+            skipped_count: 0,
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Verifying,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let outcome = run_build_for_round(
+            &db,
+            &project_id,
+            &task_id,
+            &dir,
+            2,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(matches!(outcome, BuildRoundOutcome::ActionUncertain));
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::NeedsUserAction);
+        assert_eq!(
+            current_pending_round(&db, &project_id, &task_id).unwrap(),
+            2,
+            "sanity check: this fixture must genuinely compute round 2"
+        );
+        (dir, db, project_id, task_id)
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_computes_round_1_automatically() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("cb-round1-auto", "codex_cli");
+        let confirmation =
+            confirm_no_build_applicable(&db, &project_id, &task_id, Some("round 1 confirm"))
+                .unwrap();
+        assert_eq!(confirmation.round, 1);
+        assert_eq!(confirmation.result_generation, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_computes_round_2_automatically() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_2_build_insufficient("cb-round2-auto", "codex_cli");
+        let confirmation =
+            confirm_no_build_applicable(&db, &project_id, &task_id, Some("round 2 confirm"))
+                .unwrap();
+        assert_eq!(
+            confirmation.round, 2,
+            "the backend must compute round 2 on its own — no caller ever supplies it"
+        );
+        assert_eq!(confirmation.result_generation, 0);
+        // Round 1's own confirmation slot must remain empty — this call
+        // was genuinely about round 2.
+        let round1_confirmation = db
+            .find_no_build_confirmation(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert!(round1_confirmation.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_rejects_a_task_from_a_different_project() {
+        let (dir, db, _project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("cb-wrong-project", "codex_cli");
+        let result = confirm_no_build_applicable(&db, "some-other-project-id", &task_id, None);
+        assert!(result.is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_rejects_every_non_needs_user_action_state() {
+        // Codex re-review remediation (final Major): exhaustively drives a
+        // fresh task into each of Draft/Confirmed/Queued/Running/
+        // SafeFixing/PreviewReady/AwaitingUserAcceptance/Completed/Failed/
+        // Cancelled and asserts `confirm_no_build_applicable` rejects every
+        // single one of them — only `needs_user_action` may ever accept a
+        // no-build confirmation.
+        let dir = git_project_dir("cb-reject-states");
+        let db = Database::memory().unwrap();
+        db.migrate().unwrap();
+        let project = db
+            .create_project(&CreateProjectRequest {
+                name: "P".to_string(),
+                local_path: dir.to_string_lossy().into_owned(),
+                source_type: "local".to_string(),
+                source_url: None,
+                purpose: None,
+                long_term_goal: None,
+                user_preferences: None,
+                prohibitions: None,
+            })
+            .unwrap();
+
+        let assert_rejected = |db: &Database, task_id: &str, label: &str| {
+            let result = confirm_no_build_applicable(db, &project.id, task_id, None);
+            assert!(
+                result.is_err(),
+                "state {label} must reject a no-build confirmation, but it was accepted"
+            );
+        };
+
+        // Draft: the freshest possible state, no transition at all.
+        let draft_task = db
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "Draft".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: Some("codex_cli".to_string()),
+                },
+                Actor::User,
+            )
+            .unwrap();
+        assert_rejected(&db, &draft_task.id, "Draft");
+
+        // Confirmed.
+        let confirmed_task = db
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "Confirmed".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: Some("codex_cli".to_string()),
+                },
+                Actor::User,
+            )
+            .unwrap();
+        for state in [TaskState::AwaitingConfirmation, TaskState::Confirmed] {
+            db.transition_task(
+                &confirmed_task.id,
+                state,
+                Actor::User,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        }
+        assert_rejected(&db, &confirmed_task.id, "Confirmed");
+
+        // Queued.
+        let queued_task = db
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "Queued".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: Some("codex_cli".to_string()),
+                },
+                Actor::User,
+            )
+            .unwrap();
+        for state in [
+            TaskState::AwaitingConfirmation,
+            TaskState::Confirmed,
+            TaskState::Queued,
+        ] {
+            db.transition_task(&queued_task.id, state, Actor::User, None, None, false, None)
+                .unwrap();
+        }
+        assert_rejected(&db, &queued_task.id, "Queued");
+
+        // Running.
+        let running_task = db
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "Running".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: Some("codex_cli".to_string()),
+                },
+                Actor::User,
+            )
+            .unwrap();
+        for state in [
+            TaskState::AwaitingConfirmation,
+            TaskState::Confirmed,
+            TaskState::Queued,
+            TaskState::Running,
+        ] {
+            db.transition_task(
+                &running_task.id,
+                state,
+                Actor::User,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        }
+        assert_rejected(&db, &running_task.id, "Running");
+
+        // SafeFixing.
+        let safe_fixing_task = db
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "SafeFixing".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: Some("codex_cli".to_string()),
+                },
+                Actor::User,
+            )
+            .unwrap();
+        for state in [
+            TaskState::AwaitingConfirmation,
+            TaskState::Confirmed,
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::Verifying,
+            TaskState::SafeFixing,
+        ] {
+            db.transition_task(
+                &safe_fixing_task.id,
+                state,
+                Actor::User,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        }
+        assert_rejected(&db, &safe_fixing_task.id, "SafeFixing");
+
+        // PreviewReady.
+        let preview_ready_task = db
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "PreviewReady".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: Some("codex_cli".to_string()),
+                },
+                Actor::User,
+            )
+            .unwrap();
+        for state in [
+            TaskState::AwaitingConfirmation,
+            TaskState::Confirmed,
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::Verifying,
+            TaskState::PreviewReady,
+        ] {
+            db.transition_task(
+                &preview_ready_task.id,
+                state,
+                Actor::User,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        }
+        assert_rejected(&db, &preview_ready_task.id, "PreviewReady");
+
+        // AwaitingUserAcceptance.
+        let awaiting_task = db
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "AwaitingUserAcceptance".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: Some("codex_cli".to_string()),
+                },
+                Actor::User,
+            )
+            .unwrap();
+        for state in [
+            TaskState::AwaitingConfirmation,
+            TaskState::Confirmed,
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::Verifying,
+            TaskState::PreviewReady,
+            TaskState::AwaitingUserAcceptance,
+        ] {
+            db.transition_task(
+                &awaiting_task.id,
+                state,
+                Actor::User,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        }
+        assert_rejected(&db, &awaiting_task.id, "AwaitingUserAcceptance");
+
+        // Completed (requires a real prior acceptance record).
+        let completed_task = db
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "Completed".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: Some("codex_cli".to_string()),
+                },
+                Actor::User,
+            )
+            .unwrap();
+        for state in [
+            TaskState::AwaitingConfirmation,
+            TaskState::Confirmed,
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::Verifying,
+            TaskState::PreviewReady,
+            TaskState::AwaitingUserAcceptance,
+        ] {
+            db.transition_task(
+                &completed_task.id,
+                state,
+                Actor::User,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        }
+        db.record_user_acceptance(&project.id, &completed_task.id, true, None)
+            .unwrap();
+        db.transition_task(
+            &completed_task.id,
+            TaskState::Completed,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_rejected(&db, &completed_task.id, "Completed");
+
+        // Failed (direct edge from Running).
+        let failed_task = db
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "Failed".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: Some("codex_cli".to_string()),
+                },
+                Actor::User,
+            )
+            .unwrap();
+        for state in [
+            TaskState::AwaitingConfirmation,
+            TaskState::Confirmed,
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::Failed,
+        ] {
+            db.transition_task(&failed_task.id, state, Actor::User, None, None, false, None)
+                .unwrap();
+        }
+        assert_rejected(&db, &failed_task.id, "Failed");
+
+        // Cancelled (direct edge from Draft).
+        let cancelled_task = db
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "Cancelled".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: Some("codex_cli".to_string()),
+                },
+                Actor::User,
+            )
+            .unwrap();
+        db.transition_task(
+            &cancelled_task.id,
+            TaskState::Cancelled,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_rejected(&db, &cancelled_task.id, "Cancelled");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_rejects_when_stalled_on_no_tests_instead_of_build() {
+        // needs_user_action, but the real stall reason is a missing test
+        // command confirmation, not build detection — there is no build
+        // action for the pending round at all yet (the loop never even
+        // reached the build step).
+        let dir = git_project_dir("cb-reject-no-tests-reason");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+        assert_eq!(outcome.task.state, TaskState::NeedsUserAction);
+
+        let result = confirm_no_build_applicable(&db, &project_id, &task_id, None);
+        assert!(
+            result.is_err(),
+            "a task stalled on missing test confirmation must never accept a no-build confirmation"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_rejects_when_build_genuinely_failed() {
+        let dir = git_project_dir("cb-reject-real-build-failure");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(0)\"","build":"node -e \"process.exit(1)\""}}"#,
+        )
+        .unwrap();
+        StdCommand::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-q", "-m", "add package.json"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let adapter = MockAdapter::new(vec![MockOutcome::Success, MockOutcome::Success], vec![]);
+        let outcome = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.task.state,
+            TaskState::Failed,
+            "sanity check: a genuine, persistent build failure must exhaust the one fix pass"
+        );
+
+        // `Failed` itself is already rejected by the state gate, but
+        // additionally prove the *action-level* signal (real "failed"
+        // build evidence, no insufficient-detection marker) would also
+        // have been rejected had the task somehow still been sitting in
+        // `needs_user_action` — this directly targets the "genuinely
+        // failed build must never be confirmable" requirement rather than
+        // only the state gate.
+        let build_key = build_action_key(&task_id, 0, 1);
+        let action = db.find_action(&task_id, &build_key).unwrap().unwrap();
+        assert_eq!(action.status, ActionStatus::Failed);
+        assert_ne!(
+            action.error_summary.as_deref(),
+            Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER),
+            "a genuine build failure must never carry the insufficient-detection marker"
+        );
+        let result = confirm_no_build_applicable(&db, &project_id, &task_id, None);
+        assert!(result.is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_rejects_when_build_timed_out() {
+        let dir = git_project_dir("cb-reject-build-timeout");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Verifying,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let build_key = build_action_key(&task_id, 0, 1);
+        db.plan_action(&task_id, "build_execution", &build_key)
+            .unwrap();
+        db.start_action(&task_id, &build_key, false).unwrap();
+        db.finish_action(&task_id, &build_key, ActionStatus::Failed, None, None)
+            .unwrap();
+        db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: Some("cargo build"),
+            status: "timed_out",
+            exit_code: None,
+            reason: Some("构建执行超时"),
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let result = confirm_no_build_applicable(&db, &project_id, &task_id, None);
+        assert!(
+            result.is_err(),
+            "a timed-out build (no insufficient-detection marker) must never be confirmable"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_rejects_when_build_was_cancelled() {
+        let dir = git_project_dir("cb-reject-build-cancelled");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Verifying,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let build_key = build_action_key(&task_id, 0, 1);
+        db.plan_action(&task_id, "build_execution", &build_key)
+            .unwrap();
+        db.start_action(&task_id, &build_key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &build_key,
+            ActionStatus::Cancelled,
+            None,
+            Some("user cancellation during build execution"),
+        )
+        .unwrap();
+        db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: Some("cargo build"),
+            status: "cancelled",
+            exit_code: None,
+            reason: Some("用户在构建阶段取消了任务"),
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        // A cancelled build normally lands the whole *task* in
+        // `Cancelled` (already covered by the exhaustive state-rejection
+        // test); this directly targets the action-level signal too, in
+        // case the task were ever somehow left in `needs_user_action`.
+        db.transition_task(
+            &task_id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let result = confirm_no_build_applicable(&db, &project_id, &task_id, None);
+        assert!(result.is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_rejects_when_build_command_was_allowlist_rejected() {
+        // A build command *was* detected (not `Insufficient`) but failed
+        // the strict allowlist — this must never be confirmable via
+        // "no build needed" either, even though it also produces
+        // `insufficient_evidence` build_evidence; the distinguishing
+        // signal is the action's own error_summary marker, not the shared
+        // evidence status string.
+        let dir = git_project_dir("cb-reject-allowlist-rejected");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Verifying,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let build_key = build_action_key(&task_id, 0, 1);
+        db.plan_action(&task_id, "build_execution", &build_key)
+            .unwrap();
+        db.start_action(&task_id, &build_key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &build_key,
+            ActionStatus::Failed,
+            None,
+            Some("build command not allowlisted"),
+        )
+        .unwrap();
+        db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: Some("cargo build --release"),
+            status: "insufficient_evidence",
+            exit_code: None,
+            reason: Some("构建命令未通过安全允许列表校验，已拒绝执行"),
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let result = confirm_no_build_applicable(&db, &project_id, &task_id, None);
+        assert!(
+            result.is_err(),
+            "an allowlist-rejected build command must never be confirmable as 'no build needed'"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_is_idempotent_for_repeated_calls() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("cb-idempotent-repeat", "codex_cli");
+        let first =
+            confirm_no_build_applicable(&db, &project_id, &task_id, Some("first call")).unwrap();
+        let task_after_first = db.task(&task_id).unwrap();
+        assert_eq!(task_after_first.state, TaskState::Queued);
+
+        let second = confirm_no_build_applicable(
+            &db,
+            &project_id,
+            &task_id,
+            Some("second call, different text"),
+        )
+        .unwrap();
+        assert_eq!(
+            first.id, second.id,
+            "a repeated confirmation must return the exact same existing row"
+        );
+        assert_eq!(
+            first.reason, second.reason,
+            "the second call's different reason text must never overwrite the first"
+        );
+
+        let all_confirmations_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM no_build_confirmations WHERE task_id = ?1",
+                rusqlite::params![task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            all_confirmations_count, 1,
+            "a repeated confirmation must never create a second row"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_two_concurrent_requests_produce_at_most_one_row() {
+        // Real concurrency: two threads, each opening its own connection to
+        // the same on-disk database file, racing to confirm the same
+        // (task_id, result_generation, round).
+        let dir = temp_dir("cb-concurrent");
+        let db_path = dir.join("nova.sqlite3");
+        let db1 = Database::open(&db_path).unwrap();
+        db1.migrate().unwrap();
+        let project = db1
+            .create_project(&CreateProjectRequest {
+                name: "P".to_string(),
+                local_path: dir.to_string_lossy().into_owned(),
+                source_type: "local".to_string(),
+                source_url: None,
+                purpose: None,
+                long_term_goal: None,
+                user_preferences: None,
+                prohibitions: None,
+            })
+            .unwrap();
+        let task = db1
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "T".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: Some("codex_cli".to_string()),
+                },
+                Actor::User,
+            )
+            .unwrap();
+        for state in [
+            TaskState::AwaitingConfirmation,
+            TaskState::Confirmed,
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::Verifying,
+        ] {
+            db1.transition_task(&task.id, state, Actor::User, None, None, false, None)
+                .unwrap();
+        }
+        let build_key = build_action_key(&task.id, 0, 1);
+        db1.plan_action(&task.id, "build_execution", &build_key)
+            .unwrap();
+        db1.start_action(&task.id, &build_key, false).unwrap();
+        db1.finish_action(
+            &task.id,
+            &build_key,
+            ActionStatus::Failed,
+            None,
+            Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER),
+        )
+        .unwrap();
+        db1.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+            project_id: &project.id,
+            task_id: &task.id,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: None,
+            status: "insufficient_evidence",
+            exit_code: None,
+            reason: Some("未识别到已知的项目类型"),
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        db1.transition_task(
+            &task.id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let project_id_a = project.id.clone();
+        let task_id_a = task.id.clone();
+        let db_path_a = db_path.clone();
+        let handle_a = thread::spawn(move || {
+            let db = Database::open(&db_path_a).unwrap();
+            confirm_no_build_applicable(&db, &project_id_a, &task_id_a, Some("from thread A"))
+        });
+        let project_id_b = project.id.clone();
+        let task_id_b = task.id.clone();
+        let db_path_b = db_path.clone();
+        let handle_b = thread::spawn(move || {
+            let db = Database::open(&db_path_b).unwrap();
+            confirm_no_build_applicable(&db, &project_id_b, &task_id_b, Some("from thread B"))
+        });
+        let result_a = handle_a.join().unwrap();
+        let result_b = handle_b.join().unwrap();
+
+        // Both requests must observe success (never a raw UNIQUE
+        // constraint error surfacing to either caller) and must agree on
+        // exactly the same confirmation row.
+        let confirmation_a = result_a.expect("thread A must not see a UNIQUE constraint error");
+        let confirmation_b = result_b.expect("thread B must not see a UNIQUE constraint error");
+        assert_eq!(confirmation_a.id, confirmation_b.id);
+
+        let count: i64 = db1
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM no_build_confirmations WHERE task_id = ?1",
+                rusqlite::params![task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "two concurrent confirmations for the same key must produce at most one row"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_does_not_reset_a_successful_test_action() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("cb-preserve-test-action", "codex_cli");
+        let test_key = format!("test-{task_id}-round-1");
+        let test_action_before = db.find_action(&task_id, &test_key).unwrap().unwrap();
+        assert_eq!(test_action_before.status, ActionStatus::Succeeded);
+
+        confirm_no_build_applicable(&db, &project_id, &task_id, None).unwrap();
+
+        let test_action_after = db.find_action(&task_id, &test_key).unwrap().unwrap();
+        assert_eq!(
+            test_action_after.status,
+            ActionStatus::Succeeded,
+            "confirming no-build must never reset an already-successful test action"
+        );
+        assert_eq!(
+            test_action_before.attempt_number,
+            test_action_after.attempt_number
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_does_not_reset_the_dev_action() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("cb-preserve-dev-action", "codex_cli");
+        let dev_key = format!("dev-{task_id}-round-1");
+        let dev_action_before = db.find_action(&task_id, &dev_key).unwrap().unwrap();
+        assert_eq!(dev_action_before.status, ActionStatus::Succeeded);
+
+        confirm_no_build_applicable(&db, &project_id, &task_id, None).unwrap();
+
+        let dev_action_after = db.find_action(&task_id, &dev_key).unwrap().unwrap();
+        assert_eq!(dev_action_after.status, ActionStatus::Succeeded);
+        assert_eq!(
+            dev_action_before.attempt_number,
+            dev_action_after.attempt_number
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_for_round_2_never_touches_round_1_action_or_evidence() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_2_build_insufficient("cb-round2-preserves-round1", "codex_cli");
+        let round1_build_key = build_action_key(&task_id, 0, 1);
+        let round1_action_before = db
+            .find_action(&task_id, &round1_build_key)
+            .unwrap()
+            .unwrap();
+        let round1_evidence_before = db
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+
+        let confirmation = confirm_no_build_applicable(&db, &project_id, &task_id, None).unwrap();
+        assert_eq!(confirmation.round, 2);
+
+        let round1_action_after = db
+            .find_action(&task_id, &round1_build_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(round1_action_after.status, ActionStatus::Succeeded);
+        assert_eq!(
+            round1_action_before.attempt_number, round1_action_after.attempt_number,
+            "round 2's confirmation must never touch round 1's build action"
+        );
+        let round1_evidence_after = db
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(round1_evidence_before.len(), round1_evidence_after.len());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_does_not_cross_into_a_different_generation() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("cb-generation-scoped", "codex_cli");
+        confirm_no_build_applicable(&db, &project_id, &task_id, None).unwrap();
+
+        let generation_1_confirmation = db
+            .find_no_build_confirmation(&project_id, &task_id, 1, 1)
+            .unwrap();
+        assert!(
+            generation_1_confirmation.is_none(),
+            "a generation-0 confirmation must never silently cover generation 1 of the same task"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirming_no_build_applicable_and_resuming_never_triggers_a_third_development_call() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("cb-no-third-dev-call", "codex_cli");
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+        confirm_no_build_applicable(&db, &project_id, &task_id, Some("no build needed")).unwrap();
+
+        let resumed = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+        assert_eq!(resumed.task.state, TaskState::AwaitingUserAcceptance);
+        // This `adapter` instance is only ever passed to the *resumed*
+        // `run_core_loop` call — round 1's original development already
+        // happened (and succeeded) against a *different* adapter instance
+        // inside `stall_task_at_round_1_build_insufficient`, before the
+        // build stall was ever reached. Zero calls on *this* instance is
+        // therefore the strongest possible proof that resuming after the
+        // no-build confirmation never re-invokes development at all —
+        // never mind a third time.
+        assert_eq!(
+            adapter.development_call_count(),
+            0,
+            "resuming after a no-build confirmation must never repeat development — the dev \
+             action was already succeeded before the stall even happened"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirming_no_build_applicable_and_resuming_only_continues_build_verification() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("cb-only-continues-build", "codex_cli");
+        let test_evidence_before = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(
+            test_evidence_before.len(),
+            1,
+            "round 1's test step must already have produced its one real evidence row before \
+             the build stall"
+        );
+
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+        confirm_no_build_applicable(&db, &project_id, &task_id, None).unwrap();
+        run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+
+        let test_evidence_after = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(
+            test_evidence_after.len(),
+            1,
+            "resuming after a no-build confirmation must never re-run the already-succeeded \
+             test step — the test evidence row count must stay exactly the same"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_reason_is_redacted() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("cb-reason-redacted", "codex_cli");
+        let confirmation = confirm_no_build_applicable(
+            &db,
+            &project_id,
+            &task_id,
+            Some("api_key=sk-1234567890abcdef1234567890abcdef please skip build"),
+        )
+        .unwrap();
+        assert!(!confirmation
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("sk-1234567890abcdef1234567890abcdef"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_reason_is_capped_at_a_safe_length() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("cb-reason-length-cap", "codex_cli");
+        let very_long_reason = "a".repeat(5000);
+        let confirmation =
+            confirm_no_build_applicable(&db, &project_id, &task_id, Some(&very_long_reason))
+                .unwrap();
+        assert!(
+            confirmation.reason.as_deref().unwrap().len() < 5000,
+            "an oversized reason must be capped, not stored in full"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_empty_reason_uses_a_safe_default() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("cb-reason-empty-default", "codex_cli");
+        let confirmation =
+            confirm_no_build_applicable(&db, &project_id, &task_id, Some("   ")).unwrap();
+        assert!(
+            confirmation
+                .reason
+                .as_deref()
+                .is_some_and(|r| !r.trim().is_empty()),
+            "an empty/whitespace-only reason must be replaced with a safe default explanation"
         );
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1178,31 +1178,33 @@ pub fn confirm_no_tests_applicable(
     })
 }
 
-/// Codex re-review remediation (Major 2): the build-gate equivalent of
-/// `confirm_no_tests_applicable` — the only write path for
-/// `no_build_confirmations`, always `Actor::User` (hardcoded at the
-/// storage layer), reachable only from an explicit "确认该项目当前无需构建"
-/// UI action. Scoped to the task's *current* `result_generation`, exactly
-/// mirroring the no-tests confirmation's scoping discipline.
+/// Codex re-review remediation (final Major closing Work Package 1): the
+/// build-gate equivalent of `confirm_no_tests_applicable` — the only write
+/// path for `no_build_confirmations`, always `Actor::User` (hardcoded at
+/// the storage layer), reachable only from an explicit "确认该项目当前无需构建"
+/// UI action.
+///
+/// Deliberately no longer accepts a caller-supplied `round` at all — the
+/// previous signature let any frontend (or a compromised/buggy one)
+/// pre-write a no-build confirmation for an arbitrary generation/round the
+/// task was not actually stalled on, including a future round, or write
+/// one while the task was in a state where no build stall existed at all
+/// (`Draft`/`Running`/`Completed`/...). `core_loop::confirm_no_build_
+/// applicable` is the sole authority for the generation/round (derived
+/// from the task's own real `result_generation` and
+/// `core_loop::current_pending_round`) and for the full state/action/
+/// evidence authorization boundary — this command is purely a parameter
+/// pass-through, exactly matching this codebase's "commands stay a
+/// permission/parameter boundary only" architecture rule.
 #[tauri::command]
 pub fn confirm_no_build_applicable(
     project_id: String,
     task_id: String,
-    round: i64,
     reason: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<crate::models::NoBuildConfirmation, String> {
     with_db(&state, |db| {
-        let task = db.task(&task_id)?;
-        let confirmation = db.record_no_build_confirmation(
-            &project_id,
-            &task_id,
-            task.result_generation,
-            round,
-            reason.as_deref(),
-        )?;
-        crate::core_loop::unblock_test_execution_for_retry(db, &project_id, &task_id)?;
-        Ok(confirmation)
+        crate::core_loop::confirm_no_build_applicable(db, &project_id, &task_id, reason.as_deref())
     })
 }
 

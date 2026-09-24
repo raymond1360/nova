@@ -1144,50 +1144,97 @@ mod tests {
         running
     }
 
+    /// Work Package 3 final review remediation (Major 2): replaces the
+    /// previous "print the PID to stdout, then sleep" fixture, whose
+    /// readiness signal was only ever observable *after* the whole process
+    /// tree had already been torn down (`result.stdout` is only populated
+    /// once `execute_blocking` returns). `cancellation_terminates_
+    /// grandchild_process_not_just_direct_child` paired that with a fixed
+    /// 2-second sleep before firing cancellation, gambling that PowerShell
+    /// — a much heavier process to start than the `node`/helper binaries
+    /// used elsewhere in this codebase's own marker-based tests — would
+    /// have started, spawned `ping`, and flushed its `Write-Output` within
+    /// that window on every possible run. Under full-parallel-test-suite
+    /// CPU/process-creation contention this is not guaranteed: if
+    /// cancellation fires before PowerShell's own `Start-Process`/
+    /// `Write-Output` line ever executes, the process tree is killed with
+    /// nothing ever written to stdout, and `grandchild_pid_from_stdout`
+    /// panics on an empty string — a real, reproduced instance of exactly
+    /// this (`CODEX_PHASE3_SINGLE_AI_FINAL_ACCEPTANCE_REVIEW09242120.md`
+    /// Major 2, round 1 of a 5-round full-suite run: `expected a PID
+    /// printed to stdout, got: ""`). This is a test-synchronization defect,
+    /// not a production one — real cancellation/Job Object behavior was
+    /// never in question (the *same* failing run's grandchild, once its
+    /// PID could be determined, always turned out to have actually been
+    /// terminated; `immediate_grandchild_cancel_terminates_parent_and_
+    /// grandchild_repeated`, which already uses a real PID-file handshake
+    /// for the same underlying race, has run stably for many rounds).
+    ///
+    /// The fix: the script itself now writes the grandchild's real PID to
+    /// `pid_file` — atomically (a temp file, then an in-place rename, so a
+    /// concurrent reader can never observe a partial write) — as its very
+    /// next statement after starting `ping`, before ever sleeping. This is
+    /// the exact same ready-signal discipline `nova_test_helper.rs`'s own
+    /// `grandchild-race` mode and [`wait_for_readable_pid_file`] already
+    /// use for the immediate-grandchild race tests below — reused here
+    /// rather than inventing a second, divergent mechanism.
     #[cfg(windows)]
-    fn grandchild_fixture_script() -> &'static str {
-        "$p = Start-Process ping -ArgumentList '-n','60','127.0.0.1' -PassThru -WindowStyle Hidden; \
-         Write-Output $p.Id; Start-Sleep -Seconds 60"
-    }
-
-    #[cfg(windows)]
-    fn grandchild_pid_from_stdout(stdout: &str) -> u32 {
-        stdout
-            .lines()
-            .find_map(|line| line.trim().parse::<u32>().ok())
-            .unwrap_or_else(|| panic!("expected a PID printed to stdout, got: {stdout:?}"))
+    fn grandchild_fixture_script(pid_file: &Path) -> String {
+        let pid_file = pid_file.to_string_lossy().replace('\'', "''");
+        format!(
+            "$p = Start-Process ping -ArgumentList '-n','60','127.0.0.1' -PassThru -WindowStyle Hidden; \
+             $tmp = '{pid_file}.tmp'; \
+             Set-Content -Path $tmp -Value $p.Id -NoNewline -Encoding ascii; \
+             Move-Item -Path $tmp -Destination '{pid_file}' -Force; \
+             Start-Sleep -Seconds 60"
+        )
     }
 
     #[test]
     #[cfg(windows)]
     fn timeout_terminates_grandchild_process_not_just_direct_child() {
         // PowerShell is the direct child; it starts `ping` as *its own*
-        // child (a grandchild relative to Nova) and prints that grandchild's
-        // PID before sleeping to hold the tree alive. Windows Job Objects
-        // automatically include descendants unless they explicitly break
-        // away (this script does not), so if timeout only killed the direct
-        // child, `ping.exe` would keep running — this test proves it does
-        // not. (This exercises the *normal*, post-assignment containment
-        // path; the immediate-grandchild-race tests below specifically
-        // target the spawn/assign race this remediation round closes.)
+        // child (a grandchild relative to Nova), atomically publishes that
+        // grandchild's real PID via a file (never stdout — see
+        // `grandchild_fixture_script`'s doc comment), then sleeps to hold
+        // the tree alive. Windows Job Objects automatically include
+        // descendants unless they explicitly break away (this script does
+        // not), so if timeout only killed the direct child, `ping.exe`
+        // would keep running — this test proves it does not. (This
+        // exercises the *normal*, post-assignment containment path; the
+        // immediate-grandchild-race tests below specifically target the
+        // spawn/assign race a prior remediation round closed.)
         let root = temp_root("grandchild-timeout");
+        let pid_file = root.join("grandchild-pid.txt");
         let mut req = request(
             "powershell",
             vec![
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                grandchild_fixture_script(),
+                &grandchild_fixture_script(&pid_file),
             ],
             &root,
         );
-        req.timeout = Duration::from_secs(5);
+        // Work Package 3 final review remediation (Major 2): 5 seconds was
+        // observed to be insufficient for PowerShell to reliably start,
+        // spawn `ping`, and complete the atomic PID-file write under heavy
+        // parallel process-creation contention (reproduced directly: a
+        // panic showing the fixture directory existing but completely
+        // empty even after the full wait budget). 10 seconds gives real
+        // headroom while still keeping this test's wall time bounded and
+        // small relative to the script's own 60-second sleep.
+        req.timeout = Duration::from_secs(10);
         let result = execute_blocking(req, CancellationToken::new());
         match result.outcome {
             ExecutionOutcome::Failed { kind, .. } => assert_eq!(kind, ExecutionErrorKind::TimedOut),
             other => panic!("expected TimedOut, got {other:?}"),
         }
-        let grandchild_pid = grandchild_pid_from_stdout(&result.stdout);
+        // The 10-second timeout already gave PowerShell ample time to reach
+        // and complete the atomic PID-file write well before Nova's own
+        // timeout/kill path ran — this is a short, bounded confirmation
+        // read, not a fresh open-ended wait.
+        let grandchild_pid = wait_for_readable_pid_file(&pid_file, &root, Duration::from_secs(5));
         let still_running = wait_until_not_running(grandchild_pid, 30);
         assert!(
             !still_running,
@@ -1200,22 +1247,39 @@ mod tests {
     #[cfg(windows)]
     fn cancellation_terminates_grandchild_process_not_just_direct_child() {
         let root = temp_root("grandchild-cancel");
+        let pid_file = root.join("grandchild-pid.txt");
         let mut req = request(
             "powershell",
             vec![
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                grandchild_fixture_script(),
+                &grandchild_fixture_script(&pid_file),
             ],
             &root,
         );
         req.timeout = Duration::from_secs(60);
         let cancel = CancellationToken::new();
         let cancel_for_thread = cancel.clone();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_secs(2));
+        let pid_file_for_thread = pid_file.clone();
+        let root_for_thread = root.clone();
+        // The canceller thread itself discovers the grandchild's real PID
+        // by waiting on the ready signal (bounded, generous timeout — not
+        // unbounded, not a fixed blind sleep) before firing cancellation,
+        // and hands that same PID back via the join handle, exactly
+        // mirroring `immediate_grandchild_cancel_terminates_parent_and_
+        // grandchild_repeated`'s established pattern. This guarantees
+        // cancellation is only ever attributed to "the grandchild was
+        // genuinely already running" — never ready-before-PowerShell-
+        // started-it.
+        let canceller = thread::spawn(move || {
+            let pid = wait_for_readable_pid_file(
+                &pid_file_for_thread,
+                &root_for_thread,
+                Duration::from_secs(30),
+            );
             cancel_for_thread.cancel();
+            pid
         });
         let result = execute_blocking(req, cancel);
         match result.outcome {
@@ -1224,7 +1288,7 @@ mod tests {
             }
             other => panic!("expected Cancelled, got {other:?}"),
         }
-        let grandchild_pid = grandchild_pid_from_stdout(&result.stdout);
+        let grandchild_pid = canceller.join().expect("canceller thread panicked");
         let still_running = wait_until_not_running(grandchild_pid, 30);
         assert!(
             !still_running,
@@ -1341,6 +1405,19 @@ mod tests {
         // startup delay for job assignment to "get lucky" against. Run
         // repeatedly to make a race window failure very unlikely to go
         // unnoticed.
+        //
+        // Work Package 3 final review remediation (Major 2): the original
+        // 400ms budget was reproduced failing directly (`iteration 0: pid
+        // file missing: 系统找不到指定的文件`) under heavy parallel
+        // process-creation contention — Nova's own suspend-then-Job-
+        // Object-assign-then-resume sequence for spawning even this
+        // lightweight helper (see `runtime::process::run_windows`'s own
+        // doc comments) has real, load-sensitive kernel-call overhead, the
+        // same class of cost the build-cancellation stability remediation
+        // already diagnosed for heavier process chains. 2 seconds gives
+        // real headroom while staying tiny relative to the helper's own
+        // 120-second sleep, so the timeout path is still genuinely
+        // exercised (never masked by natural completion).
         for i in 0..20 {
             let root = temp_root(&format!("immediate-grandchild-timeout-{i}"));
             let pid_file = root.join("grandchild-pid.txt");
@@ -1349,7 +1426,7 @@ mod tests {
                 vec!["grandchild-race", pid_file.to_str().unwrap()],
                 &root,
             );
-            req.timeout = Duration::from_millis(400);
+            req.timeout = Duration::from_secs(2);
             let result = execute_blocking(req, CancellationToken::new());
             match result.outcome {
                 ExecutionOutcome::Failed { kind, .. } => {
@@ -1357,9 +1434,13 @@ mod tests {
                 }
                 other => panic!("iteration {i}: expected TimedOut, got {other:?}"),
             }
-            let pid_text = fs::read_to_string(&pid_file)
-                .unwrap_or_else(|e| panic!("iteration {i}: pid file missing: {e}"));
-            let grandchild_pid: u32 = pid_text.trim().parse().expect("valid pid");
+            // Short, bounded defensive re-read (not a rescue mechanism —
+            // if the helper was genuinely killed before ever writing the
+            // file, this still fails fast and clearly) purely to absorb
+            // any residual filesystem-visibility lag right at the timeout
+            // boundary, rather than a single unbuffered read.
+            let grandchild_pid =
+                wait_for_readable_pid_file(&pid_file, &root, Duration::from_secs(2));
             let still_running = wait_until_not_running(grandchild_pid, 30);
             assert!(
                 !still_running,
@@ -1394,8 +1475,19 @@ mod tests {
     /// anywhere, so a grandchild that was ever actually created is always
     /// reliably captured and killed regardless of timing. This is a test
     /// synchronization fix only.
-    fn wait_for_readable_pid_file(path: &Path, timeout: Duration) -> u32 {
-        let deadline = Instant::now() + timeout;
+    /// Work Package 3 final review remediation (Major 2): `dir` is the
+    /// fixture's own temp directory (not necessarily `path`'s immediate
+    /// parent in every caller) — on timeout, the panic message reports the
+    /// PID file's full path, how long was actually waited, whether the
+    /// fixture directory itself still exists, and a listing of whatever is
+    /// in it (a genuine race leaves the directory present but the PID file
+    /// missing/empty; a fixture setup bug tends to leave the directory
+    /// itself missing) — enough to distinguish "the write genuinely hadn't
+    /// happened yet" from "the wrong path was ever checked" without
+    /// printing any process argv/env content that could carry secrets.
+    fn wait_for_readable_pid_file(path: &Path, dir: &Path, timeout: Duration) -> u32 {
+        let started = Instant::now();
+        let deadline = started + timeout;
         loop {
             if let Ok(text) = fs::read_to_string(path) {
                 let trimmed = text.trim();
@@ -1406,10 +1498,72 @@ mod tests {
                 }
             }
             if Instant::now() >= deadline {
-                panic!("grandchild pid file never became ready within {timeout:?}: {path:?}");
+                let dir_listing = fs::read_dir(dir)
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok())
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_else(|e| format!("<failed to list dir: {e}>"));
+                panic!(
+                    "grandchild pid file never became ready within {timeout:?} (waited {:?})\n  \
+                     pid file path: {}\n  \
+                     fixture dir: {} (exists: {}, entries: [{dir_listing}])",
+                    started.elapsed(),
+                    path.display(),
+                    dir.display(),
+                    dir.exists(),
+                );
             }
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn wait_for_readable_pid_file_times_out_with_rich_diagnostics_when_the_file_never_appears() {
+        // Work Package 3 final review remediation (Major 2, required test
+        // item 6): deterministically exercises the timeout/panic path
+        // itself (a short 150ms budget, no real process involved) and
+        // asserts the panic message actually carries the required
+        // diagnostics — never a bare "timed out".
+        let root = temp_root("pid-file-timeout-diagnostics");
+        fs::write(root.join("sentinel.txt"), "present").unwrap();
+        let pid_file = root.join("grandchild-pid.txt");
+
+        let path_for_closure = pid_file.clone();
+        let dir_for_closure = root.clone();
+        let result = std::panic::catch_unwind(move || {
+            wait_for_readable_pid_file(
+                &path_for_closure,
+                &dir_for_closure,
+                Duration::from_millis(150),
+            )
+        });
+        let panic_payload = result.expect_err("must panic when the pid file never appears");
+        let message = panic_payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic_payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+
+        assert!(
+            message.contains("grandchild pid file never became ready"),
+            "message: {message}"
+        );
+        assert!(
+            message.contains(&pid_file.to_string_lossy().into_owned()),
+            "message: {message}"
+        );
+        assert!(
+            message.contains(&root.to_string_lossy().into_owned()),
+            "message: {message}"
+        );
+        assert!(message.contains("sentinel.txt"), "message: {message}");
+        assert!(message.contains("waited"), "message: {message}");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1427,6 +1581,7 @@ mod tests {
             let cancel = CancellationToken::new();
             let cancel_for_thread = cancel.clone();
             let pid_file_for_thread = pid_file.clone();
+            let root_for_thread = root.clone();
             // The canceller thread itself discovers the grandchild's real
             // PID (waiting as long as it genuinely takes, up to a generous
             // bounded timeout) before firing cancellation, and hands that
@@ -1435,7 +1590,11 @@ mod tests {
             // window in which "the grandchild hadn't written it yet" can
             // be misread as "the file is missing".
             let canceller = thread::spawn(move || {
-                let pid = wait_for_readable_pid_file(&pid_file_for_thread, Duration::from_secs(10));
+                let pid = wait_for_readable_pid_file(
+                    &pid_file_for_thread,
+                    &root_for_thread,
+                    Duration::from_secs(10),
+                );
                 cancel_for_thread.cancel();
                 pid
             });

@@ -36,6 +36,26 @@ export const useCoreLoopStore = defineStore('coreLoop', {
     // query (never guessed on the frontend), mirroring the same pattern
     // `noTestsConfirmationNeeded` already uses for the no-tests case.
     noBuildConfirmationNeeded: false as boolean,
+    // v0.1.0 scope correction (Work Package 2 remediation, Major 1): a
+    // monotonically increasing token identifying "the current no-build
+    // query generation." `loadNoBuildConfirmationNeeded` captures this
+    // (plus the exact project/task id it is querying for) before awaiting
+    // the backend; bumped by every navigation action that could make an
+    // in-flight query's eventual answer stale (selecting a different
+    // task, switching project, or the current task leaving
+    // `needs_user_action`) and by every new query itself. A response is
+    // only ever applied if the token, project id, task id, and live task
+    // state all still match what was captured — otherwise it is a stale
+    // answer for a task/project the user has since navigated away from,
+    // and is silently discarded.
+    noBuildConfirmationRequestToken: 0 as number,
+    // v0.1.0 scope correction (Work Package 2 remediation, Minor 1):
+    // in-flight guard for `confirmNoBuildApplicable` — mirrors the
+    // `starting` guard `startTask` already uses. Set for the duration of
+    // exactly one backend call; the view layer disables the confirm
+    // button while this is `true` so a double click (or any other
+    // duplicate trigger) can never fire a second `invoke`.
+    confirmingNoBuild: false as boolean,
     devAiKind: 'codex_cli' as 'codex_cli' | 'claude_cli',
     // Reentrancy guard against duplicate-click starting the loop twice for
     // the same task — mirrors the same pattern `nova.ts`'s `sending` guard
@@ -140,6 +160,11 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       this.readiness = null
       this.detectedTestCommand = null
       this.noBuildConfirmationNeeded = false
+      // v0.1.0 scope correction (Work Package 2 remediation, Major 1):
+      // invalidates any in-flight no-build query from whatever project was
+      // previously selected — its eventual answer, however it resolves,
+      // can never apply to this new project/task pair.
+      this.noBuildConfirmationRequestToken += 1
       await invoke('set_last_active_project', { projectId: project.id }).catch(() => {})
     },
     async loadTasks() {
@@ -179,15 +204,21 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       this.currentTask = task
       this.reviews = []
       this.noBuildConfirmationNeeded = false
-      // v0.1.0 scope correction (Work Package 2): unlike
-      // `noTestsConfirmationNeeded` (a synchronous getter over fields
-      // already present on `task`), `noBuildConfirmationNeeded` requires a
-      // real backend query — selecting a task that is already sitting at
-      // `needs_user_action` (e.g. after reopening the project) must still
-      // surface the prompt without waiting for the next poll/refresh.
-      // Deliberately not awaited: `selectTask` itself stays synchronous
-      // for its existing callers, and a failed query here just leaves the
-      // prompt hidden rather than blocking task selection.
+      // v0.1.0 scope correction (Work Package 2 remediation, Major 1):
+      // invalidates any no-build query still in flight for whatever task
+      // was previously selected, *before* possibly starting a new one
+      // below — a slow response for task A must never be applied once the
+      // user has moved on to task B, even if B itself never triggers a
+      // new query (e.g. B is not `needs_user_action`).
+      this.noBuildConfirmationRequestToken += 1
+      // Unlike `noTestsConfirmationNeeded` (a synchronous getter over
+      // fields already present on `task`), `noBuildConfirmationNeeded`
+      // requires a real backend query — selecting a task that is already
+      // sitting at `needs_user_action` (e.g. after reopening the project)
+      // must still surface the prompt without waiting for the next
+      // poll/refresh. Deliberately not awaited: `selectTask` itself stays
+      // synchronous for its existing callers, and a failed query here just
+      // leaves the prompt hidden rather than blocking task selection.
       if (task.state === 'needs_user_action') {
         this.loadNoBuildConfirmationNeeded().catch(() => {})
       }
@@ -233,15 +264,41 @@ export const useCoreLoopStore = defineStore('coreLoop', {
     // never inferred from any frontend-only signal. Safe to call whenever
     // a task is `needs_user_action`; returns `false` for every other
     // reason a task can be stuck there.
+    //
+    // v0.1.0 scope correction (Work Package 2 remediation, Major 1): this
+    // query is asynchronous and the user can select a different task (or
+    // project, or the current task can leave `needs_user_action`) before
+    // it resolves. A stale response applying to the wrong task would show
+    // task A's "confirm no build" prompt while the user is looking at task
+    // B. Guarded with a captured request token plus the exact
+    // project/task id this call is *for*: the result is only ever written
+    // if, at resolution time, the token is still the latest one issued,
+    // the selected project and task are still the ones this call started
+    // for, and the task is still genuinely `needs_user_action`. A stale
+    // response — success or failure — is silently discarded and never
+    // touches store state, never sets `lastError`, and never displays
+    // anything for whichever task is now actually selected.
     async loadNoBuildConfirmationNeeded() {
       if (!this.currentTask || !this.currentProject) {
         this.noBuildConfirmationNeeded = false
         return
       }
-      this.noBuildConfirmationNeeded = await invoke<boolean>('get_no_build_confirmation_needed', {
-        projectId: this.currentProject.id,
-        taskId: this.currentTask.id,
+      this.noBuildConfirmationRequestToken += 1
+      const requestToken = this.noBuildConfirmationRequestToken
+      const projectId = this.currentProject.id
+      const taskId = this.currentTask.id
+      const needed = await invoke<boolean>('get_no_build_confirmation_needed', {
+        projectId,
+        taskId,
       })
+      if (
+        this.noBuildConfirmationRequestToken === requestToken &&
+        this.currentProject?.id === projectId &&
+        this.currentTask?.id === taskId &&
+        this.currentTask?.state === 'needs_user_action'
+      ) {
+        this.noBuildConfirmationNeeded = needed
+      }
     },
     // v0.1.0 scope correction (Work Package 2): the only way a no-build
     // confirmation can ever be recorded — a real, explicit user action.
@@ -253,19 +310,40 @@ export const useCoreLoopStore = defineStore('coreLoop', {
     // yet resume (a half-success crash), calling this again still
     // completes the recovery — the frontend never needs to distinguish
     // "first call" from "retry".
+    //
+    // v0.1.0 scope correction (Work Package 2 remediation, Minor 1): two
+    // safeguards on top of that. First, `confirmingNoBuild` makes a second
+    // overlapping call (e.g. a double click) a pure no-op — it never fires
+    // a second `invoke`, so the backend never has to be relied upon alone
+    // to dedupe a rapid double-submit. Second, the project/task this call
+    // was actually submitted for is captured up front; if the user has
+    // since selected a different task or project by the time the backend
+    // responds, this call's outcome — success or failure — is applied to
+    // its *own* captured state only where doing so is still meaningful
+    // (`refreshCurrentTask`/`lastError` are skipped entirely once stale),
+    // never onto whatever the user has since navigated to.
     async confirmNoBuildApplicable(reason: string) {
-      if (!this.currentTask || !this.currentProject) return
+      if (!this.currentTask || !this.currentProject || this.confirmingNoBuild) return
       this.lastError = ''
+      this.confirmingNoBuild = true
+      const projectId = this.currentProject.id
+      const taskId = this.currentTask.id
       try {
         await invoke<NoBuildConfirmation>('confirm_no_build_applicable', {
-          projectId: this.currentProject.id,
-          taskId: this.currentTask.id,
+          projectId,
+          taskId,
           reason: reason || null,
         })
-        await this.refreshCurrentTask()
+        if (this.currentProject?.id === projectId && this.currentTask?.id === taskId) {
+          await this.refreshCurrentTask()
+        }
       } catch (error) {
-        this.lastError = String(error)
+        if (this.currentProject?.id === projectId && this.currentTask?.id === taskId) {
+          this.lastError = String(error)
+        }
         throw error
+      } finally {
+        this.confirmingNoBuild = false
       }
     },
     // Requirement confirmation: draft -> awaiting_confirmation -> confirmed.
@@ -393,6 +471,11 @@ export const useCoreLoopStore = defineStore('coreLoop', {
         await this.loadNoBuildConfirmationNeeded().catch(() => {})
       } else {
         this.noBuildConfirmationNeeded = false
+        // v0.1.0 scope correction (Work Package 2 remediation, Major 1):
+        // the task just left `needs_user_action` (or there is no current
+        // task) — invalidate any no-build query still in flight for it so
+        // a late response cannot resurrect the prompt.
+        this.noBuildConfirmationRequestToken += 1
       }
     },
     async loadReviews() {

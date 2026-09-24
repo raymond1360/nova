@@ -98,8 +98,14 @@ async function handleConfirmNoTests() {
 }
 
 async function handleConfirmNoBuild() {
-  await store.confirmNoBuildApplicable(noBuildReason.value.trim())
-  noBuildReason.value = ''
+  try {
+    await store.confirmNoBuildApplicable(noBuildReason.value.trim())
+    noBuildReason.value = ''
+  } catch {
+    // `lastError` is already set by the store (unless this call turned
+    // out to be stale, in which case nothing was touched at all) — keep
+    // the user's draft reason so a retry never requires retyping it.
+  }
 }
 
 async function handleStart() {
@@ -305,8 +311,10 @@ const stateLabels: Record<string, string> = {
       <h3>⚠ 无法判断该项目是否需要构建</h3>
       <p>Nova 无法自动判断这个项目是否需要构建步骤。是否确认该项目当前无需构建？</p>
       <div class="row">
-        <input v-model="noBuildReason" placeholder="原因（可选）" />
-        <button @click="handleConfirmNoBuild">确认当前无需构建</button>
+        <input v-model="noBuildReason" placeholder="原因（可选）" :disabled="store.confirmingNoBuild" />
+        <button :disabled="store.confirmingNoBuild" @click="handleConfirmNoBuild">
+          {{ store.confirmingNoBuild ? '确认中…' : '确认当前无需构建' }}
+        </button>
       </div>
     </section>
 

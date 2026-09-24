@@ -796,7 +796,120 @@ pub fn confirm_no_build_applicable(
 /// for, or a task sitting in a state earlier than `needs_user_action` was
 /// ever reachable from once a build stall (and therefore this
 /// confirmation) could exist at all.
+///
+/// v0.1.0 scope correction (Work Package 2 remediation): a single call to
+/// [`reconcile_no_build_confirmation_attempt`] is not, by itself, safe
+/// under *true* concurrency — two overlapping calls can each read a
+/// consistent snapshot of their own that the other invalidates mid-flight,
+/// surfacing as a raw error even though the two calls are racing toward
+/// the exact same outcome. Two distinct windows were found by repeated
+/// stress testing:
+///
+/// 1. Both calls read [`Database::find_no_build_confirmation`] as `None`
+///    before either has inserted (a genuine TOCTOU window across two
+///    separate statements) — both proceed into the first-request gate,
+///    but if one of them completes its *entire* attempt (insert, reset,
+///    transition) before the other reaches its own re-validation of the
+///    build action, the slower call sees an already-reset action and its
+///    own gate rejects with "当前卡点不是构建检测无法判断" even though the
+///    operation it was trying to perform has, in fact, already completed.
+/// 2. Both calls resolve the *same* confirmation row (via the idempotent
+///    insert) and both reach [`Database::transition_task`] with the task
+///    still `needs_user_action`; one wins the CAS, the other's `WHERE
+///    state = 'needs_user_action'` update matches zero rows and surfaces
+///    "任务状态已被并发修改...已取消" even though the task is, at that
+///    very moment, correctly `queued`.
+///
+/// Both windows share one property: by the time the losing call's error
+/// surfaces, a confirmation row provably now exists for the *freshly
+/// recomputed* `(result_generation, round)` — because nothing except a
+/// call that itself passed the same first-request gate could have created
+/// it. That is the one signal this wrapper trusts to distinguish "a
+/// concurrent, legitimate call already converged this forward — retry and
+/// pick up where it left off" from "this is a genuine authorization/data
+/// failure that retrying can never fix" (wrong project, missing evidence,
+/// a real marker mismatch, or one of Case F's structurally-impossible
+/// early task states) — see [`no_build_confirmation_likely_converging`].
+/// Retries are capped, re-run the exact same idempotent attempt (never a
+/// different code path, never a raw SQL shortcut), and stop the moment
+/// either a call succeeds or the convergence signal is absent.
 fn reconcile_no_build_confirmation(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    reason: Option<&str>,
+) -> NovaResult<crate::models::NoBuildConfirmation> {
+    const MAX_CONCURRENT_CONVERGENCE_ATTEMPTS: u32 = 8;
+    let mut last_err =
+        NovaError::Config("无需构建确认协调未能在有限次重试内收敛，请人工检查".to_string());
+    for attempt in 0..MAX_CONCURRENT_CONVERGENCE_ATTEMPTS {
+        match reconcile_no_build_confirmation_attempt(db, project_id, task_id, reason) {
+            Ok(confirmation) => return Ok(confirmation),
+            Err(err) => {
+                let is_last_attempt = attempt + 1 == MAX_CONCURRENT_CONVERGENCE_ATTEMPTS;
+                last_err = err;
+                if is_last_attempt {
+                    break;
+                }
+                // Only retry when there is direct evidence — a
+                // confirmation row that now exists where our own attempt
+                // could not find or create one — that a concurrent call
+                // already advanced this exact operation. Never retry a
+                // failure that this same evidence check would also
+                // observe on every subsequent attempt (an unrelated
+                // project, missing evidence, a real marker mismatch, or a
+                // structurally-impossible task state) — those fail closed
+                // immediately, exactly as before this remediation.
+                if !no_build_confirmation_likely_converging(db, project_id, task_id)? {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// v0.1.0 scope correction (Work Package 2 remediation): the sole signal
+/// [`reconcile_no_build_confirmation`] trusts before retrying a failed
+/// attempt — re-reads the task fresh (never trusting anything read by the
+/// failed attempt), recomputes `(result_generation, round)` fresh via
+/// [`current_pending_round`] exactly like a brand new call would, and
+/// checks whether a confirmation now exists for that exact natural key.
+/// Deliberately excludes Case F's structurally-impossible early states
+/// (`Draft`/`AwaitingConfirmation`/`Confirmed`) even if a confirmation
+/// happens to exist, since no legitimate concurrent completion can ever
+/// explain a task sitting in one of those states this late — retrying
+/// would only ever reproduce the same fail-closed rejection.
+fn no_build_confirmation_likely_converging(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+) -> NovaResult<bool> {
+    let task = match db.task(task_id) {
+        Ok(task) => task,
+        Err(_) => return Ok(false),
+    };
+    if task.project_id != project_id
+        || matches!(
+            task.state,
+            TaskState::Draft | TaskState::AwaitingConfirmation | TaskState::Confirmed
+        )
+    {
+        return Ok(false);
+    }
+    let result_generation = task.result_generation;
+    let round = current_pending_round(db, project_id, task_id)?;
+    Ok(db
+        .find_no_build_confirmation(project_id, task_id, result_generation, round)?
+        .is_some())
+}
+
+/// The single, non-retrying reconciliation attempt driven by
+/// [`reconcile_no_build_confirmation`] — see that function's doc comment
+/// for why a single attempt is not, by itself, safe under true
+/// concurrency, and [`confirm_no_build_applicable`]'s doc comment for the
+/// half-success recovery design this attempt itself implements.
+fn reconcile_no_build_confirmation_attempt(
     db: &Database,
     project_id: &str,
     task_id: &str,
@@ -5766,6 +5879,293 @@ mod tests {
         );
         let action_after = db2.find_action(&task.id, &build_key).unwrap().unwrap();
         assert_eq!(action_after.status, ActionStatus::Planned);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- v0.1.0 scope correction (Work Package 2 remediation, Major 2):
+    // stress coverage for `reconcile_no_build_confirmation`'s new
+    // concurrent-convergence retry wrapper. ------------------------------
+
+    /// Shared setup for the concurrency tests below — a real, file-backed
+    /// database with a task genuinely stalled on build detection,
+    /// identical to the fixture the two pre-existing concurrent tests
+    /// above build inline, factored out so these new tests do not each
+    /// duplicate the same ~70 lines.
+    fn file_backed_build_insufficient_stall(
+        name: &str,
+    ) -> (PathBuf, PathBuf, String, String, String) {
+        let dir = temp_dir(name);
+        let db_path = dir.join("nova.sqlite3");
+        let db = Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+        let project = db
+            .create_project(&CreateProjectRequest {
+                name: "P".to_string(),
+                local_path: dir.to_string_lossy().into_owned(),
+                source_type: "local".to_string(),
+                source_url: None,
+                purpose: None,
+                long_term_goal: None,
+                user_preferences: None,
+                prohibitions: None,
+            })
+            .unwrap();
+        let task = db
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "T".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: Some("codex_cli".to_string()),
+                },
+                Actor::User,
+            )
+            .unwrap();
+        for state in [
+            TaskState::AwaitingConfirmation,
+            TaskState::Confirmed,
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::Verifying,
+        ] {
+            db.transition_task(&task.id, state, Actor::User, None, None, false, None)
+                .unwrap();
+        }
+        let build_key = build_action_key(&task.id, 0, 1);
+        db.plan_action(&task.id, "build_execution", &build_key)
+            .unwrap();
+        db.start_action(&task.id, &build_key, false).unwrap();
+        db.finish_action(
+            &task.id,
+            &build_key,
+            ActionStatus::Failed,
+            None,
+            Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER),
+        )
+        .unwrap();
+        db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+            project_id: &project.id,
+            task_id: &task.id,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: None,
+            status: "insufficient_evidence",
+            exit_code: None,
+            reason: Some("未识别到已知的项目类型"),
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        db.transition_task(
+            &task.id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        (dir, db_path, project.id, task.id, build_key)
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_barrier_synchronized_race_converges_across_many_iterations() {
+        // Real OS-thread concurrency, but with both threads released from
+        // a `Barrier` at the exact same instant on every iteration (rather
+        // than merely `thread::spawn`ed, which leaves a wide, unpredictable
+        // gap before either thread's first statement runs) — this reliably
+        // re-creates the two race windows fixed in this round (the
+        // first-request gate's own re-validation, and the `transition_
+        // task` CAS) on a large fraction of iterations, exercising the
+        // insert/reset/transition interleavings without any sleep or
+        // artificial serialization. 25 fresh, independent stalls; every
+        // single one must fully converge.
+        for i in 0..25 {
+            let (dir, db_path, project_id, task_id, build_key) =
+                file_backed_build_insufficient_stall(&format!("nr-barrier-race-{i}"));
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+            let barrier_a = barrier.clone();
+            let project_id_a = project_id.clone();
+            let task_id_a = task_id.clone();
+            let db_path_a = db_path.clone();
+            let handle_a = thread::spawn(move || {
+                let db = Database::open(&db_path_a).unwrap();
+                barrier_a.wait();
+                confirm_no_build_applicable(&db, &project_id_a, &task_id_a, Some("A"))
+            });
+            let barrier_b = barrier.clone();
+            let project_id_b = project_id.clone();
+            let task_id_b = task_id.clone();
+            let db_path_b = db_path.clone();
+            let handle_b = thread::spawn(move || {
+                let db = Database::open(&db_path_b).unwrap();
+                barrier_b.wait();
+                confirm_no_build_applicable(&db, &project_id_b, &task_id_b, Some("B"))
+            });
+
+            let result_a = handle_a.join().unwrap();
+            let result_b = handle_b.join().unwrap();
+            let confirmation_a = result_a.unwrap_or_else(|e| {
+                panic!("iteration {i}: thread A must not surface a raw concurrency error: {e}")
+            });
+            let confirmation_b = result_b.unwrap_or_else(|e| {
+                panic!("iteration {i}: thread B must not surface a raw concurrency error: {e}")
+            });
+            assert_eq!(
+                confirmation_a.id, confirmation_b.id,
+                "iteration {i}: both threads must converge on the same confirmation row"
+            );
+
+            let db_check = Database::open(&db_path).unwrap();
+            let count: i64 = db_check
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM no_build_confirmations WHERE task_id = ?1",
+                    rusqlite::params![task_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "iteration {i}: exactly one confirmation row");
+            assert_eq!(
+                db_check.task(&task_id).unwrap().state,
+                TaskState::Queued,
+                "iteration {i}: task must have converged to queued"
+            );
+            let action_after = db_check.find_action(&task_id, &build_key).unwrap().unwrap();
+            assert_eq!(
+                action_after.status,
+                ActionStatus::Planned,
+                "iteration {i}: build action must have converged to planned"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn concurrent_retry_wrapper_still_fails_closed_for_a_genuine_marker_mismatch() {
+        // The new retry wrapper must never turn a *genuine* inconsistency
+        // into a false "success" merely because it retries a few times —
+        // this reconstructs the same Case F/marker-mismatch scenario
+        // `confirm_no_build_applicable_fails_closed_when_the_failed_
+        // action_marker_does_not_match` already covers for a single call,
+        // and re-asserts it holds under the new multi-attempt wrapper.
+        let dir = git_project_dir("nr-retry-still-fails-closed");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let build_key = build_action_key(&task_id, 0, 1);
+        db.plan_action(&task_id, "build_execution", &build_key)
+            .unwrap();
+        db.start_action(&task_id, &build_key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &build_key,
+            ActionStatus::Failed,
+            None,
+            Some("build command not allowlisted"),
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+
+        let result = confirm_no_build_applicable(&db, &project_id, &task_id, None);
+        assert!(
+            result.is_err(),
+            "a genuine marker mismatch must still fail closed under the retry wrapper, never be \
+             retried into a false success"
+        );
+        let action_after = db.find_action(&task_id, &build_key).unwrap().unwrap();
+        assert_eq!(
+            action_after.status,
+            ActionStatus::Failed,
+            "must never reset an action for a marker mismatch, even after retries"
+        );
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::NeedsUserAction);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_race_result_survives_closing_and_reopening_the_database() {
+        // Combines this round's concurrency fix with the fourth
+        // re-review's restart-recovery guarantee: run the real two-thread
+        // race to completion, then open a brand new connection (every
+        // connection either racing thread held is already dropped by the
+        // time its thread finished) and confirm the converged state is
+        // still exactly right.
+        let (dir, db_path, project_id, task_id, build_key) =
+            file_backed_build_insufficient_stall("nr-race-then-restart");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let barrier_a = barrier.clone();
+        let project_id_a = project_id.clone();
+        let task_id_a = task_id.clone();
+        let db_path_a = db_path.clone();
+        let handle_a = thread::spawn(move || {
+            let db = Database::open(&db_path_a).unwrap();
+            barrier_a.wait();
+            confirm_no_build_applicable(&db, &project_id_a, &task_id_a, Some("A"))
+        });
+        let barrier_b = barrier.clone();
+        let project_id_b = project_id.clone();
+        let task_id_b = task_id.clone();
+        let db_path_b = db_path.clone();
+        let handle_b = thread::spawn(move || {
+            let db = Database::open(&db_path_b).unwrap();
+            barrier_b.wait();
+            confirm_no_build_applicable(&db, &project_id_b, &task_id_b, Some("B"))
+        });
+        let confirmation_a = handle_a.join().unwrap().expect("thread A must succeed");
+        let confirmation_b = handle_b.join().unwrap().expect("thread B must succeed");
+        assert_eq!(confirmation_a.id, confirmation_b.id);
+
+        let db_after_restart = Database::open(&db_path).unwrap();
+        assert_eq!(
+            db_after_restart.task(&task_id).unwrap().state,
+            TaskState::Queued
+        );
+        let action_after = db_after_restart
+            .find_action(&task_id, &build_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(action_after.status, ActionStatus::Planned);
+        let found = db_after_restart
+            .find_no_build_confirmation(&project_id, &task_id, 0, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, confirmation_a.id);
         let _ = fs::remove_dir_all(&dir);
     }
 

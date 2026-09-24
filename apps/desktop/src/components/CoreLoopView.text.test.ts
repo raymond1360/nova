@@ -44,4 +44,9 @@ describe('CoreLoopView.vue single-AI copy', () => {
     expect(source).toContain('store.noBuildConfirmationNeeded')
     expect(source).toContain('handleConfirmNoBuild')
   })
+
+  it('disables the no-build confirm button and input while a request is in flight', () => {
+    // v0.1.0 scope correction (Work Package 2 remediation, Minor 1).
+    expect(source).toContain(':disabled="store.confirmingNoBuild"')
+  })
 })

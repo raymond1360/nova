@@ -3127,20 +3127,243 @@ mod tests {
 
     // --- Codex re-review remediation (Major 3): independent build gate --
 
+    /// v0.1.0 scope correction (Work Package 2 final stability
+    /// remediation): the marker-wait budget for the two cancellation tests
+    /// below (`cancelling_while_the_independent_build_is_running_is_
+    /// recorded_as_cancelled_not_failed` and `cancelling_while_
+    /// independent_tests_are_running_is_recorded_as_cancelled_not_failed`).
+    ///
+    /// Root-cause evidence (not a guess): reaching the point where the
+    /// spawned child's own script runs its first statement requires, on
+    /// Windows, `runtime::win_spawn::resolve_executable` to walk every
+    /// `PATH` entry x `PATHEXT` looking for `npm`/`cmd.exe` (`npm` ships as
+    /// `npm.cmd`, a batch script `CreateProcessW` cannot launch directly —
+    /// see `win_spawn::is_batch_script` — so `cmd.exe` becomes a real,
+    /// separate hop), then `runtime::job_object`/`runtime::process::
+    /// run_windows` creating a suspended process, creating and configuring
+    /// a Job Object, assigning the child to it, and only then resuming
+    /// it — all *before* `npm` (itself a real Node.js program with its own
+    /// CLI bootstrap cost) has even spawned the actual `test`/`build`
+    /// script as a grandchild. Under a full parallel `cargo test
+    /// --workspace` run, with potentially hundreds of other test threads
+    /// doing the same PATH walks, process creations, and Job Object calls
+    /// at the same moment (compounded by antivirus real-time scanning of
+    /// freshly-spawned executables, a common source of extra latency this
+    /// exact chain is exposed to on every hop), the prior fixed 10-second
+    /// budget was measured to be insufficient — see the "PHASE3_BUILD_
+    /// CANCELLATION_STABILITY_REMEDIATION_REPORT" for the reproduction
+    /// (30 consecutive single-test runs of the directed test never failed;
+    /// a genuine full-suite parallel run reproduced the timeout). This is
+    /// environmental/process-creation latency under load, not a defect in
+    /// Nova's own cancellation logic (which polls at a fixed 25ms interval
+    /// once the process is actually running — see `runtime::process::
+    /// POLL_INTERVAL`) or in the marker signal itself (a real event written
+    /// by the child, never a fixed sleep).
+    const MARKER_WAIT_TIMEOUT: Duration = Duration::from_secs(45);
+
     /// Bounded wait for a real signal a spawned subprocess writes to disk —
     /// used instead of a fixed-duration sleep so cancellation tests never
-    /// race against CPU-scheduling delays under full-suite parallel load
-    /// (see the Major 2 fix below for the full rationale). Panics (failing
-    /// the test loudly) rather than waiting unboundedly if the signal never
-    /// arrives.
-    fn wait_for_marker_file(path: &Path, timeout: Duration) {
-        let deadline = std::time::Instant::now() + timeout;
+    /// race against CPU-scheduling delays under full-suite parallel load.
+    /// Panics (failing the test loudly, with as much diagnosis as can be
+    /// safely gathered from the filesystem alone — see the caller for the
+    /// additional Action Ledger/task-state diagnostics gathered *after*
+    /// this panic propagates, once it is safe to touch `db` again) rather
+    /// than waiting unboundedly if the signal never arrives.
+    fn wait_for_marker_file(path: &Path, dir: &Path, timeout: Duration) {
+        let started = std::time::Instant::now();
+        let deadline = started + timeout;
         while !path.exists() {
             if std::time::Instant::now() >= deadline {
-                panic!("marker file never appeared within {timeout:?}: {path:?}");
+                let dir_listing = fs::read_dir(dir)
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok())
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_else(|e| format!("<failed to list dir: {e}>"));
+                panic!(
+                    "marker file never appeared within {timeout:?} (waited {:?})\n  \
+                     marker path: {}\n  \
+                     project fixture dir: {} (exists: {}, entries: [{dir_listing}])",
+                    started.elapsed(),
+                    path.display(),
+                    dir.display(),
+                    dir.exists(),
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// v0.1.0 scope correction (Work Package 2 final stability
+    /// remediation): Action Ledger/task-state diagnostics for the two
+    /// marker-wait cancellation tests — deliberately gathered from the
+    /// *main* test thread only, after `canceller.join()` has already
+    /// returned (whether the canceller thread itself panicked or
+    /// succeeded), never concurrently from the canceller thread itself.
+    /// `Database`'s underlying SQLite connection is not safe to read from
+    /// a second thread while `run_core_loop` may still be mid-flight
+    /// writing to it on the main thread, and the in-memory fixture
+    /// database these tests use (`db_with_confirmed_task` ->
+    /// `Database::memory()`) has no on-disk file a second connection could
+    /// even reopen. Never includes environment variables, full command
+    /// lines, or anything that could leak a secret — only a path, a
+    /// task-state enum value, and an Action Ledger status/attempt count,
+    /// plus the action's own already-redacted `error_summary` (see
+    /// `security::redact_sensitive_text`, applied before it was ever
+    /// written to the Action Ledger).
+    fn marker_wait_action_diagnostics(db: &Database, task_id: &str, action_key: &str) -> String {
+        let task_state = db
+            .task(task_id)
+            .map(|t| t.state.to_string())
+            .unwrap_or_else(|e| format!("<failed to read task: {e}>"));
+        let action_status = match db.find_action(task_id, action_key) {
+            Ok(Some(action)) => format!(
+                "{:?} (attempt {}, error_summary: {:?})",
+                action.status, action.attempt_number, action.error_summary
+            ),
+            Ok(None) => {
+                "<no action row yet — the subprocess may never have been spawned>".to_string()
+            }
+            Err(e) => format!("<failed to read action: {e}>"),
+        };
+        format!(
+            "  task_id: {task_id}\n  current task state: {task_state}\n  action `{action_key}` \
+             status: {action_status}"
+        )
+    }
+
+    /// v0.1.0 scope correction (Work Package 2 final stability
+    /// remediation): joins a marker-wait canceller thread and, if it
+    /// panicked, re-panics on the main thread with the original message
+    /// plus fresh Action Ledger/task-state diagnostics — safe to read now
+    /// because the canceller thread has fully finished and `run_core_loop`
+    /// has already returned by the time callers reach this.
+    fn join_canceller_with_diagnostics(
+        canceller: std::thread::JoinHandle<()>,
+        db: &Database,
+        task_id: &str,
+        action_key: &str,
+    ) {
+        if let Err(panic_payload) = canceller.join() {
+            let original = panic_payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic_payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            panic!(
+                "{original}\n  additional diagnostics gathered after the panic (safe to read \
+                 now that run_core_loop has already returned):\n{}",
+                marker_wait_action_diagnostics(db, task_id, action_key)
+            );
+        }
+    }
+
+    /// v0.1.0 scope correction (Work Package 2 final stability
+    /// remediation): after a cancellation test terminates the build/test
+    /// subprocess via the Windows Job Object
+    /// (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), actual handle release can
+    /// lag the kill signal by a brief moment. Retries `fs::remove_dir_all`
+    /// for a few seconds instead of silently swallowing a failure (the
+    /// `let _ = fs::remove_dir_all(...)` pattern used elsewhere in this
+    /// file for fixtures that never had a subprocess holding anything
+    /// open) — a deletion that keeps failing past this grace period is
+    /// itself evidence of a genuinely leaked child process still holding a
+    /// file handle inside the directory, and is surfaced as a test
+    /// failure rather than ignored.
+    fn remove_dir_all_verifying_no_leftover_handles(dir: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match fs::remove_dir_all(dir) {
+                Ok(()) => return,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => panic!(
+                    "failed to remove the project fixture directory after the test finished — \
+                     a leftover child process may still be holding an open handle inside it: \
+                     {dir:?}: {e}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn wait_for_marker_file_times_out_with_rich_diagnostics_when_the_marker_never_appears() {
+        // v0.1.0 scope correction (Work Package 2 final stability
+        // remediation), required test coverage item 5 ("子进程提前退出时测试
+        // 快速失败并输出原因"): exercises `wait_for_marker_file`'s panic path
+        // directly and deterministically — no real subprocess, no real
+        // timing dependency beyond a short, fixed budget for *this specific
+        // helper unit test* (distinct from `MARKER_WAIT_TIMEOUT`, which is
+        // sized for real npm/node process-creation latency under full-suite
+        // load, not for this isolated check) — and asserts the panic
+        // message actually contains every diagnostic field required by the
+        // stability remediation report.
+        let dir = temp_dir("marker-wait-diagnostics");
+        let marker = dir.join("never-appears.marker");
+        fs::write(dir.join("sentinel.txt"), "present").unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wait_for_marker_file(&marker, &dir, Duration::from_millis(200));
+        }));
+
+        let err = result.expect_err("must panic when the marker never appears");
+        let message = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+            .expect("panic payload must be a string message");
+        assert!(
+            message.contains("marker file never appeared"),
+            "message must state what happened: {message}"
+        );
+        assert!(
+            message.contains(&marker.to_string_lossy().into_owned()),
+            "message must contain the full marker path: {message}"
+        );
+        assert!(
+            message.contains(&dir.to_string_lossy().into_owned()),
+            "message must contain the project fixture directory: {message}"
+        );
+        assert!(
+            message.contains("sentinel.txt"),
+            "message must list the fixture directory's actual contents, proving it really \
+             inspected the filesystem rather than guessing: {message}"
+        );
+        assert!(
+            message.contains("waited"),
+            "message must report how long it actually waited: {message}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_fixture_directories_are_unique_even_for_the_same_requested_name() {
+        // v0.1.0 scope correction (Work Package 2 final stability
+        // remediation), required test coverage item 2 ("marker路径在并行测试
+        // 之间唯一"): `git_project_dir`/`temp_dir` embed the current process
+        // id and a fresh UUID in every generated path — this proves two
+        // fixtures created with the *identical* literal name (exactly what
+        // two parallel test-harness threads running the *same* test
+        // function concurrently, or a test re-run, would pass) can never
+        // collide, so a marker file from one can never be mistaken for, or
+        // overwritten by, another.
+        let dir_a = temp_dir("same-name-collision-check");
+        let dir_b = temp_dir("same-name-collision-check");
+        assert_ne!(
+            dir_a, dir_b,
+            "two fixtures requested with the same name must never resolve to the same directory"
+        );
+        assert!(
+            !dir_a.join("build-started.marker").exists(),
+            "sanity check: a fresh fixture directory must never already contain a marker file \
+             left over from a different test"
+        );
+        let _ = fs::remove_dir_all(&dir_a);
+        let _ = fs::remove_dir_all(&dir_b);
     }
 
     #[test]
@@ -3254,9 +3477,16 @@ mod tests {
     fn cancelling_while_the_independent_build_is_running_is_recorded_as_cancelled_not_failed() {
         let dir = git_project_dir("build-gate-cancel-during-build");
         let marker = dir.join("build-started.marker");
+        // v0.1.0 scope correction (Work Package 2 final stability
+        // remediation): write to a temp name then rename, so any other
+        // process polling for `build-started.marker` by existence alone
+        // (as `wait_for_marker_file` does) can never observe a
+        // partially-written file — the rename is atomic on the same
+        // volume, and the target name only ever appears once fully
+        // formed.
         fs::write(
             dir.join("package.json"),
-            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(0)\"","build":"node -e \"require('fs').writeFileSync('build-started.marker','1');setTimeout(()=>process.exit(0), 6000)\""}}"#,
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"process.exit(0)\"","build":"node -e \"require('fs').writeFileSync('build-started.marker.tmp','1');require('fs').renameSync('build-started.marker.tmp','build-started.marker');setTimeout(()=>process.exit(0), 6000)\""}}"#,
         )
         .unwrap();
         StdCommand::new("git")
@@ -3270,21 +3500,22 @@ mod tests {
             .status()
             .unwrap();
         let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let build_key = build_action_key(&task_id, 0, 1);
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
         let cancel = CancellationToken::new();
         let cancel_for_timer = cancel.clone();
         let marker_for_timer = marker.clone();
+        let dir_for_timer = dir.clone();
         let canceller = std::thread::spawn(move || {
-            wait_for_marker_file(&marker_for_timer, Duration::from_secs(10));
+            wait_for_marker_file(&marker_for_timer, &dir_for_timer, MARKER_WAIT_TIMEOUT);
             cancel_for_timer.cancel();
         });
 
         let outcome =
             run_core_loop(&db, &task_id, &adapter, &cancel, &test_app_data_dir()).unwrap();
-        canceller.join().unwrap();
+        join_canceller_with_diagnostics(canceller, &db, &task_id, &build_key);
 
         assert_eq!(outcome.task.state, TaskState::Cancelled);
-        let build_key = build_action_key(&task_id, 0, 1);
         let action = db.find_action(&task_id, &build_key).unwrap().unwrap();
         assert_eq!(
             action.status,
@@ -3296,7 +3527,7 @@ mod tests {
             .unwrap();
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].status, "cancelled");
-        let _ = fs::remove_dir_all(&dir);
+        remove_dir_all_verifying_no_leftover_handles(&dir);
     }
 
     #[test]
@@ -7681,9 +7912,14 @@ mod tests {
         // test-execution step every time, regardless of scheduling delays.
         let dir = git_project_dir("cancel-during-test-execution");
         let marker = dir.join("test-started.marker");
+        // v0.1.0 scope correction (Work Package 2 final stability
+        // remediation): write to a temp name then rename — see the build
+        // cancellation test's own comment for the full rationale (atomic
+        // marker visibility) and `MARKER_WAIT_TIMEOUT`'s doc comment for
+        // why the wait budget below was raised from a fixed 10 seconds.
         fs::write(
             dir.join("package.json"),
-            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"require('fs').writeFileSync('test-started.marker','1');setTimeout(()=>process.exit(0), 6000)\""}}"#,
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"node -e \"require('fs').writeFileSync('test-started.marker.tmp','1');require('fs').renameSync('test-started.marker.tmp','test-started.marker');setTimeout(()=>process.exit(0), 6000)\""}}"#,
         )
         .unwrap();
         StdCommand::new("git")
@@ -7698,21 +7934,22 @@ mod tests {
             .unwrap();
 
         let (db, _project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let test_key = format!("test-{task_id}-round-1");
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
         let cancel = CancellationToken::new();
         let cancel_for_timer = cancel.clone();
         let marker_for_timer = marker.clone();
+        let dir_for_timer = dir.clone();
         let canceller = std::thread::spawn(move || {
-            wait_for_marker_file(&marker_for_timer, Duration::from_secs(10));
+            wait_for_marker_file(&marker_for_timer, &dir_for_timer, MARKER_WAIT_TIMEOUT);
             cancel_for_timer.cancel();
         });
 
         let outcome =
             run_core_loop(&db, &task_id, &adapter, &cancel, &test_app_data_dir()).unwrap();
-        canceller.join().unwrap();
+        join_canceller_with_diagnostics(canceller, &db, &task_id, &test_key);
 
         assert_eq!(outcome.task.state, TaskState::Cancelled);
-        let test_key = format!("test-{task_id}-round-1");
         let action = db.find_action(&task_id, &test_key).unwrap().unwrap();
         assert_eq!(
             action.status,
@@ -7725,7 +7962,7 @@ mod tests {
             .unwrap();
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].status, "cancelled");
-        let _ = fs::remove_dir_all(&dir);
+        remove_dir_all_verifying_no_leftover_handles(&dir);
     }
 
     // --- Blocker 3: independent test execution --------------------------

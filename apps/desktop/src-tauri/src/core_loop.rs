@@ -697,40 +697,6 @@ pub fn unblock_test_execution_for_retry(
     }
 }
 
-/// Codex re-review remediation (final Major closing Work Package 1): a
-/// minimal, build-only counterpart to [`unblock_test_execution_for_retry`]
-/// — resets *only* the given `(result_generation, round)`'s generation-
-/// aware build action, never the test action, never the dev action, never
-/// any other round's action, never any evidence row. Used exclusively by
-/// [`confirm_no_build_applicable`], which has already independently
-/// verified (before calling this) that the task is genuinely, structurally
-/// stalled on this exact build action — this function trusts that check
-/// and does no re-validation of its own, so it must never be called from
-/// anywhere else.
-fn unblock_build_execution_for_retry(
-    db: &Database,
-    task_id: &str,
-    result_generation: i64,
-    round: i64,
-) -> NovaResult<Task> {
-    let build_key = build_action_key(task_id, result_generation, round);
-    db.reset_failed_action_for_retry(task_id, &build_key)?;
-    let task = db.task(task_id)?;
-    if task.state == TaskState::NeedsUserAction {
-        db.transition_task(
-            task_id,
-            TaskState::Queued,
-            Actor::User,
-            Some("用户已确认该项目当前无需构建，重新排队等待继续"),
-            None,
-            false,
-            None,
-        )
-    } else {
-        Ok(task)
-    }
-}
-
 /// Codex re-review remediation (final Major closing Work Package 1): the
 /// exact, structured marker [`run_build_for_round`] writes to a build
 /// action's `error_summary` when — and only when — the round is genuinely
@@ -755,25 +721,82 @@ const BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER: &str =
 /// elsewhere in this file).
 const MAX_NO_BUILD_REASON_LEN: usize = 500;
 
-/// Codex re-review remediation (final Major closing Work Package 1): the
-/// full authorization/state/round/idempotency boundary for recording a
-/// no-build confirmation. The backend is the *sole* authority for which
-/// `result_generation`/`round` this confirmation applies to and for
-/// whether the task is genuinely, structurally stalled on build detection
-/// being unable to determine an answer — nothing here trusts any
-/// caller-supplied generation, round, task state, action key, or evidence
-/// status (the Tauri command wrapper in `commands.rs` no longer even
-/// accepts a `round` parameter at all).
+/// Codex re-review remediation (fourth re-review, the final Major closing
+/// Work Package 1): the full authorization/state/round/idempotency
+/// boundary for recording a no-build confirmation. The backend is the
+/// *sole* authority for which `result_generation`/`round` this
+/// confirmation applies to and for whether the task is genuinely,
+/// structurally stalled on build detection being unable to determine an
+/// answer — nothing here trusts any caller-supplied generation, round,
+/// task state, action key, or evidence status (the Tauri command wrapper
+/// in `commands.rs` no longer even accepts a `round` parameter at all).
 ///
-/// Ordering matters here and is deliberate: the idempotent existing-
-/// confirmation lookup runs *before* the state/action/evidence gate, not
-/// after — a second, genuinely-duplicate confirmation request arriving
-/// after the first one already resumed the task (moving it away from
-/// `needs_user_action`) must still succeed by returning the same real
-/// confirmation, not fail on "task is not needs_user_action anymore". Only
-/// when no confirmation exists yet does this enforce the full gate before
-/// ever writing one.
+/// A thin public entry point — all of the actual coordination logic lives
+/// in [`reconcile_no_build_confirmation`], named separately because it is
+/// deliberately re-entrant: every call (the genuine first request *and*
+/// every retry) runs the exact same function, which starts by asking "how
+/// much of this operation has already happened?" rather than assuming a
+/// found confirmation row means the whole operation is done.
 pub fn confirm_no_build_applicable(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    reason: Option<&str>,
+) -> NovaResult<crate::models::NoBuildConfirmation> {
+    reconcile_no_build_confirmation(db, project_id, task_id, reason)
+}
+
+/// Codex re-review remediation (fourth re-review): recovers from the exact
+/// half-success window the third re-review's implementation could get
+/// stuck in — `record_no_build_confirmation` succeeding but the
+/// reset-build-action-then-transition-task sequence that used to follow it
+/// (previously factored into a small `unblock_build_execution_for_retry`
+/// helper, now folded directly into this function so it can be re-driven
+/// step by step) failing partway (a crash, a database error, the process
+/// being killed) before completing. That implementation's idempotent
+/// lookup treated
+/// "a confirmation row exists" as synonymous with "the whole operation
+/// finished", so a retry after a partial failure would hit the early
+/// return and the task would stay stuck at `needs_user_action` forever
+/// despite a confirmation already sitting in the database.
+///
+/// The fix: **a found confirmation is not evidence of completion** — it
+/// only tells this function which `(result_generation, round)` to keep
+/// coordinating for the *build action* and *task state*, which are
+/// re-inspected fresh on every call. Every step below is naturally
+/// idempotent and safe to re-run:
+///
+/// - Writing the confirmation row (`Database::record_no_build_confirmation`)
+///   is itself `INSERT ... ON CONFLICT DO NOTHING` + re-select by natural
+///   key — safe to attempt again even if it already happened.
+/// - Resetting the build action (`reset_failed_action_for_retry`) only
+///   touches a row whose status is still exactly `failed`; once reset, a
+///   second attempt is a real no-op (its own `WHERE status = 'failed'`
+///   guard matches zero rows).
+/// - Transitioning the task only fires while it is still exactly
+///   `needs_user_action`; once moved on, a second attempt correctly does
+///   nothing.
+///
+/// This means a caller can retry this function an unbounded number of
+/// times after a crash at *any* point in the sequence — the very next call
+/// picks up from wherever the database actually is and drives forward only
+/// the steps that are still outstanding, converging on the same terminal
+/// state a single uninterrupted call would have reached. No SQLite
+/// transaction spans the whole sequence; correctness comes from every
+/// individual step being independently atomic (each is its own single
+/// `UPDATE`/`INSERT` or `Database::transition_task`'s own already-atomic
+/// state+event write) plus this function never trusting "a row exists" as
+/// a substitute for re-checking the real, current state of everything else
+/// before deciding what (if anything) is left to do.
+///
+/// Fails closed (returns `Err`, touches nothing) whenever the database
+/// holds a combination that could not have arisen from this function's own
+/// normal operation — e.g. a build action still `Failed` but carrying a
+/// different marker than the one this confirmation is supposed to answer
+/// for, or a task sitting in a state earlier than `needs_user_action` was
+/// ever reachable from once a build stall (and therefore this
+/// confirmation) could exist at all.
+fn reconcile_no_build_confirmation(
     db: &Database,
     project_id: &str,
     task_id: &str,
@@ -787,65 +810,130 @@ pub fn confirm_no_build_applicable(
     }
     let result_generation = task.result_generation;
     let round = current_pending_round(db, project_id, task_id)?;
-
-    // Idempotent fast path: a real, already-recorded confirmation for this
-    // exact (task_id, result_generation, round) is returned as-is, with no
-    // further state mutation — repeated confirmations (including two
-    // concurrent requests racing each other under `AppState.db`'s mutex)
-    // never create a second row, never re-transition the task, and never
-    // reset the build action a second time.
-    if let Some(existing) =
-        db.find_no_build_confirmation(project_id, task_id, result_generation, round)?
-    {
-        return Ok(existing);
-    }
-
-    if task.state != TaskState::NeedsUserAction {
-        return Err(NovaError::Config(format!(
-            "只有任务处于 needs_user_action 状态时才能确认无需构建，当前状态：{}",
-            task.state
-        )));
-    }
-
-    // The current stall must genuinely, structurally be "build detection
-    // could not determine an answer" — never a real build failure,
-    // timeout, cancellation, or allowlist rejection wearing the same
-    // `insufficient_evidence` evidence status.
     let build_key = build_action_key(task_id, result_generation, round);
-    let action = db.find_action(task_id, &build_key)?.ok_or_else(|| {
-        NovaError::Config("当前不存在待确认的构建检测停滞，拒绝记录确认".to_string())
-    })?;
-    if action.status != ActionStatus::Failed
-        || action.error_summary.as_deref() != Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER)
-    {
-        return Err(NovaError::Config(
-            "当前卡点不是构建检测无法判断，拒绝记录无需构建确认".to_string(),
-        ));
-    }
-    // Defense in depth: the independently-recorded build evidence for this
-    // exact generation/round must also agree.
-    let evidence_ok = db
-        .list_build_evidence_for_round(project_id, task_id, result_generation, round)?
-        .iter()
-        .any(|e| e.status == "insufficient_evidence");
-    if !evidence_ok {
-        return Err(NovaError::Config(
-            "找不到匹配的构建证据不足记录，拒绝记录无需构建确认".to_string(),
-        ));
+
+    let confirmation =
+        match db.find_no_build_confirmation(project_id, task_id, result_generation, round)? {
+            Some(existing) => existing,
+            None => {
+                // Case A (first genuine request): the full gate — never
+                // skipped, never weakened, identical to the third re-review's
+                // implementation — must hold before a confirmation is ever
+                // written for the first time.
+                if task.state != TaskState::NeedsUserAction {
+                    return Err(NovaError::Config(format!(
+                        "只有任务处于 needs_user_action 状态时才能确认无需构建，当前状态：{}",
+                        task.state
+                    )));
+                }
+                let action = db.find_action(task_id, &build_key)?.ok_or_else(|| {
+                    NovaError::Config("当前不存在待确认的构建检测停滞，拒绝记录确认".to_string())
+                })?;
+                if action.status != ActionStatus::Failed
+                    || action.error_summary.as_deref()
+                        != Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER)
+                {
+                    return Err(NovaError::Config(
+                        "当前卡点不是构建检测无法判断，拒绝记录无需构建确认".to_string(),
+                    ));
+                }
+                let evidence_ok = db
+                    .list_build_evidence_for_round(project_id, task_id, result_generation, round)?
+                    .iter()
+                    .any(|e| e.status == "insufficient_evidence");
+                if !evidence_ok {
+                    return Err(NovaError::Config(
+                        "找不到匹配的构建证据不足记录，拒绝记录无需构建确认".to_string(),
+                    ));
+                }
+                let effective_reason = match reason.map(str::trim) {
+                    Some(text) if !text.is_empty() => cap_text(text, MAX_NO_BUILD_REASON_LEN),
+                    _ => "用户确认该项目当前无需构建（未提供具体原因）".to_string(),
+                };
+                db.record_no_build_confirmation(
+                    project_id,
+                    task_id,
+                    result_generation,
+                    round,
+                    Some(&effective_reason),
+                )?
+            }
+        };
+
+    // From here on, whether this call just wrote the confirmation (case A)
+    // or found one already sitting there (cases B–F), the rest is the
+    // exact same "finish whatever is left" coordination — re-inspecting
+    // the real, current build action and task state rather than assuming
+    // anything about how far a prior attempt got.
+    if let Some(action) = db.find_action(task_id, &build_key)? {
+        if action.status == ActionStatus::Failed {
+            // Case B: the confirmation exists but the build action was
+            // never reset — a prior attempt crashed between writing the
+            // confirmation and resetting the action. Fail closed if the
+            // action's own marker no longer matches what this
+            // confirmation is supposed to be answering for (should not
+            // happen in normal operation; only reachable via external
+            // tampering or a genuine bug elsewhere) rather than blindly
+            // resetting an action this confirmation was never actually
+            // validated against.
+            if action.error_summary.as_deref()
+                != Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER)
+            {
+                return Err(NovaError::Config(
+                    "构建动作当前状态与已记录的无需构建确认不一致，拒绝继续，请人工检查"
+                        .to_string(),
+                ));
+            }
+            db.reset_failed_action_for_retry(task_id, &build_key)?;
+        }
+        // Any other status (Planned/Started/Succeeded/Cancelled/
+        // Uncertain) means the reset already happened (case C/D/E) or is
+        // not this function's concern anymore — nothing further to do to
+        // the action itself.
     }
 
-    let effective_reason = match reason.map(str::trim) {
-        Some(text) if !text.is_empty() => cap_text(text, MAX_NO_BUILD_REASON_LEN),
-        _ => "用户确认该项目当前无需构建（未提供具体原因）".to_string(),
-    };
-    let confirmation = db.record_no_build_confirmation(
-        project_id,
-        task_id,
-        result_generation,
-        round,
-        Some(&effective_reason),
-    )?;
-    unblock_build_execution_for_retry(db, task_id, result_generation, round)?;
+    let task = db.task(task_id)?;
+    match task.state {
+        TaskState::NeedsUserAction => {
+            // Case B (just reset above) or Case C: the action side is
+            // settled: resume the task exactly the same way a single,
+            // uninterrupted first call always has.
+            db.transition_task(
+                task_id,
+                TaskState::Queued,
+                Actor::User,
+                Some("用户已确认该项目当前无需构建，重新排队等待继续"),
+                None,
+                false,
+                None,
+            )?;
+        }
+        TaskState::Draft | TaskState::AwaitingConfirmation | TaskState::Confirmed => {
+            // Case F: a task that has ever reached a genuine build stall
+            // (and therefore could ever have a real no-build confirmation
+            // for it) can never legally be sitting in one of these three
+            // *earlier-than-ever-started* states — no transition edge
+            // leads back to any of them from `needs_user_action` or
+            // anything reachable after it. A confirmation existing
+            // alongside one of these states is a data inconsistency, not
+            // a legitimate "already resumed further" case — fail closed
+            // rather than silently pretending everything is fine.
+            return Err(NovaError::Config(
+                "任务当前状态与已存在的无需构建确认不一致（该状态不可能晚于确认发生），拒绝继续"
+                    .to_string(),
+            ));
+        }
+        _ => {
+            // Cases D/E: Queued/Running/Verifying/SafeFixing/PreviewReady/
+            // AwaitingUserAcceptance/Completed/Interrupted/Failed/
+            // Cancelled — the task has already legitimately continued (or
+            // terminated) past the point this confirmation unblocked.
+            // Never roll it back, never reset anything, never repeat any
+            // work — this is simply a repeated/late request for an
+            // operation that already finished.
+        }
+    }
+
     Ok(confirmation)
 }
 
@@ -4552,6 +4640,957 @@ mod tests {
                 .is_some_and(|r| !r.trim().is_empty()),
             "an empty/whitespace-only reason must be replaced with a safe default explanation"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Codex re-review remediation (fourth re-review, the final Major):
+    // half-success recovery for `reconcile_no_build_confirmation`. Every
+    // test below constructs a confirmation row directly via
+    // `db.record_no_build_confirmation` (never through
+    // `confirm_no_build_applicable`) to stand in for a prior call that
+    // wrote the confirmation and then crashed before finishing the
+    // reset/transition steps — exactly the half-success window the fourth
+    // re-review's Major identified. ---------------------------------------
+
+    #[test]
+    fn confirm_no_build_applicable_recovers_when_confirmation_written_but_reset_and_transition_never_ran(
+    ) {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nr-case-b-full-repair", "codex_cli");
+        let build_key = build_action_key(&task_id, 0, 1);
+        let seeded = db
+            .record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("half-success seed"))
+            .unwrap();
+        assert_eq!(
+            db.find_action(&task_id, &build_key)
+                .unwrap()
+                .unwrap()
+                .status,
+            ActionStatus::Failed
+        );
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::NeedsUserAction);
+
+        let recovered =
+            confirm_no_build_applicable(&db, &project_id, &task_id, Some("retry")).unwrap();
+        assert_eq!(
+            recovered.id, seeded.id,
+            "recovery must return the exact same confirmation row that already existed, never a new one"
+        );
+        assert_eq!(
+            db.find_action(&task_id, &build_key)
+                .unwrap()
+                .unwrap()
+                .status,
+            ActionStatus::Planned,
+            "the build action must be reset even though the confirmation already existed"
+        );
+        assert_eq!(
+            db.task(&task_id).unwrap().state,
+            TaskState::Queued,
+            "the task must be transitioned even though the confirmation already existed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_recovers_when_reset_done_but_transition_never_ran() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nr-case-c-transition-only", "codex_cli");
+        let build_key = build_action_key(&task_id, 0, 1);
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("half-success seed"))
+            .unwrap();
+        db.reset_failed_action_for_retry(&task_id, &build_key)
+            .unwrap();
+        let action_before = db.find_action(&task_id, &build_key).unwrap().unwrap();
+        assert_eq!(action_before.status, ActionStatus::Planned);
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::NeedsUserAction);
+
+        confirm_no_build_applicable(&db, &project_id, &task_id, Some("retry")).unwrap();
+
+        let action_after = db.find_action(&task_id, &build_key).unwrap().unwrap();
+        assert_eq!(
+            action_after.attempt_number, action_before.attempt_number,
+            "an already-reset action must never be reset a second time"
+        );
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::Queued);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_is_a_safe_no_op_when_reset_and_transition_already_done() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nr-case-d-full-noop", "codex_cli");
+        let build_key = build_action_key(&task_id, 0, 1);
+        let seeded = db
+            .record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("already complete"))
+            .unwrap();
+        db.reset_failed_action_for_retry(&task_id, &build_key)
+            .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let action_before = db.find_action(&task_id, &build_key).unwrap().unwrap();
+
+        let result =
+            confirm_no_build_applicable(&db, &project_id, &task_id, Some("retry")).unwrap();
+        assert_eq!(result.id, seeded.id);
+
+        let action_after = db.find_action(&task_id, &build_key).unwrap().unwrap();
+        assert_eq!(action_after.attempt_number, action_before.attempt_number);
+        assert_eq!(
+            db.task(&task_id).unwrap().state,
+            TaskState::Queued,
+            "a fully-complete operation must never be rolled back or repeated"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_does_not_roll_back_a_task_already_running() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nr-case-e-running", "codex_cli");
+        let build_key = build_action_key(&task_id, 0, 1);
+        let seeded = db
+            .record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        db.reset_failed_action_for_retry(&task_id, &build_key)
+            .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let action_before = db.find_action(&task_id, &build_key).unwrap().unwrap();
+
+        let result = confirm_no_build_applicable(&db, &project_id, &task_id, None).unwrap();
+        assert_eq!(result.id, seeded.id);
+
+        assert_eq!(
+            db.task(&task_id).unwrap().state,
+            TaskState::Running,
+            "a duplicate request must never roll a running task back"
+        );
+        let action_after = db.find_action(&task_id, &build_key).unwrap().unwrap();
+        assert_eq!(action_after.attempt_number, action_before.attempt_number);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_does_not_roll_back_a_task_already_preview_ready() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nr-case-e-preview-ready", "codex_cli");
+        let build_key = build_action_key(&task_id, 0, 1);
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        db.reset_failed_action_for_retry(&task_id, &build_key)
+            .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Verifying,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::PreviewReady,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let action_before = db.find_action(&task_id, &build_key).unwrap().unwrap();
+        let confirmation_count_before: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM no_build_confirmations WHERE task_id = ?1",
+                rusqlite::params![task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // A confirmation legitimately tied to generation 0 no longer
+        // applies once `preview_ready` bumps the task into generation 1 —
+        // a duplicate/late request at this point correctly finds nothing
+        // to reuse for the new generation and refuses to fabricate a fresh
+        // confirmation against a task that is no longer
+        // `needs_user_action`, rather than silently pretending success.
+        let result = confirm_no_build_applicable(&db, &project_id, &task_id, None);
+        assert!(
+            result.is_err(),
+            "a stale duplicate request must fail closed once the task has moved to a new \
+             generation, never silently succeed"
+        );
+
+        assert_eq!(
+            db.task(&task_id).unwrap().state,
+            TaskState::PreviewReady,
+            "must never roll back an already-preview-ready task"
+        );
+        let action_after = db.find_action(&task_id, &build_key).unwrap().unwrap();
+        assert_eq!(action_after.attempt_number, action_before.attempt_number);
+        assert_eq!(action_after.status, action_before.status);
+        let confirmation_count_after: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM no_build_confirmations WHERE task_id = ?1",
+                rusqlite::params![task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            confirmation_count_before, confirmation_count_after,
+            "must never fabricate a new confirmation row either"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_does_not_roll_back_a_completed_task() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nr-case-e-completed", "codex_cli");
+        let build_key = build_action_key(&task_id, 0, 1);
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        db.reset_failed_action_for_retry(&task_id, &build_key)
+            .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Verifying,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::PreviewReady,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::AwaitingUserAcceptance,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.record_user_acceptance(&project_id, &task_id, true, None)
+            .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Completed,
+            Actor::User,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let action_before = db.find_action(&task_id, &build_key).unwrap().unwrap();
+
+        let result = confirm_no_build_applicable(&db, &project_id, &task_id, None);
+        assert!(
+            result.is_err(),
+            "must never allow re-confirmation once a task is completed"
+        );
+
+        assert_eq!(
+            db.task(&task_id).unwrap().state,
+            TaskState::Completed,
+            "must never roll back a completed task"
+        );
+        let action_after = db.find_action(&task_id, &build_key).unwrap().unwrap();
+        assert_eq!(action_after.attempt_number, action_before.attempt_number);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_repairs_a_reset_that_never_happened() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nr-repair-reset", "codex_cli");
+        let build_key = build_action_key(&task_id, 0, 1);
+        db.record_no_build_confirmation(
+            &project_id,
+            &task_id,
+            0,
+            1,
+            Some("crashed right after this write"),
+        )
+        .unwrap();
+        let action_before = db.find_action(&task_id, &build_key).unwrap().unwrap();
+        assert_eq!(action_before.status, ActionStatus::Failed);
+        assert_eq!(
+            action_before.error_summary.as_deref(),
+            Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER)
+        );
+
+        confirm_no_build_applicable(&db, &project_id, &task_id, Some("retry after crash")).unwrap();
+
+        let action_after = db.find_action(&task_id, &build_key).unwrap().unwrap();
+        assert_eq!(
+            action_after.status,
+            ActionStatus::Planned,
+            "a retry must repair a reset that never ran the first time"
+        );
+        assert_eq!(
+            action_after.attempt_number,
+            action_before.attempt_number + 1,
+            "the repair must go through the real reset path, bumping attempt_number, never a \
+             raw status overwrite"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_repairs_a_transition_that_never_happened() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nr-repair-transition", "codex_cli");
+        let build_key = build_action_key(&task_id, 0, 1);
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("crashed after reset"))
+            .unwrap();
+        db.reset_failed_action_for_retry(&task_id, &build_key)
+            .unwrap();
+        // The task's original run through `stall_task_at_round_1_build_
+        // insufficient` already recorded one `-> queued` event of its own
+        // (`confirmed -> queued`, before it ever reached the build stall)
+        // — the sanity check below must compare against that baseline
+        // count, not assume zero.
+        let events_before: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM task_state_events WHERE task_id = ?1 AND new_state = 'queued'",
+                rusqlite::params![task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            db.task(&task_id).unwrap().state,
+            TaskState::NeedsUserAction,
+            "sanity check: the repair transition genuinely never happened yet"
+        );
+
+        confirm_no_build_applicable(&db, &project_id, &task_id, Some("retry after crash")).unwrap();
+
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::Queued);
+        let events_after: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM task_state_events WHERE task_id = ?1 AND new_state = 'queued'",
+                rusqlite::params![task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            events_after,
+            events_before + 1,
+            "the repair must go through the real state machine (transition_task), leaving a \
+             genuine new audit event, never a raw UPDATE"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_retry_never_inserts_a_second_confirmation_row() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nr-no-duplicate-insert", "codex_cli");
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("seed"))
+            .unwrap();
+
+        for _ in 0..3 {
+            confirm_no_build_applicable(&db, &project_id, &task_id, Some("retry")).unwrap();
+        }
+
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM no_build_confirmations WHERE task_id = ?1",
+                rusqlite::params![task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "repeated recovery retries must never create a second confirmation row"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_retry_never_resets_the_test_action() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nr-no-reset-test-action", "codex_cli");
+        let test_key = format!("test-{task_id}-round-1");
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        let test_action_before = db.find_action(&task_id, &test_key).unwrap().unwrap();
+        assert_eq!(test_action_before.status, ActionStatus::Succeeded);
+
+        confirm_no_build_applicable(&db, &project_id, &task_id, None).unwrap();
+
+        let test_action_after = db.find_action(&task_id, &test_key).unwrap().unwrap();
+        assert_eq!(test_action_after.status, ActionStatus::Succeeded);
+        assert_eq!(
+            test_action_after.attempt_number, test_action_before.attempt_number,
+            "recovering a half-success build confirmation must never touch the already-succeeded \
+             test action"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_retry_never_resets_the_dev_action() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nr-no-reset-dev-action", "codex_cli");
+        let dev_key = format!("dev-{task_id}-round-1");
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        let dev_action_before = db.find_action(&task_id, &dev_key).unwrap().unwrap();
+        assert_eq!(dev_action_before.status, ActionStatus::Succeeded);
+
+        confirm_no_build_applicable(&db, &project_id, &task_id, None).unwrap();
+
+        let dev_action_after = db.find_action(&task_id, &dev_key).unwrap().unwrap();
+        assert_eq!(dev_action_after.status, ActionStatus::Succeeded);
+        assert_eq!(
+            dev_action_after.attempt_number, dev_action_before.attempt_number,
+            "recovering a half-success build confirmation must never touch the already-succeeded \
+             dev action"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_retry_and_resume_never_triggers_a_third_development_call() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nr-no-third-dev-call-recovery", "codex_cli");
+        db.record_no_build_confirmation(
+            &project_id,
+            &task_id,
+            0,
+            1,
+            Some("crashed before reset/transition"),
+        )
+        .unwrap();
+
+        confirm_no_build_applicable(&db, &project_id, &task_id, Some("retry")).unwrap();
+
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+        let resumed = run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+        assert_eq!(resumed.task.state, TaskState::AwaitingUserAcceptance);
+        assert_eq!(
+            adapter.development_call_count(),
+            0,
+            "recovering a half-success confirmation and resuming must never repeat development"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_retry_and_resume_never_reruns_an_already_successful_test() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nr-no-rerun-test-recovery", "codex_cli");
+        let test_evidence_before = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(test_evidence_before.len(), 1);
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+
+        confirm_no_build_applicable(&db, &project_id, &task_id, None).unwrap();
+        let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+        run_core_loop(
+            &db,
+            &task_id,
+            &adapter,
+            &CancellationToken::new(),
+            &test_app_data_dir(),
+        )
+        .unwrap();
+
+        let test_evidence_after = db
+            .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(
+            test_evidence_after.len(),
+            1,
+            "recovering and resuming must never re-run the already-succeeded test step"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_retry_never_reruns_an_already_successful_round_1_build() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_2_build_insufficient("nr-no-rerun-round1-build", "codex_cli");
+        let round1_build_key = build_action_key(&task_id, 0, 1);
+        let round1_action_before = db
+            .find_action(&task_id, &round1_build_key)
+            .unwrap()
+            .unwrap();
+        let round1_evidence_before = db
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 2, None)
+            .unwrap();
+
+        confirm_no_build_applicable(&db, &project_id, &task_id, None).unwrap();
+
+        let round1_action_after = db
+            .find_action(&task_id, &round1_build_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            round1_action_after.attempt_number, round1_action_before.attempt_number,
+            "recovering round 2's confirmation must never touch round 1's already-succeeded \
+             build action"
+        );
+        let round1_evidence_after = db
+            .list_build_evidence_for_round(&project_id, &task_id, 0, 1)
+            .unwrap();
+        assert_eq!(round1_evidence_before.len(), round1_evidence_after.len());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_fails_closed_on_a_generation_mismatch() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nr-wrong-generation", "codex_cli");
+        // A confirmation genuinely exists for the task's real generation
+        // (0)/round (1) combination...
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        // ...but the task's own `result_generation` is then externally
+        // corrupted to a value that does not match where the real stalled
+        // build action and confirmation actually live — simulating a data
+        // inconsistency, never something `reconcile_no_build_confirmation`
+        // itself could produce.
+        db.conn()
+            .execute(
+                "UPDATE tasks SET result_generation = 3 WHERE id = ?1",
+                rusqlite::params![task_id],
+            )
+            .unwrap();
+
+        let result = confirm_no_build_applicable(&db, &project_id, &task_id, None);
+        assert!(
+            result.is_err(),
+            "a generation that does not match any real stalled build action must fail closed, \
+             never fabricate a confirmation"
+        );
+
+        assert_eq!(
+            db.task(&task_id).unwrap().state,
+            TaskState::NeedsUserAction,
+            "a failed-closed rejection must never itself change task state"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_fails_closed_on_a_round_mismatch() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nr-wrong-round", "codex_cli");
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        // Seed a round-2 development action directly — this alone makes
+        // `current_pending_round` compute round 2 on the very next call,
+        // even though the real stalled build action and confirmation are
+        // for round 1. A genuine round 2 would never exist without round
+        // 1 having first succeeded (dev/test/build) or been confirmed
+        // no-build — this row exists only to construct the mismatch.
+        let round2_dev_key = format!("dev-{task_id}-round-2");
+        db.plan_action(&task_id, "ai_development", &round2_dev_key)
+            .unwrap();
+
+        let result = confirm_no_build_applicable(&db, &project_id, &task_id, None);
+        assert!(
+            result.is_err(),
+            "a round that does not match any real stalled build action must fail closed"
+        );
+
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::NeedsUserAction);
+        let round1_build_key = build_action_key(&task_id, 0, 1);
+        assert_eq!(
+            db.find_action(&task_id, &round1_build_key)
+                .unwrap()
+                .unwrap()
+                .status,
+            ActionStatus::Failed,
+            "round 1's real stalled action must be left untouched by a round-2-scoped rejection"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_fails_closed_when_the_failed_action_marker_does_not_match() {
+        // Constructed directly at the Action Ledger level (not via a
+        // genuine `run_build_for_round` stall): a build action that is
+        // `failed` for some unrelated reason, alongside a confirmation row
+        // that should never have been possible to create for it —
+        // simulating external tampering or a bug elsewhere, never
+        // something this function's own Case A gate could produce (that
+        // gate already requires the exact marker before ever writing a
+        // confirmation).
+        let dir = git_project_dir("nr-wrong-marker");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        db.transition_task(
+            &task_id,
+            TaskState::Queued,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::Running,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let build_key = build_action_key(&task_id, 0, 1);
+        db.plan_action(&task_id, "build_execution", &build_key)
+            .unwrap();
+        db.start_action(&task_id, &build_key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &build_key,
+            ActionStatus::Failed,
+            None,
+            Some("build command not allowlisted"),
+        )
+        .unwrap();
+        db.transition_task(
+            &task_id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+
+        let result = confirm_no_build_applicable(&db, &project_id, &task_id, None);
+        assert!(
+            result.is_err(),
+            "a failed action whose marker does not match must fail closed, never be silently \
+             reset"
+        );
+
+        let action_after = db.find_action(&task_id, &build_key).unwrap().unwrap();
+        assert_eq!(
+            action_after.status,
+            ActionStatus::Failed,
+            "must never reset an action whose marker does not match the confirmation it \
+             supposedly answers for"
+        );
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::NeedsUserAction);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_fails_closed_on_a_confirmation_project_mismatch() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_build_insufficient("nr-wrong-project", "codex_cli");
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        let other_dir = temp_dir("nr-wrong-project-other");
+        let other_project = db
+            .create_project(&CreateProjectRequest {
+                name: "Other".to_string(),
+                local_path: other_dir.to_string_lossy().into_owned(),
+                source_type: "local".to_string(),
+                source_url: None,
+                purpose: None,
+                long_term_goal: None,
+                user_preferences: None,
+                prohibitions: None,
+            })
+            .unwrap();
+
+        let result = confirm_no_build_applicable(&db, &other_project.id, &task_id, None);
+        assert!(
+            result.is_err(),
+            "a project_id that does not own the task must be rejected even during recovery, \
+             never silently reconciled"
+        );
+
+        let build_key = build_action_key(&task_id, 0, 1);
+        assert_eq!(
+            db.find_action(&task_id, &build_key)
+                .unwrap()
+                .unwrap()
+                .status,
+            ActionStatus::Failed,
+            "a rejected cross-project request must never touch the real task's build action"
+        );
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::NeedsUserAction);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&other_dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_two_concurrent_requests_converge_to_the_same_complete_final_state(
+    ) {
+        // Beyond `confirm_no_build_applicable_two_concurrent_requests_
+        // produce_at_most_one_row` (which only proves row-count safety):
+        // both racing requests must converge on the same *complete*
+        // business state — the task actually unblocked and the build
+        // action actually reset — not merely on a single confirmation row.
+        let dir = temp_dir("nr-concurrent-converge");
+        let db_path = dir.join("nova.sqlite3");
+        let db1 = Database::open(&db_path).unwrap();
+        db1.migrate().unwrap();
+        let project = db1
+            .create_project(&CreateProjectRequest {
+                name: "P".to_string(),
+                local_path: dir.to_string_lossy().into_owned(),
+                source_type: "local".to_string(),
+                source_url: None,
+                purpose: None,
+                long_term_goal: None,
+                user_preferences: None,
+                prohibitions: None,
+            })
+            .unwrap();
+        let task = db1
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "T".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: Some("codex_cli".to_string()),
+                },
+                Actor::User,
+            )
+            .unwrap();
+        for state in [
+            TaskState::AwaitingConfirmation,
+            TaskState::Confirmed,
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::Verifying,
+        ] {
+            db1.transition_task(&task.id, state, Actor::User, None, None, false, None)
+                .unwrap();
+        }
+        let build_key = build_action_key(&task.id, 0, 1);
+        db1.plan_action(&task.id, "build_execution", &build_key)
+            .unwrap();
+        db1.start_action(&task.id, &build_key, false).unwrap();
+        db1.finish_action(
+            &task.id,
+            &build_key,
+            ActionStatus::Failed,
+            None,
+            Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER),
+        )
+        .unwrap();
+        db1.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+            project_id: &project.id,
+            task_id: &task.id,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: None,
+            status: "insufficient_evidence",
+            exit_code: None,
+            reason: Some("未识别到已知的项目类型"),
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        db1.transition_task(
+            &task.id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let project_id_a = project.id.clone();
+        let task_id_a = task.id.clone();
+        let db_path_a = db_path.clone();
+        let handle_a = thread::spawn(move || {
+            let db = Database::open(&db_path_a).unwrap();
+            confirm_no_build_applicable(&db, &project_id_a, &task_id_a, Some("from thread A"))
+        });
+        let project_id_b = project.id.clone();
+        let task_id_b = task.id.clone();
+        let db_path_b = db_path.clone();
+        let handle_b = thread::spawn(move || {
+            let db = Database::open(&db_path_b).unwrap();
+            confirm_no_build_applicable(&db, &project_id_b, &task_id_b, Some("from thread B"))
+        });
+        let confirmation_a = handle_a.join().unwrap().expect("thread A must succeed");
+        let confirmation_b = handle_b.join().unwrap().expect("thread B must succeed");
+        assert_eq!(confirmation_a.id, confirmation_b.id);
+
+        assert_eq!(
+            db1.task(&task.id).unwrap().state,
+            TaskState::Queued,
+            "both concurrent requests must converge on the task actually being unblocked, not \
+             just a confirmation row existing"
+        );
+        let action_after = db1.find_action(&task.id, &build_key).unwrap().unwrap();
+        assert_eq!(
+            action_after.status,
+            ActionStatus::Planned,
+            "both concurrent requests must converge on the build action actually being reset"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_no_build_applicable_can_reconcile_a_half_success_state_after_reopening_the_database()
+    {
+        let dir = temp_dir("nr-restart-recovery");
+        let db_path = dir.join("nova.sqlite3");
+        let db1 = Database::open(&db_path).unwrap();
+        db1.migrate().unwrap();
+        let project = db1
+            .create_project(&CreateProjectRequest {
+                name: "P".to_string(),
+                local_path: dir.to_string_lossy().into_owned(),
+                source_type: "local".to_string(),
+                source_url: None,
+                purpose: None,
+                long_term_goal: None,
+                user_preferences: None,
+                prohibitions: None,
+            })
+            .unwrap();
+        let task = db1
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project.id.clone(),
+                    title: "T".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: Some("codex_cli".to_string()),
+                },
+                Actor::User,
+            )
+            .unwrap();
+        for state in [
+            TaskState::AwaitingConfirmation,
+            TaskState::Confirmed,
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::Verifying,
+        ] {
+            db1.transition_task(&task.id, state, Actor::User, None, None, false, None)
+                .unwrap();
+        }
+        let build_key = build_action_key(&task.id, 0, 1);
+        db1.plan_action(&task.id, "build_execution", &build_key)
+            .unwrap();
+        db1.start_action(&task.id, &build_key, false).unwrap();
+        db1.finish_action(
+            &task.id,
+            &build_key,
+            ActionStatus::Failed,
+            None,
+            Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER),
+        )
+        .unwrap();
+        db1.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+            project_id: &project.id,
+            task_id: &task.id,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: None,
+            status: "insufficient_evidence",
+            exit_code: None,
+            reason: Some("未识别到已知的项目类型"),
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        db1.transition_task(
+            &task.id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        // The confirmation write "succeeded" (step 3) but the process is
+        // simulated to have stopped here — the reset and transition never
+        // ran, and the app is now "restarted": `db1` is dropped and a
+        // brand new `Database` handle is opened against the same on-disk
+        // file.
+        let seeded = db1
+            .record_no_build_confirmation(&project.id, &task.id, 0, 1, Some("before restart"))
+            .unwrap();
+        drop(db1);
+
+        let db2 = Database::open(&db_path).unwrap();
+        let recovered =
+            confirm_no_build_applicable(&db2, &project.id, &task.id, Some("after restart"))
+                .unwrap();
+        assert_eq!(
+            recovered.id, seeded.id,
+            "recovery after a restart must return the same confirmation row that survived on disk"
+        );
+        assert_eq!(
+            db2.task(&task.id).unwrap().state,
+            TaskState::Queued,
+            "recovery after a restart must still complete the reset and transition"
+        );
+        let action_after = db2.find_action(&task.id, &build_key).unwrap().unwrap();
+        assert_eq!(action_after.status, ActionStatus::Planned);
         let _ = fs::remove_dir_all(&dir);
     }
 

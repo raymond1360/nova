@@ -8917,7 +8917,7 @@ mod tests {
     #[test]
     fn every_transition_the_core_loop_performs_uses_a_backend_actor_never_user() {
         let dir = git_project_dir("actor-boundary");
-        let (db, _project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
         let adapter = MockAdapter::new(
             vec![MockOutcome::Success, MockOutcome::Success],
             vec![ReviewVerdict::ChangesRequired, ReviewVerdict::Approve],
@@ -8931,7 +8931,7 @@ mod tests {
         )
         .unwrap();
 
-        let events = db.list_task_state_events(&task_id).unwrap();
+        let events = db.list_task_state_events(&project_id, &task_id).unwrap();
         // Every event written *by this run* (after the two initial
         // user-driven confirmation transitions) must be System/Nova, never
         // User — the core loop itself never has a way to impersonate the
@@ -9102,7 +9102,7 @@ mod tests {
     #[test]
     fn cancelling_while_the_developer_ai_is_running_is_recorded_as_cancelled_not_failed() {
         let dir = git_project_dir("cancel-during-dev");
-        let (db, _project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
         let cancel = CancellationToken::new();
         let cancel_for_effect = cancel.clone();
@@ -9122,7 +9122,7 @@ mod tests {
             0,
             "a cancelled developer step must never reach the reviewer"
         );
-        let events = db.list_task_state_events(&task_id).unwrap();
+        let events = db.list_task_state_events(&project_id, &task_id).unwrap();
         assert_eq!(events.last().unwrap().new_state, TaskState::Cancelled);
         let _ = fs::remove_dir_all(&dir);
     }

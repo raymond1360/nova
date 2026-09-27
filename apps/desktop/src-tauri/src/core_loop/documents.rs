@@ -245,20 +245,102 @@ pub(crate) fn adopted_passing_generation_round(
             continue;
         }
         for round in [1_i64, 2] {
-            let test_ok = db
-                .list_test_evidence_for_round(project_id, task_id, generation, round)?
-                .iter()
-                .any(|e| e.status == "passed" || e.status == "no_tests_applicable");
-            let build_ok = db
-                .list_build_evidence_for_round(project_id, task_id, generation, round)?
-                .iter()
-                .any(|e| e.status == "passed" || e.status == "no_build_applicable");
+            let mut test_ok = false;
+            for evidence in
+                db.list_test_evidence_for_round(project_id, task_id, generation, round)?
+            {
+                if evidence.status == "passed" {
+                    test_ok = true;
+                    break;
+                }
+                if evidence.status == "no_tests_applicable"
+                    && no_tests_applicable_is_authorized(
+                        db, project_id, task_id, generation, round,
+                    )?
+                {
+                    test_ok = true;
+                    break;
+                }
+            }
+            let mut build_ok = false;
+            for evidence in
+                db.list_build_evidence_for_round(project_id, task_id, generation, round)?
+            {
+                if evidence.status == "passed" {
+                    build_ok = true;
+                    break;
+                }
+                if evidence.status == "no_build_applicable"
+                    && no_build_applicable_is_authorized(
+                        db, project_id, task_id, generation, round,
+                    )?
+                {
+                    build_ok = true;
+                    break;
+                }
+            }
             if test_ok && build_ok {
                 return Ok(Some((generation, round)));
             }
         }
     }
     Ok(None)
+}
+
+/// Phase 4 remediation (Major 2): `no_tests_applicable` evidence status
+/// string alone is never authorization — it is legitimate only when a real
+/// `no_tests_confirmations` row exists for this *exact*
+/// `(project_id, task_id, result_generation, round)` natural key. Unlike
+/// build (see [`no_build_applicable_is_authorized`]), test detection
+/// (`test_runner::detect_test_command`) has no mechanical "positively
+/// confirmed no tests apply" case — a missing test command is always either
+/// a genuine detection gap awaiting confirmation, or nothing at all — so
+/// this check alone is complete for tests, with no fallback needed.
+pub(crate) fn no_tests_applicable_is_authorized(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    result_generation: i64,
+    round: i64,
+) -> NovaResult<bool> {
+    Ok(db
+        .find_no_tests_confirmation(project_id, task_id, result_generation, round)?
+        .is_some())
+}
+
+/// Phase 4 remediation (Major 2): the build equivalent of
+/// [`no_tests_applicable_is_authorized`], with one deliberate addition —
+/// `no_build_applicable` has two distinct legitimate origins (see
+/// `Database::record_build_evidence`'s own doc comment for the full
+/// audit): a real `no_build_confirmations` row for this exact key, **or**
+/// Nova's own current, mechanical re-derivation
+/// (`test_runner::detect_build_command`) independently and positively
+/// confirming this project's build step genuinely does not apply, exactly
+/// mirroring the same check `core_loop::run_build_for_round` performs
+/// before ever writing this evidence in the first place. Re-deriving
+/// against the project's *current* files (rather than trusting the
+/// evidence row alone) is strictly more conservative than the original
+/// write-time decision: if the project has since gained a build script,
+/// this correctly stops trusting a now-stale "not applicable" claim.
+pub(crate) fn no_build_applicable_is_authorized(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    result_generation: i64,
+    round: i64,
+) -> NovaResult<bool> {
+    if db
+        .find_no_build_confirmation(project_id, task_id, result_generation, round)?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    let project = db.project(project_id)?;
+    let project_dir = Path::new(&project.local_path);
+    Ok(matches!(
+        super::test_runner::detect_build_command(project_dir),
+        super::test_runner::BuildDetection::NotApplicable(_)
+    ))
 }
 
 fn final_result_doc(
@@ -401,6 +483,409 @@ mod tests {
             )
             .unwrap();
         (db, project.id, task.id)
+    }
+
+    // --- Phase 4 remediation (Major 2): not_applicable requires an exact,
+    // matching confirmation (or, build-only, a real mechanical
+    // re-derivation) — never the bare evidence status string alone. ------
+
+    use crate::storage::evidence::{RecordBuildEvidenceRequest, RecordTestEvidenceRequest};
+
+    fn record_no_tests_applicable(
+        db: &Database,
+        project_id: &str,
+        task_id: &str,
+        generation: i64,
+        round: i64,
+    ) {
+        db.record_test_evidence(&RecordTestEvidenceRequest {
+            project_id,
+            task_id,
+            result_generation: generation,
+            round,
+            test_command_redacted: None,
+            status: "no_tests_applicable",
+            passed_count: 0,
+            failed_count: 0,
+            skipped_count: 0,
+            exit_code: None,
+            reason: Some("no test framework detected"),
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+    }
+
+    /// Constructs an adversarial, invariant-breaking database state — a
+    /// `no_tests_applicable` row with **no** matching confirmation — that
+    /// the real production write path (`Database::record_test_evidence`)
+    /// now correctly refuses to create. Deliberately bypasses that guard
+    /// via raw SQL, exactly as authorized for testing "what if an orphaned
+    /// row already exists" (e.g. from data created before this remediation,
+    /// or any other means outside the normal write path) without
+    /// duplicating or weakening the real write-time check itself.
+    fn insert_orphaned_no_tests_applicable(
+        db: &Database,
+        project_id: &str,
+        task_id: &str,
+        generation: i64,
+        round: i64,
+    ) {
+        db.conn()
+            .execute(
+                "INSERT INTO test_evidence (id, project_id, task_id, result_generation, round, test_command_redacted, status, passed_count, failed_count, skipped_count, exit_code, reason, stdout_ref, stderr_ref, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'no_tests_applicable', 0, 0, 0, NULL, 'orphaned adversarial row', NULL, NULL, ?6)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    project_id,
+                    task_id,
+                    generation,
+                    round,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn record_no_build_applicable(
+        db: &Database,
+        project_id: &str,
+        task_id: &str,
+        generation: i64,
+        round: i64,
+    ) {
+        db.record_build_evidence(&RecordBuildEvidenceRequest {
+            project_id,
+            task_id,
+            result_generation: generation,
+            round,
+            build_command_redacted: None,
+            status: "no_build_applicable",
+            exit_code: None,
+            reason: Some("no build step detected"),
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+    }
+
+    fn record_test_passed(
+        db: &Database,
+        project_id: &str,
+        task_id: &str,
+        generation: i64,
+        round: i64,
+    ) {
+        db.record_test_evidence(&RecordTestEvidenceRequest {
+            project_id,
+            task_id,
+            result_generation: generation,
+            round,
+            test_command_redacted: Some("cargo test"),
+            status: "passed",
+            passed_count: 1,
+            failed_count: 0,
+            skipped_count: 0,
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+    }
+
+    fn record_build_passed(
+        db: &Database,
+        project_id: &str,
+        task_id: &str,
+        generation: i64,
+        round: i64,
+    ) {
+        db.record_build_evidence(&RecordBuildEvidenceRequest {
+            project_id,
+            task_id,
+            result_generation: generation,
+            round,
+            build_command_redacted: Some("cargo build"),
+            status: "passed",
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+    }
+
+    fn task_at_generation(db: &Database, task_id: &str, generation: i64) -> Task {
+        let mut task = db.task(task_id).unwrap();
+        task.result_generation = generation;
+        task
+    }
+
+    #[test]
+    fn applicable_evidence_with_matching_confirmation_is_adopted() {
+        let dir = temp_dir("major2-happy-path");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        record_no_tests_applicable(&db, &project_id, &task_id, 0, 1);
+        record_no_build_applicable(&db, &project_id, &task_id, 0, 1);
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(adopted, Some((0, 1)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn applicable_test_evidence_without_any_confirmation_is_never_adopted() {
+        let dir = temp_dir("major2-test-orphaned");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        insert_orphaned_no_tests_applicable(&db, &project_id, &task_id, 0, 1);
+        record_build_passed(&db, &project_id, &task_id, 0, 1);
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            adopted, None,
+            "an unconfirmed no_tests_applicable row must never authorize completion"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn applicable_build_evidence_without_confirmation_or_mechanical_justification_is_never_adopted()
+    {
+        // `db_with_task`'s fixture directory is genuinely empty (no
+        // Cargo.toml, no package.json) — `detect_build_command` therefore
+        // returns `Insufficient`, not `NotApplicable`, so the mechanical
+        // fallback must not kick in here either.
+        let dir = temp_dir("major2-build-orphaned");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        record_test_passed(&db, &project_id, &task_id, 0, 1);
+        record_no_build_applicable(&db, &project_id, &task_id, 0, 1);
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            adopted, None,
+            "an unconfirmed no_build_applicable row with no mechanical justification must never authorize completion"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mechanically_justified_no_build_applicable_is_adopted_without_any_confirmation() {
+        // Protects the *legitimate* design this round must not break:
+        // `BuildDetection::NotApplicable` (a real package.json with no
+        // build script) never needs or produces a confirmation.
+        let dir = temp_dir("major2-build-mechanical");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        fs::write(dir.join("package.json"), r#"{"name":"x","scripts":{}}"#).unwrap();
+        record_test_passed(&db, &project_id, &task_id, 0, 1);
+        record_no_build_applicable(&db, &project_id, &task_id, 0, 1);
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            adopted,
+            Some((0, 1)),
+            "a mechanically-detected NotApplicable build must still be adopted without a confirmation"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_confirmation_for_a_stale_generation_never_authorizes_the_current_generations_evidence() {
+        let dir = temp_dir("major2-stale-generation");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        db.record_no_tests_confirmation(&project_id, &task_id, 5, 1, None)
+            .unwrap();
+        insert_orphaned_no_tests_applicable(&db, &project_id, &task_id, 0, 1);
+        record_build_passed(&db, &project_id, &task_id, 0, 1);
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(adopted, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_confirmation_for_a_stale_round_never_authorizes_the_current_rounds_evidence() {
+        let dir = temp_dir("major2-stale-round");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 2, None)
+            .unwrap();
+        insert_orphaned_no_tests_applicable(&db, &project_id, &task_id, 0, 1);
+        record_build_passed(&db, &project_id, &task_id, 0, 1);
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(adopted, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_confirmation_belonging_to_a_different_task_never_authorizes_this_tasks_evidence() {
+        let dir = temp_dir("major2-wrong-task");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        let other_task = db
+            .create_task(
+                &CreateTaskRequest {
+                    project_id: project_id.clone(),
+                    title: "Other".to_string(),
+                    goal: None,
+                    in_scope: None,
+                    not_in_scope: None,
+                    done_criteria: None,
+                    ai_kind: None,
+                },
+                Actor::User,
+            )
+            .unwrap();
+        db.record_no_tests_confirmation(&project_id, &other_task.id, 0, 1, None)
+            .unwrap();
+        insert_orphaned_no_tests_applicable(&db, &project_id, &task_id, 0, 1);
+        record_build_passed(&db, &project_id, &task_id, 0, 1);
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(adopted, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_confirmation_belonging_to_a_different_project_never_authorizes_this_tasks_evidence() {
+        let dir_a = temp_dir("major2-wrong-project-a");
+        let dir_b = temp_dir("major2-wrong-project-b");
+        let (db, project_a, task_a) = db_with_task(&dir_a);
+        let (_db_unused, project_b, _task_b) = db_with_task(&dir_b);
+        // A confirmation genuinely exists, just under a different project —
+        // the natural key (including project_id) must not match task_a's.
+        let cross_project_result = db.record_no_tests_confirmation(&project_b, &task_a, 0, 1, None);
+        assert!(
+            cross_project_result.is_err(),
+            "storage itself already refuses to write a confirmation for a task the project doesn't own"
+        );
+        insert_orphaned_no_tests_applicable(&db, &project_a, &task_a, 0, 1);
+        record_build_passed(&db, &project_a, &task_a, 0, 1);
+
+        let task = task_at_generation(&db, &task_a, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_a, &task_a, &task).unwrap();
+        assert_eq!(
+            adopted, None,
+            "no confirmation exists for task_a at all, so its no_tests_applicable evidence must not be adopted"
+        );
+        let _ = fs::remove_dir_all(&dir_a);
+        let _ = fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn test_and_build_evidence_from_different_generations_never_pair_up() {
+        let dir = temp_dir("major2-mismatched-generation");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        record_test_passed(&db, &project_id, &task_id, 0, 1);
+        record_build_passed(&db, &project_id, &task_id, 1, 1);
+
+        let task = task_at_generation(&db, &task_id, 1);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            adopted, None,
+            "test passing at generation 0 and build passing at generation 1 must never combine"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_and_build_evidence_from_different_rounds_never_pair_up() {
+        let dir = temp_dir("major2-mismatched-round");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        record_test_passed(&db, &project_id, &task_id, 0, 1);
+        record_build_passed(&db, &project_id, &task_id, 0, 2);
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            adopted, None,
+            "round 1 test evidence and round 2 build evidence must never combine"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legitimate_no_tests_and_no_build_confirmations_still_adopt_normally() {
+        let dir = temp_dir("major2-both-legitimate");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, Some("no framework"))
+            .unwrap();
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("no build needed"))
+            .unwrap();
+        record_no_tests_applicable(&db, &project_id, &task_id, 0, 1);
+        record_no_build_applicable(&db, &project_id, &task_id, 0, 1);
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            adopted,
+            Some((0, 1)),
+            "the ordinary, fully-legitimate no-tests + no-build product path must keep working"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopted_generation_round_facts_survive_a_real_file_backed_database_reopen() {
+        let dir = temp_dir("major2-reopen");
+        let db_path = dir.join("nova.sqlite3");
+        let (project_id, task_id) = {
+            let db = Database::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let project = db
+                .create_project(&CreateProjectRequest {
+                    name: "P".to_string(),
+                    local_path: dir.to_string_lossy().into_owned(),
+                    source_type: "local".to_string(),
+                    source_url: None,
+                    purpose: None,
+                    long_term_goal: None,
+                    user_preferences: None,
+                    prohibitions: None,
+                })
+                .unwrap();
+            let task = db
+                .create_task(
+                    &CreateTaskRequest {
+                        project_id: project.id.clone(),
+                        title: "T".to_string(),
+                        goal: None,
+                        in_scope: None,
+                        not_in_scope: None,
+                        done_criteria: None,
+                        ai_kind: None,
+                    },
+                    Actor::User,
+                )
+                .unwrap();
+            db.record_no_tests_confirmation(&project.id, &task.id, 0, 1, None)
+                .unwrap();
+            record_no_tests_applicable(&db, &project.id, &task.id, 0, 1);
+            // Deliberately orphaned build evidence — no confirmation, and
+            // this fixture dir has no Cargo.toml/package.json either.
+            record_no_build_applicable(&db, &project.id, &task.id, 0, 1);
+            (project.id, task.id)
+        };
+
+        let db = Database::open(&db_path).unwrap();
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            adopted, None,
+            "the legitimate no-tests confirmation must survive the reopen, but the orphaned \
+             build evidence must still fail closed rather than becoming trusted after a restart"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

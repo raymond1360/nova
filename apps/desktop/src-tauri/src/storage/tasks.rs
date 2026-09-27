@@ -223,7 +223,23 @@ impl Database {
             .optional_result()
     }
 
-    pub fn list_task_state_events(&self, task_id: &str) -> NovaResult<Vec<TaskStateEvent>> {
+    /// Phase 4 remediation (Major 1): requires `project_id` and verifies
+    /// `task.project_id == project_id` — via the same
+    /// `assert_task_belongs_to_project` guard every evidence-reading
+    /// function in this codebase already uses — before ever touching
+    /// `task_state_events`. Previously this accepted only `task_id`, so a
+    /// caller that merely knew or guessed a `task_id` from a different
+    /// project could read its full state history (reasons, actor, recovery
+    /// flag, safety summary, timestamps). Pushing the check down here
+    /// (rather than leaving it solely at whichever call site happens to
+    /// check first) makes it structurally impossible for any future direct
+    /// caller to skip it.
+    pub fn list_task_state_events(
+        &self,
+        project_id: &str,
+        task_id: &str,
+    ) -> NovaResult<Vec<TaskStateEvent>> {
+        self.assert_task_belongs_to_project(project_id, task_id)?;
         let mut stmt = self.conn().prepare(
             "SELECT id, project_id, task_id, old_state, new_state, reason, actor, correlation_id, is_recovery, safety_summary, created_at
              FROM task_state_events WHERE task_id = ?1 ORDER BY created_at ASC",
@@ -507,10 +523,74 @@ mod tests {
         let (db, project_id) = db_with_project(&dir);
         let task = new_task(&db, &project_id);
         assert_eq!(task.state, TaskState::Draft);
-        let events = db.list_task_state_events(&task.id).unwrap();
+        let events = db.list_task_state_events(&project_id, &task.id).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].old_state, None);
         assert_eq!(events[0].new_state, TaskState::Draft);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Phase 4 remediation (Major 1): list_task_state_events ownership ---
+
+    #[test]
+    fn list_task_state_events_returns_real_events_for_the_correct_project_and_task() {
+        let dir = temp_dir("state-events-correct-owner");
+        let (db, project_id) = db_with_project(&dir);
+        let task = new_task(&db, &project_id);
+        let events = db.list_task_state_events(&project_id, &task.id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].task_id, task.id);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_task_state_events_rejects_a_project_id_that_does_not_own_the_task() {
+        let dir_a = temp_dir("state-events-wrong-project-a");
+        let dir_b = temp_dir("state-events-wrong-project-b");
+        let (db, _project_a) = db_with_project(&dir_a);
+        let task_a = new_task(&db, &_project_a);
+        let (_db_unused, project_b) = db_with_project(&dir_b);
+
+        let result = db.list_task_state_events(&project_b, &task_a.id);
+        assert!(
+            result.is_err(),
+            "a project_id that does not own task_a must never be able to read its state events"
+        );
+        let _ = fs::remove_dir_all(&dir_a);
+        let _ = fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn list_task_state_events_never_leaks_a_sibling_tasks_events_within_the_same_project() {
+        let dir = temp_dir("state-events-sibling-tasks");
+        let (db, project_id) = db_with_project(&dir);
+        let task_a = new_task(&db, &project_id);
+        let task_b = new_task(&db, &project_id);
+        db.transition_task(
+            &task_b.id,
+            TaskState::AwaitingConfirmation,
+            Actor::User,
+            Some("only task B's own event"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let events_a = db.list_task_state_events(&project_id, &task_a.id).unwrap();
+        assert!(
+            events_a.iter().all(|e| e.task_id == task_a.id),
+            "task A's query must never include task B's rows, even within the same project"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_task_state_events_fails_safely_for_a_task_id_that_does_not_exist() {
+        let dir = temp_dir("state-events-missing-task");
+        let (db, project_id) = db_with_project(&dir);
+        let result = db.list_task_state_events(&project_id, "no-such-task-id");
+        assert!(result.is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1300,7 +1380,10 @@ mod tests {
         let dir = temp_dir("same-transaction");
         let (db, project_id) = db_with_project(&dir);
         let task = new_task(&db, &project_id);
-        let before_events = db.list_task_state_events(&task.id).unwrap().len();
+        let before_events = db
+            .list_task_state_events(&project_id, &task.id)
+            .unwrap()
+            .len();
 
         db.transition_task(
             &task.id,
@@ -1314,7 +1397,7 @@ mod tests {
         .unwrap();
 
         let after = db.task(&task.id).unwrap();
-        let events = db.list_task_state_events(&task.id).unwrap();
+        let events = db.list_task_state_events(&project_id, &task.id).unwrap();
         assert_eq!(after.state, TaskState::AwaitingConfirmation);
         assert_eq!(events.len(), before_events + 1);
         assert_eq!(
@@ -1340,7 +1423,7 @@ mod tests {
         )
         .unwrap();
 
-        let events = db.list_task_state_events(&task.id).unwrap();
+        let events = db.list_task_state_events(&project_id, &task.id).unwrap();
         let reason = events.last().unwrap().reason.as_deref().unwrap();
         assert!(
             !reason.contains("abc123supersecretvalue"),
@@ -1371,7 +1454,7 @@ mod tests {
             result.is_ok(),
             "backend-internal Actor::System + is_recovery must still be usable"
         );
-        let events = db.list_task_state_events(&task.id).unwrap();
+        let events = db.list_task_state_events(&project_id, &task.id).unwrap();
         assert_eq!(events.last().unwrap().actor, Actor::System);
         assert!(events.last().unwrap().is_recovery);
         let _ = fs::remove_dir_all(&dir);
@@ -1383,7 +1466,7 @@ mod tests {
         let (db, project_id) = db_with_project(&dir);
         let task = new_task(&db, &project_id);
         let before = db.task(&task.id).unwrap();
-        let before_events = db.list_task_state_events(&task.id).unwrap();
+        let before_events = db.list_task_state_events(&project_id, &task.id).unwrap();
 
         // An illegal transition is rejected before any write is attempted,
         // so this also proves the "reject" path never partially applies.
@@ -1399,7 +1482,7 @@ mod tests {
         assert!(result.is_err());
 
         let after = db.task(&task.id).unwrap();
-        let after_events = db.list_task_state_events(&task.id).unwrap();
+        let after_events = db.list_task_state_events(&project_id, &task.id).unwrap();
         assert_eq!(before, after);
         assert_eq!(before_events, after_events);
         let _ = fs::remove_dir_all(&dir);

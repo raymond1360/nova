@@ -136,21 +136,68 @@ fn state_label(state: TaskState) -> &'static str {
     }
 }
 
-/// Normalizes a `test_evidence`/`build_evidence` `status` column value into
-/// the one shared, user-facing vocabulary required for every piece of
-/// evidence this module surfaces: `passed` / `failed` / `cancelled` /
-/// `timed_out` / `insufficient_evidence` / `not_applicable`. The two
-/// `no_..._applicable` spellings collapse into one `not_applicable` here —
-/// both already only ever exist in the database because a real, persisted
-/// user confirmation legitimized them (see `core_loop::reconcile_no_tests_
-/// confirmation_attempt`/`reconcile_no_build_confirmation_attempt`), so
-/// `not_applicable` alone, without a separate "was this legitimate" flag, is
-/// not a weakening — the row could not exist otherwise.
-fn normalize_evidence_status(raw: &str) -> String {
-    match raw {
-        "no_tests_applicable" | "no_build_applicable" => "not_applicable".to_string(),
-        other => other.to_string(),
+/// Normalizes a real `test_evidence` row's `status` into the shared,
+/// user-facing vocabulary: `passed` / `failed` / `cancelled` / `timed_out`
+/// / `insufficient_evidence` / `not_applicable`.
+///
+/// Phase 4 remediation (Major 2): a `no_tests_applicable` status string is
+/// **not**, by itself, authorization — this now re-verifies a real,
+/// exact-key `no_tests_confirmations` row exists
+/// (`documents::no_tests_applicable_is_authorized`) before ever mapping to
+/// `not_applicable`. An orphaned/unconfirmed row (which should never arise
+/// from the real production write path, but must never be silently trusted
+/// either) fails closed to `insufficient_evidence` — an existing, stable
+/// status the frontend already handles, not a new protocol surface.
+fn normalize_test_evidence_status(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    evidence: &TestEvidence,
+) -> NovaResult<String> {
+    if evidence.status == "no_tests_applicable" {
+        return Ok(
+            if super::documents::no_tests_applicable_is_authorized(
+                db,
+                project_id,
+                task_id,
+                evidence.result_generation,
+                evidence.round,
+            )? {
+                "not_applicable".to_string()
+            } else {
+                "insufficient_evidence".to_string()
+            },
+        );
     }
+    Ok(evidence.status.clone())
+}
+
+/// The build equivalent of [`normalize_test_evidence_status`] — see
+/// `documents::no_build_applicable_is_authorized` for why build's check
+/// also accepts Nova's own current mechanical re-derivation, not just a
+/// confirmation row.
+fn normalize_build_evidence_status(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    evidence: &BuildEvidence,
+) -> NovaResult<String> {
+    if evidence.status == "no_build_applicable" {
+        return Ok(
+            if super::documents::no_build_applicable_is_authorized(
+                db,
+                project_id,
+                task_id,
+                evidence.result_generation,
+                evidence.round,
+            )? {
+                "not_applicable".to_string()
+            } else {
+                "insufficient_evidence".to_string()
+            },
+        );
+    }
+    Ok(evidence.status.clone())
 }
 
 /// Builds the trusted, read-only evidence/timeline/completion view for one
@@ -180,7 +227,7 @@ pub fn build_task_evidence_overview(
 
     let mut timeline = Vec::new();
     push_task_created_entry(&mut timeline, &task);
-    push_state_event_entries(db, task_id, &mut timeline)?;
+    push_state_event_entries(db, project_id, task_id, &mut timeline)?;
     push_dev_action_entries(db, task_id, &task, &mut timeline)?;
     for generation in 0..=task.result_generation {
         for round in [1_i64, 2] {
@@ -247,10 +294,11 @@ fn push_task_created_entry(timeline: &mut Vec<TimelineEntry>, task: &Task) {
 
 fn push_state_event_entries(
     db: &Database,
+    project_id: &str,
     task_id: &str,
     timeline: &mut Vec<TimelineEntry>,
 ) -> NovaResult<()> {
-    for event in db.list_task_state_events(task_id)? {
+    for event in db.list_task_state_events(project_id, task_id)? {
         let needs_user_action = event.new_state == TaskState::NeedsUserAction;
         let title = match event.old_state {
             Some(old) => format!(
@@ -335,7 +383,7 @@ fn push_test_entries(
     }
     let title = format!("第{round}轮独立测试（第 {generation} 代）");
     if let Some(latest) = evidence.last() {
-        let status = normalize_evidence_status(&latest.status);
+        let status = normalize_test_evidence_status(db, project_id, task_id, latest)?;
         timeline.push(TimelineEntry {
             id: format!("test-evidence-{}", latest.id),
             event_type: "test_evidence".to_string(),
@@ -422,7 +470,7 @@ fn push_build_entries(
     }
     let title = format!("第{round}轮独立构建（第 {generation} 代）");
     if let Some(latest) = evidence.last() {
-        let status = normalize_evidence_status(&latest.status);
+        let status = normalize_build_evidence_status(db, project_id, task_id, latest)?;
         timeline.push(TimelineEntry {
             id: format!("build-evidence-{}", latest.id),
             event_type: "build_evidence".to_string(),
@@ -887,6 +935,46 @@ mod tests {
             .timeline
             .iter()
             .any(|e| e.event_type == "no_tests_confirmed"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_orphaned_no_tests_applicable_row_never_shows_as_not_applicable_in_the_timeline() {
+        // The real write path (`Database::record_test_evidence`) now
+        // refuses to create this row at all — insert it via raw SQL to
+        // prove the *read* layer also fails closed on its own, for any
+        // orphaned row that could exist regardless of how it got there
+        // (e.g. data written before this remediation).
+        let dir = temp_dir("orphaned-not-applicable");
+        let (db, project_id, task_id) = db_with_task(&dir, "P");
+        db.conn()
+            .execute(
+                "INSERT INTO test_evidence (id, project_id, task_id, result_generation, round, test_command_redacted, status, passed_count, failed_count, skipped_count, exit_code, reason, stdout_ref, stderr_ref, created_at)
+                 VALUES (?1, ?2, ?3, 0, 1, NULL, 'no_tests_applicable', 0, 0, 0, NULL, 'orphaned', NULL, NULL, ?4)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    project_id,
+                    task_id,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+
+        let overview = build_task_evidence_overview(&db, &project_id, &task_id).unwrap();
+        let evidence_entry = overview
+            .timeline
+            .iter()
+            .find(|e| e.event_type == "test_evidence")
+            .unwrap();
+        assert_eq!(
+            evidence_entry.status, "insufficient_evidence",
+            "an orphaned no_tests_applicable row with no matching confirmation must fail closed, \
+             never display as not_applicable"
+        );
+        assert!(
+            !overview.acceptance_ready,
+            "an orphaned not-applicable row must never make the task look acceptance-ready"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

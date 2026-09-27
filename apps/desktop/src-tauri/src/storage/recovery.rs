@@ -379,7 +379,10 @@ mod tests {
         let task_id = task_at(&db, &project_id, TaskState::Running);
 
         db.run_startup_recovery().unwrap();
-        let events_after_first = db.list_task_state_events(&task_id).unwrap().len();
+        let events_after_first = db
+            .list_task_state_events(&project_id, &task_id)
+            .unwrap()
+            .len();
         let checkpoints_after_first: i64 = db
             .conn()
             .query_row(
@@ -392,7 +395,10 @@ mod tests {
         db.run_startup_recovery().unwrap();
         db.run_startup_recovery().unwrap();
 
-        let events_after_more = db.list_task_state_events(&task_id).unwrap().len();
+        let events_after_more = db
+            .list_task_state_events(&project_id, &task_id)
+            .unwrap()
+            .len();
         let checkpoints_after_more: i64 = db
             .conn()
             .query_row(

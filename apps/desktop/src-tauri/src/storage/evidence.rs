@@ -270,11 +270,37 @@ impl Database {
     /// `test_command_redacted`/`reason`/`stdout_ref`/`stderr_ref` are
     /// redacted before storage, same as every other evidence-writing
     /// function in this module.
+    ///
+    /// Phase 4 remediation (Major 2, write-layer defense in depth): a
+    /// `no_tests_applicable` row may only ever be written once a real
+    /// `no_tests_confirmations` row already exists for this *exact*
+    /// `(project_id, task_id, result_generation, round)` — mirroring the
+    /// check `core_loop::run_tests_for_round` (the only production caller
+    /// of this status) already performs immediately before calling this
+    /// function. Enforcing it here too means no future caller, test, or
+    /// refactor can accidentally persist an unconfirmed "not applicable"
+    /// row that the read/completion-gate layers would then have to treat
+    /// as legitimate. Every other status is unaffected.
     pub fn record_test_evidence(
         &self,
         request: &RecordTestEvidenceRequest<'_>,
     ) -> NovaResult<TestEvidence> {
         self.assert_task_belongs_to_project(request.project_id, request.task_id)?;
+        if request.status == "no_tests_applicable"
+            && self
+                .find_no_tests_confirmation(
+                    request.project_id,
+                    request.task_id,
+                    request.result_generation,
+                    request.round,
+                )?
+                .is_none()
+        {
+            return Err(NovaError::Config(
+                "拒绝写入 no_tests_applicable：当前 generation/round 不存在匹配的无测试确认记录"
+                    .to_string(),
+            ));
+        }
         let id = new_id();
         let now = now();
         let test_command_redacted = request.test_command_redacted.map(redact_sensitive_text);
@@ -340,6 +366,26 @@ impl Database {
     /// build attempt for a task's *current* `(result_generation, round)` —
     /// mirrors [`Database::record_test_evidence`] exactly, including the
     /// same redaction discipline for every text field.
+    ///
+    /// Phase 4 remediation (Major 2): deliberately does **not** gain the
+    /// same write-time "a matching confirmation must already exist" guard
+    /// [`Database::record_test_evidence`] does — audited production call
+    /// chain (`core_loop::run_build_for_round`) shows `no_build_applicable`
+    /// has two distinct legitimate origins: (a) `BuildDetection::
+    /// Insufficient` resolved via a real, persisted `no_build_confirmation`
+    /// (mirrors the test case exactly), and (b) `BuildDetection::
+    /// NotApplicable` — Nova's own mechanical, deterministic determination
+    /// from real project metadata (e.g. `package.json` with no `build`
+    /// script) that a build genuinely never applies, which by design has
+    /// never required or written a confirmation row at all. A write-time
+    /// guard requiring a confirmation for every `no_build_applicable` row
+    /// would reject case (b) outright — a real functional regression,
+    /// proven by three existing single-AI closed-loop tests failing when
+    /// this guard was attempted. See `core_loop::documents::
+    /// no_build_applicable_is_authorized` for where this asymmetry is
+    /// instead enforced correctly, at the read/completion-gate layer, which
+    /// can re-derive case (b)'s legitimacy directly from the project
+    /// directory rather than assuming every unconfirmed row is illegitimate.
     pub fn record_build_evidence(
         &self,
         request: &RecordBuildEvidenceRequest<'_>,

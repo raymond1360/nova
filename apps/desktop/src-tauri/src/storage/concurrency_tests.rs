@@ -152,7 +152,9 @@ fn two_threads_transitioning_the_same_task_concurrently_only_one_wins() {
     let final_task = verify_conn.task(&task_id).unwrap();
     assert_eq!(final_task.state, TaskState::Verifying);
 
-    let events = verify_conn.list_task_state_events(&task_id).unwrap();
+    let events = verify_conn
+        .list_task_state_events(&project.id, &task_id)
+        .unwrap();
     let verifying_events = events
         .iter()
         .filter(|e| e.new_state == TaskState::Verifying)

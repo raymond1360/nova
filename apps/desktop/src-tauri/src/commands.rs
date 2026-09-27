@@ -554,12 +554,21 @@ pub fn transition_task(
     })
 }
 
+/// Phase 4 remediation (Major 1): now requires `project_id` — the previous
+/// `task_id`-only signature let any WebView caller that knew or guessed a
+/// `task_id` read another project's full state-event history. The real
+/// ownership check lives at the storage layer
+/// (`Database::list_task_state_events`); this command is purely a
+/// parameter pass-through.
 #[tauri::command]
 pub fn list_task_state_events(
+    project_id: String,
     task_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<TaskStateEvent>, String> {
-    with_db(&state, |db| db.list_task_state_events(&task_id))
+    with_db(&state, |db| {
+        db.list_task_state_events(&project_id, &task_id)
+    })
 }
 
 /// Must only be invoked by the UI action tied to the user's explicit

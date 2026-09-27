@@ -176,6 +176,20 @@ impl Database {
         Ok(rows)
     }
 
+    /// Phase 4 (evidence/document gate): every Git fact recorded for a
+    /// task, oldest first — read-only counterpart to
+    /// [`Database::record_git_evidence`].
+    pub fn list_git_evidence_for_task(&self, task_id: &str) -> NovaResult<Vec<GitEvidence>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT id, project_id, task_id, event_kind, commit_sha, branch, diff_stat, created_at
+             FROM git_evidence WHERE task_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![task_id], read_git_evidence)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn record_git_evidence(
         &self,
         project_id: &str,
@@ -230,6 +244,23 @@ impl Database {
                 read_file_change_evidence,
             )
             .map_err(Into::into)
+    }
+
+    /// Phase 4 (evidence/document gate): every file-change fact recorded
+    /// for a task, oldest first — read-only counterpart to
+    /// [`Database::record_file_change_evidence`].
+    pub fn list_file_change_evidence_for_task(
+        &self,
+        task_id: &str,
+    ) -> NovaResult<Vec<FileChangeEvidence>> {
+        let mut stmt = self.conn().prepare(
+            "SELECT id, project_id, task_id, file_path, change_kind, summary, created_at
+             FROM file_change_evidence WHERE task_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![task_id], read_file_change_evidence)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Phase 3 remediation (Blocker 3): records one independently-run test
@@ -434,6 +465,32 @@ impl Database {
                 read_user_acceptance,
             )
             .map_err(Into::into)
+    }
+
+    /// Phase 4 (evidence/document gate): every acceptance/rejection row a
+    /// task has ever accumulated, oldest generation first — unlike
+    /// [`Database::user_acceptance_for_task`] (which deliberately returns
+    /// only the *current*-generation row, the one `completed` actually
+    /// depends on), this is a read-only audit view for the evidence
+    /// timeline. Older rows are real, already-recorded facts and are never
+    /// hidden, but callers must never treat anything returned here as
+    /// authorizing completion for a generation other than the task's
+    /// current one — that decision stays exclusively with
+    /// `user_acceptance_for_task`.
+    pub fn list_user_acceptance_for_task(
+        &self,
+        project_id: &str,
+        task_id: &str,
+    ) -> NovaResult<Vec<UserAcceptance>> {
+        self.assert_task_belongs_to_project(project_id, task_id)?;
+        let mut stmt = self.conn().prepare(
+            "SELECT id, project_id, task_id, result_generation, accepted, user_note, accepted_at, created_at
+             FROM user_acceptance WHERE task_id = ?1 ORDER BY result_generation ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![task_id], read_user_acceptance)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// The acceptance row for a task's *current* `result_generation`, if
@@ -800,6 +857,68 @@ mod tests {
             "acceptance note must be redacted before storage: {note}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_user_acceptance_for_task_returns_every_generation_in_order() {
+        let dir = temp_dir("list-acceptance-history");
+        let (db, project_id, task_id) = db_with_task(&dir, "P");
+        drive_to_awaiting_acceptance(&db, &task_id);
+        db.record_user_acceptance(&project_id, &task_id, false, Some("第一次拒绝"))
+            .unwrap();
+        // Bump the generation the same way a real fix-and-requeue cycle
+        // does, then accept the new generation — mirrors how a real task's
+        // history accumulates more than one acceptance row over its
+        // lifetime.
+        db.transition_task(
+            &task_id,
+            TaskState::NeedsUserAction,
+            Actor::System,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        // Transitioning back through to a fresh `preview_ready` is what
+        // actually bumps `result_generation` (see
+        // `storage::tasks::transition_task`) — mirrors how a real
+        // fix-and-requeue cycle produces a second, distinct generation.
+        for state in [
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::Verifying,
+            TaskState::PreviewReady,
+            TaskState::AwaitingUserAcceptance,
+        ] {
+            db.transition_task(&task_id, state, Actor::System, None, None, false, None)
+                .unwrap();
+        }
+        db.record_user_acceptance(&project_id, &task_id, true, Some("第二次通过"))
+            .unwrap();
+
+        let history = db
+            .list_user_acceptance_for_task(&project_id, &task_id)
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(!history[0].accepted);
+        assert_eq!(history[0].user_note.as_deref(), Some("第一次拒绝"));
+        assert!(history[1].accepted);
+        assert_eq!(history[1].user_note.as_deref(), Some("第二次通过"));
+        assert!(history[0].result_generation < history[1].result_generation);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_user_acceptance_for_task_rejects_a_project_id_that_does_not_own_the_task() {
+        let dir_a = temp_dir("list-acceptance-wrong-project-a");
+        let dir_b = temp_dir("list-acceptance-wrong-project-b");
+        let (db, _project_a, task_a) = db_with_task(&dir_a, "A");
+        let (_db_unused, project_b, _task_b) = db_with_task(&dir_b, "B");
+        let result = db.list_user_acceptance_for_task(&project_b, &task_a);
+        assert!(result.is_err());
+        let _ = fs::remove_dir_all(&dir_a);
+        let _ = fs::remove_dir_all(&dir_b);
     }
 
     #[test]

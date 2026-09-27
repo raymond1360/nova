@@ -214,3 +214,138 @@ export interface CliBinaryTrustStatus {
   confirmed_at: string | null
   mismatch_reason: string | null
 }
+
+// --- Phase 4: evidence and document gate ---
+// Mirrors src-tauri/src/core_loop/evidence_overview.rs's serde output.
+
+export interface TimelineEntry {
+  id: string
+  event_type: string
+  title: string
+  status: string
+  started_at: string | null
+  finished_at: string | null
+  result_generation: number | null
+  round: number | null
+  needs_user_action: boolean
+  is_historical: boolean
+}
+
+export interface TestEvidence {
+  id: string
+  project_id: string
+  task_id: string
+  result_generation: number
+  round: number
+  test_command_redacted: string | null
+  status: string
+  passed_count: number
+  failed_count: number
+  skipped_count: number
+  exit_code: number | null
+  reason: string | null
+  stdout_ref: string | null
+  stderr_ref: string | null
+  created_at: string
+}
+
+export interface TestEvidenceEntry extends TestEvidence {
+  is_current_generation: boolean
+}
+
+export interface BuildEvidence {
+  id: string
+  project_id: string
+  task_id: string
+  result_generation: number
+  round: number
+  build_command_redacted: string | null
+  status: string
+  exit_code: number | null
+  reason: string | null
+  stdout_ref: string | null
+  stderr_ref: string | null
+  created_at: string
+}
+
+export interface BuildEvidenceEntry extends BuildEvidence {
+  is_current_generation: boolean
+}
+
+export interface CommandEvidence {
+  id: string
+  project_id: string
+  task_id: string
+  command_redacted: string
+  exit_code: number | null
+  started_at: string | null
+  finished_at: string | null
+  stdout_ref: string | null
+  stderr_ref: string | null
+  created_at: string
+}
+
+export interface GitEvidence {
+  id: string
+  project_id: string
+  task_id: string
+  event_kind: string
+  commit_sha: string | null
+  branch: string | null
+  diff_stat: string | null
+  created_at: string
+}
+
+export interface FileChangeEvidence {
+  id: string
+  project_id: string
+  task_id: string
+  file_path: string
+  change_kind: 'created' | 'modified' | 'deleted'
+  summary: string | null
+  created_at: string
+}
+
+export interface UserAcceptanceRecord {
+  id: string
+  project_id: string
+  task_id: string
+  result_generation: number
+  accepted: boolean
+  user_note: string | null
+  accepted_at: string
+  created_at: string
+}
+
+export interface TaskEvidenceOverview {
+  project_id: string
+  task_id: string
+  task_state: TaskState
+  result_generation: number
+  pending_round: number
+  needs_user_action: boolean
+  acceptance_ready: boolean
+  is_completed: boolean
+  timeline: TimelineEntry[]
+  file_changes: FileChangeEvidence[]
+  git_events: GitEvidence[]
+  commands: CommandEvidence[]
+  tests: TestEvidenceEntry[]
+  builds: BuildEvidenceEntry[]
+  acceptance_history: UserAcceptanceRecord[]
+}
+
+export interface TaskDocumentInfo {
+  document_type: string
+  display_name: string
+  exists: boolean
+  is_optional_diagnostic: boolean
+}
+
+export interface TaskDocumentContent {
+  document_type: string
+  display_name: string
+  exists: boolean
+  content: string | null
+  error: string | null
+}

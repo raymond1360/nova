@@ -1642,4 +1642,275 @@ describe('coreLoop store', () => {
 
     expect(store.currentTask).toBeNull()
   })
+
+  // --- Phase 4 (evidence and document gate) ---------------------------
+
+  function fakeEvidenceOverview(
+    overrides: Partial<import('../types').TaskEvidenceOverview> = {},
+  ): import('../types').TaskEvidenceOverview {
+    return {
+      project_id: 'proj-1',
+      task_id: 'task-1',
+      task_state: 'running',
+      result_generation: 0,
+      pending_round: 1,
+      needs_user_action: false,
+      acceptance_ready: false,
+      is_completed: false,
+      timeline: [],
+      file_changes: [],
+      git_events: [],
+      commands: [],
+      tests: [],
+      builds: [],
+      acceptance_history: [],
+      ...overrides,
+    }
+  }
+
+  function fakeDocumentInfo(
+    overrides: Partial<import('../types').TaskDocumentInfo> = {},
+  ): import('../types').TaskDocumentInfo {
+    return {
+      document_type: 'REQUIREMENT',
+      display_name: '需求确认单',
+      exists: true,
+      is_optional_diagnostic: false,
+      ...overrides,
+    }
+  }
+
+  it('selectTask loads the real evidence overview and document list for the selected task', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    const overview = fakeEvidenceOverview({ task_id: 'task-1' })
+    routeInvoke({
+      get_task_evidence_overview: async () => overview,
+      list_task_documents: async () => [fakeDocumentInfo()],
+    })
+
+    store.selectTask(fakeTask({ id: 'task-1', state: 'running' }))
+    await vi.waitFor(() => expect(store.evidenceOverview).not.toBeNull())
+
+    expect(store.evidenceOverview).toEqual(overview)
+    expect(store.taskDocuments).toHaveLength(1)
+  })
+
+  it('refreshCurrentTask reloads the evidence overview and document list from the backend', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ id: 'task-1', state: 'running' })
+    const refreshedOverview = fakeEvidenceOverview({
+      task_id: 'task-1',
+      timeline: [
+        {
+          id: 'evt-1',
+          event_type: 'task_created',
+          title: '任务已创建',
+          status: 'created',
+          started_at: 'now',
+          finished_at: 'now',
+          result_generation: null,
+          round: null,
+          needs_user_action: false,
+          is_historical: false,
+        },
+      ],
+    })
+    routeInvoke({
+      list_tasks_for_project: async () => [fakeTask({ id: 'task-1', state: 'running' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+      get_task_evidence_overview: async () => refreshedOverview,
+      list_task_documents: async () => [fakeDocumentInfo({ exists: false })],
+    })
+
+    await store.refreshCurrentTask()
+
+    expect(store.evidenceOverview?.timeline).toHaveLength(1)
+    expect(store.taskDocuments[0].exists).toBe(false)
+  })
+
+  it('restoreLastSession restores the evidence and document view for the recovered task', async () => {
+    const store = useCoreLoopStore()
+    const overview = fakeEvidenceOverview({ task_id: 'still-going' })
+    routeInvoke({
+      get_last_active_project: async () => fakeProject(),
+      list_tasks_for_project: async () => [fakeTask({ id: 'still-going', state: 'running' })],
+      list_task_reviews: async () => [],
+      get_task_evidence_overview: async () => overview,
+      list_task_documents: async () => [fakeDocumentInfo()],
+    })
+
+    await store.restoreLastSession()
+
+    expect(store.currentTask?.id).toBe('still-going')
+    expect(store.evidenceOverview).toEqual(overview)
+    expect(store.taskDocuments).toHaveLength(1)
+  })
+
+  it('a slow evidence-overview response for task A never overwrites task B after switching', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    const taskA = fakeTask({ id: 'task-a', state: 'running' })
+    const taskB = fakeTask({ id: 'task-b', state: 'running' })
+    const responseA = deferred<import('../types').TaskEvidenceOverview>()
+    routeInvoke({
+      get_task_evidence_overview: async (args) => {
+        const taskId = (args as { taskId: string }).taskId
+        if (taskId === 'task-a') return responseA.promise
+        return fakeEvidenceOverview({ task_id: 'task-b' })
+      },
+      list_task_documents: async () => [],
+    })
+
+    store.selectTask(taskA)
+    store.selectTask(taskB)
+    await flushMicrotasks()
+    const afterB = store.evidenceOverview
+
+    responseA.resolve(fakeEvidenceOverview({ task_id: 'task-a' }))
+    await flushMicrotasks()
+
+    expect(store.currentTask?.id).toBe('task-b')
+    expect(store.evidenceOverview).toEqual(afterB)
+    expect(store.evidenceOverview?.task_id).toBe('task-b')
+  })
+
+  it('repeated loadEvidenceOverview calls replace the timeline wholesale, never duplicating entries', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ id: 'task-1' })
+    const oneEntryOverview = fakeEvidenceOverview({
+      timeline: [
+        {
+          id: 'evt-1',
+          event_type: 'task_created',
+          title: '任务已创建',
+          status: 'created',
+          started_at: 'now',
+          finished_at: 'now',
+          result_generation: null,
+          round: null,
+          needs_user_action: false,
+          is_historical: false,
+        },
+      ],
+    })
+    routeInvoke({ get_task_evidence_overview: async () => oneEntryOverview })
+
+    await store.loadEvidenceOverview()
+    await store.loadEvidenceOverview()
+    await store.loadEvidenceOverview()
+
+    expect(store.evidenceOverview?.timeline).toHaveLength(1)
+  })
+
+  it('a failed evidence-overview query leaves evidenceOverview alone instead of showing a fake result', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ id: 'task-1' })
+    store.evidenceOverview = fakeEvidenceOverview({ task_id: 'task-1', acceptance_ready: true })
+    routeInvoke({
+      get_task_evidence_overview: async () => {
+        throw new Error('backend unavailable')
+      },
+    })
+
+    await expect(store.loadEvidenceOverview()).rejects.toThrow('backend unavailable')
+
+    expect(store.evidenceOverview?.acceptance_ready).toBe(true)
+  })
+
+  it('document list rejects an unexpected shape but never invents a fake successful list', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ id: 'task-1' })
+    routeInvoke({
+      list_task_documents: async () => {
+        throw new Error('unknown document type')
+      },
+    })
+
+    await expect(store.loadTaskDocuments()).rejects.toThrow()
+    expect(store.taskDocuments).toEqual([])
+  })
+
+  it('viewTaskDocument sends only the fixed document_type from the list, never a free-typed path', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ id: 'task-1' })
+    let sentArgs: unknown = null
+    routeInvoke({
+      read_task_document: async (args) => {
+        sentArgs = args
+        return {
+          document_type: 'REQUIREMENT',
+          display_name: '需求确认单',
+          exists: true,
+          content: '# REQUIREMENT\n...',
+          error: null,
+        }
+      },
+    })
+
+    await store.viewTaskDocument('REQUIREMENT')
+
+    expect(sentArgs).toEqual({
+      projectId: 'proj-1',
+      taskId: 'task-1',
+      documentType: 'REQUIREMENT',
+    })
+    expect(Object.keys(sentArgs as object)).not.toContain('path')
+    expect(store.selectedDocument?.content).toContain('REQUIREMENT')
+  })
+
+  it('a stale document-view response never overwrites a newer one for a different document', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ id: 'task-1' })
+    const slowFirst = deferred<import('../types').TaskDocumentContent>()
+    routeInvoke({
+      read_task_document: async (args) => {
+        const documentType = (args as { documentType: string }).documentType
+        if (documentType === 'REQUIREMENT') return slowFirst.promise
+        return {
+          document_type: 'FINAL_RESULT',
+          display_name: '最终结果',
+          exists: true,
+          content: 'final content',
+          error: null,
+        }
+      },
+    })
+
+    const firstCall = store.viewTaskDocument('REQUIREMENT')
+    await store.viewTaskDocument('FINAL_RESULT')
+    slowFirst.resolve({
+      document_type: 'REQUIREMENT',
+      display_name: '需求确认单',
+      exists: true,
+      content: 'stale requirement content',
+      error: null,
+    })
+    await firstCall
+    await flushMicrotasks()
+
+    expect(store.selectedDocument?.document_type).toBe('FINAL_RESULT')
+  })
+
+  it('clearing selectedDocument (closing the viewer) does not require a backend call', async () => {
+    const store = useCoreLoopStore()
+    store.selectedDocument = {
+      document_type: 'REQUIREMENT',
+      display_name: '需求确认单',
+      exists: true,
+      content: 'x',
+      error: null,
+    }
+
+    store.selectedDocument = null
+
+    expect(store.selectedDocument).toBeNull()
+  })
 })

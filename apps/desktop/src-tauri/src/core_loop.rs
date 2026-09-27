@@ -26,7 +26,9 @@
 //! permission/parameter boundary only.
 
 pub(crate) mod documents;
+pub(crate) mod evidence_overview;
 mod review_isolation;
+pub(crate) mod task_documents;
 pub(crate) mod test_runner;
 
 #[cfg(test)]
@@ -608,6 +610,46 @@ pub fn resync_task_documents(
     documents::generate_result_documents(db, project_id, task_id, app_data_dir)?;
     db.set_document_sync_pending(task_id, false)?;
     db.task(task_id)
+}
+
+/// Phase 4 (evidence and document gate): the trusted, read-only timeline +
+/// evidence summary + completion-gate view for one task — see
+/// `evidence_overview`'s own module doc comment for exactly what this
+/// derives from and why nothing here is stored. A thin wrapper, per this
+/// codebase's "commands stay a permission/parameter boundary only" rule —
+/// `commands::get_task_evidence_overview` is a pure pass-through to this.
+pub fn task_evidence_overview(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+) -> NovaResult<evidence_overview::TaskEvidenceOverview> {
+    evidence_overview::build_task_evidence_overview(db, project_id, task_id)
+}
+
+/// Phase 4 (evidence and document gate): the safe, allowlisted listing of a
+/// task's seven result documents — see `task_documents`'s own module doc
+/// comment for the path-safety design.
+pub fn list_task_documents(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    app_data_dir: &Path,
+) -> NovaResult<Vec<task_documents::TaskDocumentInfo>> {
+    task_documents::list_task_documents(db, project_id, task_id, app_data_dir)
+}
+
+/// Phase 4 (evidence and document gate): reads exactly one of the task's
+/// seven result documents, identified only by its fixed `document_type`
+/// (never a caller-supplied path) — see `task_documents`'s own module doc
+/// comment.
+pub fn read_task_document(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    document_type: &str,
+    app_data_dir: &Path,
+) -> NovaResult<task_documents::TaskDocumentContent> {
+    task_documents::read_task_document(db, project_id, task_id, document_type, app_data_dir)
 }
 
 /// Codex re-review remediation (Major 1): the round a task is currently

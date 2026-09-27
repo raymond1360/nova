@@ -146,6 +146,9 @@ pub fn run() {
             commands::get_no_build_confirmation_needed,
             commands::accept_task_result,
             commands::resync_task_documents,
+            commands::get_task_evidence_overview,
+            commands::list_task_documents,
+            commands::read_task_document,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Nova")

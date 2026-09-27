@@ -83,4 +83,62 @@ describe('CoreLoopView.vue single-AI copy', () => {
     expect(genericMessageMatch).not.toBeNull()
     expect(genericMessageMatch?.[0]).toContain('!store.noTestsConfirmationNeeded')
   })
+
+  // Phase 4 (evidence and document gate): source-text checks only — there
+  // is still no `@vue/test-utils` mount harness in this project (see the
+  // module doc comment above), so these cannot render the component and
+  // inspect the actually-visible DOM. Real component-mount coverage
+  // remains a known, documented gap (tracked as a Minor), not fixed in
+  // this round.
+
+  it('never introduces v0.2.0 dual-AI review product text in the new evidence/document sections', () => {
+    // The existing reviews-diagnostic section already carries this label;
+    // this guards that no *new* text repeats "Codex/Claude 审核" as a
+    // product-facing verb for Nova's own verification.
+    expect(source).not.toContain('Codex 审核')
+    expect(source).not.toContain('Claude 审核')
+    expect(source).not.toContain('首次审核')
+    expect(source).not.toContain('二次审核')
+    expect(source).toContain('Nova 验证')
+  })
+
+  it('gates the acceptance-readiness text purely on the real backend field, never a local computation', () => {
+    expect(source).toContain('store.evidenceOverview.acceptance_ready')
+  })
+
+  it('renders the timeline and technical evidence detail behind collapsed <details>, not expanded by default', () => {
+    expect(source).toMatch(/<details class="timeline-detail">/)
+    expect(source).toMatch(/<details class="evidence-detail">/)
+  })
+
+  it('never renders raw stdout/stderr content in the evidence technical details', () => {
+    expect(source).not.toContain('stdout_ref')
+    expect(source).not.toContain('stderr_ref')
+  })
+
+  it('never binds a numeric percent-complete value in the template', () => {
+    const templateMatch = source.match(/<template>[\s\S]*<\/template>/)
+    expect(templateMatch).not.toBeNull()
+    // No interpolation ending in a literal `%` (a fabricated "N% done"
+    // readout) anywhere in the rendered markup.
+    expect(templateMatch?.[0]).not.toMatch(/\{\{[^}]*\}\}\s*%/)
+  })
+
+  it('lists task documents by their real display name and only ever passes document_type back to the store', () => {
+    expect(source).toContain('doc.display_name')
+    expect(source).toContain('handleViewDocument(doc.document_type)')
+    // No free-text input feeding into `viewTaskDocument`/`read_task_document`.
+    expect(source).not.toMatch(/viewTaskDocument\(\s*[a-zA-Z]+\.value/)
+  })
+
+  it('shows evidence and documents regardless of task state, including terminal ones', () => {
+    const evidenceSection = source.match(
+      /<section v-if="store\.currentTask" class="block">\s*<h3>7\. 时间线与 Nova 验证<\/h3>/,
+    )
+    const documentSection = source.match(
+      /<section v-if="store\.currentTask" class="block">\s*<h3>8\. 任务文档<\/h3>/,
+    )
+    expect(evidenceSection).not.toBeNull()
+    expect(documentSection).not.toBeNull()
+  })
 })

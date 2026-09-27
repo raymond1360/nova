@@ -8,6 +8,9 @@ import type {
   NoTestsConfirmation,
   Project,
   Task,
+  TaskDocumentContent,
+  TaskDocumentInfo,
+  TaskEvidenceOverview,
   TaskReview,
   TaskState,
 } from '../types'
@@ -95,6 +98,28 @@ export const useCoreLoopStore = defineStore('coreLoop', {
     // `loadPendingRound()`, called from `refreshCurrentTask()`. Defaults to
     // 1, matching the backend's own default before anything has run.
     pendingRound: 1 as number,
+    // Phase 4 (evidence and document gate): the real, backend-derived
+    // timeline/evidence/completion-gate view for the current task —
+    // always a full replace (never appended to), so a repeated load can
+    // never duplicate a timeline entry; see `loadEvidenceOverview`.
+    evidenceOverview: null as TaskEvidenceOverview | null,
+    // Mirrors `noTestsConfirmationRequestToken`'s stale-response-guard
+    // pattern exactly: bumped by every navigation action that could make
+    // an in-flight query's eventual answer stale, and by every new query
+    // itself. A response is only ever applied if the token, project id,
+    // and task id all still match what was captured when the request was
+    // issued — unlike the no-tests/no-build queries, this one is not also
+    // gated on task state, since evidence is relevant in every state.
+    evidenceRequestToken: 0 as number,
+    taskDocuments: [] as TaskDocumentInfo[],
+    documentsRequestToken: 0 as number,
+    // The currently-expanded document's redacted content, if the user has
+    // asked to view one — cleared on every task/project switch so a slow
+    // response for a previously-viewed document can never render under a
+    // different task.
+    selectedDocument: null as TaskDocumentContent | null,
+    selectedDocumentRequestToken: 0 as number,
+    loadingDocument: false,
   }),
   getters: {
     reviewerAiKind(state): 'codex_cli' | 'claude_cli' {
@@ -167,6 +192,9 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       this.detectedTestCommand = null
       this.noBuildConfirmationNeeded = false
       this.noTestsConfirmationNeeded = false
+      this.evidenceOverview = null
+      this.taskDocuments = []
+      this.selectedDocument = null
       // v0.1.0 scope correction (Work Package 2 remediation, Major 1) /
       // Work Package 3 final review remediation (Major 1): invalidates any
       // in-flight no-build/no-tests query from whatever project was
@@ -174,6 +202,11 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       // can never apply to this new project/task pair.
       this.noBuildConfirmationRequestToken += 1
       this.noTestsConfirmationRequestToken += 1
+      // Phase 4: same stale-response invalidation for the evidence/document
+      // queries below.
+      this.evidenceRequestToken += 1
+      this.documentsRequestToken += 1
+      this.selectedDocumentRequestToken += 1
       await invoke('set_last_active_project', { projectId: project.id }).catch(() => {})
     },
     async loadTasks() {
@@ -214,6 +247,9 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       this.reviews = []
       this.noBuildConfirmationNeeded = false
       this.noTestsConfirmationNeeded = false
+      this.evidenceOverview = null
+      this.taskDocuments = []
+      this.selectedDocument = null
       // v0.1.0 scope correction (Work Package 2 remediation, Major 1) /
       // Work Package 3 final review remediation (Major 1): invalidates any
       // no-build/no-tests query still in flight for whatever task was
@@ -223,6 +259,9 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       // (e.g. B is not `needs_user_action`).
       this.noBuildConfirmationRequestToken += 1
       this.noTestsConfirmationRequestToken += 1
+      this.evidenceRequestToken += 1
+      this.documentsRequestToken += 1
+      this.selectedDocumentRequestToken += 1
       // Both require a real backend query — selecting a task that is
       // already sitting at `needs_user_action` (e.g. after reopening the
       // project) must still surface the right prompt without waiting for
@@ -234,6 +273,11 @@ export const useCoreLoopStore = defineStore('coreLoop', {
         this.loadNoBuildConfirmationNeeded().catch(() => {})
         this.loadNoTestsConfirmationNeeded().catch(() => {})
       }
+      // Phase 4: unlike the no-build/no-tests prompts, evidence and
+      // documents are relevant regardless of task state — always load them
+      // for whichever task the user just selected.
+      this.loadEvidenceOverview().catch(() => {})
+      this.loadTaskDocuments().catch(() => {})
     },
     async detectTestCommand() {
       if (!this.currentProject) return
@@ -538,6 +582,11 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       if (refreshed) this.currentTask = refreshed
       await this.loadReviews()
       await this.loadPendingRound().catch(() => {})
+      // Phase 4: every refresh re-derives the timeline/evidence/documents
+      // from the backend's current truth — never appended to, so polling
+      // while a task is running can never duplicate a timeline entry.
+      await this.loadEvidenceOverview().catch(() => {})
+      await this.loadTaskDocuments().catch(() => {})
       if (this.currentTask?.state === 'needs_user_action') {
         await this.detectTestCommand().catch(() => {})
         await this.loadNoBuildConfirmationNeeded().catch(() => {})
@@ -589,6 +638,90 @@ export const useCoreLoopStore = defineStore('coreLoop', {
         taskId: this.currentTask.id,
       })
     },
+    // Phase 4 (evidence and document gate): the one real, backend-derived
+    // timeline + evidence summary + completion-gate view — never inferred
+    // or assembled from other frontend state. Mirrors
+    // `loadNoTestsConfirmationNeeded`'s stale-response guard: the result is
+    // only ever written if, at resolution time, the token is still the
+    // latest one issued and the selected project/task are still the ones
+    // this call started for. Always a full replace of `evidenceOverview`,
+    // never appended to, so a repeated call (e.g. the running-task poll)
+    // can never duplicate a timeline entry.
+    async loadEvidenceOverview() {
+      if (!this.currentTask || !this.currentProject) {
+        this.evidenceOverview = null
+        return
+      }
+      this.evidenceRequestToken += 1
+      const requestToken = this.evidenceRequestToken
+      const projectId = this.currentProject.id
+      const taskId = this.currentTask.id
+      const overview = await invoke<TaskEvidenceOverview>('get_task_evidence_overview', {
+        projectId,
+        taskId,
+      })
+      if (
+        this.evidenceRequestToken === requestToken &&
+        this.currentProject?.id === projectId &&
+        this.currentTask?.id === taskId
+      ) {
+        this.evidenceOverview = overview
+      }
+    },
+    // Phase 4: lists the seven result documents' display metadata (never
+    // their content — see `viewTaskDocument` for that). Same
+    // stale-response guard as `loadEvidenceOverview`.
+    async loadTaskDocuments() {
+      if (!this.currentTask || !this.currentProject) {
+        this.taskDocuments = []
+        return
+      }
+      this.documentsRequestToken += 1
+      const requestToken = this.documentsRequestToken
+      const projectId = this.currentProject.id
+      const taskId = this.currentTask.id
+      const docs = await invoke<TaskDocumentInfo[]>('list_task_documents', {
+        projectId,
+        taskId,
+      })
+      if (
+        this.documentsRequestToken === requestToken &&
+        this.currentProject?.id === projectId &&
+        this.currentTask?.id === taskId
+      ) {
+        this.taskDocuments = docs
+      }
+    },
+    // Phase 4: reads exactly one document's redacted content, identified
+    // only by its fixed `document_type` tag — never a caller-supplied
+    // path. A stale response (the user has since switched task/project) is
+    // silently discarded, exactly like every other query in this store.
+    async viewTaskDocument(documentType: string) {
+      if (!this.currentTask || !this.currentProject) return
+      this.selectedDocumentRequestToken += 1
+      const requestToken = this.selectedDocumentRequestToken
+      const projectId = this.currentProject.id
+      const taskId = this.currentTask.id
+      this.loadingDocument = true
+      try {
+        const content = await invoke<TaskDocumentContent>('read_task_document', {
+          projectId,
+          taskId,
+          documentType,
+        })
+        if (
+          this.selectedDocumentRequestToken === requestToken &&
+          this.currentProject?.id === projectId &&
+          this.currentTask?.id === taskId
+        ) {
+          this.selectedDocument = content
+        }
+      } finally {
+        if (this.selectedDocumentRequestToken === requestToken) {
+          this.loadingDocument = false
+        }
+      }
+    },
     // Second re-review remediation (UI restart/restore): re-loads the last
     // active project and its current unfinished task (if any) so an app
     // restart does not lose the user's place — polling for an in-flight
@@ -612,6 +745,10 @@ export const useCoreLoopStore = defineStore('coreLoop', {
             await this.loadNoBuildConfirmationNeeded().catch(() => {})
             await this.loadNoTestsConfirmationNeeded().catch(() => {})
           }
+          // Phase 4: a restored session must surface the same trusted
+          // evidence/document view an app restart should never hide.
+          await this.loadEvidenceOverview().catch(() => {})
+          await this.loadTaskDocuments().catch(() => {})
         }
       } catch (error) {
         this.lastError = String(error)

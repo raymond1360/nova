@@ -5,9 +5,9 @@
 // nothing here is a static demo. Deliberately does NOT implement: the full
 // Phase 4 timeline, the evidence center, GitHub import, Create Product,
 // auto-deployment, or push/PR — those are out of this round's scope.
-import { onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useCoreLoopStore } from '../stores/coreLoop'
-import type { Project } from '../types'
+import type { Project, TimelineEntry } from '../types'
 
 const store = useCoreLoopStore()
 
@@ -165,6 +165,69 @@ const stateLabels: Record<string, string> = {
   interrupted: '已中断',
   failed: '失败',
   cancelled: '已取消',
+}
+
+// Phase 4 (evidence and document gate): a single shared vocabulary for
+// every status string the backend can hand back — evidence outcomes
+// (passed/failed/cancelled/timed_out/insufficient_evidence/not_applicable/
+// not_run), action-ledger states (planned/started/succeeded/uncertain),
+// and the handful of fixed labels this module itself assigns
+// (created/confirmed/accepted/rejected). Falls back to `stateLabels` (task
+// states reused by `state_transition` timeline entries) and finally to the
+// raw string itself — never silently blank.
+const statusLabels: Record<string, string> = {
+  passed: '通过',
+  failed: '失败',
+  cancelled: '已取消',
+  timed_out: '超时',
+  insufficient_evidence: '证据不足',
+  not_applicable: '不适用（已确认）',
+  not_run: '尚未运行',
+  planned: '已计划',
+  started: '进行中',
+  succeeded: '已完成',
+  uncertain: '状态不确定（需用户确认）',
+  confirmed: '已确认',
+  accepted: '已验收',
+  rejected: '未通过验收',
+  created: '已创建',
+}
+function statusLabel(status: string): string {
+  return statusLabels[status] ?? stateLabels[status] ?? status
+}
+const badStatuses = new Set(['failed', 'cancelled', 'timed_out', 'insufficient_evidence', 'uncertain', 'rejected'])
+const okStatuses = new Set(['passed', 'succeeded', 'not_applicable', 'confirmed', 'accepted'])
+function timelineEntryClass(entry: TimelineEntry): string {
+  if (entry.needs_user_action || badStatuses.has(entry.status)) return 'bad'
+  if (okStatuses.has(entry.status)) return 'ok'
+  return ''
+}
+
+const latestTimelineEntry = computed(() => {
+  const timeline = store.evidenceOverview?.timeline
+  return timeline && timeline.length > 0 ? timeline[timeline.length - 1] : null
+})
+const latestGitEvent = computed(() => {
+  const events = store.evidenceOverview?.git_events
+  return events && events.length > 0 ? events[events.length - 1] : null
+})
+const currentTests = computed(() =>
+  (store.evidenceOverview?.tests ?? []).filter((t) => t.is_current_generation),
+)
+const currentBuilds = computed(() =>
+  (store.evidenceOverview?.builds ?? []).filter((b) => b.is_current_generation),
+)
+const currentTestStatusLabel = computed(() => {
+  const list = currentTests.value
+  return list.length > 0 ? statusLabel(list[list.length - 1].status) : '尚未运行'
+})
+const currentBuildStatusLabel = computed(() => {
+  const list = currentBuilds.value
+  return list.length > 0 ? statusLabel(list[list.length - 1].status) : '尚未运行'
+})
+
+async function handleViewDocument(documentType: string) {
+  await store.viewTaskDocument(documentType)
 }
 </script>
 
@@ -401,6 +464,80 @@ const stateLabels: Record<string, string> = {
       </p>
       <p v-if="store.currentTask.state === 'cancelled'">任务已被用户取消。</p>
     </section>
+
+    <!-- Phase 4 (evidence and document gate): a real timeline derived
+         entirely from already-persisted facts (state transitions, the
+         Action Ledger, test/build evidence, user confirmations and
+         acceptance) — never a fabricated progress percentage, and never an
+         event for something that has not actually happened. Available for
+         a task in any state, including terminal ones — viewing evidence
+         never re-executes anything. -->
+    <section v-if="store.currentTask" class="block">
+      <h3>7. 时间线与 Nova 验证</h3>
+      <div v-if="store.evidenceOverview">
+        <p>
+          <strong>当前阶段：</strong>{{ stateLabels[store.evidenceOverview.task_state] ?? store.evidenceOverview.task_state }}
+          <span v-if="store.isRunning" class="hint"> · 运行中</span>
+        </p>
+        <p v-if="latestTimelineEntry" class="hint">
+          最近活动：{{ latestTimelineEntry.title }} — {{ statusLabel(latestTimelineEntry.status) }}
+        </p>
+        <details class="timeline-detail">
+          <summary>查看完整时间线（{{ store.evidenceOverview.timeline.length }} 条）</summary>
+          <ul class="timeline-list">
+            <li v-for="entry in store.evidenceOverview.timeline" :key="entry.id">
+              <span>{{ entry.title }}</span> —
+              <span :class="timelineEntryClass(entry)">{{ statusLabel(entry.status) }}</span>
+              <span v-if="entry.is_historical" class="hint">（历史）</span>
+              <span v-if="entry.needs_user_action" class="bad">（需要用户处理）</span>
+            </li>
+          </ul>
+        </details>
+
+        <h4>Nova 验证摘要</h4>
+        <p>改动文件：{{ store.evidenceOverview.file_changes.length }} 个</p>
+        <p v-if="latestGitEvent">
+          Git：{{ latestGitEvent.branch ?? '（未知分支）' }} · {{ latestGitEvent.commit_sha ?? '（无提交）' }}
+          <span v-if="latestGitEvent.diff_stat"> · {{ latestGitEvent.diff_stat }}</span>
+        </p>
+        <p>测试：<span :class="badStatuses.has(currentTests[currentTests.length - 1]?.status) ? 'bad' : 'ok'">{{ currentTestStatusLabel }}</span></p>
+        <p>构建：<span :class="badStatuses.has(currentBuilds[currentBuilds.length - 1]?.status) ? 'bad' : 'ok'">{{ currentBuildStatusLabel }}</span></p>
+        <p>
+          是否可以验收：
+          <span :class="store.evidenceOverview.acceptance_ready ? 'ok' : 'hint'">{{ store.evidenceOverview.acceptance_ready ? '可以验收' : '尚不可验收' }}</span>
+        </p>
+        <details class="evidence-detail">
+          <summary>技术详情（Nova 执行过的命令，已脱敏）</summary>
+          <div v-for="cmd in store.evidenceOverview.commands" :key="cmd.id" class="evidence-item">
+            <code>{{ cmd.command_redacted }}</code> — exit {{ cmd.exit_code ?? '(无)' }}
+          </div>
+          <p v-if="store.evidenceOverview.commands.length === 0" class="hint">暂无命令记录。</p>
+        </details>
+      </div>
+      <button class="link-button" @click="store.loadEvidenceOverview">刷新时间线与证据</button>
+    </section>
+
+    <!-- Phase 4: the seven result documents, listed by their real
+         generation/existence status and shown only in their redacted form
+         — no arbitrary file path is ever accepted from the UI. -->
+    <section v-if="store.currentTask" class="block">
+      <h3>8. 任务文档</h3>
+      <ul class="document-list">
+        <li v-for="doc in store.taskDocuments" :key="doc.document_type">
+          <span>{{ doc.display_name }}</span>
+          <span v-if="!doc.exists" class="hint">（尚未生成）</span>
+          <button v-else class="link-button" @click="handleViewDocument(doc.document_type)">查看</button>
+        </li>
+      </ul>
+      <button class="link-button" @click="store.loadTaskDocuments">刷新文档列表</button>
+      <div v-if="store.selectedDocument" class="document-content">
+        <h4>{{ store.selectedDocument.display_name }}</h4>
+        <p v-if="store.selectedDocument.error" class="bad">{{ store.selectedDocument.error }}</p>
+        <pre v-else-if="store.selectedDocument.content">{{ store.selectedDocument.content }}</pre>
+        <p v-else class="hint">该文档尚未生成。</p>
+        <button class="link-button" @click="store.selectedDocument = null">关闭</button>
+      </div>
+    </section>
   </div>
 </template>
 
@@ -494,5 +631,42 @@ const stateLabels: Record<string, string> = {
 .cli-trust-item {
   flex: 1;
   min-width: 260px;
+}
+.timeline-list {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0;
+}
+.timeline-list li {
+  padding: 4px 0;
+  border-bottom: 1px solid #333;
+}
+.evidence-item {
+  font-size: 0.9em;
+  padding: 4px 0;
+  word-break: break-all;
+}
+.document-list {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0;
+}
+.document-list li {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 4px 0;
+}
+.document-content {
+  border: 1px solid #444;
+  border-radius: 4px;
+  padding: 8px;
+  margin-top: 8px;
+}
+.document-content pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 400px;
+  overflow-y: auto;
 }
 </style>

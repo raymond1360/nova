@@ -1252,6 +1252,57 @@ pub fn get_no_build_confirmation_needed(
     })
 }
 
+/// Phase 4 (evidence and document gate): the one read-only, backend-derived
+/// timeline + evidence summary + completion-gate view for a task. Never
+/// accepts a caller-supplied generation/round/action-status — every fact
+/// returned is computed fresh from the database's current truth by
+/// `core_loop::task_evidence_overview`.
+#[tauri::command]
+pub fn get_task_evidence_overview(
+    project_id: String,
+    task_id: String,
+    state: State<'_, AppState>,
+) -> Result<crate::core_loop::evidence_overview::TaskEvidenceOverview, String> {
+    with_db(&state, |db| {
+        crate::core_loop::task_evidence_overview(db, &project_id, &task_id)
+    })
+}
+
+/// Phase 4 (evidence and document gate): lists the seven result documents'
+/// display metadata (never their content) for a task.
+#[tauri::command]
+pub fn list_task_documents(
+    project_id: String,
+    task_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::core_loop::task_documents::TaskDocumentInfo>, String> {
+    with_db(&state, |db| {
+        crate::core_loop::list_task_documents(db, &project_id, &task_id, &state.app_data_dir)
+    })
+}
+
+/// Phase 4 (evidence and document gate): reads exactly one of the task's
+/// seven result documents, identified only by a fixed `document_type` tag
+/// — never a caller-supplied path. See `core_loop::task_documents` for the
+/// allowlist and path-safety design.
+#[tauri::command]
+pub fn read_task_document(
+    project_id: String,
+    task_id: String,
+    document_type: String,
+    state: State<'_, AppState>,
+) -> Result<crate::core_loop::task_documents::TaskDocumentContent, String> {
+    with_db(&state, |db| {
+        crate::core_loop::read_task_document(
+            db,
+            &project_id,
+            &task_id,
+            &document_type,
+            &state.app_data_dir,
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

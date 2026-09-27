@@ -204,54 +204,43 @@ fn fix_report_doc(db: &Database, task_id: &str) -> NovaResult<String> {
     Ok(body)
 }
 
-fn final_result_doc(
+/// v0.1.0 scope correction (`CODEX_V0.1_SCOPE_CORRECTION_AUDIT_09211027.md`,
+/// Blocker 4): completion is gated on Nova's own independent test/build
+/// verification for the current result generation — never on a reviewer
+/// `approve` row. The dormant v0.2.0 dual-AI path may still write real
+/// `task_reviews` rows (kept as supplementary evidence, surfaced in
+/// FIRST_REVIEW.md/SECOND_REVIEW.md when present), but their absence must
+/// never block a v0.1.0 single-AI result from being shown as ready for user
+/// acceptance. Checks both rounds (1 and 2, the fixed "at most one automatic
+/// fix pass" product rule) since either could be the one that actually
+/// produced the current result.
+///
+/// Real bug found via testing: `tasks.result_generation` is bumped on the
+/// `-> preview_ready` transition, which happens *after* the round's test
+/// evidence was already recorded against the *pre-bump* generation — so a
+/// task that has just reached `awaiting_user_acceptance` for the first time
+/// always has its real, passing test evidence one generation behind
+/// `task.result_generation` as read here. Checking both
+/// `task.result_generation` and `task.result_generation - 1` covers both
+/// that case and the (harmless, already-correct) case of re-checking an
+/// older, already-superseded generation.
+///
+/// Phase 4 (evidence/document gate): extracted unchanged from
+/// `final_result_doc` (previously inlined there) so the completion
+/// authority has exactly one implementation — `evidence_overview`'s
+/// `acceptance_ready`/`is_completed` fields and `FINAL_RESULT.md`'s own
+/// status line now both call this, instead of risking two independently
+/// hand-written copies of the same gate silently drifting apart. Behavior
+/// is unchanged: see `final_result_never_says_completed_before_a_real_user_
+/// acceptance_exists` and `final_result_shows_test_and_build_evidence_
+/// separately` below, which still assert on the exact same rendered output.
+pub(crate) fn adopted_passing_generation_round(
     db: &Database,
     project_id: &str,
     task_id: &str,
     task: &Task,
-) -> NovaResult<String> {
-    let acceptance = db.user_acceptance_for_task(task_id)?;
-    let accepted_current_generation = acceptance
-        .as_ref()
-        .is_some_and(|a| a.result_generation == task.result_generation && a.accepted);
-
-    // v0.1.0 scope correction (`CODEX_V0.1_SCOPE_CORRECTION_AUDIT_09211027.md`,
-    // Blocker 4): completion is gated on Nova's own independent test/build
-    // verification for the current result generation — never on a reviewer
-    // `approve` row. The dormant v0.2.0 dual-AI path may still write real
-    // `task_reviews` rows (kept as supplementary evidence, surfaced in
-    // FIRST_REVIEW.md/SECOND_REVIEW.md below when present), but their
-    // absence must never block a v0.1.0 single-AI result from being shown
-    // as ready for user acceptance. Checks both rounds (1 and 2, the fixed
-    // "at most one automatic fix pass" product rule) since either could be
-    // the one that actually produced the current result.
-    //
-    // Real bug found via testing: `tasks.result_generation` is bumped on
-    // the `-> preview_ready` transition, which happens *after* the round's
-    // test evidence was already recorded against the *pre-bump* generation
-    // — so a task that has just reached `awaiting_user_acceptance` for the
-    // first time always has its real, passing test evidence one generation
-    // behind `task.result_generation` as read here. Checking both
-    // `task.result_generation` and `task.result_generation - 1` covers
-    // both that case and the (harmless, already-correct) case of
-    // re-checking an older, already-superseded generation.
-    // Codex re-review remediation (second re-review, Minor): the status
-    // line and the evidence breakdown below must always agree on *which*
-    // generation actually satisfied the gate. Previously the gate check
-    // could accept `task.result_generation - 1` (see the off-by-one note
-    // above) while the evidence breakdown unconditionally rendered only
-    // `task.result_generation`, so a task that had just reached
-    // `awaiting_user_acceptance` could show `status: 等待用户验收` above a
-    // `(尚未触发)` evidence line — internally contradictory. A single
-    // search now finds the *one* `(generation, round)` pair whose test
-    // *and* build evidence both actually passed together (the same pair
-    // `finish_success_path` itself required to let that round succeed —
-    // test and build evidence for a round are always written under the
-    // same `result_generation`, so this is never a mismatched combination
-    // across rounds), and that exact pair drives both the status line and
-    // the evidence breakdown below.
-    let mut adopted: Option<(i64, i64)> = None;
-    'adopt: for generation in [task.result_generation, task.result_generation - 1] {
+) -> NovaResult<Option<(i64, i64)>> {
+    for generation in [task.result_generation, task.result_generation - 1] {
         if generation < 0 {
             continue;
         }
@@ -265,11 +254,40 @@ fn final_result_doc(
                 .iter()
                 .any(|e| e.status == "passed" || e.status == "no_build_applicable");
             if test_ok && build_ok {
-                adopted = Some((generation, round));
-                break 'adopt;
+                return Ok(Some((generation, round)));
             }
         }
     }
+    Ok(None)
+}
+
+fn final_result_doc(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    task: &Task,
+) -> NovaResult<String> {
+    let acceptance = db.user_acceptance_for_task(task_id)?;
+    let accepted_current_generation = acceptance
+        .as_ref()
+        .is_some_and(|a| a.result_generation == task.result_generation && a.accepted);
+
+    // Codex re-review remediation (second re-review, Minor): the status
+    // line and the evidence breakdown below must always agree on *which*
+    // generation actually satisfied the gate. Previously the gate check
+    // could accept `task.result_generation - 1` (see the off-by-one note
+    // on [`adopted_passing_generation_round`]) while the evidence breakdown
+    // unconditionally rendered only `task.result_generation`, so a task
+    // that had just reached `awaiting_user_acceptance` could show `status:
+    // 等待用户验收` above a `(尚未触发)` evidence line — internally
+    // contradictory. A single search now finds the *one* `(generation,
+    // round)` pair whose test *and* build evidence both actually passed
+    // together (the same pair `finish_success_path` itself required to let
+    // that round succeed — test and build evidence for a round are always
+    // written under the same `result_generation`, so this is never a
+    // mismatched combination across rounds), and that exact pair drives
+    // both the status line and the evidence breakdown below.
+    let adopted = adopted_passing_generation_round(db, project_id, task_id, task)?;
     let gate_ok = adopted.is_some();
 
     let status_line = if task.state == TaskState::Completed && accepted_current_generation {

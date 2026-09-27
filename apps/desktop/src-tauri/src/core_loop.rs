@@ -1385,23 +1385,45 @@ fn reconcile_no_tests_confirmation_attempt(
     Ok(confirmation)
 }
 
-/// Work Package 3 final review remediation (Major 1 / Suggestion 2): a
-/// read-only counterpart to [`current_pending_round`] the frontend uses to
-/// decide whether to show the "confirm this project currently has no
-/// applicable tests" prompt for a `needs_user_action` task — mirrors
-/// [`no_build_confirmation_needed`] exactly, but for the no-tests stall.
-/// Mirrors exactly the same real signals [`reconcile_no_tests_confirmation`]'s
-/// Case A gate requires before ever accepting a confirmation (task
-/// ownership, `NeedsUserAction`, the current generation/round's test action
-/// genuinely `Failed` with the internal no-tests-awaiting-confirmation
-/// marker, and an empty test-evidence list for that exact generation/round),
-/// but never writes anything and never mutates task/action/evidence state.
+/// Work Package 3 final review remediation (Major 1 / Suggestion 2),
+/// extended by the Phase 3 final rereview remediation (Case C recovery
+/// visibility): a read-only counterpart to [`current_pending_round`] the
+/// frontend uses to decide whether to show the "confirm this project
+/// currently has no applicable tests" prompt/recovery card for a
+/// `needs_user_action` task — mirrors [`no_build_confirmation_needed`], but
+/// for the no-tests stall. Never writes anything and never mutates
+/// task/action/evidence state; ownership and `NeedsUserAction` are checked
+/// once up front for both branches below.
+///
+/// Returns `true` for exactly two legal states, matching
+/// [`reconcile_no_tests_confirmation_attempt`]'s own two recoverable
+/// branches:
+///
+/// - **Branch A (awaiting first confirmation)**: the current generation/
+///   round's test action is genuinely `Failed` with the internal
+///   no-tests-awaiting-confirmation marker, and no test evidence exists yet
+///   for that exact generation/round.
+/// - **Branch B (Case C — confirmed, reset, but the task transition never
+///   completed)**: a real confirmation already exists for the *exact*
+///   current `(task_id, result_generation, round)` natural key, the test
+///   action has already been reset to `Planned` (the reset half of Case
+///   C's recovery ran, but a crash/restart happened before the
+///   `Queued` transition), and no test evidence contradicts it. Before this
+///   fix, this branch returned `false` — the production command
+///   ([`confirm_no_tests_applicable`]) could already recover this exact
+///   state, but the UI had no way to know to show the entry point, leaving
+///   a real task stuck at `needs_user_action` with only a generic message
+///   after a restart.
+///
 /// Returns `Ok(false)` for every other combination (wrong project, wrong
 /// task state, no matching action, a genuine test failure/timeout/
-/// cancellation/allowlist rejection, or a build stall instead) rather than
-/// erroring, since this is meant to be polled freely by the UI without the
-/// caller having to pre-validate anything itself. Never returns or leaks
-/// the internal marker string itself — only the boolean fact.
+/// cancellation/allowlist rejection, a build stall instead, an action
+/// already `Queued`/`Started`/`Succeeded`/`Cancelled`/`Uncertain`, a
+/// `Planned` action with no matching current-natural-key confirmation, or
+/// any state with contradicting current-generation/round test evidence)
+/// rather than erroring, since this is meant to be polled freely by the UI
+/// without the caller having to pre-validate anything itself. Never returns
+/// or leaks the internal marker string itself — only the boolean fact.
 pub fn no_tests_confirmation_needed(
     db: &Database,
     project_id: &str,
@@ -1418,14 +1440,31 @@ pub fn no_tests_confirmation_needed(
         Some(action) => action,
         None => return Ok(false),
     };
-    if action.status != ActionStatus::Failed
-        || action.error_summary.as_deref() != Some(NO_TESTS_AWAITING_CONFIRMATION_MARKER)
-    {
-        return Ok(false);
-    }
-    Ok(db
+    let evidence_empty = db
         .list_test_evidence_for_round(project_id, task_id, result_generation, round)?
-        .is_empty())
+        .is_empty();
+
+    match action.status {
+        ActionStatus::Failed => {
+            if action.error_summary.as_deref() != Some(NO_TESTS_AWAITING_CONFIRMATION_MARKER) {
+                return Ok(false);
+            }
+            Ok(evidence_empty)
+        }
+        ActionStatus::Planned => {
+            // Case C: fail closed immediately on any contradicting
+            // evidence, before ever consulting the confirmations table —
+            // a real test outcome for this exact generation/round always
+            // takes priority over an existing confirmation row.
+            if !evidence_empty {
+                return Ok(false);
+            }
+            Ok(db
+                .find_no_tests_confirmation(project_id, task_id, result_generation, round)?
+                .is_some())
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Outcome of [`run_dev_and_test_round`] — the developer-AI-plus-Nova's-
@@ -10334,6 +10373,214 @@ mod tests {
         let confirmation = confirm_no_tests_applicable(&db, &project_id, &task_id, None).unwrap();
         assert_eq!(confirmation.round, 1);
         assert_eq!(db.task(&task_id).unwrap().state, TaskState::Queued);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Phase 3 final rereview remediation: `no_tests_confirmation_
+    // needed`'s Case C branch (confirmed + reset to `planned` + task still
+    // `needs_user_action`, i.e. a crash/restart between the reset and the
+    // `queued` transition) — the production recovery command could already
+    // handle this state (see the test directly above), but the read-only
+    // UI query used to return `false` for it, hiding the only visible
+    // recovery entry point from the user after a restart. ------------------
+
+    #[test]
+    fn no_tests_confirmation_needed_is_true_for_case_c_confirmed_reset_but_not_yet_transitioned() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_no_tests("no-tests-needed-case-c-true", "codex_cli");
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, Some("case c"))
+            .unwrap();
+        let test_key = test_action_key(&task_id, 0, 1);
+        db.reset_failed_action_for_retry(&task_id, &test_key)
+            .unwrap();
+        assert_eq!(
+            db.find_action(&task_id, &test_key).unwrap().unwrap().status,
+            ActionStatus::Planned
+        );
+        assert_eq!(db.task(&task_id).unwrap().state, TaskState::NeedsUserAction);
+
+        let needed = no_tests_confirmation_needed(&db, &project_id, &task_id).unwrap();
+        assert!(
+            needed,
+            "Case C (confirmed + action planned + task still needs_user_action) must surface a \
+             visible recovery entry"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_tests_confirmation_needed_is_false_when_planned_but_no_current_natural_key_confirmation_exists(
+    ) {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_no_tests("no-tests-needed-planned-no-confirmation", "codex_cli");
+        // Reset the action directly, without ever recording a real
+        // confirmation — an action reaching `planned` some other way must
+        // never, on its own, be mistaken for a legitimate Case C recovery
+        // state.
+        let test_key = test_action_key(&task_id, 0, 1);
+        db.reset_failed_action_for_retry(&task_id, &test_key)
+            .unwrap();
+        assert_eq!(
+            db.find_action(&task_id, &test_key).unwrap().unwrap().status,
+            ActionStatus::Planned
+        );
+
+        let needed = no_tests_confirmation_needed(&db, &project_id, &task_id).unwrap();
+        assert!(
+            !needed,
+            "a planned action with no real confirmation for the current natural key must never \
+             be treated as recoverable"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_tests_confirmation_needed_is_false_for_case_c_when_the_confirmation_belongs_to_a_stale_generation_or_round(
+    ) {
+        for (label, confirm_generation, confirm_round) in [
+            ("stale-generation", 5_i64, 1_i64),
+            ("stale-round", 0_i64, 5_i64),
+        ] {
+            let (dir, db, project_id, task_id) = stall_task_at_round_1_no_tests(
+                &format!("no-tests-needed-case-c-{label}"),
+                "codex_cli",
+            );
+            // A confirmation exists, but for a *different* generation/round
+            // than the task's real current natural key — never the exact
+            // match `no_tests_confirmation_needed` requires.
+            db.record_no_tests_confirmation(
+                &project_id,
+                &task_id,
+                confirm_generation,
+                confirm_round,
+                None,
+            )
+            .unwrap();
+            let test_key = test_action_key(&task_id, 0, 1);
+            db.reset_failed_action_for_retry(&task_id, &test_key)
+                .unwrap();
+
+            let needed = no_tests_confirmation_needed(&db, &project_id, &task_id).unwrap();
+            assert!(
+                !needed,
+                "{label}: a confirmation for a stale generation/round must never unlock the \
+                 current one's recovery entry"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn no_tests_confirmation_needed_is_false_for_case_c_when_current_generation_round_evidence_contradicts_it(
+    ) {
+        let (dir, db, project_id, task_id) = stall_task_at_round_1_no_tests(
+            "no-tests-needed-case-c-contradicting-evidence",
+            "codex_cli",
+        );
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        let test_key = test_action_key(&task_id, 0, 1);
+        db.reset_failed_action_for_retry(&task_id, &test_key)
+            .unwrap();
+        // A real test outcome for this exact generation/round exists
+        // (however it got there) — it must take priority over the
+        // confirmation row and fail closed rather than silently resurface
+        // a recovery entry that no longer reflects reality.
+        db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            test_command_redacted: Some("npm test"),
+            status: "passed",
+            passed_count: 1,
+            failed_count: 0,
+            skipped_count: 0,
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+
+        let needed = no_tests_confirmation_needed(&db, &project_id, &task_id).unwrap();
+        assert!(
+            !needed,
+            "real current-generation/round test evidence must fail closed even with a real \
+             confirmation and a planned action"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_tests_confirmation_needed_is_false_once_the_action_has_advanced_past_planned() {
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_no_tests("no-tests-needed-advanced-past-planned", "codex_cli");
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        let test_key = test_action_key(&task_id, 0, 1);
+        db.reset_failed_action_for_retry(&task_id, &test_key)
+            .unwrap();
+        db.start_action(&task_id, &test_key, false).unwrap();
+        assert_eq!(
+            db.find_action(&task_id, &test_key).unwrap().unwrap().status,
+            ActionStatus::Started
+        );
+
+        let needed = no_tests_confirmation_needed(&db, &project_id, &task_id).unwrap();
+        assert!(
+            !needed,
+            "an action already started (or later: succeeded/cancelled/uncertain) must never be \
+             shown as awaiting a no-tests recovery entry"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_tests_confirmation_needed_rejects_a_project_id_that_does_not_own_the_task_for_case_c() {
+        let (dir, db, _project_id, task_id) =
+            stall_task_at_round_1_no_tests("no-tests-needed-case-c-wrong-project", "codex_cli");
+        db.record_no_tests_confirmation(&_project_id, &task_id, 0, 1, None)
+            .unwrap();
+        let test_key = test_action_key(&task_id, 0, 1);
+        db.reset_failed_action_for_retry(&task_id, &test_key)
+            .unwrap();
+
+        let other_dir = temp_dir("no-tests-needed-case-c-wrong-project-other");
+        let other_project = db
+            .create_project(&CreateProjectRequest {
+                name: "Other".to_string(),
+                local_path: other_dir.to_string_lossy().into_owned(),
+                source_type: "local".to_string(),
+                source_url: None,
+                purpose: None,
+                long_term_goal: None,
+                user_preferences: None,
+                prohibitions: None,
+            })
+            .unwrap();
+
+        let needed = no_tests_confirmation_needed(&db, &other_project.id, &task_id).unwrap();
+        assert!(
+            !needed,
+            "wrong project ownership must never surface a recovery entry"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&other_dir);
+    }
+
+    #[test]
+    fn no_tests_confirmation_needed_still_returns_true_for_the_original_failed_plus_marker_branch()
+    {
+        // Regression guard: Branch A (the pre-existing behavior this fix
+        // must not weaken) still works exactly as before.
+        let (dir, db, project_id, task_id) =
+            stall_task_at_round_1_no_tests("no-tests-needed-branch-a-regression", "codex_cli");
+        let needed = no_tests_confirmation_needed(&db, &project_id, &task_id).unwrap();
+        assert!(
+            needed,
+            "the original awaiting-first-confirmation branch must remain true"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

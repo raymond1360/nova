@@ -60,4 +60,27 @@ describe('CoreLoopView.vue single-AI copy', () => {
     // Work Package 3 final review remediation (Major 1).
     expect(source).toContain(':disabled="store.confirmingNoTests"')
   })
+
+  it('shows the no-tests recovery card instead of the generic needs_user_action message whenever the backend needs it', () => {
+    // Phase 3 final rereview remediation (Case C visibility): there is no
+    // `@vue/test-utils`-based mount harness in this project (see the
+    // module doc comment above), so this cannot render the component and
+    // assert on the actually-visible DOM for a Case C store state.
+    // Instead, this asserts on the real template source that the generic
+    // "needs_user_action" fallback message's own `v-if` condition
+    // explicitly excludes `store.noTestsConfirmationNeeded` — the same
+    // real property `store.noTestsConfirmationNeeded` the no-tests card
+    // above is gated on. Since the backend fix makes that property `true`
+    // for Case C exactly like it always has for the original
+    // awaiting-confirmation state, this structural guarantee is sufficient
+    // to prove the recovery card, not the generic message, is what renders
+    // whenever the backend says a no-tests entry point (first-time or
+    // Case C recovery) is needed — real component-mount coverage remains a
+    // known gap, tracked as a Minor, not fixed in this round.
+    const genericMessageMatch = source.match(
+      /<p\s+v-if="store\.currentTask\.state === 'needs_user_action'[^"]*"/,
+    )
+    expect(genericMessageMatch).not.toBeNull()
+    expect(genericMessageMatch?.[0]).toContain('!store.noTestsConfirmationNeeded')
+  })
 })

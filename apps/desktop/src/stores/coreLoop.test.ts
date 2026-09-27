@@ -1020,6 +1020,107 @@ describe('coreLoop store', () => {
     expect(store.noTestsConfirmationNeeded).toBe(true)
   })
 
+  // Phase 3 final rereview remediation: Case C (confirmation already
+  // recorded, the backend's test action already reset to `planned`, but a
+  // crash/restart happened before the task ever transitioned out of
+  // `needs_user_action`) used to be invisible to the UI even though the
+  // production `confirm_no_tests_applicable` command could already recover
+  // it — the backend query returned `false` and the frontend never knew to
+  // show the recovery entry. The store itself does not (and must not) know
+  // *why* the backend said `true`; these tests exist specifically to
+  // document and lock in that a Case C-shaped `true` response is surfaced
+  // through every real user-facing path a restart could take, exactly like
+  // any other `true` response.
+
+  it('loadNoTestsConfirmationNeeded surfaces Case C recovery (confirmed + reset, still needs_user_action)', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ state: 'needs_user_action' })
+    // The backend's `no_tests_confirmation_needed` now returns `true` for
+    // this exact half-success state — the store only needs to trust it.
+    routeInvoke({
+      get_no_tests_confirmation_needed: async () => true,
+    })
+
+    await store.loadNoTestsConfirmationNeeded()
+
+    expect(store.noTestsConfirmationNeeded).toBe(true)
+  })
+
+  it('restoreLastSession surfaces the Case C recovery card after an app restart', async () => {
+    const store = useCoreLoopStore()
+    const stuckTask = fakeTask({ id: 'task-case-c', state: 'needs_user_action' })
+    routeInvoke({
+      get_last_active_project: async () => fakeProject(),
+      list_tasks_for_project: async () => [stuckTask],
+      list_task_reviews: async () => [],
+      get_no_build_confirmation_needed: async () => false,
+      // Simulates the exact Case C production state: a confirmation was
+      // already recorded and the test action already reset to `planned`
+      // before the process was interrupted — the real backend query would
+      // now return `true` for this task on the very first poll after
+      // restart, with no user action required to trigger it.
+      get_no_tests_confirmation_needed: async () => true,
+    })
+
+    await store.restoreLastSession()
+
+    expect(store.currentTask?.id).toBe('task-case-c')
+    expect(store.noTestsConfirmationNeeded).toBe(true)
+  })
+
+  it('selectTask surfaces the Case C recovery card for an already-needs_user_action task', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    routeInvoke({
+      get_no_build_confirmation_needed: async () => false,
+      get_no_tests_confirmation_needed: async () => true,
+    })
+
+    store.selectTask(fakeTask({ state: 'needs_user_action' }))
+    await vi.waitFor(() => expect(store.noTestsConfirmationNeeded).toBe(true))
+  })
+
+  it('user can still invoke confirmNoTestsApplicable from a surfaced Case C recovery card, with a clean payload', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    store.currentTask = fakeTask({ state: 'needs_user_action' })
+    routeInvoke({
+      get_no_tests_confirmation_needed: async () => true,
+    })
+    await store.loadNoTestsConfirmationNeeded()
+    expect(store.noTestsConfirmationNeeded).toBe(true)
+
+    let sentArgs: unknown = null
+    routeInvoke({
+      confirm_no_tests_applicable: async (args) => {
+        sentArgs = args
+        return {
+          id: 'nt-case-c',
+          project_id: 'proj-1',
+          task_id: 'task-1',
+          result_generation: 0,
+          round: 1,
+          confirmed_by: 'user',
+          reason: null,
+          confirmed_at: 'now',
+          created_at: 'now',
+        }
+      },
+      list_tasks_for_project: async () => [fakeTask({ state: 'queued' })],
+      list_task_reviews: async () => [],
+      get_pending_round: async () => 1,
+    })
+
+    await store.confirmNoTestsApplicable('resuming after restart')
+
+    expect(sentArgs).not.toHaveProperty('round')
+    expect(sentArgs).not.toHaveProperty('result_generation')
+    expect(sentArgs).not.toHaveProperty('resultGeneration')
+    expect(sentArgs).not.toHaveProperty('actionStatus')
+    expect(store.currentTask?.state).toBe('queued')
+  })
+
   it('refreshCurrentTask loads noTestsConfirmationNeeded only while needs_user_action', async () => {
     const store = useCoreLoopStore()
     store.currentProject = fakeProject()

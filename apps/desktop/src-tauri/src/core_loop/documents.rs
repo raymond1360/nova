@@ -272,7 +272,12 @@ pub(crate) fn adopted_passing_generation_round(
                 }
                 if evidence.status == "no_build_applicable"
                     && no_build_applicable_is_authorized(
-                        db, project_id, task_id, generation, round,
+                        db,
+                        project_id,
+                        task_id,
+                        generation,
+                        round,
+                        evidence.authorization_source.as_deref(),
                     )?
                 {
                     build_ok = true;
@@ -308,26 +313,41 @@ pub(crate) fn no_tests_applicable_is_authorized(
         .is_some())
 }
 
-/// Phase 4 remediation (Major 2): the build equivalent of
-/// [`no_tests_applicable_is_authorized`], with one deliberate addition —
-/// `no_build_applicable` has two distinct legitimate origins (see
-/// `Database::record_build_evidence`'s own doc comment for the full
-/// audit): a real `no_build_confirmations` row for this exact key, **or**
-/// Nova's own current, mechanical re-derivation
-/// (`test_runner::detect_build_command`) independently and positively
-/// confirming this project's build step genuinely does not apply, exactly
-/// mirroring the same check `core_loop::run_build_for_round` performs
-/// before ever writing this evidence in the first place. Re-deriving
-/// against the project's *current* files (rather than trusting the
-/// evidence row alone) is strictly more conservative than the original
-/// write-time decision: if the project has since gained a build script,
-/// this correctly stops trusting a now-stale "not applicable" claim.
+/// Phase 4 remediation (Major 2, then the second re-review's remaining
+/// Major): the build equivalent of [`no_tests_applicable_is_authorized`],
+/// with one deliberate addition — `no_build_applicable` has two distinct
+/// legitimate origins (see `Database::record_build_evidence`'s own doc
+/// comment for the full audit):
+///
+/// 1. A real `no_build_confirmations` row for this exact key — re-verified
+///    here every time, never trusted merely because the evidence row
+///    claims `authorization_source = user_confirmed_not_applicable`, so a
+///    confirmation that is later deleted/invalidated correctly stops
+///    authorizing the row.
+/// 2. `authorization_source == "mechanical_not_applicable"` — Nova's own
+///    mechanical detection result, persisted at the *exact moment*
+///    `run_build_for_round` observed `BuildDetection::NotApplicable` (see
+///    `core_loop::run_build_for_round`'s `NotApplicable` branch). This is a
+///    **persisted historical fact**, not re-derived: this function used to
+///    re-run `test_runner::detect_build_command` against the project's
+///    *current* files here, which meant a change to the project's build
+///    configuration after the evidence was written could retroactively
+///    authorize an orphaned row (if a build script was later removed) or
+///    invalidate a legitimately-mechanical row (if one was later added).
+///    Trusting the persisted `authorization_source` instead makes the
+///    result depend only on the database's own history, identical before
+///    and after a restart, and identical regardless of what the project
+///    directory currently contains.
+///
+/// Any other value (`legacy_unknown`, or `None` on an orphaned/malformed
+/// row) is authorized only through path 1 above — never on its own.
 pub(crate) fn no_build_applicable_is_authorized(
     db: &Database,
     project_id: &str,
     task_id: &str,
     result_generation: i64,
     round: i64,
+    authorization_source: Option<&str>,
 ) -> NovaResult<bool> {
     if db
         .find_no_build_confirmation(project_id, task_id, result_generation, round)?
@@ -335,12 +355,7 @@ pub(crate) fn no_build_applicable_is_authorized(
     {
         return Ok(true);
     }
-    let project = db.project(project_id)?;
-    let project_dir = Path::new(&project.local_path);
-    Ok(matches!(
-        super::test_runner::detect_build_command(project_dir),
-        super::test_runner::BuildDetection::NotApplicable(_)
-    ))
+    Ok(authorization_source == Some("mechanical_not_applicable"))
 }
 
 fn final_result_doc(
@@ -547,7 +562,7 @@ mod tests {
             .unwrap();
     }
 
-    fn record_no_build_applicable(
+    fn record_no_build_applicable_confirmed(
         db: &Database,
         project_id: &str,
         task_id: &str,
@@ -561,12 +576,72 @@ mod tests {
             round,
             build_command_redacted: None,
             status: "no_build_applicable",
+            authorization_source: Some(
+                crate::models::BuildEvidenceAuthorizationSource::UserConfirmedNotApplicable,
+            ),
             exit_code: None,
             reason: Some("no build step detected"),
             stdout_ref: None,
             stderr_ref: None,
         })
         .unwrap();
+    }
+
+    fn record_no_build_applicable_mechanical(
+        db: &Database,
+        project_id: &str,
+        task_id: &str,
+        generation: i64,
+        round: i64,
+    ) {
+        db.record_build_evidence(&RecordBuildEvidenceRequest {
+            project_id,
+            task_id,
+            result_generation: generation,
+            round,
+            build_command_redacted: None,
+            status: "no_build_applicable",
+            authorization_source: Some(
+                crate::models::BuildEvidenceAuthorizationSource::MechanicalNotApplicable,
+            ),
+            exit_code: None,
+            reason: Some("no build step detected"),
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+    }
+
+    /// Constructs an adversarial, invariant-breaking database state — a
+    /// `no_build_applicable` row with `authorization_source =
+    /// 'legacy_unknown'` and **no** matching confirmation — exactly the
+    /// shape schema v10's migration produces for a pre-existing row whose
+    /// true origin cannot be determined, and exactly what
+    /// `Database::record_build_evidence` itself now refuses to create
+    /// through its normal write path (it rejects `LegacyUnknown` outright).
+    /// Bypasses that guard via raw SQL, mirroring
+    /// `insert_orphaned_no_tests_applicable`.
+    fn insert_orphaned_no_build_applicable(
+        db: &Database,
+        project_id: &str,
+        task_id: &str,
+        generation: i64,
+        round: i64,
+    ) {
+        db.conn()
+            .execute(
+                "INSERT INTO build_evidence (id, project_id, task_id, result_generation, round, build_command_redacted, status, authorization_source, exit_code, reason, stdout_ref, stderr_ref, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'no_build_applicable', 'legacy_unknown', NULL, 'orphaned adversarial row', NULL, NULL, ?6)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    project_id,
+                    task_id,
+                    generation,
+                    round,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
     }
 
     fn record_test_passed(
@@ -608,6 +683,7 @@ mod tests {
             round,
             build_command_redacted: Some("cargo build"),
             status: "passed",
+            authorization_source: None,
             exit_code: Some(0),
             reason: None,
             stdout_ref: None,
@@ -631,7 +707,7 @@ mod tests {
         db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
             .unwrap();
         record_no_tests_applicable(&db, &project_id, &task_id, 0, 1);
-        record_no_build_applicable(&db, &project_id, &task_id, 0, 1);
+        record_no_build_applicable_confirmed(&db, &project_id, &task_id, 0, 1);
 
         let task = task_at_generation(&db, &task_id, 0);
         let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
@@ -665,7 +741,7 @@ mod tests {
         let dir = temp_dir("major2-build-orphaned");
         let (db, project_id, task_id) = db_with_task(&dir);
         record_test_passed(&db, &project_id, &task_id, 0, 1);
-        record_no_build_applicable(&db, &project_id, &task_id, 0, 1);
+        insert_orphaned_no_build_applicable(&db, &project_id, &task_id, 0, 1);
 
         let task = task_at_generation(&db, &task_id, 0);
         let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
@@ -677,7 +753,8 @@ mod tests {
     }
 
     #[test]
-    fn mechanically_justified_no_build_applicable_is_adopted_without_any_confirmation() {
+    fn no_build_applicable_with_mechanical_not_applicable_source_is_adopted_without_any_confirmation(
+    ) {
         // Protects the *legitimate* design this round must not break:
         // `BuildDetection::NotApplicable` (a real package.json with no
         // build script) never needs or produces a confirmation.
@@ -685,7 +762,7 @@ mod tests {
         let (db, project_id, task_id) = db_with_task(&dir);
         fs::write(dir.join("package.json"), r#"{"name":"x","scripts":{}}"#).unwrap();
         record_test_passed(&db, &project_id, &task_id, 0, 1);
-        record_no_build_applicable(&db, &project_id, &task_id, 0, 1);
+        record_no_build_applicable_mechanical(&db, &project_id, &task_id, 0, 1);
 
         let task = task_at_generation(&db, &task_id, 0);
         let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
@@ -823,7 +900,7 @@ mod tests {
         db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("no build needed"))
             .unwrap();
         record_no_tests_applicable(&db, &project_id, &task_id, 0, 1);
-        record_no_build_applicable(&db, &project_id, &task_id, 0, 1);
+        record_no_build_applicable_confirmed(&db, &project_id, &task_id, 0, 1);
 
         let task = task_at_generation(&db, &task_id, 0);
         let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
@@ -873,7 +950,7 @@ mod tests {
             record_no_tests_applicable(&db, &project.id, &task.id, 0, 1);
             // Deliberately orphaned build evidence — no confirmation, and
             // this fixture dir has no Cargo.toml/package.json either.
-            record_no_build_applicable(&db, &project.id, &task.id, 0, 1);
+            insert_orphaned_no_build_applicable(&db, &project.id, &task.id, 0, 1);
             (project.id, task.id)
         };
 
@@ -884,6 +961,460 @@ mod tests {
             adopted, None,
             "the legitimate no-tests confirmation must survive the reopen, but the orphaned \
              build evidence must still fail closed rather than becoming trusted after a restart"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Phase 4 remediation (second re-review): time-consistency of the
+    // persisted no-build authorization source — the completion gate must
+    // never depend on what the project's files look like *now*. ----------
+
+    #[test]
+    fn mechanical_authorization_survives_a_later_build_script_addition() {
+        let dir = temp_dir("temporal-mechanical-survives-addition");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        // No package.json at write time — matches what `run_build_for_round`
+        // would have observed as `BuildDetection::NotApplicable` via the
+        // "no scripts at all" branch... actually that branch requires a
+        // real package.json; simulate the persisted fact directly, exactly
+        // as `run_build_for_round` would have written it at the time.
+        fs::write(dir.join("package.json"), r#"{"name":"x","scripts":{}}"#).unwrap();
+        record_test_passed(&db, &project_id, &task_id, 0, 1);
+        record_no_build_applicable_mechanical(&db, &project_id, &task_id, 0, 1);
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let before = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(before, Some((0, 1)));
+
+        // The project now gains a real build script — under the old
+        // read-time re-detection design this would have flipped the
+        // *historical* evidence's authorization to false. It must not.
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","scripts":{"build":"webpack"}}"#,
+        )
+        .unwrap();
+
+        let after = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            before, after,
+            "a persisted mechanical authorization must be unaffected by a later build-script addition"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn orphaned_evidence_is_never_retroactively_authorized_by_removing_the_build_requirement() {
+        let dir = temp_dir("temporal-orphan-not-retro-authorized");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        // At write time the project genuinely required a build (or Nova
+        // could not tell) — either way, this row was written without any
+        // confirmation, so it is adversarial regardless of what caused it.
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","scripts":{"build":"webpack"}}"#,
+        )
+        .unwrap();
+        record_test_passed(&db, &project_id, &task_id, 0, 1);
+        insert_orphaned_no_build_applicable(&db, &project_id, &task_id, 0, 1);
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let before = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(before, None);
+
+        // The build script is later removed — the project's *current*
+        // shape now mechanically looks NotApplicable. The orphaned row
+        // must still never be authorized: its `authorization_source` is
+        // `legacy_unknown`/`None`, a persisted fact this read never
+        // re-derives from the filesystem.
+        fs::write(dir.join("package.json"), r#"{"name":"x","scripts":{}}"#).unwrap();
+        let after = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            after, None,
+            "removing the build requirement after the fact must never retroactively authorize \
+             an orphaned no_build_applicable row"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn orphaned_evidence_written_during_insufficient_detection_stays_fail_closed_after_the_project_becomes_not_applicable(
+    ) {
+        let dir = temp_dir("temporal-insufficient-then-not-applicable");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        // `db_with_task`'s directory has neither Cargo.toml nor
+        // package.json at all — genuinely `Insufficient` at write time.
+        record_test_passed(&db, &project_id, &task_id, 0, 1);
+        insert_orphaned_no_build_applicable(&db, &project_id, &task_id, 0, 1);
+
+        fs::write(dir.join("package.json"), r#"{"name":"x","scripts":{}}"#).unwrap();
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            adopted, None,
+            "an orphaned row written during genuine detection failure must stay fail-closed \
+             even once the project later becomes mechanically NotApplicable"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_unknown_row_is_never_authorized_by_the_current_files_alone() {
+        let dir = temp_dir("temporal-legacy-unknown-no-confirmation");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        fs::write(dir.join("package.json"), r#"{"name":"x","scripts":{}}"#).unwrap();
+        record_test_passed(&db, &project_id, &task_id, 0, 1);
+        insert_orphaned_no_build_applicable(&db, &project_id, &task_id, 0, 1);
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            adopted, None,
+            "a legacy_unknown row must never be authorized just because the project's current \
+             files happen to look NotApplicable"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_unknown_row_is_authorized_once_a_real_exact_confirmation_exists() {
+        let dir = temp_dir("temporal-legacy-unknown-with-confirmation");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        record_test_passed(&db, &project_id, &task_id, 0, 1);
+        insert_orphaned_no_build_applicable(&db, &project_id, &task_id, 0, 1);
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("user confirmed"))
+            .unwrap();
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            adopted,
+            Some((0, 1)),
+            "a legacy_unknown row must become authorized once a real, exact-key confirmation \
+             exists — the same path any other unconfirmed row can use"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_persisted_user_confirmed_source_is_re_verified_against_the_real_confirmation_every_time() {
+        // Codex re-review requirement: "读取和完成门禁时仍重新核验精确confirmation，
+        // 防止数据不一致" — a row that *claims*
+        // `user_confirmed_not_applicable` is never trusted on the label
+        // alone; the exact-key confirmation must genuinely exist right now.
+        let dir = temp_dir("temporal-user-confirmed-reverified");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        // A real confirmation exists, but only for round 1 — the evidence
+        // row below (constructed via raw SQL to simulate a data anomaly,
+        // since the normal write API would itself reject this mismatch)
+        // claims `user_confirmed_not_applicable` for round 2.
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO build_evidence (id, project_id, task_id, result_generation, round, build_command_redacted, status, authorization_source, exit_code, reason, stdout_ref, stderr_ref, created_at)
+                 VALUES (?1, ?2, ?3, 0, 2, NULL, 'no_build_applicable', 'user_confirmed_not_applicable', NULL, 'claims confirmed, but for the wrong round', NULL, NULL, ?4)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    project_id,
+                    task_id,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        record_test_passed(&db, &project_id, &task_id, 0, 2);
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            adopted, None,
+            "a row merely labeled user_confirmed_not_applicable must never be trusted without \
+             re-verifying the exact-key confirmation actually exists"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evidence_overview_and_final_result_agree_on_mechanical_authorization() {
+        let dir = temp_dir("temporal-overview-final-result-agree");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        fs::write(dir.join("package.json"), r#"{"name":"x","scripts":{}}"#).unwrap();
+        record_test_passed(&db, &project_id, &task_id, 0, 1);
+        record_no_build_applicable_mechanical(&db, &project_id, &task_id, 0, 1);
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let gate_result =
+            adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(gate_result, Some((0, 1)));
+
+        let overview = super::super::evidence_overview::build_task_evidence_overview(
+            &db,
+            &project_id,
+            &task_id,
+        )
+        .unwrap();
+        let build_entry = overview
+            .builds
+            .iter()
+            .find(|b| b.evidence.result_generation == 0 && b.evidence.round == 1)
+            .unwrap();
+        assert_eq!(
+            build_entry.evidence.authorization_source.as_deref(),
+            Some("mechanical_not_applicable")
+        );
+        let timeline_entry = overview
+            .timeline
+            .iter()
+            .find(|e| e.event_type == "build_evidence")
+            .unwrap();
+        assert_eq!(
+            timeline_entry.status, "not_applicable",
+            "evidence_overview's timeline and documents::adopted_passing_generation_round must \
+             agree — both call the same shared authorization function"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn orphaned_evidence_gate_result_is_unaffected_by_a_missing_project_directory() {
+        let dir = temp_dir("temporal-missing-dir-orphan");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        record_test_passed(&db, &project_id, &task_id, 0, 1);
+        insert_orphaned_no_build_applicable(&db, &project_id, &task_id, 0, 1);
+        // Delete the project directory entirely — the old design would
+        // have called `detect_build_command` against a now-nonexistent
+        // path; the new design never touches the filesystem for this
+        // decision at all.
+        let _ = fs::remove_dir_all(&dir);
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            adopted, None,
+            "a missing project directory must not change an orphaned row's fail-closed outcome"
+        );
+    }
+
+    #[test]
+    fn mechanical_evidence_gate_result_is_unaffected_by_a_missing_project_directory() {
+        let dir = temp_dir("temporal-missing-dir-mechanical");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        fs::write(dir.join("package.json"), r#"{"name":"x","scripts":{}}"#).unwrap();
+        record_test_passed(&db, &project_id, &task_id, 0, 1);
+        record_no_build_applicable_mechanical(&db, &project_id, &task_id, 0, 1);
+        let _ = fs::remove_dir_all(&dir);
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            adopted,
+            Some((0, 1)),
+            "a legitimately-persisted mechanical authorization must survive even if the project \
+             directory is later deleted — the gate never re-reads the filesystem"
+        );
+    }
+
+    #[test]
+    fn gate_results_are_unaffected_by_package_json_becoming_corrupted_after_evidence_was_written() {
+        let dir = temp_dir("temporal-corrupted-package-json");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        fs::write(dir.join("package.json"), r#"{"name":"x","scripts":{}}"#).unwrap();
+        record_test_passed(&db, &project_id, &task_id, 0, 1);
+        record_no_build_applicable_mechanical(&db, &project_id, &task_id, 0, 1);
+        insert_orphaned_no_build_applicable(&db, &project_id, &task_id, 0, 2);
+        record_test_passed(&db, &project_id, &task_id, 0, 2);
+
+        // Corrupt package.json after both evidence rows were written. The
+        // old design re-read this file at gate time; the new design never
+        // touches it, so this must change nothing about either round.
+        fs::write(dir.join("package.json"), b"{ this is not valid json").unwrap();
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            adopted,
+            Some((0, 1)),
+            "a corrupted package.json must not invalidate round 1's already-persisted \
+             legitimate mechanical authorization, and must not retroactively authorize round \
+             2's orphaned evidence either"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legitimate_mechanical_not_applicable_authorization_survives_a_real_file_backed_database_reopen(
+    ) {
+        let dir = temp_dir("temporal-mechanical-reopen");
+        let db_path = dir.join("nova.sqlite3");
+        fs::write(dir.join("package.json"), r#"{"name":"x","scripts":{}}"#).unwrap();
+        let (project_id, task_id) = {
+            let db = Database::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let project = db
+                .create_project(&CreateProjectRequest {
+                    name: "P".to_string(),
+                    local_path: dir.to_string_lossy().into_owned(),
+                    source_type: "local".to_string(),
+                    source_url: None,
+                    purpose: None,
+                    long_term_goal: None,
+                    user_preferences: None,
+                    prohibitions: None,
+                })
+                .unwrap();
+            let task = db
+                .create_task(
+                    &CreateTaskRequest {
+                        project_id: project.id.clone(),
+                        title: "T".to_string(),
+                        goal: None,
+                        in_scope: None,
+                        not_in_scope: None,
+                        done_criteria: None,
+                        ai_kind: None,
+                    },
+                    Actor::User,
+                )
+                .unwrap();
+            record_test_passed(&db, &project.id, &task.id, 0, 1);
+            record_no_build_applicable_mechanical(&db, &project.id, &task.id, 0, 1);
+            (project.id, task.id)
+        };
+
+        let db = Database::open(&db_path).unwrap();
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            adopted,
+            Some((0, 1)),
+            "a legitimately mechanical authorization must be preserved across a real database \
+             close/reopen, without depending on re-detecting the project's current files"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_duplicate_or_concurrent_orphaned_row_never_weakens_an_already_authorized_round() {
+        // `build_evidence` is append-only (no UPDATE path touches the
+        // table at all), so a repeated/crash-recovery/concurrent write can
+        // only ever add a new row, never overwrite an existing row's
+        // persisted `authorization_source`. This test locks in that an
+        // extra, illegitimate duplicate row appearing alongside a genuine
+        // one (e.g. from a retried or racing write) does not retroactively
+        // invalidate the round: the gate looks for *any* authorized
+        // evidence in the generation/round, so one legitimate row is
+        // sufficient regardless of what else got written alongside it.
+        let dir = temp_dir("temporal-duplicate-does-not-weaken");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        fs::write(dir.join("package.json"), r#"{"name":"x","scripts":{}}"#).unwrap();
+        record_test_passed(&db, &project_id, &task_id, 0, 1);
+        record_no_build_applicable_mechanical(&db, &project_id, &task_id, 0, 1);
+        // Simulate a duplicate/concurrent write landing an orphaned row for
+        // the exact same generation/round (adversarial: only reachable via
+        // raw SQL, since the real write API would reject a bare orphaned
+        // write, but a duplicate real call could still legally add another
+        // legitimate or even a differently-shaped row here).
+        insert_orphaned_no_build_applicable(&db, &project_id, &task_id, 0, 1);
+
+        let task = task_at_generation(&db, &task_id, 0);
+        let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
+        assert_eq!(
+            adopted,
+            Some((0, 1)),
+            "an extra orphaned duplicate row must never downgrade a round that already has a \
+             genuinely authorized evidence row"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_build_evidence_rejects_legacy_unknown_from_the_normal_write_api() {
+        let dir = temp_dir("write-api-rejects-legacy-unknown");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        let result = db.record_build_evidence(&RecordBuildEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: None,
+            status: "no_build_applicable",
+            authorization_source: Some(
+                crate::models::BuildEvidenceAuthorizationSource::LegacyUnknown,
+            ),
+            exit_code: None,
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        });
+        assert!(
+            result.is_err(),
+            "legacy_unknown must only ever be producible by the schema v10 migration, never a live write"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_build_evidence_rejects_a_status_source_mismatch() {
+        let dir = temp_dir("write-api-rejects-mismatch");
+        let (db, project_id, task_id) = db_with_task(&dir);
+
+        let passed_with_source = db.record_build_evidence(&RecordBuildEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: Some("cargo build"),
+            status: "passed",
+            authorization_source: Some(
+                crate::models::BuildEvidenceAuthorizationSource::MechanicalNotApplicable,
+            ),
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        });
+        assert!(passed_with_source.is_err());
+
+        let not_applicable_without_source = db.record_build_evidence(&RecordBuildEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 2,
+            build_command_redacted: None,
+            status: "no_build_applicable",
+            authorization_source: None,
+            exit_code: None,
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        });
+        assert!(not_applicable_without_source.is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_build_evidence_rejects_user_confirmed_source_without_a_real_confirmation() {
+        let dir = temp_dir("write-api-rejects-unconfirmed-user-source");
+        let (db, project_id, task_id) = db_with_task(&dir);
+        let result = db.record_build_evidence(&RecordBuildEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            build_command_redacted: None,
+            status: "no_build_applicable",
+            authorization_source: Some(
+                crate::models::BuildEvidenceAuthorizationSource::UserConfirmedNotApplicable,
+            ),
+            exit_code: None,
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        });
+        assert!(
+            result.is_err(),
+            "user_confirmed_not_applicable must be rejected at write time when no matching \
+             confirmation exists"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1007,6 +1538,7 @@ mod tests {
             round: 1,
             build_command_redacted: Some("cargo build"),
             status: "failed",
+            authorization_source: None,
             exit_code: Some(1),
             reason: None,
             stdout_ref: None,
@@ -1148,6 +1680,7 @@ mod tests {
             round: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
+            authorization_source: None,
             exit_code: Some(0),
             reason: None,
             stdout_ref: None,
@@ -1220,6 +1753,7 @@ mod tests {
             round: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
+            authorization_source: None,
             exit_code: Some(0),
             reason: None,
             stdout_ref: None,
@@ -1294,6 +1828,7 @@ mod tests {
             round: 2,
             build_command_redacted: Some("cargo build"),
             status: "passed",
+            authorization_source: None,
             exit_code: Some(0),
             reason: None,
             stdout_ref: None,
@@ -1344,6 +1879,7 @@ mod tests {
             round: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
+            authorization_source: None,
             exit_code: Some(0),
             reason: None,
             stdout_ref: None,
@@ -1446,6 +1982,7 @@ mod tests {
             round: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
+            authorization_source: None,
             exit_code: Some(0),
             reason: None,
             stdout_ref: None,
@@ -1532,6 +2069,7 @@ mod tests {
             round: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
+            authorization_source: None,
             exit_code: Some(0),
             reason: None,
             stdout_ref: None,

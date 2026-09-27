@@ -190,6 +190,7 @@ fn normalize_build_evidence_status(
                 task_id,
                 evidence.result_generation,
                 evidence.round,
+                evidence.authorization_source.as_deref(),
             )? {
                 "not_applicable".to_string()
             } else {
@@ -995,6 +996,7 @@ mod tests {
                 round,
                 build_command_redacted: Some("cargo build"),
                 status,
+                authorization_source: None,
                 exit_code: None,
                 reason: None,
                 stdout_ref: None,

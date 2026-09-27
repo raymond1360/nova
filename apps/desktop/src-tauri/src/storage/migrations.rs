@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// Current schema version this build of Nova understands. Bump this and
 /// append a new [`Migration`] to [`MIGRATIONS`] whenever the schema changes
 /// — never edit an already-shipped migration's SQL in place.
-pub const CURRENT_SCHEMA_VERSION: i64 = 9;
+pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 
 #[derive(Debug)]
 pub enum MigrationError {
@@ -773,6 +773,65 @@ const V9_SQL: &str = "
     CREATE INDEX idx_no_build_confirmations_task ON no_build_confirmations(task_id);
 ";
 
+/// Phase 4 remediation (second re-review, remaining Major): persists the
+/// authorization basis for a `no_build_applicable` row at the exact moment
+/// it is written, instead of the prior design where the completion gate
+/// re-ran `detect_build_command` against the project's *current* files at
+/// read time — a mechanically-legitimate row could be invalidated by a
+/// later build-script addition, and worse, an orphaned/unconfirmed row
+/// could become retroactively "authorized" purely because the project's
+/// files happened to look `NotApplicable` by the time someone read it.
+///
+/// Table-recreate pattern (mirrors every prior schema-evolution step in
+/// this file, e.g. v6's `_v3`-suffix rename): purely additive in effect —
+/// no column is removed, no existing table other than `build_evidence`
+/// itself is touched. Every pre-existing `no_build_applicable` row is
+/// migrated to `legacy_unknown` — deliberately never inferred as
+/// `mechanical_not_applicable` from whatever the upgrading machine's
+/// project directory happens to contain right now, and never silently left
+/// `NULL` either (the `CHECK` below requires an explicit value whenever
+/// `status = 'no_build_applicable'`). Every other status's row gets `NULL`,
+/// enforced by the same `CHECK`. Old databases with zero `build_evidence`
+/// rows (or none with this status) upgrade to an empty/unaffected table,
+/// same as any other additive migration.
+const V10_SQL: &str = "
+    CREATE TABLE build_evidence_v10 (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        result_generation INTEGER NOT NULL,
+        round INTEGER NOT NULL,
+        build_command_redacted TEXT,
+        status TEXT NOT NULL CHECK(status IN ('passed', 'failed', 'no_build_applicable', 'timed_out', 'cancelled', 'insufficient_evidence')),
+        -- The `authorization_source IS NOT NULL AND` clause below is
+        -- required, not redundant: SQLite's `IN` operator evaluates to
+        -- NULL (neither true nor false) when its left side is NULL, and a
+        -- CHECK constraint only rejects a row when its expression
+        -- evaluates to *false* — a NULL result is treated as passing. Without
+        -- the explicit NULL check, `no_build_applicable` rows with a
+        -- missing `authorization_source` would silently be accepted.
+        authorization_source TEXT CHECK(
+            (status != 'no_build_applicable' AND authorization_source IS NULL)
+            OR (status = 'no_build_applicable' AND authorization_source IS NOT NULL AND authorization_source IN ('user_confirmed_not_applicable', 'mechanical_not_applicable', 'legacy_unknown'))
+        ),
+        exit_code INTEGER,
+        reason TEXT,
+        stdout_ref TEXT,
+        stderr_ref TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (task_id, project_id) REFERENCES tasks(id, project_id) ON DELETE CASCADE
+    );
+    INSERT INTO build_evidence_v10 (id, project_id, task_id, result_generation, round, build_command_redacted, status, authorization_source, exit_code, reason, stdout_ref, stderr_ref, created_at)
+      SELECT id, project_id, task_id, result_generation, round, build_command_redacted, status,
+             CASE WHEN status = 'no_build_applicable' THEN 'legacy_unknown' ELSE NULL END,
+             exit_code, reason, stdout_ref, stderr_ref, created_at
+      FROM build_evidence;
+    DROP TABLE build_evidence;
+    ALTER TABLE build_evidence_v10 RENAME TO build_evidence;
+    CREATE INDEX idx_build_evidence_task ON build_evidence(task_id);
+    CREATE INDEX idx_build_evidence_task_gen_round ON build_evidence(task_id, result_generation, round);
+";
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -818,6 +877,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 9,
         requires_backup: true,
         sql: V9_SQL,
+    },
+    Migration {
+        version: 10,
+        requires_backup: true,
+        sql: V10_SQL,
     },
 ];
 
@@ -1925,6 +1989,233 @@ mod tests {
         );
     }
 
+    // --- Phase 4 remediation (second re-review): schema v10, persisted
+    // no-build authorization source ---------------------------------------
+
+    #[test]
+    fn schema_v10_passes_integrity_and_foreign_key_checks_and_has_authorization_source_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn, None).unwrap();
+
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            fk_violations, 0,
+            "a fresh v10 database must have zero foreign key violations"
+        );
+
+        let columns: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(build_evidence)").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(
+            columns.contains(&"authorization_source".to_string()),
+            "build_evidence missing column authorization_source: {columns:?}"
+        );
+    }
+
+    #[test]
+    fn upgrades_a_v9_database_to_v10_marking_pre_existing_no_build_applicable_rows_as_legacy_unknown(
+    ) {
+        let dir = temp_dir("v9-to-v10-legacy");
+        let (conn, path) = open_file_db(&dir);
+        conn.execute_batch(BASELINE_SQL).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(PHASE2_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        conn.execute_batch(V3_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+        conn.execute_batch(V4_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
+        conn.execute_batch(V5_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 5;").unwrap();
+        conn.execute_batch(V6_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 6;").unwrap();
+        conn.execute_batch(V7_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 7;").unwrap();
+        conn.execute_batch(V8_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 8;").unwrap();
+        conn.execute_batch(V9_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 9;").unwrap();
+
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, created_at, updated_at)
+             VALUES ('proj-1', 'P', 'C:/p', 'c:/p', 'local', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+             VALUES ('task-1', 'proj-1', 'T', 'draft', 0, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        // Two pre-v10 rows: one real "passed" build, and one
+        // `no_build_applicable` row with no way to know — at migration
+        // time — whether it was originally mechanical or user-confirmed.
+        conn.execute(
+            "INSERT INTO build_evidence (id, project_id, task_id, result_generation, round, status, created_at)
+             VALUES ('be-passed', 'proj-1', 'task-1', 0, 1, 'passed', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO build_evidence (id, project_id, task_id, result_generation, round, status, created_at)
+             VALUES ('be-na', 'proj-1', 'task-1', 0, 2, 'no_build_applicable', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+
+        run(&conn, Some(&path)).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        let passed_source: Option<String> = conn
+            .query_row(
+                "SELECT authorization_source FROM build_evidence WHERE id = 'be-passed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            passed_source, None,
+            "a real 'passed' row must never gain an authorization_source"
+        );
+
+        let na_source: Option<String> = conn
+            .query_row(
+                "SELECT authorization_source FROM build_evidence WHERE id = 'be-na'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            na_source,
+            Some("legacy_unknown".to_string()),
+            "a pre-existing no_build_applicable row must migrate to legacy_unknown — never \
+             inferred as mechanical or user-confirmed from the upgrading machine's current state"
+        );
+
+        let title: String = conn
+            .query_row("SELECT title FROM tasks WHERE id = 'task-1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            title, "T",
+            "upgrading to v10 must never alter a pre-existing tasks row"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_evidence_authorization_source_check_rejects_invalid_combinations() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn, None).unwrap();
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, created_at, updated_at)
+             VALUES ('proj-1', 'P', 'C:/p', 'c:/p', 'local', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+             VALUES ('task-1', 'proj-1', 'T', 'draft', 0, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+
+        // A real "passed" row must never carry an authorization_source.
+        let passed_with_source = conn.execute(
+            "INSERT INTO build_evidence (id, project_id, task_id, result_generation, round, status, authorization_source, created_at)
+             VALUES ('be-1', 'proj-1', 'task-1', 0, 1, 'passed', 'mechanical_not_applicable', '2026-01-01')",
+            [],
+        );
+        assert!(
+            passed_with_source.is_err(),
+            "a non-no_build_applicable status must never carry an authorization_source"
+        );
+
+        // A `no_build_applicable` row must always carry one of the three
+        // known values — never NULL, never an arbitrary string.
+        let na_without_source = conn.execute(
+            "INSERT INTO build_evidence (id, project_id, task_id, result_generation, round, status, created_at)
+             VALUES ('be-2', 'proj-1', 'task-1', 0, 1, 'no_build_applicable', '2026-01-01')",
+            [],
+        );
+        assert!(
+            na_without_source.is_err(),
+            "a no_build_applicable row without any authorization_source must be rejected"
+        );
+
+        let na_with_unknown_source = conn.execute(
+            "INSERT INTO build_evidence (id, project_id, task_id, result_generation, round, status, authorization_source, created_at)
+             VALUES ('be-3', 'proj-1', 'task-1', 0, 1, 'no_build_applicable', 'ai_claimed_not_applicable', '2026-01-01')",
+            [],
+        );
+        assert!(
+            na_with_unknown_source.is_err(),
+            "an arbitrary authorization_source string must be rejected by the CHECK constraint"
+        );
+
+        // The three legitimate values must all be accepted.
+        for (id, source) in [
+            ("be-4", "user_confirmed_not_applicable"),
+            ("be-5", "mechanical_not_applicable"),
+            ("be-6", "legacy_unknown"),
+        ] {
+            let result = conn.execute(
+                &format!(
+                    "INSERT INTO build_evidence (id, project_id, task_id, result_generation, round, status, authorization_source, created_at)
+                     VALUES ('{id}', 'proj-1', 'task-1', 0, 1, 'no_build_applicable', '{source}', '2026-01-01')"
+                ),
+                [],
+            );
+            assert!(result.is_ok(), "{source} must be accepted: {result:?}");
+        }
+    }
+
+    #[test]
+    fn reopening_a_v10_database_does_not_re_migrate_or_error() {
+        let dir = temp_dir("v10-reopen-idempotent");
+        let (conn, path) = open_file_db(&dir);
+        run(&conn, Some(&path)).unwrap();
+        drop(conn);
+
+        // A second, independent connection to the same file must see the
+        // already-migrated schema and do nothing further.
+        let conn2 = Connection::open(&path).unwrap();
+        run(&conn2, Some(&path)).unwrap();
+        let version: i64 = conn2
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        let backups_dir = dir.join("backups");
+        let count = fs::read_dir(&backups_dir)
+            .map(|iter| iter.filter_map(|e| e.ok()).count())
+            .unwrap_or(0);
+        assert_eq!(
+            count, 9,
+            "reopening an already-fully-migrated database must not take any new backups"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn non_trivial_migration_creates_a_backup_file() {
         let dir = temp_dir("backup-created");
@@ -1944,8 +2235,8 @@ mod tests {
             .collect();
         assert_eq!(
             entries.len(),
-            8,
-            "expected exactly eight backups (migrations 2, 3, 4, 5, 6, 7, 8, and 9 each require one): {entries:?}"
+            9,
+            "expected exactly nine backups (migrations 2, 3, 4, 5, 6, 7, 8, 9, and 10 each require one): {entries:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1970,13 +2261,13 @@ mod tests {
             .collect();
         assert_eq!(
             names.len(),
-            8,
-            "migrations 2, 3, 4, 5, 6, 7, 8, and 9 each produce their own backup"
+            9,
+            "migrations 2, 3, 4, 5, 6, 7, 8, 9, and 10 each produce their own backup"
         );
         let unique: std::collections::HashSet<&String> = names.iter().collect();
         assert_eq!(
             unique.len(),
-            8,
+            9,
             "all backups from the same run must have distinct names, never collide"
         );
         for name in &names {
@@ -2105,8 +2396,8 @@ mod tests {
         let backups_dir = dir.join("backups");
         let count = fs::read_dir(&backups_dir).unwrap().count();
         assert_eq!(
-            count, 8,
-            "already-applied migrations must not be re-run, so no extra backups beyond the eight produced by the first run"
+            count, 9,
+            "already-applied migrations must not be re-run, so no extra backups beyond the nine produced by the first run"
         );
         let _ = fs::remove_dir_all(&dir);
     }

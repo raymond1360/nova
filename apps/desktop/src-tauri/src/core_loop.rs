@@ -2433,6 +2433,7 @@ fn run_build_for_round(
                 round,
                 build_command_redacted: None,
                 status: "insufficient_evidence",
+                authorization_source: None,
                 exit_code: None,
                 reason: Some(
                     "构建动作已记录为成功，但找不到对应 generation/round 的构建证据，已按不确定处理",
@@ -2464,6 +2465,15 @@ fn run_build_for_round(
                     round,
                     build_command_redacted: None,
                     status: "no_build_applicable",
+                    // Phase 4 remediation (second re-review): persisted at
+                    // the exact moment Nova's own mechanical detection
+                    // observed `BuildDetection::NotApplicable` — the read/
+                    // gate layer trusts this fact and never re-runs
+                    // detection against the project's (possibly
+                    // since-changed) current files.
+                    authorization_source: Some(
+                        crate::models::BuildEvidenceAuthorizationSource::MechanicalNotApplicable,
+                    ),
                     exit_code: None,
                     reason: Some(&reason),
                     stdout_ref: None,
@@ -2494,6 +2504,13 @@ fn run_build_for_round(
                         round,
                         build_command_redacted: None,
                         status: "no_build_applicable",
+                        // A real, persisted `no_build_confirmations` row was
+                        // just found above for this exact key —
+                        // `record_build_evidence` itself re-verifies this
+                        // before accepting the write.
+                        authorization_source: Some(
+                            crate::models::BuildEvidenceAuthorizationSource::UserConfirmedNotApplicable,
+                        ),
                         exit_code: None,
                         reason: Some(&confirmed_reason),
                         stdout_ref: None,
@@ -2512,6 +2529,7 @@ fn run_build_for_round(
                 round,
                 build_command_redacted: None,
                 status: "insufficient_evidence",
+                authorization_source: None,
                 exit_code: None,
                 reason: Some(&reason),
                 stdout_ref: None,
@@ -2548,6 +2566,7 @@ fn run_build_for_round(
             round,
             build_command_redacted: Some(&command.display()),
             status: "insufficient_evidence",
+            authorization_source: None,
             exit_code: None,
             reason: Some("构建命令未通过安全允许列表校验，已拒绝执行"),
             stdout_ref: None,
@@ -2589,6 +2608,7 @@ fn run_build_for_round(
             round,
             build_command_redacted: Some(&command_display),
             status: "cancelled",
+            authorization_source: None,
             exit_code: outcome.exit_code.map(i64::from),
             reason: Some("用户在构建阶段取消了任务"),
             stdout_ref: None,
@@ -2629,6 +2649,7 @@ fn run_build_for_round(
         round,
         build_command_redacted: Some(&command_display),
         status,
+        authorization_source: None,
         exit_code: outcome.exit_code.map(i64::from),
         reason: if outcome.timed_out {
             Some("构建执行超时")
@@ -4324,6 +4345,7 @@ mod tests {
             round: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
+            authorization_source: None,
             exit_code: Some(0),
             reason: None,
             stdout_ref: None,
@@ -4631,6 +4653,7 @@ mod tests {
             round: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
+            authorization_source: None,
             exit_code: Some(0),
             reason: None,
             stdout_ref: None,
@@ -5346,6 +5369,7 @@ mod tests {
             round: 1,
             build_command_redacted: Some("cargo build"),
             status: "timed_out",
+            authorization_source: None,
             exit_code: None,
             reason: Some("构建执行超时"),
             stdout_ref: None,
@@ -5424,6 +5448,7 @@ mod tests {
             round: 1,
             build_command_redacted: Some("cargo build"),
             status: "cancelled",
+            authorization_source: None,
             exit_code: None,
             reason: Some("用户在构建阶段取消了任务"),
             stdout_ref: None,
@@ -5509,6 +5534,7 @@ mod tests {
             round: 1,
             build_command_redacted: Some("cargo build --release"),
             status: "insufficient_evidence",
+            authorization_source: None,
             exit_code: None,
             reason: Some("构建命令未通过安全允许列表校验，已拒绝执行"),
             stdout_ref: None,
@@ -5638,6 +5664,7 @@ mod tests {
             round: 1,
             build_command_redacted: None,
             status: "insufficient_evidence",
+            authorization_source: None,
             exit_code: None,
             reason: Some("未识别到已知的项目类型"),
             stdout_ref: None,
@@ -6699,6 +6726,7 @@ mod tests {
             round: 1,
             build_command_redacted: None,
             status: "insufficient_evidence",
+            authorization_source: None,
             exit_code: None,
             reason: Some("未识别到已知的项目类型"),
             stdout_ref: None,
@@ -6811,6 +6839,7 @@ mod tests {
             round: 1,
             build_command_redacted: None,
             status: "insufficient_evidence",
+            authorization_source: None,
             exit_code: None,
             reason: Some("未识别到已知的项目类型"),
             stdout_ref: None,
@@ -6926,6 +6955,7 @@ mod tests {
             round: 1,
             build_command_redacted: None,
             status: "insufficient_evidence",
+            authorization_source: None,
             exit_code: None,
             reason: Some("未识别到已知的项目类型"),
             stdout_ref: None,
@@ -7545,6 +7575,9 @@ mod tests {
             round: 1,
             build_command_redacted: None,
             status: "no_build_applicable",
+            authorization_source: Some(
+                crate::models::BuildEvidenceAuthorizationSource::MechanicalNotApplicable,
+            ),
             exit_code: None,
             reason: Some("round 1 result"),
             stdout_ref: None,

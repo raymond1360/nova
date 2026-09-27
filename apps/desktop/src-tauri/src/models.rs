@@ -559,6 +559,61 @@ pub struct TestEvidence {
     pub created_at: String,
 }
 
+/// Phase 4 remediation (second re-review, remaining Major): the persisted
+/// basis for treating a `no_build_applicable` row as legitimate — decided
+/// once, at the exact moment the evidence is written, and never
+/// re-derived later from whatever the project's files happen to look like
+/// when someone reads the row. Only meaningful when [`BuildEvidence::
+/// status`] is `no_build_applicable`; every other status always stores
+/// `None` here (enforced by a `CHECK` constraint, see `storage::
+/// migrations`'s schema v10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildEvidenceAuthorizationSource {
+    /// A real, persisted `no_build_confirmations` row existed for this
+    /// exact `(project_id, task_id, result_generation, round)` at write
+    /// time. Read/gate time re-verifies the confirmation still exists
+    /// (never trusts this label alone) — see `core_loop::documents::
+    /// no_build_applicable_is_authorized`.
+    UserConfirmedNotApplicable,
+    /// `run_build_for_round` observed `test_runner::BuildDetection::
+    /// NotApplicable` — Nova's own mechanical, deterministic reading of
+    /// the project's real files — at the exact moment this row was
+    /// written. This is the *only* legitimate source for this value; no
+    /// other code path may ever write it. Read/gate time trusts this
+    /// persisted fact and never re-runs detection against the project's
+    /// (possibly since-changed) current files.
+    MechanicalNotApplicable,
+    /// A `no_build_applicable` row whose true origin cannot be
+    /// determined — exclusively produced by the schema v10 migration for
+    /// rows that predate this column, never by any live write path.
+    /// Authorized only if a real confirmation currently exists for its
+    /// exact natural key; otherwise fails closed.
+    LegacyUnknown,
+}
+
+impl BuildEvidenceAuthorizationSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UserConfirmedNotApplicable => "user_confirmed_not_applicable",
+            Self::MechanicalNotApplicable => "mechanical_not_applicable",
+            Self::LegacyUnknown => "legacy_unknown",
+        }
+    }
+}
+
+impl std::str::FromStr for BuildEvidenceAuthorizationSource {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "user_confirmed_not_applicable" => Ok(Self::UserConfirmedNotApplicable),
+            "mechanical_not_applicable" => Ok(Self::MechanicalNotApplicable),
+            "legacy_unknown" => Ok(Self::LegacyUnknown),
+            other => Err(format!("未知的构建不适用授权来源：{other}")),
+        }
+    }
+}
+
 /// Codex re-review remediation (Major 3): one independently-run build
 /// attempt for a task's *current* `(result_generation, round)`, mirroring
 /// [`TestEvidence`]'s shape exactly so a round's test and build results are
@@ -579,6 +634,10 @@ pub struct BuildEvidence {
     /// constraint) — the only field a caller may treat as "did the build
     /// really succeed".
     pub status: String,
+    /// See [`BuildEvidenceAuthorizationSource`]. `None` for every status
+    /// other than `no_build_applicable`; always `Some` when the status is
+    /// `no_build_applicable` (enforced by schema v10's `CHECK`).
+    pub authorization_source: Option<String>,
     pub exit_code: Option<i64>,
     /// Human-readable reason, e.g. why no build command could be
     /// determined for this project.

@@ -47,6 +47,15 @@ pub struct RecordTestEvidenceRequest<'a> {
 /// [`Database::record_build_evidence`] — mirrors
 /// [`RecordTestEvidenceRequest`] exactly, one field shorter (no
 /// pass/fail/skip counts, since a build has no such concept).
+///
+/// Phase 4 remediation (second re-review, remaining Major): `authorization_source`
+/// must be `Some(...)` exactly when `status == "no_build_applicable"` and
+/// `None` for every other status — `record_build_evidence` rejects any
+/// other combination before writing anything. `LegacyUnknown` is
+/// deliberately not constructible as a *new* write's source through the
+/// normal production call sites (only `run_build_for_round` calls this at
+/// all, and it never passes `LegacyUnknown`) — it exists purely so the
+/// schema v10 migration has a safe value for rows that predate this field.
 pub struct RecordBuildEvidenceRequest<'a> {
     pub project_id: &'a str,
     pub task_id: &'a str,
@@ -54,6 +63,7 @@ pub struct RecordBuildEvidenceRequest<'a> {
     pub round: i64,
     pub build_command_redacted: Option<&'a str>,
     pub status: &'a str,
+    pub authorization_source: Option<crate::models::BuildEvidenceAuthorizationSource>,
     pub exit_code: Option<i64>,
     pub reason: Option<&'a str>,
     pub stdout_ref: Option<&'a str>,
@@ -367,39 +377,101 @@ impl Database {
     /// mirrors [`Database::record_test_evidence`] exactly, including the
     /// same redaction discipline for every text field.
     ///
-    /// Phase 4 remediation (Major 2): deliberately does **not** gain the
-    /// same write-time "a matching confirmation must already exist" guard
-    /// [`Database::record_test_evidence`] does — audited production call
-    /// chain (`core_loop::run_build_for_round`) shows `no_build_applicable`
-    /// has two distinct legitimate origins: (a) `BuildDetection::
-    /// Insufficient` resolved via a real, persisted `no_build_confirmation`
-    /// (mirrors the test case exactly), and (b) `BuildDetection::
-    /// NotApplicable` — Nova's own mechanical, deterministic determination
-    /// from real project metadata (e.g. `package.json` with no `build`
-    /// script) that a build genuinely never applies, which by design has
-    /// never required or written a confirmation row at all. A write-time
-    /// guard requiring a confirmation for every `no_build_applicable` row
-    /// would reject case (b) outright — a real functional regression,
-    /// proven by three existing single-AI closed-loop tests failing when
-    /// this guard was attempted. See `core_loop::documents::
-    /// no_build_applicable_is_authorized` for where this asymmetry is
-    /// instead enforced correctly, at the read/completion-gate layer, which
-    /// can re-derive case (b)'s legitimacy directly from the project
-    /// directory rather than assuming every unconfirmed row is illegitimate.
+    /// Phase 4 remediation (Major 2, then the second re-review's remaining
+    /// Major): deliberately does **not** gain the same write-time "a
+    /// matching confirmation must already exist" guard
+    /// [`Database::record_test_evidence`] has for every `no_build_applicable`
+    /// row — audited production call chain (`core_loop::run_build_for_round`)
+    /// shows `no_build_applicable` has two distinct legitimate origins: (a)
+    /// `BuildDetection::Insufficient` resolved via a real, persisted
+    /// `no_build_confirmation` (mirrors the test case exactly — this
+    /// function *does* require that confirmation to exist, see below), and
+    /// (b) `BuildDetection::NotApplicable` — Nova's own mechanical,
+    /// deterministic determination from real project metadata that a build
+    /// genuinely never applies, which by design has never required or
+    /// written a confirmation row at all.
+    ///
+    /// What this function *does* enforce, unconditionally, before writing
+    /// anything:
+    /// - `authorization_source` must be `Some(...)` exactly when
+    ///   `status == "no_build_applicable"`, and `None` for every other
+    ///   status — a mismatch is rejected outright (mirrors the schema v10
+    ///   `CHECK`, as defense in depth rather than relying on the `CHECK`
+    ///   alone to produce a clear error).
+    /// - `authorization_source == Some(UserConfirmedNotApplicable)` requires
+    ///   a real, exact-key `no_build_confirmations` row to already exist —
+    ///   the same requirement `record_test_evidence` has for
+    ///   `no_tests_applicable`.
+    /// - `authorization_source == Some(LegacyUnknown)` is rejected outright:
+    ///   that value exists solely for the schema v10 migration's own SQL to
+    ///   assign to pre-existing rows, never for a live write through this
+    ///   API.
+    /// - `authorization_source == Some(MechanicalNotApplicable)` has no
+    ///   database-level corroboration possible (there is nothing to look
+    ///   up) — this function trusts its one and only legitimate caller
+    ///   (`run_build_for_round`'s `BuildDetection::NotApplicable` branch,
+    ///   immediately after observing that real detection result) exactly
+    ///   the same way `no_build_confirmations.confirmed_by = 'user'` trusts
+    ///   its one legitimate caller elsewhere in this codebase — this
+    ///   function is never reachable from a Tauri command, so the frontend
+    ///   has no way to originate this value.
     pub fn record_build_evidence(
         &self,
         request: &RecordBuildEvidenceRequest<'_>,
     ) -> NovaResult<BuildEvidence> {
+        use crate::models::BuildEvidenceAuthorizationSource as Source;
+
         self.assert_task_belongs_to_project(request.project_id, request.task_id)?;
+
+        match (request.status, request.authorization_source) {
+            ("no_build_applicable", None) => {
+                return Err(NovaError::Config(
+                    "拒绝写入 no_build_applicable：必须显式提供 authorization_source".to_string(),
+                ));
+            }
+            (status, Some(_)) if status != "no_build_applicable" => {
+                return Err(NovaError::Config(format!(
+                    "拒绝写入：状态 {status} 不是 no_build_applicable，不应携带 authorization_source"
+                )));
+            }
+            ("no_build_applicable", Some(Source::LegacyUnknown)) => {
+                return Err(NovaError::Config(
+                    "拒绝写入：legacy_unknown 仅供 schema 迁移使用，不得通过正常写入路径产生"
+                        .to_string(),
+                ));
+            }
+            ("no_build_applicable", Some(Source::UserConfirmedNotApplicable)) => {
+                if self
+                    .find_no_build_confirmation(
+                        request.project_id,
+                        request.task_id,
+                        request.result_generation,
+                        request.round,
+                    )?
+                    .is_none()
+                {
+                    return Err(NovaError::Config(
+                        "拒绝写入 no_build_applicable：当前 generation/round 不存在匹配的无需构建确认记录"
+                            .to_string(),
+                    ));
+                }
+            }
+            ("no_build_applicable", Some(Source::MechanicalNotApplicable)) => {}
+            _ => {}
+        }
+
         let id = new_id();
         let now = now();
         let build_command_redacted = request.build_command_redacted.map(redact_sensitive_text);
         let reason = request.reason.map(redact_sensitive_text);
         let stdout_ref = request.stdout_ref.map(redact_sensitive_text);
         let stderr_ref = request.stderr_ref.map(redact_sensitive_text);
+        let authorization_source = request
+            .authorization_source
+            .map(|source| source.as_str().to_string());
         self.conn().execute(
-            "INSERT INTO build_evidence (id, project_id, task_id, result_generation, round, build_command_redacted, status, exit_code, reason, stdout_ref, stderr_ref, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO build_evidence (id, project_id, task_id, result_generation, round, build_command_redacted, status, authorization_source, exit_code, reason, stdout_ref, stderr_ref, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 id,
                 request.project_id,
@@ -408,6 +480,7 @@ impl Database {
                 request.round,
                 build_command_redacted,
                 request.status,
+                authorization_source,
                 request.exit_code,
                 reason,
                 stdout_ref,
@@ -417,7 +490,7 @@ impl Database {
         )?;
         self.conn()
             .query_row(
-                "SELECT id, project_id, task_id, result_generation, round, build_command_redacted, status, exit_code, reason, stdout_ref, stderr_ref, created_at
+                "SELECT id, project_id, task_id, result_generation, round, build_command_redacted, status, authorization_source, exit_code, reason, stdout_ref, stderr_ref, created_at
                  FROM build_evidence WHERE id = ?1",
                 params![id],
                 read_build_evidence,
@@ -436,7 +509,7 @@ impl Database {
     ) -> NovaResult<Vec<BuildEvidence>> {
         self.assert_task_belongs_to_project(project_id, task_id)?;
         let mut stmt = self.conn().prepare(
-            "SELECT id, project_id, task_id, result_generation, round, build_command_redacted, status, exit_code, reason, stdout_ref, stderr_ref, created_at
+            "SELECT id, project_id, task_id, result_generation, round, build_command_redacted, status, authorization_source, exit_code, reason, stdout_ref, stderr_ref, created_at
              FROM build_evidence WHERE task_id = ?1 AND result_generation = ?2 AND round = ?3 ORDER BY created_at ASC",
         )?;
         let rows = stmt
@@ -691,11 +764,12 @@ fn read_build_evidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<BuildEvidenc
         round: row.get(4)?,
         build_command_redacted: row.get(5)?,
         status: row.get(6)?,
-        exit_code: row.get(7)?,
-        reason: row.get(8)?,
-        stdout_ref: row.get(9)?,
-        stderr_ref: row.get(10)?,
-        created_at: row.get(11)?,
+        authorization_source: row.get(7)?,
+        exit_code: row.get(8)?,
+        reason: row.get(9)?,
+        stdout_ref: row.get(10)?,
+        stderr_ref: row.get(11)?,
+        created_at: row.get(12)?,
     })
 }
 
@@ -1095,6 +1169,7 @@ mod tests {
                 round: 1,
                 build_command_redacted: Some("cargo build"),
                 status: "passed",
+                authorization_source: None,
                 exit_code: Some(0),
                 reason: None,
                 stdout_ref: None,
@@ -1118,6 +1193,7 @@ mod tests {
                 round: 1,
                 build_command_redacted: Some("npm run build"),
                 status: "failed",
+                authorization_source: None,
                 exit_code: Some(1),
                 reason: Some("api_key=sk-1234567890abcdef1234567890abcdef build failed"),
                 stdout_ref: Some("sk-1234567890abcdef1234567890abcdef in stdout"),
@@ -1146,6 +1222,7 @@ mod tests {
             round: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
+            authorization_source: None,
             exit_code: Some(0),
             reason: None,
             stdout_ref: None,
@@ -1159,6 +1236,7 @@ mod tests {
             round: 2,
             build_command_redacted: Some("cargo build"),
             status: "failed",
+            authorization_source: None,
             exit_code: Some(1),
             reason: None,
             stdout_ref: None,
@@ -1192,6 +1270,7 @@ mod tests {
             round: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
+            authorization_source: None,
             exit_code: Some(0),
             reason: None,
             stdout_ref: None,

@@ -1,0 +1,146 @@
+{
+  "baseline_head": "6a90df951c6c72ab7ae95228d5f2cc4de7e17273",
+  "checkpoint": "audit/checkpoints/wp2a-remediation-20261015-1112",
+  "changed_files": [
+    {
+      "path": "apps/desktop/src-tauri/src/commands.rs",
+      "baseline": "checkpoint",
+      "before_sha256": "c18a20c8609fea250e7e5d99333edad05308ae493099694922b441529dd898b4",
+      "after_sha256": "0196479d1cae5f58774c710ae3d44ad46fde9bab086774a43bf10136a06db2bc",
+      "bytes": 59226
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/core_loop.rs",
+      "baseline": "checkpoint",
+      "before_sha256": "b6126d2a9a75493d1c2f3e44a03062338028a8d75b6d12a346f6693de5dfdee2",
+      "after_sha256": "840247f16f415694f722723c799923542138c997c7ee594ac1aefb631b500222",
+      "bytes": 528326
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/core_loop/documents.rs",
+      "baseline": "checkpoint",
+      "before_sha256": "24f7824b553bfa4ee8fd4c9c12a0055bae88d13efac729112f9c0986c2a71a20",
+      "after_sha256": "77b38aa2212397b9f2ba401bb3f436f3dadf7d190ef150c8c7883e7681544f2b",
+      "bytes": 93541
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/core_loop/evidence_overview.rs",
+      "baseline": "checkpoint",
+      "before_sha256": "e96ef192521684d97f57007c4c946b1b58cb427ac3cb25ec8bbbaa70c29e7fb8",
+      "after_sha256": "ee98143332736835acc81ed4d28204603a3ad8af2ce1907462219a875f52bdde",
+      "bytes": 44974
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/core_loop/self_check_parser.rs",
+      "baseline": "checkpoint",
+      "before_sha256": "76252d1c35a65bc4b96d49b58aefb4970ce651d9533e9859bc202a5d28141272",
+      "after_sha256": "00131572c626916aec5e868bbf436b7c74da1376805cc39bb514f827d7d8b199",
+      "bytes": 7783
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/core_loop/test_runner.rs",
+      "baseline": "HEAD-clean",
+      "before_sha256": "f9b54c51e9d632851d39f1386d4526b02edb9770b85e38287a922def6801ea2a",
+      "after_sha256": "9c17824edd1465a819bf2f8d954907f60814a1547e4f72759f33e32463d19809",
+      "bytes": 40444
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/core_loop/wp2a_remediation_tests.rs",
+      "baseline": "new",
+      "before_sha256": null,
+      "after_sha256": "a201fad07336084a9302766375169b5b4874b6835b061dfc34993a8d9420de4c",
+      "bytes": 46462
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/lib.rs",
+      "baseline": "checkpoint",
+      "before_sha256": "69522f18a961fd91e6fd26f98c5b7e382b3aba0b87f9e84d4e0c2ce18b6fbc3a",
+      "after_sha256": "c842a86b125abcff04fdc0c0b4c4362b5a761a73710a58d8e891398d8fd2ceea",
+      "bytes": 6877
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/runtime/ai_adapter.rs",
+      "baseline": "checkpoint",
+      "before_sha256": "ab8932ae2a51eaf082b190fbcd098c8fc6f513e9682e2b44ffa3dc2e8f0cd0f7",
+      "after_sha256": "036efe9ed322bcada72f5e103f10833e13078e69d867b8dd769a4782b0fb928b",
+      "bytes": 57599
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/storage/actions.rs",
+      "baseline": "checkpoint",
+      "before_sha256": "0c860bbdef7601efcd9368ecd7784355a01318f2e674ba6d369d7807f063ba04",
+      "after_sha256": "46d0a9dee59b6adad1d831b083a9d1dd172f80df10a8e123dfa5b4f561e115b0",
+      "bytes": 23810
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/storage/migrations.rs",
+      "baseline": "checkpoint",
+      "before_sha256": "00e64b36fd5ae218b72f296aa0fc2f95158698329bf5007bc53b98fe1beb5aaf",
+      "after_sha256": "a10da1fd34f936115b72b04d0a084d4657907aebf9e3c0a8fa3b6cef3d1d59f0",
+      "bytes": 128582
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/storage/no_build_confirmation.rs",
+      "baseline": "checkpoint",
+      "before_sha256": "c10f149dbdba47b09f599e4fba4101f59264e6073c77fd214666269fb39221cc",
+      "after_sha256": "47ec78ea63a51265d5996a21282bf0c83979e1c68da89604c946680e4ce44206",
+      "bytes": 14238
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/storage/no_tests_confirmation.rs",
+      "baseline": "checkpoint",
+      "before_sha256": "b41f589610521b52a367aa02bac8473f6cad50ea9c373660e3aa4fdff26736d3",
+      "after_sha256": "2b4deb4c5ba31a1eebd6aed501130e02136be9efb3aa7ae258225da3e0a6e4d9",
+      "bytes": 14507
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/storage/requirement_items.rs",
+      "baseline": "checkpoint",
+      "before_sha256": "2a0097e8be63f4f37d4c0fbcf7c3b17762ec41c663324f0904ee29cf372e7fca",
+      "after_sha256": "a4464d164cac4ebea8c728fd1bb1c76a954e2fe2076dbc80b05d0fcd2cb2993f",
+      "bytes": 8107
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/storage/tasks.rs",
+      "baseline": "checkpoint",
+      "before_sha256": "b5a5536eabfda769a09f4d11387b8426201915b0a0fd7eb63befcd3cb9c9b740",
+      "after_sha256": "c594c3b74cdc3efc65b760021d89d3a825713cdf49fd4529dac4a84e1496077c",
+      "bytes": 71401
+    },
+    {
+      "path": "apps/desktop/src/components/CoreLoopView.text.test.ts",
+      "baseline": "HEAD-clean",
+      "before_sha256": "ddedd37ab21749891c046a6a7cab54477916efe62f7c91fd2fce10ae17f32a34",
+      "after_sha256": "896f7075d9b93506ac21570f03eae71ab66e745151dd938f65464927a0614a10",
+      "bytes": 8931
+    },
+    {
+      "path": "apps/desktop/src/components/CoreLoopView.vue",
+      "baseline": "checkpoint",
+      "before_sha256": "42f129b0221d8cb5a278dc99b297c61fabafe8c6fafc520fb0433f4e1e4fd1d7",
+      "after_sha256": "5691d5d032b0c281e9ad50fbe2918d437ea6bf4ecb8173bc9866277ea72adbee",
+      "bytes": 33750
+    },
+    {
+      "path": "apps/desktop/src/stores/coreLoop.test.ts",
+      "baseline": "HEAD-clean",
+      "before_sha256": "409eec0f887e8fd8915041176c28cac29101e7ba14a76e3ddb8eba87663723a6",
+      "after_sha256": "19ac0a0f30b7ebde697403754fd3873f1604a4e3680948db3816f9781a64b9c1",
+      "bytes": 74289
+    },
+    {
+      "path": "apps/desktop/src/stores/coreLoop.ts",
+      "baseline": "checkpoint",
+      "before_sha256": "dbc936cd429d7e6e0110bf73def965bfdd05017e4a62ddae330d883b36d8e838",
+      "after_sha256": "23a4fa64b90a8c5c7ceb4c3bb8488b76eb789a3111622300dcc3f4a2e9951278",
+      "bytes": 40738
+    },
+    {
+      "path": "apps/desktop/src/types.ts",
+      "baseline": "checkpoint",
+      "before_sha256": "a89f9e49711322cb7c8174f508534571cb82ab8a20bba95d195f4b97a95adb93",
+      "after_sha256": "ae19b8f118966d427c78f6c46357583c2aa8dcd8d6268c2619e487e34d5f86c6",
+      "bytes": 9016
+    }
+  ]
+}

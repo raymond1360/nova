@@ -1,0 +1,153 @@
+{
+  "assertions": [
+    {
+      "assertion": "nine real WebView DOM/IPC scene groups passed",
+      "passed": true
+    },
+    {
+      "assertion": "database is exactly inside this new audit run",
+      "passed": true
+    },
+    {
+      "assertion": "WebView user data is exactly isolated",
+      "passed": true
+    },
+    {
+      "assertion": "fake binary pinned hash matches after run",
+      "passed": true
+    },
+    {
+      "assertion": "all spawned runtime commands use only pinned fake or git",
+      "passed": true
+    },
+    {
+      "assertion": "all spawned runtime working directories stay isolated",
+      "passed": true
+    },
+    {
+      "assertion": "exactly four fake development calls; no automatic Case C AI call",
+      "passed": true
+    },
+    {
+      "assertion": "each fake development reads actual snapshot and output contract",
+      "passed": true
+    },
+    {
+      "assertion": "isolated database integrity_check",
+      "passed": true
+    },
+    {
+      "assertion": "isolated database foreign_key_check",
+      "passed": true
+    },
+    {
+      "assertion": "normal fake result completed with exactly one acceptance",
+      "passed": true
+    },
+    {
+      "assertion": "normal actual persisted self-check is valid and complete",
+      "passed": true
+    },
+    {
+      "assertion": "02  rejected completion and wrote no acceptance",
+      "passed": true
+    },
+    {
+      "assertion": "03  rejected completion and wrote no acceptance",
+      "passed": true
+    },
+    {
+      "assertion": "04  rejected completion and wrote no acceptance",
+      "passed": true
+    },
+    {
+      "assertion": "Case C remains Queued after all subsequent scenarios",
+      "passed": true
+    },
+    {
+      "assertion": "Case C confirmation and all action records unchanged",
+      "passed": true
+    },
+    {
+      "assertion": "frozen cancellation preserves classification and writes no acceptance",
+      "passed": true
+    },
+    {
+      "assertion": "new generation remains unaccepted",
+      "passed": true
+    },
+    {
+      "assertion": "backfill creates exactly six items",
+      "passed": true
+    },
+    {
+      "assertion": "DOM-created confirmed task contains six items",
+      "passed": true
+    },
+    {
+      "assertion": "actual SQLite failure displays both read errors",
+      "passed": true
+    },
+    {
+      "assertion": "only three pre-existing files changed from this-turn checkpoint",
+      "passed": true
+    },
+    {
+      "assertion": "normal release binary contains no validation command/driver identity",
+      "passed": true
+    },
+    {
+      "assertion": "release feature intentionally refuses compilation",
+      "passed": true
+    },
+    {
+      "assertion": "production command registration list identical to reviewed delivery",
+      "passed": true
+    }
+  ],
+  "process_count": 44,
+  "fake_development_calls": 4,
+  "checkpoint_count": 17,
+  "driver": {
+    "completed": true,
+    "results": [
+      {
+        "name": "01-confirmation-snapshot",
+        "passed": true
+      },
+      {
+        "name": "02-explicit-backfill",
+        "passed": true
+      },
+      {
+        "name": "03-fake-cli-summary-precheck",
+        "passed": true
+      },
+      {
+        "name": "04-first-user-acceptance",
+        "passed": true
+      },
+      {
+        "name": "05-self-check-rejections",
+        "passed": true
+      },
+      {
+        "name": "06-case-c-recovery",
+        "passed": true
+      },
+      {
+        "name": "07-stale-and-read-errors",
+        "passed": true
+      },
+      {
+        "name": "08-old-attempt-history",
+        "passed": true
+      },
+      {
+        "name": "09-frozen-history",
+        "passed": true
+      }
+    ]
+  },
+  "screenshots_captured": 0
+}

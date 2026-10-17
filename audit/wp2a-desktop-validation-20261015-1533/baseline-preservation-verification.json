@@ -1,0 +1,13 @@
+{
+  "changed": [
+    "apps/desktop/src-tauri/Cargo.toml",
+    "apps/desktop/src-tauri/src/lib.rs",
+    "apps/desktop/src-tauri/src/runtime/process.rs"
+  ],
+  "unchanged_count": 30,
+  "expected_changed": [
+    "apps/desktop/src-tauri/Cargo.toml",
+    "apps/desktop/src-tauri/src/lib.rs",
+    "apps/desktop/src-tauri/src/runtime/process.rs"
+  ]
+}

@@ -384,6 +384,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("cargo test"),
             status: "failed",
             passed_count: 0,

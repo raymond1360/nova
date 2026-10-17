@@ -2,10 +2,116 @@ use rusqlite::params;
 
 use crate::db::Database;
 use crate::error::{NovaError, NovaResult};
-use crate::models::{Actor, CreateTaskRequest, Task, TaskState, TaskStateEvent};
+use crate::models::{Actor, ActionStatus, CreateTaskRequest, Task, TaskState, TaskStateEvent};
 use crate::security::redact_sensitive_text;
 
 use super::{new_id, now};
+
+#[cfg(test)]
+thread_local! {
+    // One-shot barrier for deterministic two-connection transition races.
+    pub(crate) static BEFORE_TRANSITION_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// WP2A: why [`Database::transition_task`] refused a `to == Completed`
+/// attempt. Never itself written anywhere — it is a pure in-memory
+/// classification of already-persisted data, recomputed fresh on every
+/// call (including by a read-only precheck a caller can run before even
+/// attempting the transition, so the UI can explain *why* a "mark
+/// complete" action is currently disabled without actually attempting it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionRejectReason {
+    /// The task's historical AI-mode could not be confirmed as a clean,
+    /// positively-evidenced single-AI run (`legacy_classification` is
+    /// `dual_ai_evidenced` or `unknown_insufficient`) — frozen at migration
+    /// time, never re-evaluated for a task created afterward.
+    LegacyTaskFrozen,
+    InvalidCompletionState,
+    /// No `(generation, round)` has both a successfully-completed dev/fix
+    /// action and real passing test+build evidence (or valid no-tests/
+    /// no-build authorization) attributed to that exact action's current
+    /// attempt. Should not be reachable in practice once a task has
+    /// legitimately reached `awaiting_user_acceptance` — kept as a
+    /// defensive, never-expected-to-fire check.
+    NoAdoptedEvidence,
+    /// The dev/fix action for the otherwise-adopted round is missing or
+    /// not `Succeeded`. Same defensive status as `NoAdoptedEvidence`.
+    DevActionNotSucceeded,
+    TestAttemptMismatch,
+    BuildAttemptMismatch,
+    SelfCheckMissing,
+    SelfCheckInvalidFormat,
+    SelfCheckNotComplete,
+    UnfinishedItemsPresent,
+    BlockingIssuesPresent,
+    RequirementSnapshotMissing,
+    RequirementCoverageIncomplete,
+    UserAcceptanceMissing,
+}
+
+impl CompletionRejectReason {
+    /// A stable, machine-readable identifier for this reason — for a
+    /// frontend that wants to branch on *which* reason it is (e.g. to show
+    /// a different follow-up action) without parsing the Chinese
+    /// [`message`](Self::message) text.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::LegacyTaskFrozen => "legacy_task_frozen",
+            Self::InvalidCompletionState => "invalid_completion_state",
+            Self::NoAdoptedEvidence => "no_adopted_evidence",
+            Self::DevActionNotSucceeded => "dev_action_not_succeeded",
+            Self::TestAttemptMismatch => "test_attempt_mismatch",
+            Self::BuildAttemptMismatch => "build_attempt_mismatch",
+            Self::SelfCheckMissing => "self_check_missing",
+            Self::SelfCheckInvalidFormat => "self_check_invalid_format",
+            Self::SelfCheckNotComplete => "self_check_not_complete",
+            Self::UnfinishedItemsPresent => "unfinished_items_present",
+            Self::BlockingIssuesPresent => "blocking_issues_present",
+            Self::RequirementSnapshotMissing => "requirement_snapshot_missing",
+            Self::RequirementCoverageIncomplete => "requirement_coverage_incomplete",
+            Self::UserAcceptanceMissing => "user_acceptance_missing",
+        }
+    }
+
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::LegacyTaskFrozen => "该任务的历史执行路径无法确认，已冻结，不能完成",
+            Self::InvalidCompletionState => "只有等待用户验收的结果可以提交验收或完成",
+            Self::NoAdoptedEvidence => "尚未找到真实通过的测试与构建证据",
+            Self::DevActionNotSucceeded => "开发/修复执行记录异常，无法确认归属",
+            Self::TestAttemptMismatch => "采纳结果的测试证据与当前开发执行不匹配",
+            Self::BuildAttemptMismatch => "采纳结果的构建证据与当前开发执行不匹配",
+            Self::SelfCheckMissing => "缺少当前轮次的自检记录",
+            Self::SelfCheckInvalidFormat => "自检记录格式无效，无法解析",
+            Self::SelfCheckNotComplete => "开发AI自检认为尚未完成或被阻断",
+            Self::UnfinishedItemsPresent => "自检记录中存在未完成项",
+            Self::BlockingIssuesPresent => "自检记录中存在阻断问题",
+            Self::RequirementSnapshotMissing => "任务缺少已确认需求快照，无法核对覆盖情况",
+            Self::RequirementCoverageIncomplete => "自检的需求覆盖记录不完整或不一致",
+            Self::UserAcceptanceMissing => "缺少当前结果的用户确认",
+        }
+    }
+}
+
+/// `tasks.legacy_classification` values that block the entry points listed
+/// in the WP2A design docs (`run_core_loop`, `unblock_test_execution_for_retry`,
+/// `confirm_no_tests_applicable`/`confirm_no_build_applicable`, and this
+/// module's own `to IN (Queued, Running, Completed)` checks). `None` and
+/// `"single_ai_evidenced"` (never actually assigned under the current
+/// schema, kept for forward compatibility) are never frozen.
+pub fn is_legacy_frozen(task: &Task) -> bool {
+    matches!(
+        task.legacy_classification.as_deref(),
+        Some("dual_ai_evidenced") | Some("unknown_insufficient")
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct CoverageEntry {
+    item: String,
+    status: String,
+}
 
 /// Every legal `(from, to)` transition. Anything not listed here is
 /// rejected by [`is_legal_transition`] — deny-by-default, not
@@ -149,7 +255,7 @@ impl Database {
     pub fn task(&self, id: &str) -> NovaResult<Task> {
         self.conn()
             .query_row(
-                "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, test_command_redacted, test_command_source, document_sync_pending, created_at, updated_at
+                "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, test_command_redacted, test_command_source, document_sync_pending, legacy_classification, created_at, updated_at
                  FROM tasks WHERE id = ?1",
                 params![id],
                 read_task,
@@ -198,7 +304,7 @@ impl Database {
 
     pub fn list_tasks_for_project(&self, project_id: &str) -> NovaResult<Vec<Task>> {
         let mut stmt = self.conn().prepare(
-            "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, test_command_redacted, test_command_source, document_sync_pending, created_at, updated_at
+            "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, test_command_redacted, test_command_source, document_sync_pending, legacy_classification, created_at, updated_at
              FROM tasks WHERE project_id = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt
@@ -213,7 +319,7 @@ impl Database {
     pub fn unfinished_task_for_project(&self, project_id: &str) -> NovaResult<Option<Task>> {
         self.conn()
             .query_row(
-                "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, test_command_redacted, test_command_source, document_sync_pending, created_at, updated_at
+                "SELECT id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, result_generation, test_command_redacted, test_command_source, document_sync_pending, legacy_classification, created_at, updated_at
                  FROM tasks
                  WHERE project_id = ?1 AND state NOT IN ('completed', 'cancelled', 'failed')
                  ORDER BY updated_at DESC LIMIT 1",
@@ -259,6 +365,156 @@ impl Database {
         Ok(count.max(0) as u32)
     }
 
+    /// WP2A: the full `completed` gate — read-only, callable standalone as
+    /// a precheck (so the UI can explain why "mark complete" is disabled
+    /// without attempting it) and also called by [`Database::transition_task`]
+    /// itself immediately before its own atomic `UPDATE`, inside the same
+    /// `BEGIN IMMEDIATE` transaction, so there is no window between this
+    /// check and the write where a concurrent writer could invalidate it.
+    ///
+    /// Finds the `(round, dev_attempt)` whose dev/fix action succeeded and
+    /// whose test+build evidence (or no-tests/no-build authorization) is
+    /// attributed to that *exact* attempt — never just "some evidence for
+    /// this generation/round", which is what [`NoAdoptedEvidence`] /
+    /// [`DevActionNotSucceeded`] exist to catch defensively (should not be
+    /// reachable once a task has legitimately reached
+    /// `awaiting_user_acceptance`, since `result_attempt` binding already
+    /// prevents a stale attempt's evidence from ever being written in the
+    /// first place — see `core_loop::run_tests_for_round`/
+    /// `run_build_for_round`). Then requires: a current, valid, complete
+    /// self-check with no unfinished/blocking items; full requirement
+    /// coverage against [`Database::list_confirmed_requirement_items`];
+    /// and a real `accepted = 1` `user_acceptance` row for the task's
+    /// current `result_generation`.
+    ///
+    /// [`NoAdoptedEvidence`]: CompletionRejectReason::NoAdoptedEvidence
+    /// [`DevActionNotSucceeded`]: CompletionRejectReason::DevActionNotSucceeded
+    pub fn evaluate_completion_gate(
+        &self,
+        task: &Task,
+    ) -> NovaResult<Result<(), CompletionRejectReason>> {
+        self.evaluate_result_gate(task, true)
+    }
+
+    /// Predict the explicit accept operation, which records the user's decision
+    /// before completion. This does not grant direct completion permission.
+    pub fn evaluate_acceptance_submission(&self, task: &Task) -> NovaResult<Result<(), CompletionRejectReason>> {
+        self.evaluate_result_gate(task, false)
+    }
+
+    fn evaluate_result_gate(&self, task: &Task, require_acceptance: bool) -> NovaResult<Result<(), CompletionRejectReason>> {
+        if is_legacy_frozen(task) {
+            return Ok(Err(CompletionRejectReason::LegacyTaskFrozen));
+        }
+        if task.state != TaskState::AwaitingUserAcceptance {
+            return Ok(Err(CompletionRejectReason::InvalidCompletionState));
+        }
+
+        // Freeze the authoritative adoption before checking attribution. A failed
+        // check must never search another generation/round for a rescue.
+        let Some((generation, adopted_round)) = crate::core_loop::documents::adopted_passing_generation_round(
+            self, &task.project_id, &task.id, task,
+        )? else {
+            return Ok(Err(CompletionRejectReason::NoAdoptedEvidence));
+        };
+        let dev_key = format!("dev-{}-round-{adopted_round}", task.id);
+        let Some(dev_action) = self.find_action(&task.id, &dev_key)? else {
+            return Ok(Err(CompletionRejectReason::DevActionNotSucceeded));
+        };
+        if dev_action.status != ActionStatus::Succeeded {
+            return Ok(Err(CompletionRejectReason::DevActionNotSucceeded));
+        }
+        let current_attempt = dev_action.attempt_number;
+        let mut test_ok = false;
+        for evidence in self.list_test_evidence_for_round(&task.project_id, &task.id, generation, adopted_round)? {
+            if evidence.result_attempt != Some(current_attempt) { continue; }
+            if evidence.status == "passed" || (evidence.status == "no_tests_applicable"
+                && crate::core_loop::documents::no_tests_applicable_is_authorized(
+                    self, &task.project_id, &task.id, generation, adopted_round, Some(current_attempt),
+                )?) { test_ok = true; break; }
+        }
+        if !test_ok { return Ok(Err(CompletionRejectReason::TestAttemptMismatch)); }
+        let mut build_ok = false;
+        for evidence in self.list_build_evidence_for_round(&task.project_id, &task.id, generation, adopted_round)? {
+            if evidence.result_attempt != Some(current_attempt) { continue; }
+            if evidence.status == "passed" || (evidence.status == "no_build_applicable"
+                && crate::core_loop::documents::no_build_applicable_is_authorized(
+                    self, &task.project_id, &task.id, generation, adopted_round, Some(current_attempt),
+                    evidence.authorization_source.as_deref(),
+                )?) { build_ok = true; break; }
+        }
+        if !build_ok { return Ok(Err(CompletionRejectReason::BuildAttemptMismatch)); }
+
+        let Some(self_check) = self.current_self_check(&task.id, adopted_round, current_attempt)?
+        else {
+            return Ok(Err(CompletionRejectReason::SelfCheckMissing));
+        };
+        if self_check.parse_status != "valid" {
+            return Ok(Err(CompletionRejectReason::SelfCheckInvalidFormat));
+        }
+        if self_check.self_reported_status.as_deref() != Some("self_reported_complete") {
+            return Ok(Err(CompletionRejectReason::SelfCheckNotComplete));
+        }
+        let Some(unfinished): Option<Vec<String>> = self_check.unfinished_items_json.as_deref()
+            .and_then(|json| serde_json::from_str(json).ok()) else {
+            return Ok(Err(CompletionRejectReason::SelfCheckInvalidFormat));
+        };
+        if !unfinished.is_empty() {
+            return Ok(Err(CompletionRejectReason::UnfinishedItemsPresent));
+        }
+        let Some(blocking): Option<Vec<String>> = self_check.blocking_issues_json.as_deref()
+            .and_then(|json| serde_json::from_str(json).ok()) else {
+            return Ok(Err(CompletionRejectReason::SelfCheckInvalidFormat));
+        };
+        if !blocking.is_empty() {
+            return Ok(Err(CompletionRejectReason::BlockingIssuesPresent));
+        }
+
+        let authoritative = self.list_confirmed_requirement_items(&task.id)?;
+        if authoritative.is_empty() {
+            return Ok(Err(CompletionRejectReason::RequirementSnapshotMissing));
+        }
+        let coverage: Vec<CoverageEntry> = self_check
+            .requirement_coverage_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default();
+        let authoritative_keys: std::collections::BTreeSet<String> = authoritative
+            .iter()
+            .map(|item| format!("{}:{}", item.field, item.item_index))
+            .collect();
+        let mut seen_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut coverage_ok = !coverage.is_empty();
+        for entry in &coverage {
+            if entry.status != "covered" {
+                coverage_ok = false;
+            }
+            if !authoritative_keys.contains(&entry.item) {
+                coverage_ok = false; // fabricated/extra item
+            }
+            if !seen_keys.insert(entry.item.clone()) {
+                coverage_ok = false; // duplicate item
+            }
+        }
+        if seen_keys.len() != authoritative_keys.len() {
+            coverage_ok = false; // missing item(s)
+        }
+        if !coverage_ok {
+            return Ok(Err(CompletionRejectReason::RequirementCoverageIncomplete));
+        }
+
+        let accepted: i64 = self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM user_acceptance WHERE task_id = ?1 AND result_generation = ?2 AND accepted = 1)",
+            params![task.id, task.result_generation],
+            |row| row.get(0),
+        )?;
+        if require_acceptance && accepted == 0 {
+            return Ok(Err(CompletionRejectReason::UserAcceptanceMissing));
+        }
+
+        Ok(Ok(()))
+    }
+
     /// The single authoritative entry point for moving a task from one
     /// state to another. Validates the transition against
     /// [`LEGAL_TRANSITIONS`] and the automatic-fix-cycle cap up front, then
@@ -278,60 +534,60 @@ impl Database {
         is_recovery: bool,
         safety_summary: Option<&str>,
     ) -> NovaResult<Task> {
-        let task = self.task(task_id)?;
-        let from = task.state;
-
-        if !is_legal_transition(from, to) {
-            return Err(NovaError::Config(format!(
-                "非法的任务状态转换：{from} -> {to}"
-            )));
-        }
-
-        if to == TaskState::SafeFixing && actor != Actor::User && !is_recovery {
-            let existing = self.count_automatic_safe_fixing_entries(task_id)?;
-            assert_fix_cycle_allowed(existing).map_err(NovaError::Config)?;
-        }
-
         let reason = reason.map(redact_sensitive_text);
         let safety_summary = safety_summary.map(redact_sensitive_text);
         let now = now();
+        #[cfg(test)]
+        BEFORE_TRANSITION_LOCK.with(|hook| {
+            if let Some(callback) = hook.borrow_mut().take() { callback(); }
+        });
         self.conn().execute("BEGIN IMMEDIATE;", [])?;
         let result = (|| -> NovaResult<()> {
-            // Conditioned on `state = from` (not a bare `WHERE id = ?`): if
-            // a concurrent writer (another connection — e.g. a second Nova
-            // process on the same database file) already moved this task
-            // out of `from` between our read above and this write taking
-            // the lock, `rows_affected` is 0 and we abort instead of
-            // silently recording a second, stale transition on top of
-            // whatever really happened.
-            //
-            // The `completed` acceptance gate is folded into this same
-            // `WHERE` clause (rather than a preceding `SELECT COUNT(*)`
-            // check) so the whole decision — legal prior state AND, only
-            // for `completed`, "current result_generation has a matching
-            // accepted=1 row" — is evaluated and committed atomically in
-            // one statement. A separate read-then-write here would reopen
-            // exactly the kind of TOCTOU race this remediation closes:
-            // two concurrent `completed` attempts could otherwise both
-            // observe a valid acceptance row and both "win".
+            let task = self.task(task_id)?;
+            let from = task.state;
+
+            if !is_legal_transition(from, to) {
+                return Err(NovaError::Config(format!(
+                    "非法的任务状态转换：{from} -> {to}"
+                )));
+            }
+
+            // Read and validate under the write lock. No state, event, action,
+            // or confirmation is changed by a rejected frozen transition.
+            if (to == TaskState::Queued || to == TaskState::Running) && is_legacy_frozen(&task) {
+                return Err(NovaError::Config(
+                    CompletionRejectReason::LegacyTaskFrozen.message().to_string(),
+                ));
+            }
+
+            if to == TaskState::SafeFixing && actor != Actor::User && !is_recovery {
+                let existing = self.count_automatic_safe_fixing_entries(task_id)?;
+                assert_fix_cycle_allowed(existing).map_err(NovaError::Config)?;
+            }
+
+            // WP2A (B2): the full completed gate is evaluated here, inside
+            // this same transaction, immediately before the `UPDATE`
+            // below — not as a separate, earlier, independently-committed
+            // step. Its boolean result is folded into the same `WHERE`
+            // clause the pre-existing user-acceptance check already used,
+            // preserving the exact TOCTOU-closing property that check's
+            // own comment describes: there is no window between "we
+            // decided completion is allowed" and "we wrote it" where a
+            // concurrent connection could invalidate the decision.
+            let completion_reason: Option<CompletionRejectReason> = if to == TaskState::Completed {
+                self.evaluate_completion_gate(&task)?.err()
+            } else {
+                None
+            };
+            let completion_ok = completion_reason.is_none();
+
             let rows_affected = self.conn().execute(
                 "UPDATE tasks
                  SET state = ?1, updated_at = ?2
                  WHERE id = ?3
                    AND state = ?4
-                   AND (
-                     ?1 <> 'completed'
-                     OR (
-                       result_generation > 0
-                       AND EXISTS (
-                         SELECT 1 FROM user_acceptance ua
-                         WHERE ua.task_id = tasks.id
-                           AND ua.result_generation = tasks.result_generation
-                           AND ua.accepted = 1
-                       )
-                     )
-                   )",
-                params![to.as_str(), now, task_id, from.as_str()],
+                   AND (?1 <> 'completed' OR ?5 = 1)",
+                params![to.as_str(), now, task_id, from.as_str(), completion_ok as i64],
             )?;
             if rows_affected == 0 {
                 // Diagnose why, purely for a clear error message — this
@@ -344,10 +600,10 @@ impl Database {
                     )));
                 }
                 if to == TaskState::Completed {
-                    return Err(NovaError::Config(
-                        "无法进入 completed：当前结果版本（result_generation）缺少匹配的用户确认记录"
-                            .to_string(),
-                    ));
+                    let message = completion_reason
+                        .map(|r| r.message())
+                        .unwrap_or("无法进入 completed：完工门禁未通过");
+                    return Err(NovaError::Config(format!("无法进入 completed：{message}")));
                 }
                 return Err(NovaError::Config(format!(
                     "任务状态转换失败：{from} -> {to}"
@@ -385,6 +641,18 @@ impl Database {
                     now,
                 ],
             )?;
+
+            // WP2A-0: the moment a task leaves `Draft` for `AwaitingConfirmation`
+            // *is* "the user confirmed the requirement" — this is the one
+            // and only place a fresh task's requirement snapshot is taken,
+            // in the same transaction as the state write itself. Silently
+            // a no-op if a snapshot already exists for this task (it never
+            // will yet, for a task taking this edge for the first and only
+            // legal time, but the check is defensive, not load-bearing).
+            if to == TaskState::AwaitingConfirmation {
+                self.insert_confirmed_requirement_items_if_absent(&task.project_id, &task)?;
+            }
+
             Ok(())
         })();
 
@@ -440,8 +708,9 @@ fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         test_command_redacted: row.get(10)?,
         test_command_source: row.get(11)?,
         document_sync_pending: row.get::<_, i64>(12)? != 0,
-        created_at: row.get(13)?,
-        updated_at: row.get(14)?,
+        legacy_classification: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
     })
 }
 
@@ -762,6 +1031,101 @@ mod tests {
         .unwrap();
     }
 
+    /// WP2A fixture helper: satisfies every piece of `evaluate_completion_gate`
+    /// except user acceptance itself — a succeeded dev action for `round`,
+    /// passing test+build evidence bound to that action's attempt number,
+    /// and a valid/complete self-check whose `requirement_coverage` is an
+    /// exact match for the task's confirmed requirement items (as produced
+    /// by `list_confirmed_requirement_items`, i.e. whatever non-empty
+    /// fields the caller's `CreateTaskRequest` actually set). Callers still
+    /// need to call `db.record_user_acceptance(...)` themselves for the
+    /// relevant `result_generation` before a `Completed` transition can
+    /// succeed — this only clears the evidence/self-check half of the gate.
+    fn satisfy_completion_gate_evidence_and_self_check(
+        db: &Database,
+        project_id: &str,
+        task_id: &str,
+        generation: i64,
+        round: i64,
+    ) {
+        use crate::storage::evidence::{RecordBuildEvidenceRequest, RecordTestEvidenceRequest};
+        use crate::storage::self_check::RecordSelfCheckRequest;
+
+        let dev_key = format!("dev-{task_id}-round-{round}");
+        let planned = db.plan_action(task_id, "ai_development", &dev_key).unwrap();
+        let started = db
+            .start_action(task_id, &dev_key, false)
+            .unwrap_or(planned);
+        let attempt = started.attempt_number;
+        db.finish_action(
+            task_id,
+            &dev_key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            attempt,
+        )
+        .unwrap();
+
+        db.record_test_evidence(&RecordTestEvidenceRequest {
+            project_id,
+            task_id,
+            result_generation: generation,
+            round,
+            result_attempt: attempt,
+            test_command_redacted: Some("cargo test"),
+            status: "passed",
+            passed_count: 1,
+            failed_count: 0,
+            skipped_count: 0,
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        db.record_build_evidence(&RecordBuildEvidenceRequest {
+            project_id,
+            task_id,
+            result_generation: generation,
+            round,
+            result_attempt: attempt,
+            build_command_redacted: Some("cargo build"),
+            status: "passed",
+            authorization_source: None,
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+
+        let items = db.list_confirmed_requirement_items(task_id).unwrap();
+        let coverage: Vec<serde_json::Value> = items
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "item": format!("{}:{}", item.field, item.item_index),
+                    "status": "covered",
+                })
+            })
+            .collect();
+        db.record_self_check(&RecordSelfCheckRequest {
+            project_id,
+            task_id,
+            round,
+            result_attempt: attempt,
+            parse_status: "valid",
+            self_reported_status: Some("self_reported_complete"),
+            requirement_coverage_json: Some(&serde_json::to_string(&coverage).unwrap()),
+            check_results_json: Some("[]"),
+            unfinished_items_json: Some("[]"),
+            blocking_issues_json: Some("[]"),
+            raw_block_redacted: "mock self-check",
+        })
+        .unwrap();
+    }
+
     #[test]
     fn completed_requires_a_prior_user_acceptance_record() {
         let dir = temp_dir("completed-needs-acceptance");
@@ -783,6 +1147,7 @@ mod tests {
             "completed must be blocked without a user_acceptance row"
         );
 
+        satisfy_completion_gate_evidence_and_self_check(&db, &project_id, &task.id, 1, 1);
         db.record_user_acceptance(&project_id, &task.id, true, None)
             .unwrap();
         let with_acceptance = db.transition_task(
@@ -926,6 +1291,7 @@ mod tests {
             "the generation-1 acceptance must not be able to complete generation 2"
         );
 
+        satisfy_completion_gate_evidence_and_self_check(&db, &project_id, &task.id, 2, 1);
         db.record_user_acceptance(&project_id, &task.id, true, None)
             .unwrap();
         let completed = db

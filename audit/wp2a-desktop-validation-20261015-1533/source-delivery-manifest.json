@@ -1,0 +1,37 @@
+[
+  {
+    "path": "apps/desktop/src-tauri/Cargo.toml",
+    "sha256": "0dd7ebe1a14f18870a171e67569bf30a347fb9d9197f2f9b25833a746eac94ad",
+    "boundary": "modified this turn"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/lib.rs",
+    "sha256": "4843eb9638f70f96ab14d50c16d8c2a8699a205ba3b8a4c26da1075492608386",
+    "boundary": "modified this turn"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/runtime/process.rs",
+    "sha256": "7c5a0856abfe9d63ade9376f3f92f1472f29730739316f0ae5bb2c96a24707cd",
+    "boundary": "modified this turn"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/isolated_validation.rs",
+    "sha256": "197c3decd42bdf0e5d27889e8fb8881627cea357356f9ed805310176c47a3628",
+    "boundary": "new this turn"
+  },
+  {
+    "path": "apps/desktop/src-tauri/tests/fixtures/wp2a_validation_main.rs",
+    "sha256": "539126d5e1ecf86a76b65983a3c2f5b9394e4121d763fae77518d6c2299dd575",
+    "boundary": "new this turn"
+  },
+  {
+    "path": "apps/desktop/src-tauri/tests/fixtures/wp2a_fake_cli.rs",
+    "sha256": "b7a60120c7fbea6707b16df630e80c97c43854a19e4353f14b1e0c2b318aac5f",
+    "boundary": "new this turn"
+  },
+  {
+    "path": "apps/desktop/src-tauri/tests/fixtures/wp2a_validation_driver.js",
+    "sha256": "f196bc6e0cedd8ff1cb4517446e40d4bec600a983da46b5a81f572339a27fb70",
+    "boundary": "new this turn"
+  }
+]

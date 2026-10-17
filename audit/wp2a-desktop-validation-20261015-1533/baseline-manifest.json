@@ -1,0 +1,134 @@
+[
+  {
+    "path": "apps/desktop/src-tauri/Cargo.toml",
+    "sha256": "2b1675f1f1014e570c086c957cb53668cc1801a46791afaa8d5f9f068d400c64"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/commands.rs",
+    "sha256": "0196479d1cae5f58774c710ae3d44ad46fde9bab086774a43bf10136a06db2bc"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop.rs",
+    "sha256": "840247f16f415694f722723c799923542138c997c7ee594ac1aefb631b500222"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop/documents.rs",
+    "sha256": "77b38aa2212397b9f2ba401bb3f436f3dadf7d190ef150c8c7883e7681544f2b"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop/evidence_overview.rs",
+    "sha256": "ee98143332736835acc81ed4d28204603a3ad8af2ce1907462219a875f52bdde"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop/self_check_parser.rs",
+    "sha256": "00131572c626916aec5e868bbf436b7c74da1376805cc39bb514f827d7d8b199"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop/task_documents.rs",
+    "sha256": "dc908d051c6be801d8affdbe15c7b24201795ae226a44591918d96f7f36ba275"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop/test_runner.rs",
+    "sha256": "9c17824edd1465a819bf2f8d954907f60814a1547e4f72759f33e32463d19809"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop/wp2a_remediation_tests.rs",
+    "sha256": "a201fad07336084a9302766375169b5b4874b6835b061dfc34993a8d9420de4c"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/credential.rs",
+    "sha256": "b3ca11d6cfffeecac134ff3e834994bb42e59f20fd1e4710fac0f2a9433cccb4"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/error.rs",
+    "sha256": "a78b454f4b4025d2ddcdae8f2b3f1e31ae28532d1f258e590afd2f5b90947fa8"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/lib.rs",
+    "sha256": "c842a86b125abcff04fdc0c0b4c4362b5a761a73710a58d8e891398d8fd2ceea"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/models.rs",
+    "sha256": "00c03c91b1dc91525d736b916e0c05708b211ea75cb5c426b0ead85e5eb0d5a0"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/runtime/ai_adapter.rs",
+    "sha256": "036efe9ed322bcada72f5e103f10833e13078e69d867b8dd769a4782b0fb928b"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/runtime/process.rs",
+    "sha256": "a9b5b3a82161fc14da9409a357cc782580a8abc2cb87e5ea249ac9913eaba1ca"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/actions.rs",
+    "sha256": "46d0a9dee59b6adad1d831b083a9d1dd172f80df10a8e123dfa5b4f561e115b0"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/concurrency_tests.rs",
+    "sha256": "0b5cd7a537e37742336b51bcb8fd27653f3722a973a3c9f1bbaba3b56ed3c104"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/evidence.rs",
+    "sha256": "b6c89e1b8a2df1814e0b162e8cdd40e78e1681ea29d7df8276afd2b03af20799"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/migrations.rs",
+    "sha256": "a10da1fd34f936115b72b04d0a084d4657907aebf9e3c0a8fa3b6cef3d1d59f0"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/mod.rs",
+    "sha256": "21b7a5ae8b8f2ccd93ab1c01f5a42619d36d1eeb79f7b7b5044992eb6512ef66"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/no_build_confirmation.rs",
+    "sha256": "47ec78ea63a51265d5996a21282bf0c83979e1c68da89604c946680e4ce44206"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/no_tests_confirmation.rs",
+    "sha256": "2b4deb4c5ba31a1eebd6aed501130e02136be9efb3aa7ae258225da3e0a6e4d9"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/requirement_items.rs",
+    "sha256": "a4464d164cac4ebea8c728fd1bb1c76a954e2fe2076dbc80b05d0fcd2cb2993f"
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/tasks.rs",
+    "sha256": "c594c3b74cdc3efc65b760021d89d3a825713cdf49fd4529dac4a84e1496077c"
+  },
+  {
+    "path": "apps/desktop/src/components/CoreLoopView.text.test.ts",
+    "sha256": "896f7075d9b93506ac21570f03eae71ab66e745151dd938f65464927a0614a10"
+  },
+  {
+    "path": "apps/desktop/src/components/CoreLoopView.vue",
+    "sha256": "5691d5d032b0c281e9ad50fbe2918d437ea6bf4ecb8173bc9866277ea72adbee"
+  },
+  {
+    "path": "apps/desktop/src/stores/coreLoop.test.ts",
+    "sha256": "19ac0a0f30b7ebde697403754fd3873f1604a4e3680948db3816f9781a64b9c1"
+  },
+  {
+    "path": "apps/desktop/src/stores/coreLoop.ts",
+    "sha256": "23a4fa64b90a8c5c7ceb4c3bb8488b76eb789a3111622300dcc3f4a2e9951278"
+  },
+  {
+    "path": "apps/desktop/src/types.ts",
+    "sha256": "ae19b8f118966d427c78f6c46357583c2aa8dcd8d6268c2619e487e34d5f86c6"
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_WP2A_REMEDIATION_NOTES10151146.md",
+    "sha256": "6fc59b7b127be4df7f39874fe7e653a671b8179e3aad138e7a845f2969c8df53"
+  },
+  {
+    "path": "docs/reports/CODEX_WP2A_REMEDIATION_REPORT10151146.md",
+    "sha256": "89391e2f2e38d16e0f725a185c899f0ffbc902f990f128aa91c3dc8a46edef47"
+  },
+  {
+    "path": "product/NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md",
+    "sha256": "6f0eae6165d01baf6ed272b42b960f141316c491901ecedde3d0bbba07ff265b"
+  },
+  {
+    "path": "product/NOVA_V1_MVP_PRODUCT_DEVELOPMENT_SPEC_V3.md",
+    "sha256": "d37f768ece2976376ca573bf7a85c569128a0811b4f85ec3b8a35c310d31f966"
+  }
+]

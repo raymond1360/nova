@@ -1,0 +1,712 @@
+{
+  "baseline_head": "6a90df951c6c72ab7ae95228d5f2cc4de7e17273",
+  "not_a_delivery_commit": true,
+  "delivery_files": [
+    {
+      "path": "apps/desktop/src/components/CoreLoopView.text.test.ts",
+      "bytes": 8931,
+      "sha256": "896f7075d9b93506ac21570f03eae71ab66e745151dd938f65464927a0614a10"
+    },
+    {
+      "path": "apps/desktop/src/components/CoreLoopView.vue",
+      "bytes": 33750,
+      "sha256": "5691d5d032b0c281e9ad50fbe2918d437ea6bf4ecb8173bc9866277ea72adbee"
+    },
+    {
+      "path": "apps/desktop/src/stores/coreLoop.test.ts",
+      "bytes": 74289,
+      "sha256": "19ac0a0f30b7ebde697403754fd3873f1604a4e3680948db3816f9781a64b9c1"
+    },
+    {
+      "path": "apps/desktop/src/stores/coreLoop.ts",
+      "bytes": 40738,
+      "sha256": "23a4fa64b90a8c5c7ceb4c3bb8488b76eb789a3111622300dcc3f4a2e9951278"
+    },
+    {
+      "path": "apps/desktop/src/types.ts",
+      "bytes": 9016,
+      "sha256": "ae19b8f118966d427c78f6c46357583c2aa8dcd8d6268c2619e487e34d5f86c6"
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/commands.rs",
+      "bytes": 59226,
+      "sha256": "0196479d1cae5f58774c710ae3d44ad46fde9bab086774a43bf10136a06db2bc"
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/core_loop/documents.rs",
+      "bytes": 93541,
+      "sha256": "77b38aa2212397b9f2ba401bb3f436f3dadf7d190ef150c8c7883e7681544f2b"
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/core_loop/evidence_overview.rs",
+      "bytes": 44974,
+      "sha256": "ee98143332736835acc81ed4d28204603a3ad8af2ce1907462219a875f52bdde"
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/core_loop/self_check_parser.rs",
+      "bytes": 7783,
+      "sha256": "00131572c626916aec5e868bbf436b7c74da1376805cc39bb514f827d7d8b199"
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/core_loop/test_runner.rs",
+      "bytes": 40444,
+      "sha256": "9c17824edd1465a819bf2f8d954907f60814a1547e4f72759f33e32463d19809"
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/core_loop/wp2a_remediation_tests.rs",
+      "bytes": 46462,
+      "sha256": "a201fad07336084a9302766375169b5b4874b6835b061dfc34993a8d9420de4c"
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/core_loop.rs",
+      "bytes": 528326,
+      "sha256": "840247f16f415694f722723c799923542138c997c7ee594ac1aefb631b500222"
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/lib.rs",
+      "bytes": 6877,
+      "sha256": "c842a86b125abcff04fdc0c0b4c4362b5a761a73710a58d8e891398d8fd2ceea"
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/runtime/ai_adapter.rs",
+      "bytes": 57599,
+      "sha256": "036efe9ed322bcada72f5e103f10833e13078e69d867b8dd769a4782b0fb928b"
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/storage/actions.rs",
+      "bytes": 23810,
+      "sha256": "46d0a9dee59b6adad1d831b083a9d1dd172f80df10a8e123dfa5b4f561e115b0"
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/storage/migrations.rs",
+      "bytes": 128582,
+      "sha256": "a10da1fd34f936115b72b04d0a084d4657907aebf9e3c0a8fa3b6cef3d1d59f0"
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/storage/no_build_confirmation.rs",
+      "bytes": 14238,
+      "sha256": "47ec78ea63a51265d5996a21282bf0c83979e1c68da89604c946680e4ce44206"
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/storage/no_tests_confirmation.rs",
+      "bytes": 14507,
+      "sha256": "2b4deb4c5ba31a1eebd6aed501130e02136be9efb3aa7ae258225da3e0a6e4d9"
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/storage/requirement_items.rs",
+      "bytes": 8107,
+      "sha256": "a4464d164cac4ebea8c728fd1bb1c76a954e2fe2076dbc80b05d0fcd2cb2993f"
+    },
+    {
+      "path": "apps/desktop/src-tauri/src/storage/tasks.rs",
+      "bytes": 71401,
+      "sha256": "c594c3b74cdc3efc65b760021d89d3a825713cdf49fd4529dac4a84e1496077c"
+    },
+    {
+      "path": "docs/release-v0.1.0/NOVA_WP2A_REMEDIATION_NOTES10151146.md",
+      "bytes": 7602,
+      "sha256": "6fc59b7b127be4df7f39874fe7e653a671b8179e3aad138e7a845f2969c8df53"
+    },
+    {
+      "path": "docs/reports/CODEX_WP2A_REMEDIATION_REPORT10151146.md",
+      "bytes": 21691,
+      "sha256": "89391e2f2e38d16e0f725a185c899f0ffbc902f990f128aa91c3dc8a46edef47"
+    }
+  ],
+  "evidence_files": [
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/backend-build-final.log",
+      "bytes": 358,
+      "sha256": "6baa4601e53aad1f794bf52b70f23862be0d4aa430f10e38f0a7aab55c0d829d"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/backend-check-final.log",
+      "bytes": 132,
+      "sha256": "f87071eaece4d4baa1b5fc6645e03971faa0c48fdbf6464dca59036391831c27"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/backend-final.log",
+      "bytes": 68614,
+      "sha256": "f32532500a525d40ceab7afe6d0e5891aeb0c5b936eee659c7bea7b0c930431d"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/backend-first.log",
+      "bytes": 67696,
+      "sha256": "01a6364e6a9b0e980e4288ac7d99a195b17ff89d71b92b622990b44a30dcab5f"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/backend-second.log",
+      "bytes": 68364,
+      "sha256": "3021a0418d5f655d0898b3722e05a8cef87e0a9ecfda9965bbbea07d00d0fd8e"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src/components/CoreLoopView.vue",
+      "bytes": 31455,
+      "sha256": "42f129b0221d8cb5a278dc99b297c61fabafe8c6fafc520fb0433f4e1e4fd1d7"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src/stores/coreLoop.ts",
+      "bytes": 38010,
+      "sha256": "dbc936cd429d7e6e0110bf73def965bfdd05017e4a62ddae330d883b36d8e838"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src/types.ts",
+      "bytes": 8543,
+      "sha256": "a89f9e49711322cb7c8174f508534571cb82ab8a20bba95d195f4b97a95adb93"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/commands.rs",
+      "bytes": 58940,
+      "sha256": "c18a20c8609fea250e7e5d99333edad05308ae493099694922b441529dd898b4"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/core_loop/documents.rs",
+      "bytes": 95189,
+      "sha256": "24f7824b553bfa4ee8fd4c9c12a0055bae88d13efac729112f9c0986c2a71a20"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/core_loop/evidence_overview.rs",
+      "bytes": 43302,
+      "sha256": "e96ef192521684d97f57007c4c946b1b58cb427ac3cb25ec8bbbaa70c29e7fb8"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/core_loop/self_check_parser.rs",
+      "bytes": 7311,
+      "sha256": "76252d1c35a65bc4b96d49b58aefb4970ce651d9533e9859bc202a5d28141272"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/core_loop/task_documents.rs",
+      "bytes": 15850,
+      "sha256": "dc908d051c6be801d8affdbe15c7b24201795ae226a44591918d96f7f36ba275"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/core_loop.rs",
+      "bytes": 512624,
+      "sha256": "b6126d2a9a75493d1c2f3e44a03062338028a8d75b6d12a346f6693de5dfdee2"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/error.rs",
+      "bytes": 2063,
+      "sha256": "a78b454f4b4025d2ddcdae8f2b3f1e31ae28532d1f258e590afd2f5b90947fa8"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/lib.rs",
+      "bytes": 6824,
+      "sha256": "69522f18a961fd91e6fd26f98c5b7e382b3aba0b87f9e84d4e0c2ce18b6fbc3a"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/models.rs",
+      "bytes": 33463,
+      "sha256": "00c03c91b1dc91525d736b916e0c05708b211ea75cb5c426b0ead85e5eb0d5a0"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/runtime/ai_adapter.rs",
+      "bytes": 56866,
+      "sha256": "ab8932ae2a51eaf082b190fbcd098c8fc6f513e9682e2b44ffa3dc2e8f0cd0f7"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/storage/actions.rs",
+      "bytes": 23560,
+      "sha256": "0c860bbdef7601efcd9368ecd7784355a01318f2e674ba6d369d7807f063ba04"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/storage/concurrency_tests.rs",
+      "bytes": 28929,
+      "sha256": "0b5cd7a537e37742336b51bcb8fd27653f3722a973a3c9f1bbaba3b56ed3c104"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/storage/evidence.rs",
+      "bytes": 54692,
+      "sha256": "b6c89e1b8a2df1814e0b162e8cdd40e78e1681ea29d7df8276afd2b03af20799"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/storage/migrations.rs",
+      "bytes": 120071,
+      "sha256": "00e64b36fd5ae218b72f296aa0fc2f95158698329bf5007bc53b98fe1beb5aaf"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/storage/mod.rs",
+      "bytes": 452,
+      "sha256": "21b7a5ae8b8f2ccd93ab1c01f5a42619d36d1eeb79f7b7b5044992eb6512ef66"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/storage/no_build_confirmation.rs",
+      "bytes": 15024,
+      "sha256": "c10f149dbdba47b09f599e4fba4101f59264e6073c77fd214666269fb39221cc"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/storage/no_tests_confirmation.rs",
+      "bytes": 13406,
+      "sha256": "b41f589610521b52a367aa02bac8473f6cad50ea9c373660e3aa4fdff26736d3"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/storage/requirement_items.rs",
+      "bytes": 6793,
+      "sha256": "2a0097e8be63f4f37d4c0fbcf7c3b17762ec41c663324f0904ee29cf372e7fca"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/storage/self_check.rs",
+      "bytes": 11537,
+      "sha256": "9c0ce7a03316b7e9821e7f999be7e805a24b92a92d04556d7f4b68da646376ba"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/apps/desktop/src-tauri/src/storage/tasks.rs",
+      "bytes": 69104,
+      "sha256": "b5a5536eabfda769a09f4d11387b8426201915b0a0fd7eb63befcd3cb9c9b740"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/design/NOVA_V0.1.0_NEW_PRODUCT_BETA_DIALOGUE_SCRIPT10132137.md",
+      "bytes": 20497,
+      "sha256": "e4349b3a8a9a2cd65765eaf937e882267eee13cde72792c5d4db632362a10049"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/design/NOVA_V0.1.0_NEW_PRODUCT_BETA_DIALOGUE_SCRIPT10132331.md",
+      "bytes": 16926,
+      "sha256": "7508679e93fc44fb09c051beac47880d568f090b86e3ece3224620aacc0f18a3"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/CLAUDE_SINGLE_AI_REVIEW_REMEDIATION10140157.md",
+      "bytes": 7220,
+      "sha256": "6f4732abf759fa6cbff7af636c91ac7b2ffe1b3527b46b5a759678ef3f8d2359"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/CLAUDE_WP2A_SPEC_REMEDIATION10141223.md",
+      "bytes": 10863,
+      "sha256": "2348468c6357e31b45dc1945229f5287e23fc67af84dc63e7f8ae867b0db11d6"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/CODEX_PHASE3_NO_BUILD_CONFIRMATION_FINAL_REVIEW09240918.md",
+      "bytes": 10927,
+      "sha256": "86d9aa2a620e050704fa0324a4ee2ba7e177e412fc29762bc00674e20f6c571f"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/CODEX_PHASE3_NO_BUILD_CONFIRMATION_RECOVERY_FINAL_REVIEW09241054.md",
+      "bytes": 11427,
+      "sha256": "b1a41205b415c18bdf97e5b55887e857c090711b8b4164016f8056f930f60d8f"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/CODEX_PHASE3_SINGLE_AI_RUNTIME_FINAL_REREVIEW09232135.md",
+      "bytes": 14721,
+      "sha256": "475a9cc3d32820062af0cf58ff6f3618d7b7fee44edfbc6853f7da389950a2ea"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/CODEX_PHASE3_SINGLE_AI_RUNTIME_REMEDIATION_REREVIEW09211747.md",
+      "bytes": 13725,
+      "sha256": "533086cd933a9784810eb5b56cd23ddc907c0727600a8095874cd6b52dc507ae"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/CODEX_PHASE3_SINGLE_AI_RUNTIME_REVIEW09211520.md",
+      "bytes": 17031,
+      "sha256": "fd4b09d7dcf80b06b12633bb171dfe55916f846a8f88e01e2b38a176a2654185"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/CODEX_V0.1_SCOPE_CORRECTION_AUDIT_09211027.md",
+      "bytes": 18965,
+      "sha256": "607d517d7f02b1f868827e4edd552b7bf941cb28d6f6f5c2e83787a30831e152"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_SINGLE_AI_IMPLEMENTATION_AUDIT10132239.md",
+      "bytes": 8444,
+      "sha256": "aba9478d03b1c8f1bfe1c8595c6382c915c73f5f76d1b0da98069160f03d20e6"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_SINGLE_AI_IMPLEMENTATION_AUDIT10132327.md",
+      "bytes": 6023,
+      "sha256": "bbb2d6f62dc90c9b7cb3796dc7f8b36a7557aa1cafa5d4dd9c9c250af8f8489c"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_SINGLE_AI_MIGRATION_PLAN10132240.md",
+      "bytes": 10238,
+      "sha256": "93db0c67e5d857d3b126c93af54e63d2858c80db5b3c4cfa5981ec6b6c04a751"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_SINGLE_AI_MIGRATION_PLAN10132328.md",
+      "bytes": 10737,
+      "sha256": "f6c8d17584478a3e6d3437b3a6a8ad093e8fa25ad114aa7e81b237f6bf7777d0"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_SINGLE_AI_MIGRATION_PLAN10140155.md",
+      "bytes": 11162,
+      "sha256": "032a1e1654c2bbb06fada8d6474cffaa7e651ed5d89413cb843bfa0b51a33415"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_SINGLE_AI_MIGRATION_PLAN10141222.md",
+      "bytes": 6524,
+      "sha256": "382e72cbd0add5c96680109423419ccc336db7f9200ba0895993831df97aeadd"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_SINGLE_AI_MIGRATION_PLAN10141246.md",
+      "bytes": 6766,
+      "sha256": "ca63ebd1eaa886fdeb0bf56ab1a5a8d44e116835cc129d06affba84e9dcad0db"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_SINGLE_AI_MIGRATION_PLAN10141317.md",
+      "bytes": 3437,
+      "sha256": "6e39f6831bb5eaf74d373b1b2bdda64d4b93c9102ddf2411566e486b7981cf88"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_SINGLE_AI_MIGRATION_PLAN10141350.md",
+      "bytes": 4633,
+      "sha256": "4b5130b3656e42d4b74c5cd07c40950fae4565216ed8ce52bff87a7ea4aba73d"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_SINGLE_AI_MIGRATION_PLAN10141420.md",
+      "bytes": 4143,
+      "sha256": "28af9ce297f064adf657dd428e755196931db464d605c2738628adafac1b4348"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_V010_SINGLE_AI_SCOPE_CHANGE10132237.md",
+      "bytes": 15222,
+      "sha256": "81147ccdf8433571a33f974349bf4885b14005822c6dcf535092481509b7ed15"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_V010_SINGLE_AI_SCOPE_CHANGE10132326.md",
+      "bytes": 11683,
+      "sha256": "b60bebbfa5a6c2e49de4967321884d5a5956df77450b8fc7d47c66250c3a6d64"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_WP2A_FINAL_AMENDMENT10141726.md",
+      "bytes": 19912,
+      "sha256": "b5b02ebc9d6ae93090e6941d09026c7757a63ded0d2bd51f6c2fbc02a66b8962"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_WP2A_IMPLEMENTATION_NOTES10150058.md",
+      "bytes": 4933,
+      "sha256": "e9e862e076df71eed5ce6f7aa20a122a56f8c5bfd8b1ab4705e4de9f157f454f"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_WP2A_SELF_CHECK_SPEC10140153.md",
+      "bytes": 14792,
+      "sha256": "16edc8c01484558edf93cc4148a64417c67867b001b33c7c8bd163b64176e96a"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_WP2A_SELF_CHECK_SPEC10141220.md",
+      "bytes": 24608,
+      "sha256": "0d292f0a67b1eb1b7eb8a36fb873c78835a9d0e11f1c3b5bd1d708ae081c0932"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_WP2A_SELF_CHECK_SPEC10141243.md",
+      "bytes": 26264,
+      "sha256": "86521ec4d98bc874d7a12847ec1748cd7a53d260565fa4bbfd83c995b39addbd"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_WP2A_SELF_CHECK_SPEC10141315.md",
+      "bytes": 29641,
+      "sha256": "fa4338d4896e4eacc5ff14911796373363462916e82563ce7e72caf862b1d62e"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_WP2A_SELF_CHECK_SPEC10141347.md",
+      "bytes": 32235,
+      "sha256": "0799b1b00c5a03ad540d16300da37cfe4fe60c46ed790327549ecd365451eff8"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/release-v0.1.0/NOVA_WP2A_SELF_CHECK_SPEC10141417.md",
+      "bytes": 28971,
+      "sha256": "aafa632eac24a26614c1d7affcdcdbe68af702b632772217190679fa8b60d489"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reports/CLAUDE_WP2A_FINAL_AMENDMENT_REPORT10141728.md",
+      "bytes": 5868,
+      "sha256": "b4fc2adc572096a58ff57013d6a8f60063c4696212b2717e0dd9c6328d1ce6ce"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reports/CLAUDE_WP2A_IMPLEMENTATION_REPORT10150058.md",
+      "bytes": 20700,
+      "sha256": "307b092a8f055c5188619dc90aa6222f6726cdb854b2c97c504a016a3926844e"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reports/CLAUDE_WP2A_SPEC_REMEDIATION10141248.md",
+      "bytes": 7720,
+      "sha256": "c5e16aba92d268c2bcc638ca79860100bc910fb3750b561f94f7030bc7d5d75e"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reports/CLAUDE_WP2A_SPEC_REMEDIATION10141318.md",
+      "bytes": 8133,
+      "sha256": "a6268357e7066f48f431109216a2b6f364f9b400529c2f90e07316970554439b"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reports/CLAUDE_WP2A_SPEC_REMEDIATION10141351.md",
+      "bytes": 6272,
+      "sha256": "90f04d442c7ebe688f909d14563ecb5bb0976a9cf1d091512e0562564d1b11cd"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reports/CLAUDE_WP2A_SPEC_REMEDIATION10141421.md",
+      "bytes": 5914,
+      "sha256": "5807f17cc56f97d58b8aa69efd1ede6f589ec8c01d890f32242f83ec07b6afd6"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reports/PHASE3_ACCEPTANCE_REMEDIATION_REPORT09181744.md",
+      "bytes": 24089,
+      "sha256": "cb8f256e792113ab4801411233d30077317caf7f856d09c10df4accbe32efc34"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reports/PHASE3_BUILD_CANCELLATION_STABILITY_REMEDIATION_REPORT09241633.md",
+      "bytes": 18193,
+      "sha256": "7edf5a8fe35df121e2747fefd8f5321e517e358d55b05805526ed8c4db6fe2e2"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reports/PHASE3_FINAL_NO_TESTS_AND_PROCESS_STABILITY_REMEDIATION_REPORT09250003.md",
+      "bytes": 28138,
+      "sha256": "111e7307c02be8c0298999812382d6c90a8d8a867e17f3bbe6fdefe8125510e9"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reports/PHASE3_NO_BUILD_CONFIRMATION_RECOVERY_REPORT09241006.md",
+      "bytes": 16357,
+      "sha256": "a1ec2eaa000f600862a45708af5878f9b7bcd08faa9215dd2cee9cb9b1f654d8"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reports/PHASE3_NO_BUILD_CONFIRMATION_REMEDIATION_REPORT09240851.md",
+      "bytes": 19139,
+      "sha256": "3dc74974b41c7c0b088eb6d1d60628de2c29c8e855fd2b7e2c577ee06da5b1b7"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reports/PHASE3_SINGLE_AI_FINAL_ACCEPTANCE_EVIDENCE_REPORT09242012.md",
+      "bytes": 30331,
+      "sha256": "1252d43088de248640a6f47e1ed1415a7e5843b2440161ddfac342a63d57819e"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reports/PHASE3_SINGLE_AI_RUNTIME_FINAL_REMEDIATION_REPORT09230940.md",
+      "bytes": 23838,
+      "sha256": "933fc6b063091358b5235cab7c8258cf3d6d9b90c5d08f03e2259ffa003850ea"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reports/PHASE3_SINGLE_AI_RUNTIME_REMEDIATION_REPORT09211305.md",
+      "bytes": 14675,
+      "sha256": "3d0600b63c545945577f35dac58b78c86d07476bb9187283f6a4ea87a5996b28"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reports/PHASE3_SINGLE_AI_RUNTIME_REVIEW_REMEDIATION_REPORT09211649.md",
+      "bytes": 27011,
+      "sha256": "815ffb5c9d26d847e2f7799c1102a90629ce19249cc3aa5dbf426c3147e28c22"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reports/PHASE3_SINGLE_AI_UI_REPORT_SCOPE_CORRECTION_REMEDIATION_REPORT09241458.md",
+      "bytes": 20752,
+      "sha256": "c5ff75b89dfa4be6e1cd06a9802b93854bac50e6bf99ed0b69f08cd0953d45e7"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reports/PHASE3_SINGLE_AI_UI_REPORT_SCOPE_CORRECTION_REPORT09241150.md",
+      "bytes": 18584,
+      "sha256": "ce2325c6548c32923921147048a3f9970f0adfb8f04b174445e7125d873edfa6"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reviews/CODEX_WP2A_AMENDMENT_REVIEW10141751.md",
+      "bytes": 7040,
+      "sha256": "b804326f8a0f65c5186a77a11a28ff47481f2af9d09dd1677ba9cd633b430190"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reviews/CODEX_WP2A_IMPLEMENTATION_REVIEW10151053.md",
+      "bytes": 20383,
+      "sha256": "7b2389b5789021c5b4240389c0cdd9fb7df16383b1a2742224968922814edfa7"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reviews/CODEX_WP2A_SPEC_CLOSURE_REVIEW10141407.md",
+      "bytes": 15952,
+      "sha256": "9a400b2759e4f7fc3c396ffe8d9dc2d47ff56304a3619266586877ace5543c7a"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reviews/CODEX_WP2A_SPEC_FINAL_CLOSURE_REVIEW10141613.md",
+      "bytes": 13024,
+      "sha256": "0a2a99f3ad179de47e5a83ad8b388cd38f2452f1176622b553a5aa3497cc0d74"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reviews/CODEX_WP2A_SPEC_REREVIEW10141259.md",
+      "bytes": 14957,
+      "sha256": "a285a934daf08791759c79c50d10ab66472a6dd957779dca4beedfb811eab20b"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/docs/reviews/CODEX_WP2A_SPEC_TARGETED_REVIEW10141332.md",
+      "bytes": 15043,
+      "sha256": "395a67f1dce15ae6395a9d5f0818722e262ab4e30c035ea9fc3bacc93a4693f3"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/product/NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md",
+      "bytes": 28529,
+      "sha256": "6f0eae6165d01baf6ed272b42b960f141316c491901ecedde3d0bbba07ff265b"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/files/product/NOVA_V1_MVP_PRODUCT_DEVELOPMENT_SPEC_V3.md",
+      "bytes": 32512,
+      "sha256": "d37f768ece2976376ca573bf7a85c569128a0811b4f85ec3b8a35c310d31f966"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/frontend-build-final.log",
+      "bytes": 403,
+      "sha256": "763dfae944fb858322b40c951352e58f42fe64c4dce81d57681102c83cbf14ac"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/frontend-tests-final.log",
+      "bytes": 475,
+      "sha256": "f8facf2cec7ff1e586879708967f1a2b4b3439625377300f0b05be05233bf147"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/handoff-documents.json",
+      "bytes": 221,
+      "sha256": "4281a542c078a53d8b6842c596639d8eb4b2337cc735152337b39b4d99ccdceb"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/index-before.patch",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/initial-files-after.json",
+      "bytes": 22478,
+      "sha256": "12a34c92e5999ce15ad24a84daea8a176e2c142203be2e29e90436594bfada97"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/manifest.json",
+      "bytes": 16492,
+      "sha256": "9cac6b73f33fe686eb4633febfe30503f2f9ee1d3141aaa2ee9e4d701e2be265"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/README.txt",
+      "bytes": 405,
+      "sha256": "4d51edc9992749c750d927306f321bca03376fe6e7ac512f318abe76b2c22087"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/regression-red-evidence.txt",
+      "bytes": 498,
+      "sha256": "2b78ec317aa972a35a57ba21fe17f6d7bd155fbf4f7aad0269f9ed83f12ccf54"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src/components/CoreLoopView.text.test.ts",
+      "bytes": 7510,
+      "sha256": "65857845d299c8ae432b9486d4fb0d82057dd461564b2aa30c26b2f285c565f4"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src/components/CoreLoopView.vue",
+      "bytes": 32218,
+      "sha256": "36688e37f41e1fa47033364f561d9a7285f33ba4ff5c2d66361b7004df29f286"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src/stores/coreLoop.test.ts",
+      "bytes": 68994,
+      "sha256": "82c9cf402f4b750cde078a2830a7cafe00d068b58540a9753c5537182c809148"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src/stores/coreLoop.ts",
+      "bytes": 38852,
+      "sha256": "c3fda3a35f9dcc747a8a99290a690a4a5f8eae7f4c6674cfefb02c63abed7fe4"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src/types.ts",
+      "bytes": 8920,
+      "sha256": "73b52a7a05d0f89850caecca1020159d5966142583caedd62d511818e24d0c1e"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src-tauri/src/commands.rs",
+      "bytes": 60429,
+      "sha256": "167c948115107c1822681b446380da0df2d811bbfee75cae2d09073dfad4adb4"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src-tauri/src/core_loop/documents.rs",
+      "bytes": 95189,
+      "sha256": "24f7824b553bfa4ee8fd4c9c12a0055bae88d13efac729112f9c0986c2a71a20"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src-tauri/src/core_loop/evidence_overview.rs",
+      "bytes": 44432,
+      "sha256": "0163ead1e9f8b93a45b85b1a9e53e694b4e2c9349f55e4c90a9b7827ebc5ae00"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src-tauri/src/core_loop/self_check_parser.rs",
+      "bytes": 7490,
+      "sha256": "f9fd39802cf78fed0ab13d8c51269c6742393233b5091a89c1572851121f151f"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src-tauri/src/core_loop/test_runner.rs",
+      "bytes": 40863,
+      "sha256": "db58fe1b377e690135d4ea1ed4000e8676d6672896c348465fd42035349424f7"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src-tauri/src/core_loop.rs",
+      "bytes": 525491,
+      "sha256": "1781fbb94c5acad173093c3ee81b41bd9503ba8925716a1958e116b12162f173"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src-tauri/src/lib.rs",
+      "bytes": 7000,
+      "sha256": "e45b22089bf5f0683796e62995a3a84c6ff2ec0f48a50438c0e702ec30c0db3e"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src-tauri/src/runtime/ai_adapter.rs",
+      "bytes": 58205,
+      "sha256": "16dc834256417382eff5b590a2024f73242d804e87529a940c117c9691523990"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src-tauri/src/storage/actions.rs",
+      "bytes": 24115,
+      "sha256": "acea606dd7e89bfbeccf98cfb869700ee841048042445953cfd870715b5cbdbc"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src-tauri/src/storage/migrations.rs",
+      "bytes": 122911,
+      "sha256": "fb7a81e92db630b33f1a0168afdf4198b59df7228125f44b94fa3381130834b1"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src-tauri/src/storage/no_build_confirmation.rs",
+      "bytes": 15384,
+      "sha256": "d73744d86cb56e341143af55ed812dfe21332ce028f9734581bb194fd379f2ae"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src-tauri/src/storage/no_tests_confirmation.rs",
+      "bytes": 13733,
+      "sha256": "d38f72d6deb835716e5d65b471fbc7696de74a9c36c2e087d3419f0432ec2743"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src-tauri/src/storage/requirement_items.rs",
+      "bytes": 6962,
+      "sha256": "ad40bfd5f4a0005fe2c68ecbd2552cb059fe6319beabec602f8b41553f2b5214"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill/apps/desktop/src-tauri/src/storage/tasks.rs",
+      "bytes": 71002,
+      "sha256": "74b1d33466e7f23ca6ac64e1fdb601197eb32aa9a56d88c212c07d2e37fceee8"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/rollback-drill-result.json",
+      "bytes": 3085,
+      "sha256": "b384b3eeb62453312b8d090460cc11d980e504db25fade9fa5c6e6fba4bb875b"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/source-manifest.json",
+      "bytes": 6473,
+      "sha256": "0f940029e9a56fa32d6d3e9ba6958a3c6d342b7c65e88850293a5d9ccc092a17"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/source-remediation.patch",
+      "bytes": 122295,
+      "sha256": "30315bac6f0f0bcd432c72facccafa6d772608b70a0fb0319f4278f9323778ed"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/status-before.txt",
+      "bytes": 14171,
+      "sha256": "a9ac756725700db15f760420dcfaf1cbd40514ae43407e24d80e231419ff09e8"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/tauri-bundle-overlay.json",
+      "bytes": 28,
+      "sha256": "fbe83fe877dba5c9211fbb766d432b7255195894ba164033f0c65e4ce4e98193"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/tauri-package-final.log",
+      "bytes": 1408,
+      "sha256": "b75088add688a0bb31f944e70ec0acc5bf0b091320eb41338dbcf5a32b3401c0"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/tauri-package.log",
+      "bytes": 1761,
+      "sha256": "bffc1240c1f87df66cd9c406c8149cab6cc649e7a684e914352cdf2a4e00ba22"
+    },
+    {
+      "path": "audit/checkpoints/wp2a-remediation-20261015-1112/tracked-before.patch",
+      "bytes": 289413,
+      "sha256": "e5e5d93b8b0d865e6c4516aded83dee6d7afd95f10b89cd676c2e9e67f2b960d"
+    }
+  ],
+  "installer": {
+    "path": "apps/desktop/src-tauri/target/release/bundle/nsis/Nova_0.1.0_x64-setup.exe",
+    "sha256": "40b18ce4eb8828cc47bca50005bc4723be0719e64467b1879e2fadae21814df1"
+  }
+}

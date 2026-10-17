@@ -32,6 +32,10 @@ pub struct RecordTestEvidenceRequest<'a> {
     pub task_id: &'a str,
     pub result_generation: i64,
     pub round: i64,
+    /// WP2A: the test action's own `attempt_number`, captured by the
+    /// caller before the command ran (see `core_loop::run_tests_for_round`)
+    /// — never re-queried at write time.
+    pub result_attempt: i64,
     pub test_command_redacted: Option<&'a str>,
     pub status: &'a str,
     pub passed_count: i64,
@@ -61,6 +65,10 @@ pub struct RecordBuildEvidenceRequest<'a> {
     pub task_id: &'a str,
     pub result_generation: i64,
     pub round: i64,
+    /// WP2A: the build action's own `attempt_number`, captured by the
+    /// caller before the command ran — same discipline as
+    /// [`RecordTestEvidenceRequest::result_attempt`].
+    pub result_attempt: i64,
     pub build_command_redacted: Option<&'a str>,
     pub status: &'a str,
     pub authorization_source: Option<crate::models::BuildEvidenceAuthorizationSource>,
@@ -303,11 +311,12 @@ impl Database {
                     request.task_id,
                     request.result_generation,
                     request.round,
+                    request.result_attempt,
                 )?
                 .is_none()
         {
             return Err(NovaError::Config(
-                "拒绝写入 no_tests_applicable：当前 generation/round 不存在匹配的无测试确认记录"
+                "拒绝写入 no_tests_applicable：当前 generation/round/attempt 不存在匹配的无测试确认记录"
                     .to_string(),
             ));
         }
@@ -318,14 +327,15 @@ impl Database {
         let stdout_ref = request.stdout_ref.map(redact_sensitive_text);
         let stderr_ref = request.stderr_ref.map(redact_sensitive_text);
         self.conn().execute(
-            "INSERT INTO test_evidence (id, project_id, task_id, result_generation, round, test_command_redacted, status, passed_count, failed_count, skipped_count, exit_code, reason, stdout_ref, stderr_ref, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO test_evidence (id, project_id, task_id, result_generation, round, result_attempt, test_command_redacted, status, passed_count, failed_count, skipped_count, exit_code, reason, stdout_ref, stderr_ref, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 id,
                 request.project_id,
                 request.task_id,
                 request.result_generation,
                 request.round,
+                request.result_attempt,
                 test_command_redacted,
                 request.status,
                 request.passed_count,
@@ -340,7 +350,7 @@ impl Database {
         )?;
         self.conn()
             .query_row(
-                "SELECT id, project_id, task_id, result_generation, round, test_command_redacted, status, passed_count, failed_count, skipped_count, exit_code, reason, stdout_ref, stderr_ref, created_at
+                "SELECT id, project_id, task_id, result_generation, round, result_attempt, test_command_redacted, status, passed_count, failed_count, skipped_count, exit_code, reason, stdout_ref, stderr_ref, created_at
                  FROM test_evidence WHERE id = ?1",
                 params![id],
                 read_test_evidence,
@@ -360,7 +370,7 @@ impl Database {
     ) -> NovaResult<Vec<TestEvidence>> {
         self.assert_task_belongs_to_project(project_id, task_id)?;
         let mut stmt = self.conn().prepare(
-            "SELECT id, project_id, task_id, result_generation, round, test_command_redacted, status, passed_count, failed_count, skipped_count, exit_code, reason, stdout_ref, stderr_ref, created_at
+            "SELECT id, project_id, task_id, result_generation, round, result_attempt, test_command_redacted, status, passed_count, failed_count, skipped_count, exit_code, reason, stdout_ref, stderr_ref, created_at
              FROM test_evidence WHERE task_id = ?1 AND result_generation = ?2 AND round = ?3 ORDER BY created_at ASC",
         )?;
         let rows = stmt
@@ -447,11 +457,12 @@ impl Database {
                         request.task_id,
                         request.result_generation,
                         request.round,
+                        request.result_attempt,
                     )?
                     .is_none()
                 {
                     return Err(NovaError::Config(
-                        "拒绝写入 no_build_applicable：当前 generation/round 不存在匹配的无需构建确认记录"
+                        "拒绝写入 no_build_applicable：当前 generation/round/attempt 不存在匹配的无需构建确认记录"
                             .to_string(),
                     ));
                 }
@@ -470,14 +481,15 @@ impl Database {
             .authorization_source
             .map(|source| source.as_str().to_string());
         self.conn().execute(
-            "INSERT INTO build_evidence (id, project_id, task_id, result_generation, round, build_command_redacted, status, authorization_source, exit_code, reason, stdout_ref, stderr_ref, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO build_evidence (id, project_id, task_id, result_generation, round, result_attempt, build_command_redacted, status, authorization_source, exit_code, reason, stdout_ref, stderr_ref, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 id,
                 request.project_id,
                 request.task_id,
                 request.result_generation,
                 request.round,
+                request.result_attempt,
                 build_command_redacted,
                 request.status,
                 authorization_source,
@@ -490,7 +502,7 @@ impl Database {
         )?;
         self.conn()
             .query_row(
-                "SELECT id, project_id, task_id, result_generation, round, build_command_redacted, status, authorization_source, exit_code, reason, stdout_ref, stderr_ref, created_at
+                "SELECT id, project_id, task_id, result_generation, round, result_attempt, build_command_redacted, status, authorization_source, exit_code, reason, stdout_ref, stderr_ref, created_at
                  FROM build_evidence WHERE id = ?1",
                 params![id],
                 read_build_evidence,
@@ -509,7 +521,7 @@ impl Database {
     ) -> NovaResult<Vec<BuildEvidence>> {
         self.assert_task_belongs_to_project(project_id, task_id)?;
         let mut stmt = self.conn().prepare(
-            "SELECT id, project_id, task_id, result_generation, round, build_command_redacted, status, authorization_source, exit_code, reason, stdout_ref, stderr_ref, created_at
+            "SELECT id, project_id, task_id, result_generation, round, result_attempt, build_command_redacted, status, authorization_source, exit_code, reason, stdout_ref, stderr_ref, created_at
              FROM build_evidence WHERE task_id = ?1 AND result_generation = ?2 AND round = ?3 ORDER BY created_at ASC",
         )?;
         let rows = stmt
@@ -742,16 +754,17 @@ fn read_test_evidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<TestEvidence>
         task_id: row.get(2)?,
         result_generation: row.get(3)?,
         round: row.get(4)?,
-        test_command_redacted: row.get(5)?,
-        status: row.get(6)?,
-        passed_count: row.get(7)?,
-        failed_count: row.get(8)?,
-        skipped_count: row.get(9)?,
-        exit_code: row.get(10)?,
-        reason: row.get(11)?,
-        stdout_ref: row.get(12)?,
-        stderr_ref: row.get(13)?,
-        created_at: row.get(14)?,
+        result_attempt: row.get(5)?,
+        test_command_redacted: row.get(6)?,
+        status: row.get(7)?,
+        passed_count: row.get(8)?,
+        failed_count: row.get(9)?,
+        skipped_count: row.get(10)?,
+        exit_code: row.get(11)?,
+        reason: row.get(12)?,
+        stdout_ref: row.get(13)?,
+        stderr_ref: row.get(14)?,
+        created_at: row.get(15)?,
     })
 }
 
@@ -762,14 +775,15 @@ fn read_build_evidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<BuildEvidenc
         task_id: row.get(2)?,
         result_generation: row.get(3)?,
         round: row.get(4)?,
-        build_command_redacted: row.get(5)?,
-        status: row.get(6)?,
-        authorization_source: row.get(7)?,
-        exit_code: row.get(8)?,
-        reason: row.get(9)?,
-        stdout_ref: row.get(10)?,
-        stderr_ref: row.get(11)?,
-        created_at: row.get(12)?,
+        result_attempt: row.get(5)?,
+        build_command_redacted: row.get(6)?,
+        status: row.get(7)?,
+        authorization_source: row.get(8)?,
+        exit_code: row.get(9)?,
+        reason: row.get(10)?,
+        stdout_ref: row.get(11)?,
+        stderr_ref: row.get(12)?,
+        created_at: row.get(13)?,
     })
 }
 
@@ -1141,6 +1155,7 @@ mod tests {
                 task_id: &task_id,
                 result_generation: 0,
                 round: 1,
+                result_attempt: 1,
                 test_command_redacted: Some("cargo test"),
                 status: "passed",
                 passed_count: 125,
@@ -1167,6 +1182,7 @@ mod tests {
                 task_id: &task_id,
                 result_generation: 0,
                 round: 1,
+                result_attempt: 1,
                 build_command_redacted: Some("cargo build"),
                 status: "passed",
                 authorization_source: None,
@@ -1191,6 +1207,7 @@ mod tests {
                 task_id: &task_id,
                 result_generation: 0,
                 round: 1,
+                result_attempt: 1,
                 build_command_redacted: Some("npm run build"),
                 status: "failed",
                 authorization_source: None,
@@ -1220,6 +1237,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
             authorization_source: None,
@@ -1234,6 +1252,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 2,
+            result_attempt: 1,
             build_command_redacted: Some("cargo build"),
             status: "failed",
             authorization_source: None,
@@ -1268,6 +1287,7 @@ mod tests {
             task_id: &task_a,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
             authorization_source: None,
@@ -1321,6 +1341,7 @@ mod tests {
                 task_id: &task_id,
                 result_generation: 0,
                 round: 1,
+                result_attempt: 1,
                 test_command_redacted: Some("cargo test"),
                 status: "passed",
                 passed_count: 10,

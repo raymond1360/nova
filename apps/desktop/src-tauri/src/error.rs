@@ -12,6 +12,15 @@ pub enum NovaError {
     Network(String),
     #[error("接口错误：{0}")]
     Api(String),
+    /// WP2A: produced only by `Database::finish_action`'s CAS check
+    /// (`rows_affected == 0` because the row's `attempt_number` no longer
+    /// matches the caller's `expected_attempt`) — never by any other error
+    /// path. Callers must match this variant specifically to treat an
+    /// outcome as a stale/superseded execution; every other `NovaError`
+    /// variant must propagate as a real failure, never be folded into the
+    /// same "stale" handling.
+    #[error("陈旧执行：{0}")]
+    StaleActionAttempt(String),
 }
 
 impl NovaError {
@@ -22,6 +31,7 @@ impl NovaError {
             Self::Database(_) => "本地数据读写失败，请稍后重试".to_string(),
             Self::Network(message) => format!("网络错误：{message}"),
             Self::Api(message) => message.clone(),
+            Self::StaleActionAttempt(_) => "该执行已被更新的一次执行取代".to_string(),
         }
     }
 }

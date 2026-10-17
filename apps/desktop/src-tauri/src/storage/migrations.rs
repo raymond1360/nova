@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// Current schema version this build of Nova understands. Bump this and
 /// append a new [`Migration`] to [`MIGRATIONS`] whenever the schema changes
 /// — never edit an already-shipped migration's SQL in place.
-pub const CURRENT_SCHEMA_VERSION: i64 = 10;
+pub const CURRENT_SCHEMA_VERSION: i64 = 11;
 
 #[derive(Debug)]
 pub enum MigrationError {
@@ -832,6 +832,195 @@ const V10_SQL: &str = "
     CREATE INDEX idx_build_evidence_task_gen_round ON build_evidence(task_id, result_generation, round);
 ";
 
+/// WP2A: unified execution-attribution (`result_attempt`) across evidence
+/// and confirmation tables, structured self-check contract, the needs-
+/// confirmation snapshot of a task's requirement fields, and the one-time
+/// legacy-task classification column that the migration itself populates
+/// (see `classify_legacy_tasks_v11` below, run inside this same migration
+/// step's transaction).
+///
+/// `result_attempt` is nullable and backfilled `NULL` on every pre-existing
+/// row in `test_evidence`/`build_evidence`/`no_tests_confirmations`/
+/// `no_build_confirmations` — deliberately never inferred from whatever
+/// `task_actions.attempt_number` happens to be *now* (that would be
+/// retroactively assigning an attribution the row was never actually
+/// written with). `NULL` can never satisfy the completed gate's exact
+/// `result_attempt = ?` match, so historical rows simply never again
+/// participate in any future completion decision; they remain fully
+/// readable for audit.
+///
+/// `no_tests_confirmations`/`no_build_confirmations`' unique key grows from
+/// `(task_id, result_generation, round)` to additionally include
+/// `result_attempt`. This is purely additive in effect: SQL's standard NULL
+/// semantics (no two NULLs are ever considered equal for a UNIQUE
+/// constraint) mean every pre-existing backfilled-NULL row coexists without
+/// conflict with any number of distinct new per-attempt confirmations for
+/// the same `(task_id, result_generation, round)` — old rows are never
+/// deleted or renumbered, and a new attempt's confirmation is never blocked
+/// by an older attempt's row occupying the same three-column prefix.
+const V11_SQL: &str = "
+    ALTER TABLE tasks ADD COLUMN legacy_classification TEXT
+      CHECK(legacy_classification IS NULL
+            OR legacy_classification IN ('dual_ai_evidenced', 'single_ai_evidenced', 'unknown_insufficient'));
+
+    CREATE TABLE confirmed_requirement_items (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES nova_projects(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        field TEXT NOT NULL CHECK(field IN ('goal', 'in_scope', 'not_in_scope', 'done_criteria')),
+        item_index INTEGER NOT NULL CHECK(item_index >= 0),
+        item_text_redacted TEXT NOT NULL CHECK(length(item_text_redacted) > 0),
+        created_at TEXT NOT NULL,
+        UNIQUE(task_id, field, item_index)
+    );
+    CREATE INDEX idx_confirmed_requirement_items_task ON confirmed_requirement_items(task_id);
+
+    CREATE TABLE self_checks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES nova_projects(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        round INTEGER NOT NULL,
+        result_attempt INTEGER NOT NULL,
+        parse_status TEXT NOT NULL CHECK(parse_status IN ('valid', 'invalid_format')),
+        self_reported_status TEXT CHECK(
+            self_reported_status IS NULL
+            OR self_reported_status IN ('self_reported_complete', 'self_reported_incomplete', 'self_reported_blocked')
+        ),
+        requirement_coverage_json TEXT,
+        check_results_json TEXT,
+        unfinished_items_json TEXT,
+        blocking_issues_json TEXT,
+        raw_block_redacted TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_self_checks_task_round_attempt ON self_checks(task_id, round, result_attempt);
+
+    CREATE TABLE test_evidence_v11 (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        result_generation INTEGER NOT NULL,
+        round INTEGER NOT NULL,
+        result_attempt INTEGER,
+        test_command_redacted TEXT,
+        status TEXT NOT NULL CHECK(status IN ('passed', 'failed', 'no_tests_applicable', 'timed_out', 'cancelled', 'insufficient_evidence')),
+        passed_count INTEGER NOT NULL DEFAULT 0,
+        failed_count INTEGER NOT NULL DEFAULT 0,
+        skipped_count INTEGER NOT NULL DEFAULT 0,
+        exit_code INTEGER,
+        reason TEXT,
+        stdout_ref TEXT,
+        stderr_ref TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (task_id, project_id) REFERENCES tasks(id, project_id) ON DELETE CASCADE
+    );
+    INSERT INTO test_evidence_v11 (id, project_id, task_id, result_generation, round, result_attempt, test_command_redacted, status, passed_count, failed_count, skipped_count, exit_code, reason, stdout_ref, stderr_ref, created_at)
+      SELECT id, project_id, task_id, result_generation, round, NULL, test_command_redacted, status, passed_count, failed_count, skipped_count, exit_code, reason, stdout_ref, stderr_ref, created_at
+      FROM test_evidence;
+    DROP TABLE test_evidence;
+    ALTER TABLE test_evidence_v11 RENAME TO test_evidence;
+    CREATE INDEX idx_test_evidence_task ON test_evidence(task_id);
+    CREATE INDEX idx_test_evidence_task_gen_round ON test_evidence(task_id, result_generation, round);
+
+    CREATE TABLE build_evidence_v11 (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        result_generation INTEGER NOT NULL,
+        round INTEGER NOT NULL,
+        result_attempt INTEGER,
+        build_command_redacted TEXT,
+        status TEXT NOT NULL CHECK(status IN ('passed', 'failed', 'no_build_applicable', 'timed_out', 'cancelled', 'insufficient_evidence')),
+        authorization_source TEXT CHECK(
+            (status != 'no_build_applicable' AND authorization_source IS NULL)
+            OR (status = 'no_build_applicable' AND authorization_source IS NOT NULL AND authorization_source IN ('user_confirmed_not_applicable', 'mechanical_not_applicable', 'legacy_unknown'))
+        ),
+        exit_code INTEGER,
+        reason TEXT,
+        stdout_ref TEXT,
+        stderr_ref TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (task_id, project_id) REFERENCES tasks(id, project_id) ON DELETE CASCADE
+    );
+    INSERT INTO build_evidence_v11 (id, project_id, task_id, result_generation, round, result_attempt, build_command_redacted, status, authorization_source, exit_code, reason, stdout_ref, stderr_ref, created_at)
+      SELECT id, project_id, task_id, result_generation, round, NULL, build_command_redacted, status, authorization_source, exit_code, reason, stdout_ref, stderr_ref, created_at
+      FROM build_evidence;
+    DROP TABLE build_evidence;
+    ALTER TABLE build_evidence_v11 RENAME TO build_evidence;
+    CREATE INDEX idx_build_evidence_task ON build_evidence(task_id);
+    CREATE INDEX idx_build_evidence_task_gen_round ON build_evidence(task_id, result_generation, round);
+
+    CREATE TABLE no_tests_confirmations_v11 (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        result_generation INTEGER NOT NULL,
+        round INTEGER NOT NULL,
+        result_attempt INTEGER,
+        confirmed_by TEXT NOT NULL CHECK(confirmed_by = 'user'),
+        reason TEXT,
+        confirmed_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(task_id, result_generation, round, result_attempt),
+        FOREIGN KEY (task_id, project_id) REFERENCES tasks(id, project_id) ON DELETE CASCADE
+    );
+    INSERT INTO no_tests_confirmations_v11 (id, project_id, task_id, result_generation, round, result_attempt, confirmed_by, reason, confirmed_at, created_at)
+      SELECT id, project_id, task_id, result_generation, round, NULL, confirmed_by, reason, confirmed_at, created_at
+      FROM no_tests_confirmations;
+    DROP TABLE no_tests_confirmations;
+    ALTER TABLE no_tests_confirmations_v11 RENAME TO no_tests_confirmations;
+    CREATE INDEX idx_no_tests_confirmations_task ON no_tests_confirmations(task_id);
+
+    CREATE TABLE no_build_confirmations_v11 (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        result_generation INTEGER NOT NULL,
+        round INTEGER NOT NULL,
+        result_attempt INTEGER,
+        confirmed_by TEXT NOT NULL CHECK(confirmed_by = 'user'),
+        reason TEXT,
+        confirmed_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(task_id, result_generation, round, result_attempt),
+        FOREIGN KEY (task_id, project_id) REFERENCES tasks(id, project_id) ON DELETE CASCADE
+    );
+    INSERT INTO no_build_confirmations_v11 (id, project_id, task_id, result_generation, round, result_attempt, confirmed_by, reason, confirmed_at, created_at)
+      SELECT id, project_id, task_id, result_generation, round, NULL, confirmed_by, reason, confirmed_at, created_at
+      FROM no_build_confirmations;
+    DROP TABLE no_build_confirmations;
+    ALTER TABLE no_build_confirmations_v11 RENAME TO no_build_confirmations;
+    CREATE INDEX idx_no_build_confirmations_task ON no_build_confirmations(task_id);
+
+    -- One-time legacy classification: only for tasks that are non-terminal
+    -- *right now, at migration time*. Tasks created after this migration
+    -- runs are never touched by these two statements (they start with
+    -- legacy_classification already NULL and stay that way), so a brand
+    -- new single-AI task is never mistakenly frozen just for lacking
+    -- review signals it could never have had reason to produce.
+    --
+    -- dual_ai_evidenced: either strong, code-written (never directly user-
+    -- editable) signal is present — an `ai_review`-typed action ever ran,
+    -- or a `task_reviews` row exists. Either alone is sufficient (OR): both
+    -- are independent witnesses to the same real event, not votes that need
+    -- to agree.
+    UPDATE tasks SET legacy_classification = 'dual_ai_evidenced'
+      WHERE state NOT IN ('completed', 'failed', 'cancelled')
+        AND (
+          EXISTS (SELECT 1 FROM task_actions ta WHERE ta.task_id = tasks.id AND ta.action_type = 'ai_review')
+          OR EXISTS (SELECT 1 FROM task_reviews tr WHERE tr.task_id = tasks.id)
+        );
+
+    -- Everything else still non-terminal (including a task whose
+    -- development simply never got far enough to prove anything either
+    -- way) falls back to unknown_insufficient — never silently treated as
+    -- single-AI, because the shared dev-step code can't prove that on its
+    -- own (see the design docs this migration implements).
+    UPDATE tasks SET legacy_classification = 'unknown_insufficient'
+      WHERE state NOT IN ('completed', 'failed', 'cancelled')
+        AND legacy_classification IS NULL;
+";
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -882,6 +1071,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 10,
         requires_backup: true,
         sql: V10_SQL,
+    },
+    Migration {
+        version: 11,
+        requires_backup: true,
+        sql: V11_SQL,
     },
 ];
 
@@ -1034,6 +1228,7 @@ fn verify_backup(source_path: &Path, backup_path: &Path) -> Result<(), Migration
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -2123,6 +2318,308 @@ mod tests {
     }
 
     #[test]
+    fn schema_v11_adds_wp2a_tables_and_result_attempt_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn, None).unwrap();
+
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_violations, 0);
+
+        for (table, column) in [
+            ("tasks", "legacy_classification"),
+            ("test_evidence", "result_attempt"),
+            ("build_evidence", "result_attempt"),
+            ("no_tests_confirmations", "result_attempt"),
+            ("no_build_confirmations", "result_attempt"),
+        ] {
+            let columns: Vec<String> = {
+                let mut stmt = conn
+                    .prepare(&format!("PRAGMA table_info({table})"))
+                    .unwrap();
+                stmt.query_map([], |row| row.get::<_, String>(1))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            assert!(
+                columns.contains(&column.to_string()),
+                "{table} missing column {column}: {columns:?}"
+            );
+        }
+
+        conn.query_row("SELECT COUNT(*) FROM self_checks", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+        conn.query_row("SELECT COUNT(*) FROM confirmed_requirement_items", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    }
+
+    /// Builds a file-backed database pinned at schema v10 (every migration
+    /// through `V10_SQL` applied, `user_version` set to 10, nothing from
+    /// `V11_SQL` yet) — the fixed starting point every v10-to-v11 migration
+    /// test below upgrades from.
+    fn open_v10_database(name: &str) -> (Connection, PathBuf, PathBuf) {
+        let dir = temp_dir(name);
+        let (conn, path) = open_file_db(&dir);
+        conn.execute_batch(BASELINE_SQL).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(PHASE2_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        conn.execute_batch(V3_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+        conn.execute_batch(V4_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
+        conn.execute_batch(V5_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 5;").unwrap();
+        conn.execute_batch(V6_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 6;").unwrap();
+        conn.execute_batch(V7_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 7;").unwrap();
+        conn.execute_batch(V8_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 8;").unwrap();
+        conn.execute_batch(V9_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 9;").unwrap();
+        conn.execute_batch(V10_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 10;").unwrap();
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, created_at, updated_at)
+             VALUES ('proj-1', 'P', 'C:/p', 'c:/p', 'local', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        (conn, path, dir)
+    }
+
+
+    fn seed_wp2a_v10_history(conn: &Connection) {
+        conn.execute_batch("INSERT INTO tasks(id,project_id,title,state,created_at,updated_at) VALUES('history','proj-1','historical','awaiting_user_acceptance','time','time');
+        INSERT INTO test_evidence(id,project_id,task_id,result_generation,round,status,passed_count,created_at) VALUES('old-test','proj-1','history',0,1,'passed',7,'time');
+        INSERT INTO build_evidence(id,project_id,task_id,result_generation,round,status,authorization_source,created_at) VALUES('old-build','proj-1','history',0,1,'no_build_applicable','legacy_unknown','time');
+        INSERT INTO no_tests_confirmations(id,project_id,task_id,result_generation,round,confirmed_by,reason,confirmed_at,created_at) VALUES('old-nt','proj-1','history',0,1,'user','preserve tests','time','time');
+        INSERT INTO no_build_confirmations(id,project_id,task_id,result_generation,round,confirmed_by,reason,confirmed_at,created_at) VALUES('old-nb','proj-1','history',0,1,'user','preserve build','time','time');").unwrap();
+    }
+
+    #[test]
+    fn wp2a_v11_preserves_four_tables_null_attribution_and_indexes() {
+        let (conn,path,_dir)=open_v10_database("wp2a-preservation");seed_wp2a_v10_history(&conn);
+        run(&conn,Some(&path)).unwrap();
+        for table in ["test_evidence","build_evidence","no_tests_confirmations","no_build_confirmations"] {
+            let values:(i64,i64)=conn.query_row(&format!("SELECT count(*),count(result_attempt) FROM {table} WHERE task_id='history'"),[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();assert_eq!(values,(1,0),"{table}");
+            let indexes:i64=conn.query_row(&format!("SELECT count(*) FROM pragma_index_list('{table}')"),[],|r|r.get(0)).unwrap();assert!(indexes>=2,"{table}");
+        }
+        assert_eq!(conn.query_row("SELECT passed_count FROM test_evidence WHERE id='old-test'",[],|r|r.get::<_,i64>(0)).unwrap(),7);
+        assert_eq!(conn.query_row("SELECT reason FROM no_build_confirmations WHERE id='old-nb'",[],|r|r.get::<_,String>(0)).unwrap(),"preserve build");
+        for attempt in [1,2] {conn.execute("INSERT INTO no_build_confirmations(id,project_id,task_id,result_generation,round,result_attempt,confirmed_by,confirmed_at,created_at) VALUES(?1,'proj-1','history',0,1,?2,'user','time','time')",rusqlite::params![format!("new-{attempt}"),attempt]).unwrap();}
+        assert!(conn.execute("INSERT INTO no_build_confirmations(id,project_id,task_id,result_generation,round,result_attempt,confirmed_by,confirmed_at,created_at) VALUES('duplicate','proj-1','history',0,1,2,'user','time','time')",[]).is_err());
+        assert_eq!(conn.query_row("SELECT count(*) FROM pragma_foreign_key_check",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    #[test]
+    fn wp2a_v11_failure_after_test_table_rebuild_rolls_back_the_whole_step() {
+        let (conn,path,dir)=open_v10_database("wp2a-atomic-v11");seed_wp2a_v10_history(&conn);
+        // Collision occurs after test_evidence DROP/RENAME, not before any work.
+        conn.execute_batch("CREATE TABLE build_evidence_v11(block INTEGER);").unwrap();
+        assert!(run(&conn,Some(&path)).is_err());
+        assert_eq!(conn.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),10);
+        assert_eq!(conn.query_row("SELECT count(*) FROM pragma_table_info('tasks') WHERE name='legacy_classification'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        for table in ["test_evidence","build_evidence","no_tests_confirmations","no_build_confirmations"] {
+            assert_eq!(conn.query_row(&format!("SELECT count(*) FROM {table} WHERE task_id='history'"),[],|r|r.get::<_,i64>(0)).unwrap(),1);
+            assert_eq!(conn.query_row(&format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name='result_attempt'"),[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        }
+        assert_eq!(std::fs::read_dir(dir.join("backups")).unwrap().count(),1);
+        assert_eq!(conn.query_row("PRAGMA integrity_check",[],|r|r.get::<_,String>(0)).unwrap(),"ok");
+    }
+
+    #[test]
+    fn wp2a_online_backup_and_closed_connection_restore_include_wal_commits() {
+        let (conn,path,dir)=open_v10_database("wp2a-wal-restore");
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").unwrap();
+        seed_wp2a_v10_history(&conn);
+        assert!(path.with_extension("sqlite3-wal").exists());
+        // Online backup reads committed WAL content while the source is open.
+        let backup=backup_database(&conn,&path).unwrap();
+        conn.execute("UPDATE tasks SET title='after backup' WHERE id='history'",[]).unwrap();
+        drop(conn); // Restore only after every source connection is closed.
+        let restored=dir.join("restored.sqlite3"); std::fs::copy(&backup,&restored).unwrap();
+        // Restore to a fresh name: never pair a backup with stale WAL/SHM files.
+        assert!(!restored.with_extension("sqlite3-wal").exists());
+        let check=Connection::open_with_flags(&restored,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(check.query_row("SELECT title FROM tasks WHERE id='history'",[],|r|r.get::<_,String>(0)).unwrap(),"historical");
+        assert_eq!(check.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),10);
+        assert_eq!(check.query_row("PRAGMA integrity_check",[],|r|r.get::<_,String>(0)).unwrap(),"ok");
+        assert_eq!(check.query_row("SELECT count(*) FROM pragma_foreign_key_check",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(check.query_row("SELECT count(*) FROM test_evidence WHERE task_id='history'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    #[test]
+    fn migration_classifies_a_non_terminal_task_with_an_ai_review_action_as_dual_ai_evidenced() {
+        let (conn, path, dir) = open_v10_database("v10-to-v11-dual-action");
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+             VALUES ('task-1', 'proj-1', 'T', 'verifying', 0, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_actions (id, task_id, action_type, idempotency_key, status, created_at, updated_at)
+             VALUES ('act-1', 'task-1', 'ai_review', 'review-task-1-round-1', 'succeeded', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+
+        run(&conn, Some(&path)).unwrap();
+
+        let classification: Option<String> = conn
+            .query_row(
+                "SELECT legacy_classification FROM tasks WHERE id = 'task-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(classification, Some("dual_ai_evidenced".to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_classifies_a_non_terminal_task_with_a_task_reviews_row_as_dual_ai_evidenced() {
+        let (conn, path, dir) = open_v10_database("v10-to-v11-dual-review");
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+             VALUES ('task-1', 'proj-1', 'T', 'verifying', 0, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_reviews (id, project_id, task_id, result_generation, round, reviewer_ai_kind, verdict, created_at)
+             VALUES ('rev-1', 'proj-1', 'task-1', 0, 1, 'codex_cli', 'approve', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+
+        run(&conn, Some(&path)).unwrap();
+
+        let classification: Option<String> = conn
+            .query_row(
+                "SELECT legacy_classification FROM tasks WHERE id = 'task-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(classification, Some("dual_ai_evidenced".to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_classifies_a_non_terminal_task_with_no_review_signal_as_unknown_insufficient() {
+        let (conn, path, dir) = open_v10_database("v10-to-v11-unknown");
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+             VALUES ('task-1', 'proj-1', 'T', 'running', 0, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+
+        run(&conn, Some(&path)).unwrap();
+
+        let classification: Option<String> = conn
+            .query_row(
+                "SELECT legacy_classification FROM tasks WHERE id = 'task-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(classification, Some("unknown_insufficient".to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_never_classifies_a_task_already_terminal_at_migration_time() {
+        let (conn, path, dir) = open_v10_database("v10-to-v11-terminal");
+        // Three terminal states, none with any review signal — proving the
+        // freeze is about non-terminal-at-migration-time, not about
+        // "lacks a review signal" alone (a terminal task lacking one is
+        // simply done, not frozen).
+        for (id, state) in [
+            ("task-completed", "completed"),
+            ("task-failed", "failed"),
+            ("task-cancelled", "cancelled"),
+        ] {
+            conn.execute(
+                "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+                 VALUES (?1, 'proj-1', 'T', ?2, 0, '2026-01-01', '2026-01-01')",
+                params![id, state],
+            )
+            .unwrap();
+        }
+
+        run(&conn, Some(&path)).unwrap();
+
+        for id in ["task-completed", "task-failed", "task-cancelled"] {
+            let classification: Option<String> = conn
+                .query_row(
+                    "SELECT legacy_classification FROM tasks WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                classification, None,
+                "a task already terminal at migration time ({id}) must never be classified/frozen"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_task_created_after_the_v11_migration_runs_is_never_classified_or_frozen() {
+        let dir = temp_dir("v11-fresh-task-not-frozen");
+        let (conn, path) = open_file_db(&dir);
+        run(&conn, Some(&path)).unwrap();
+        conn.execute(
+            "INSERT INTO nova_projects (id, name, local_path, normalized_path, source_type, created_at, updated_at)
+             VALUES ('proj-1', 'P', 'C:/p', 'c:/p', 'local', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        // A brand-new task created on an already-v11 database (the real
+        // `Database::create_task` never sets `legacy_classification`
+        // itself — simulated here by the same bare INSERT, which leaves
+        // the column at its default, implicit NULL).
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, state, result_generation, created_at, updated_at)
+             VALUES ('task-new', 'proj-1', 'T', 'running', 0, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+
+        let classification: Option<String> = conn
+            .query_row(
+                "SELECT legacy_classification FROM tasks WHERE id = 'task-new'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            classification, None,
+            "a task created after the v11 migration has already run must never be \
+             retroactively classified/frozen — only the one-time migration UPDATE does that"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn build_evidence_authorization_source_check_rejects_invalid_combinations() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn, None).unwrap();
@@ -2210,7 +2707,7 @@ mod tests {
             .map(|iter| iter.filter_map(|e| e.ok()).count())
             .unwrap_or(0);
         assert_eq!(
-            count, 9,
+            count, 10,
             "reopening an already-fully-migrated database must not take any new backups"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -2235,8 +2732,8 @@ mod tests {
             .collect();
         assert_eq!(
             entries.len(),
-            9,
-            "expected exactly nine backups (migrations 2, 3, 4, 5, 6, 7, 8, 9, and 10 each require one): {entries:?}"
+            10,
+            "expected exactly ten backups (migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, and 11 each require one): {entries:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2261,13 +2758,13 @@ mod tests {
             .collect();
         assert_eq!(
             names.len(),
-            9,
-            "migrations 2, 3, 4, 5, 6, 7, 8, 9, and 10 each produce their own backup"
+            10,
+            "migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, and 11 each produce their own backup"
         );
         let unique: std::collections::HashSet<&String> = names.iter().collect();
         assert_eq!(
             unique.len(),
-            9,
+            10,
             "all backups from the same run must have distinct names, never collide"
         );
         for name in &names {
@@ -2396,8 +2893,8 @@ mod tests {
         let backups_dir = dir.join("backups");
         let count = fs::read_dir(&backups_dir).unwrap().count();
         assert_eq!(
-            count, 9,
-            "already-applied migrations must not be re-run, so no extra backups beyond the nine produced by the first run"
+            count, 10,
+            "already-applied migrations must not be re-run, so no extra backups beyond the ten produced by the first run"
         );
         let _ = fs::remove_dir_all(&dir);
     }

@@ -255,7 +255,12 @@ pub(crate) fn adopted_passing_generation_round(
                 }
                 if evidence.status == "no_tests_applicable"
                     && no_tests_applicable_is_authorized(
-                        db, project_id, task_id, generation, round,
+                        db,
+                        project_id,
+                        task_id,
+                        generation,
+                        round,
+                        evidence.result_attempt,
                     )?
                 {
                     test_ok = true;
@@ -277,6 +282,7 @@ pub(crate) fn adopted_passing_generation_round(
                         task_id,
                         generation,
                         round,
+                        evidence.result_attempt,
                         evidence.authorization_source.as_deref(),
                     )?
                 {
@@ -307,9 +313,16 @@ pub(crate) fn no_tests_applicable_is_authorized(
     task_id: &str,
     result_generation: i64,
     round: i64,
+    result_attempt: Option<i64>,
 ) -> NovaResult<bool> {
+    // WP2A: a `None` attempt (a row that predates schema v11, or an
+    // orphaned row) can never be authorized — historical NULL attribution
+    // must never satisfy the gate, see the WP2A design docs.
+    let Some(attempt) = result_attempt else {
+        return Ok(false);
+    };
     Ok(db
-        .find_no_tests_confirmation(project_id, task_id, result_generation, round)?
+        .find_no_tests_confirmation(project_id, task_id, result_generation, round, attempt)?
         .is_some())
 }
 
@@ -347,12 +360,13 @@ pub(crate) fn no_build_applicable_is_authorized(
     task_id: &str,
     result_generation: i64,
     round: i64,
+    result_attempt: Option<i64>,
     authorization_source: Option<&str>,
 ) -> NovaResult<bool> {
-    if db
-        .find_no_build_confirmation(project_id, task_id, result_generation, round)?
-        .is_some()
-    {
+    // Historical NULL is displayable history, never live authorization,
+    // including mechanical and legacy_unknown rows.
+    let Some(attempt) = result_attempt else { return Ok(false); };
+    if db.find_no_build_confirmation(project_id, task_id, result_generation, round, attempt)?.is_some() {
         return Ok(true);
     }
     Ok(authorization_source == Some("mechanical_not_applicable"))
@@ -518,6 +532,7 @@ mod tests {
             task_id,
             result_generation: generation,
             round,
+            result_attempt: 1,
             test_command_redacted: None,
             status: "no_tests_applicable",
             passed_count: 0,
@@ -574,6 +589,7 @@ mod tests {
             task_id,
             result_generation: generation,
             round,
+            result_attempt: 1,
             build_command_redacted: None,
             status: "no_build_applicable",
             authorization_source: Some(
@@ -599,6 +615,7 @@ mod tests {
             task_id,
             result_generation: generation,
             round,
+            result_attempt: 1,
             build_command_redacted: None,
             status: "no_build_applicable",
             authorization_source: Some(
@@ -656,6 +673,7 @@ mod tests {
             task_id,
             result_generation: generation,
             round,
+            result_attempt: 1,
             test_command_redacted: Some("cargo test"),
             status: "passed",
             passed_count: 1,
@@ -681,6 +699,7 @@ mod tests {
             task_id,
             result_generation: generation,
             round,
+            result_attempt: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
             authorization_source: None,
@@ -698,13 +717,73 @@ mod tests {
         task
     }
 
+    /// WP2A fixture helper (mirrors `core_loop::tests::satisfy_completion_
+    /// gate_evidence_and_self_check`): records a succeeded
+    /// `dev-{task_id}-round-{round}` action at attempt 1 and a valid/
+    /// complete self-check whose `requirement_coverage` matches this
+    /// task's real confirmed requirement items — for tests in this module
+    /// that already record their own test/build evidence via
+    /// `record_test_passed`/`record_build_passed` (always at
+    /// `result_attempt: 1`) and only need the dev action + self-check half
+    /// of `Database::evaluate_completion_gate` to legitimately reach
+    /// `Completed` via a direct `db.transition_task` call.
+    fn satisfy_dev_action_and_self_check(
+        db: &Database,
+        project_id: &str,
+        task_id: &str,
+        round: i64,
+    ) {
+        use crate::storage::self_check::RecordSelfCheckRequest;
+
+        let dev_key = format!("dev-{task_id}-round-{round}");
+        let planned = db.plan_action(task_id, "ai_development", &dev_key).unwrap();
+        let started = db
+            .start_action(task_id, &dev_key, false)
+            .unwrap_or(planned);
+        let attempt = started.attempt_number;
+        db.finish_action(
+            task_id,
+            &dev_key,
+            crate::models::ActionStatus::Succeeded,
+            None,
+            None,
+            attempt,
+        )
+        .unwrap();
+
+        let items = db.list_confirmed_requirement_items(task_id).unwrap();
+        let coverage: Vec<serde_json::Value> = items
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "item": format!("{}:{}", item.field, item.item_index),
+                    "status": "covered",
+                })
+            })
+            .collect();
+        db.record_self_check(&RecordSelfCheckRequest {
+            project_id,
+            task_id,
+            round,
+            result_attempt: attempt,
+            parse_status: "valid",
+            self_reported_status: Some("self_reported_complete"),
+            requirement_coverage_json: Some(&serde_json::to_string(&coverage).unwrap()),
+            check_results_json: Some("[]"),
+            unfinished_items_json: Some("[]"),
+            blocking_issues_json: Some("[]"),
+            raw_block_redacted: "mock self-check",
+        })
+        .unwrap();
+    }
+
     #[test]
     fn applicable_evidence_with_matching_confirmation_is_adopted() {
         let dir = temp_dir("major2-happy-path");
         let (db, project_id, task_id) = db_with_task(&dir);
-        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         record_no_tests_applicable(&db, &project_id, &task_id, 0, 1);
         record_no_build_applicable_confirmed(&db, &project_id, &task_id, 0, 1);
@@ -778,7 +857,7 @@ mod tests {
     fn a_confirmation_for_a_stale_generation_never_authorizes_the_current_generations_evidence() {
         let dir = temp_dir("major2-stale-generation");
         let (db, project_id, task_id) = db_with_task(&dir);
-        db.record_no_tests_confirmation(&project_id, &task_id, 5, 1, None)
+        db.record_no_tests_confirmation(&project_id, &task_id, 5, 1, 1, None)
             .unwrap();
         insert_orphaned_no_tests_applicable(&db, &project_id, &task_id, 0, 1);
         record_build_passed(&db, &project_id, &task_id, 0, 1);
@@ -793,7 +872,7 @@ mod tests {
     fn a_confirmation_for_a_stale_round_never_authorizes_the_current_rounds_evidence() {
         let dir = temp_dir("major2-stale-round");
         let (db, project_id, task_id) = db_with_task(&dir);
-        db.record_no_tests_confirmation(&project_id, &task_id, 0, 2, None)
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 2, 1, None)
             .unwrap();
         insert_orphaned_no_tests_applicable(&db, &project_id, &task_id, 0, 1);
         record_build_passed(&db, &project_id, &task_id, 0, 1);
@@ -822,7 +901,7 @@ mod tests {
                 Actor::User,
             )
             .unwrap();
-        db.record_no_tests_confirmation(&project_id, &other_task.id, 0, 1, None)
+        db.record_no_tests_confirmation(&project_id, &other_task.id, 0, 1, 1, None)
             .unwrap();
         insert_orphaned_no_tests_applicable(&db, &project_id, &task_id, 0, 1);
         record_build_passed(&db, &project_id, &task_id, 0, 1);
@@ -841,7 +920,7 @@ mod tests {
         let (_db_unused, project_b, _task_b) = db_with_task(&dir_b);
         // A confirmation genuinely exists, just under a different project —
         // the natural key (including project_id) must not match task_a's.
-        let cross_project_result = db.record_no_tests_confirmation(&project_b, &task_a, 0, 1, None);
+        let cross_project_result = db.record_no_tests_confirmation(&project_b, &task_a, 0, 1, 1, None);
         assert!(
             cross_project_result.is_err(),
             "storage itself already refuses to write a confirmation for a task the project doesn't own"
@@ -895,9 +974,9 @@ mod tests {
     fn legitimate_no_tests_and_no_build_confirmations_still_adopt_normally() {
         let dir = temp_dir("major2-both-legitimate");
         let (db, project_id, task_id) = db_with_task(&dir);
-        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, Some("no framework"))
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, 1, Some("no framework"))
             .unwrap();
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("no build needed"))
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, Some("no build needed"))
             .unwrap();
         record_no_tests_applicable(&db, &project_id, &task_id, 0, 1);
         record_no_build_applicable_confirmed(&db, &project_id, &task_id, 0, 1);
@@ -945,7 +1024,7 @@ mod tests {
                     Actor::User,
                 )
                 .unwrap();
-            db.record_no_tests_confirmation(&project.id, &task.id, 0, 1, None)
+            db.record_no_tests_confirmation(&project.id, &task.id, 0, 1, 1, None)
                 .unwrap();
             record_no_tests_applicable(&db, &project.id, &task.id, 0, 1);
             // Deliberately orphaned build evidence — no confirmation, and
@@ -1077,21 +1156,20 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_unknown_row_is_authorized_once_a_real_exact_confirmation_exists() {
+    fn a_legacy_unknown_null_row_stays_unauthorized_even_with_a_non_null_confirmation() {
         let dir = temp_dir("temporal-legacy-unknown-with-confirmation");
         let (db, project_id, task_id) = db_with_task(&dir);
         record_test_passed(&db, &project_id, &task_id, 0, 1);
         insert_orphaned_no_build_applicable(&db, &project_id, &task_id, 0, 1);
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("user confirmed"))
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, Some("user confirmed"))
             .unwrap();
 
         let task = task_at_generation(&db, &task_id, 0);
         let adopted = adopted_passing_generation_round(&db, &project_id, &task_id, &task).unwrap();
         assert_eq!(
             adopted,
-            Some((0, 1)),
-            "a legacy_unknown row must become authorized once a real, exact-key confirmation \
-             exists — the same path any other unconfirmed row can use"
+            None,
+            "NULL attribution cannot be repaired by another attempt's confirmation"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1108,7 +1186,7 @@ mod tests {
         // row below (constructed via raw SQL to simulate a data anomaly,
         // since the normal write API would itself reject this mismatch)
         // claims `user_confirmed_not_applicable` for round 2.
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         db.conn()
             .execute(
@@ -1336,6 +1414,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             build_command_redacted: None,
             status: "no_build_applicable",
             authorization_source: Some(
@@ -1363,6 +1442,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
             authorization_source: Some(
@@ -1380,6 +1460,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 2,
+            result_attempt: 1,
             build_command_redacted: None,
             status: "no_build_applicable",
             authorization_source: None,
@@ -1401,6 +1482,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             build_command_redacted: None,
             status: "no_build_applicable",
             authorization_source: Some(
@@ -1520,6 +1602,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("cargo test"),
             status: "passed",
             passed_count: 3,
@@ -1536,6 +1619,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             build_command_redacted: Some("cargo build"),
             status: "failed",
             authorization_source: None,
@@ -1592,6 +1676,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("cargo test"),
             status: "passed",
             passed_count: 1,
@@ -1662,6 +1747,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("cargo test"),
             status: "passed",
             passed_count: 1,
@@ -1678,6 +1764,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
             authorization_source: None,
@@ -1735,6 +1822,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("cargo test"),
             status: "passed",
             passed_count: 1,
@@ -1751,6 +1839,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
             authorization_source: None,
@@ -1794,6 +1883,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("cargo test"),
             status: "failed",
             passed_count: 0,
@@ -1810,6 +1900,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 2,
+            result_attempt: 1,
             test_command_redacted: Some("cargo test"),
             status: "passed",
             passed_count: 1,
@@ -1826,6 +1917,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 2,
+            result_attempt: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
             authorization_source: None,
@@ -1861,6 +1953,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("cargo test"),
             status: "passed",
             passed_count: 1,
@@ -1877,6 +1970,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
             authorization_source: None,
@@ -1887,6 +1981,7 @@ mod tests {
         })
         .unwrap();
         drive_to_awaiting_user_acceptance_at_generation_zero(&db, &task_id);
+        satisfy_dev_action_and_self_check(&db, &project_id, &task_id, 1);
         db.record_user_acceptance(&project_id, &task_id, true, Some("looks good"))
             .unwrap();
         db.transition_task(
@@ -1964,6 +2059,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("cargo test"),
             status: "passed",
             passed_count: 1,
@@ -1980,6 +2076,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
             authorization_source: None,
@@ -2009,6 +2106,7 @@ mod tests {
         let second_review = fs::read_to_string(doc_dir.join("SECOND_REVIEW.md")).unwrap();
         assert!(second_review.contains(NOT_TRIGGERED_ZH));
 
+        satisfy_dev_action_and_self_check(&db, &project_id, &task_id, 1);
         db.record_user_acceptance(&project_id, &task_id, true, Some("looks good"))
             .unwrap();
         db.transition_task(
@@ -2051,6 +2149,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("cargo test"),
             status: "passed",
             passed_count: 1,
@@ -2067,6 +2166,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
             authorization_source: None,

@@ -33,7 +33,6 @@ use crate::models::{
     TestEvidence, UserAcceptance,
 };
 
-use super::documents::adopted_passing_generation_round;
 
 /// One real, already-happened fact in a task's history, normalized into a
 /// single shape regardless of which underlying table it came from — see
@@ -70,6 +69,7 @@ pub struct TestEvidenceEntry {
     #[serde(flatten)]
     pub evidence: TestEvidence,
     pub is_current_generation: bool,
+    pub is_current_attempt: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +77,7 @@ pub struct BuildEvidenceEntry {
     #[serde(flatten)]
     pub evidence: BuildEvidence,
     pub is_current_generation: bool,
+    pub is_current_attempt: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -162,6 +163,7 @@ fn normalize_test_evidence_status(
                 task_id,
                 evidence.result_generation,
                 evidence.round,
+                evidence.result_attempt,
             )? {
                 "not_applicable".to_string()
             } else {
@@ -190,6 +192,7 @@ fn normalize_build_evidence_status(
                 task_id,
                 evidence.result_generation,
                 evidence.round,
+                evidence.result_attempt,
                 evidence.authorization_source.as_deref(),
             )? {
                 "not_applicable".to_string()
@@ -218,8 +221,7 @@ pub fn build_task_evidence_overview(
     }
 
     let pending_round = super::current_pending_round(db, project_id, task_id)?;
-    let adopted = adopted_passing_generation_round(db, project_id, task_id, &task)?;
-    let acceptance_ready = task.state == TaskState::AwaitingUserAcceptance && adopted.is_some();
+    let acceptance_ready = db.evaluate_acceptance_submission(&task)?.is_ok();
     let acceptance_history = db.list_user_acceptance_for_task(project_id, task_id)?;
     let is_completed = task.state == TaskState::Completed
         && acceptance_history
@@ -378,12 +380,14 @@ fn push_test_entries(
     let is_historical = generation < task.result_generation;
     let key = super::test_action_key(task_id, generation, round);
     let action = db.find_action(task_id, &key)?;
+    let dev_attempt = super::dev_attempt_for_round(db, task_id, round)?;
     let evidence = db.list_test_evidence_for_round(project_id, task_id, generation, round)?;
     if action.is_none() && evidence.is_empty() {
         return Ok(());
     }
     let title = format!("第{round}轮独立测试（第 {generation} 代）");
     if let Some(latest) = evidence.last() {
+        let is_historical = is_historical || latest.result_attempt.is_none() || latest.result_attempt != dev_attempt;
         let status = normalize_test_evidence_status(db, project_id, task_id, latest)?;
         timeline.push(TimelineEntry {
             id: format!("test-evidence-{}", latest.id),
@@ -428,9 +432,8 @@ fn push_test_entries(
             sort_key: (sort_time, TIE_TEST_ACTION, action.id.clone()),
         });
     }
-    if let Some(confirmation) =
-        db.find_no_tests_confirmation(project_id, task_id, generation, round)?
-    {
+    for confirmation in db.list_no_tests_confirmations_for_round(project_id, task_id, generation, round)? {
+        let is_historical = is_historical || confirmation.result_attempt.is_none() || confirmation.result_attempt != dev_attempt;
         timeline.push(TimelineEntry {
             id: format!("no-tests-confirmation-{}", confirmation.id),
             event_type: "no_tests_confirmed".to_string(),
@@ -465,12 +468,14 @@ fn push_build_entries(
     let is_historical = generation < task.result_generation;
     let key = super::build_action_key(task_id, generation, round);
     let action = db.find_action(task_id, &key)?;
+    let dev_attempt = super::dev_attempt_for_round(db, task_id, round)?;
     let evidence = db.list_build_evidence_for_round(project_id, task_id, generation, round)?;
     if action.is_none() && evidence.is_empty() {
         return Ok(());
     }
     let title = format!("第{round}轮独立构建（第 {generation} 代）");
     if let Some(latest) = evidence.last() {
+        let is_historical = is_historical || latest.result_attempt.is_none() || latest.result_attempt != dev_attempt;
         let status = normalize_build_evidence_status(db, project_id, task_id, latest)?;
         timeline.push(TimelineEntry {
             id: format!("build-evidence-{}", latest.id),
@@ -515,9 +520,8 @@ fn push_build_entries(
             sort_key: (sort_time, TIE_BUILD_ACTION, action.id.clone()),
         });
     }
-    if let Some(confirmation) =
-        db.find_no_build_confirmation(project_id, task_id, generation, round)?
-    {
+    for confirmation in db.list_no_build_confirmations_for_round(project_id, task_id, generation, round)? {
+        let is_historical = is_historical || confirmation.result_attempt.is_none() || confirmation.result_attempt != dev_attempt;
         timeline.push(TimelineEntry {
             id: format!("no-build-confirmation-{}", confirmation.id),
             event_type: "no_build_confirmed".to_string(),
@@ -589,10 +593,8 @@ fn collect_test_entries(
                 db.list_test_evidence_for_round(project_id, task_id, generation, round)?
             {
                 let is_current_generation = evidence.result_generation == task.result_generation;
-                out.push(TestEvidenceEntry {
-                    evidence,
-                    is_current_generation,
-                });
+                let is_current_attempt = evidence.result_attempt.is_some() && evidence.result_attempt == super::dev_attempt_for_round(db, task_id, round)?;
+                out.push(TestEvidenceEntry { evidence, is_current_generation, is_current_attempt });
             }
         }
     }
@@ -612,10 +614,8 @@ fn collect_build_entries(
                 db.list_build_evidence_for_round(project_id, task_id, generation, round)?
             {
                 let is_current_generation = evidence.result_generation == task.result_generation;
-                out.push(BuildEvidenceEntry {
-                    evidence,
-                    is_current_generation,
-                });
+                let is_current_attempt = evidence.result_attempt.is_some() && evidence.result_attempt == super::dev_attempt_for_round(db, task_id, round)?;
+                out.push(BuildEvidenceEntry { evidence, is_current_generation, is_current_attempt });
             }
         }
     }
@@ -724,6 +724,7 @@ mod tests {
             task_id: &task_b,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("cargo test"),
             status: "passed",
             passed_count: 1,
@@ -797,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn old_generation_test_evidence_is_marked_historical_and_new_generation_is_not() {
+    fn generation_flags_do_not_imply_current_execution_without_a_dev_action() {
         let dir = temp_dir("historical-marking");
         let (db, project_id, task_id) = db_with_task(&dir, "P");
         db.record_test_evidence(&RecordTestEvidenceRequest {
@@ -805,6 +806,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("cargo test"),
             status: "passed",
             passed_count: 1,
@@ -825,6 +827,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 1,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("cargo test"),
             status: "failed",
             passed_count: 0,
@@ -864,7 +867,8 @@ mod tests {
             .iter()
             .find(|e| e.event_type == "test_evidence" && e.result_generation == Some(1))
             .unwrap();
-        assert!(!gen1_timeline_entry.is_historical);
+        assert!(!gen1.is_current_attempt, "same generation alone is not current execution proof");
+        assert!(gen1_timeline_entry.is_historical);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -906,13 +910,33 @@ mod tests {
     fn not_applicable_status_only_appears_alongside_its_legitimizing_confirmation() {
         let dir = temp_dir("not-applicable");
         let (db, project_id, task_id) = db_with_task(&dir, "P");
-        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, Some("no framework"))
+        // The timeline's `no_tests_confirmed` entry is only ever surfaced
+        // alongside a real `test_execution` action (its `attempt_number`
+        // is what the confirmation lookup binds to) — a bare test_evidence
+        // row with no matching action, as this test used to construct,
+        // can never produce one. Mirrors the real production flow: a
+        // stalled test action always exists before a no-tests confirmation
+        // is recorded against it.
+        let key = super::super::test_action_key(&task_id, 0, 1);
+        db.plan_action(&task_id, "test_execution", &key).unwrap();
+        let started = db.start_action(&task_id, &key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &key,
+            crate::models::ActionStatus::Failed,
+            None,
+            Some(super::super::NO_TESTS_AWAITING_CONFIRMATION_MARKER),
+            started.attempt_number,
+        )
+        .unwrap();
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, 1, Some("no framework"))
             .unwrap();
         db.record_test_evidence(&RecordTestEvidenceRequest {
             project_id: &project_id,
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: None,
             status: "no_tests_applicable",
             passed_count: 0,
@@ -994,6 +1018,7 @@ mod tests {
                 task_id: &task_id,
                 result_generation: generation,
                 round,
+                result_attempt: 1,
                 build_command_redacted: Some("cargo build"),
                 status,
                 authorization_source: None,
@@ -1066,6 +1091,7 @@ mod tests {
                 task_id: &task.id,
                 result_generation: 0,
                 round: 1,
+                result_attempt: 1,
                 test_command_redacted: Some("cargo test"),
                 status: "passed",
                 passed_count: 1,

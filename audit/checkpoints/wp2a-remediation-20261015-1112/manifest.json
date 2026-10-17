@@ -1,0 +1,470 @@
+[
+  {
+    "path": "apps/desktop/src-tauri/src/commands.rs",
+    "sha256": "C18A20C8609FEA250E7E5D99333EDAD05308AE493099694922B441529DD898B4",
+    "bytes": 58940,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop.rs",
+    "sha256": "B6126D2A9A75493D1C2F3E44A03062338028A8D75B6D12A346F6693DE5DFDEE2",
+    "bytes": 512624,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop/documents.rs",
+    "sha256": "24F7824B553BFA4EE8FD4C9C12A0055BAE88D13EFAC729112F9C0986C2A71A20",
+    "bytes": 95189,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop/evidence_overview.rs",
+    "sha256": "E96EF192521684D97F57007C4C946B1B58CB427AC3CB25EC8BBBAA70C29E7FB8",
+    "bytes": 43302,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop/task_documents.rs",
+    "sha256": "DC908D051C6BE801D8AFFDBE15C7B24201795AE226A44591918D96F7F36BA275",
+    "bytes": 15850,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/error.rs",
+    "sha256": "A78B454F4B4025D2DDCDAE8F2B3F1E31AE28532D1F258E590AFD2F5B90947FA8",
+    "bytes": 2063,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/lib.rs",
+    "sha256": "69522F18A961FD91E6FD26F98C5B7E382B3ABA0B87F9E84D4E0C2CE18B6FBC3A",
+    "bytes": 6824,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/models.rs",
+    "sha256": "00C03C91B1DC91525D736B916E0C05708B211EA75CB5C426B0EAD85E5EB0D5A0",
+    "bytes": 33463,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/runtime/ai_adapter.rs",
+    "sha256": "AB8932AE2A51EAF082B190FBCD098C8FC6F513E9682E2B44FFA3DC2E8F0CD0F7",
+    "bytes": 56866,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/actions.rs",
+    "sha256": "0C860BBDEF7601EFCD9368ECD7784355A01318F2E674BA6D369D7807F063BA04",
+    "bytes": 23560,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/concurrency_tests.rs",
+    "sha256": "0B5CD7A537E37742336B51BCB8FD27653F3722A973A3C9F1BBABA3B56ED3C104",
+    "bytes": 28929,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/evidence.rs",
+    "sha256": "B6C89E1B8A2DF1814E0B162E8CDD40E78E1681EA29D7DF8276AFD2B03AF20799",
+    "bytes": 54692,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/migrations.rs",
+    "sha256": "00E64B36FD5AE218B72F296AA0FC2F95158698329BF5007BC53B98FE1BEB5AAF",
+    "bytes": 120071,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/mod.rs",
+    "sha256": "21B7A5AE8B8F2CCD93AB1C01F5A42619D36D1EEB79F7B7B5044992EB6512EF66",
+    "bytes": 452,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/no_build_confirmation.rs",
+    "sha256": "C10F149DBDBA47B09F599E4FBA4101F59264E6073C77FD214666269FB39221CC",
+    "bytes": 15024,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/no_tests_confirmation.rs",
+    "sha256": "B41F589610521B52A367AA02BAC8473F6CAD50EA9C373660E3AA4FDFF26736D3",
+    "bytes": 13406,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/tasks.rs",
+    "sha256": "B5A5536EABFDA769A09F4D11387B8426201915B0A0FD7EB63BEFCD3CB9C9B740",
+    "bytes": 69104,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src/components/CoreLoopView.vue",
+    "sha256": "42F129B0221D8CB5A278DC99B297C61FABAFE8C6FAFC520FB0433F4E1E4FD1D7",
+    "bytes": 31455,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src/stores/coreLoop.ts",
+    "sha256": "DBC936CD429D7E6E0110BF73DEF965BFDD05017E4A62DDAE330D883B36D8E838",
+    "bytes": 38010,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src/types.ts",
+    "sha256": "A89F9E49711322CB7C8174F508534571CB82AB8A20BBA95D195F4B97A95ADB93",
+    "bytes": 8543,
+    "tracked": true
+  },
+  {
+    "path": "product/NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md",
+    "sha256": "6F0EAE6165D01BAF6ED272B42B960F141316C491901ECEDDE3D0BBBA07FF265B",
+    "bytes": 28529,
+    "tracked": true
+  },
+  {
+    "path": "product/NOVA_V1_MVP_PRODUCT_DEVELOPMENT_SPEC_V3.md",
+    "sha256": "D37F768ECE2976376CA573BF7A85C569128A0811B4F85EC3B8A35C310D31F966",
+    "bytes": 32512,
+    "tracked": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop/self_check_parser.rs",
+    "sha256": "76252D1C35A65BC4B96D49B58AEFB4970CE651D9533E9859BC202A5D28141272",
+    "bytes": 7311,
+    "tracked": false
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/requirement_items.rs",
+    "sha256": "2A0097E8BE63F4F37D4C0FBCF7C3B17762EC41C663324F0904EE29CF372E7FCA",
+    "bytes": 6793,
+    "tracked": false
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/self_check.rs",
+    "sha256": "9C0CE7A03316B7E9821E7F999BE7E805A24B92A92D04556D7F4B68DA646376BA",
+    "bytes": 11537,
+    "tracked": false
+  },
+  {
+    "path": "docs/design/NOVA_V0.1.0_NEW_PRODUCT_BETA_DIALOGUE_SCRIPT10132137.md",
+    "sha256": "E4349B3A8A9A2CD65765EAF937E882267EEE13CDE72792C5D4DB632362A10049",
+    "bytes": 20497,
+    "tracked": false
+  },
+  {
+    "path": "docs/design/NOVA_V0.1.0_NEW_PRODUCT_BETA_DIALOGUE_SCRIPT10132331.md",
+    "sha256": "7508679E93FC44FB09C051BEAC47880D568F090B86E3ECE3224620AACC0F18A3",
+    "bytes": 16926,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/CLAUDE_SINGLE_AI_REVIEW_REMEDIATION10140157.md",
+    "sha256": "6F4732ABF759FA6CBFF7AF636C91AC7B2FFE1B3527B46B5A759678EF3F8D2359",
+    "bytes": 7220,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/CLAUDE_WP2A_SPEC_REMEDIATION10141223.md",
+    "sha256": "2348468C6357E31B45DC1945229F5287E23FC67AF84DC63E7F8AE867B0DB11D6",
+    "bytes": 10863,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/CODEX_PHASE3_NO_BUILD_CONFIRMATION_FINAL_REVIEW09240918.md",
+    "sha256": "86D9AA2A620E050704FA0324A4EE2BA7E177E412FC29762BC00674E20F6C571F",
+    "bytes": 10927,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/CODEX_PHASE3_NO_BUILD_CONFIRMATION_RECOVERY_FINAL_REVIEW09241054.md",
+    "sha256": "B1A41205B415C18BDF97E5B55887E857C090711B8B4164016F8056F930F60D8F",
+    "bytes": 11427,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/CODEX_PHASE3_SINGLE_AI_RUNTIME_FINAL_REREVIEW09232135.md",
+    "sha256": "475A9CC3D32820062AF0CF58FF6F3618D7B7FEE44EDFBC6853F7DA389950A2EA",
+    "bytes": 14721,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/CODEX_PHASE3_SINGLE_AI_RUNTIME_REMEDIATION_REREVIEW09211747.md",
+    "sha256": "533086CD933A9784810EB5B56CD23DDC907C0727600A8095874CD6B52DC507AE",
+    "bytes": 13725,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/CODEX_PHASE3_SINGLE_AI_RUNTIME_REVIEW09211520.md",
+    "sha256": "FD4B09D7DCF80B06B12633BB171DFE55916F846A8F88E01E2B38A176A2654185",
+    "bytes": 17031,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/CODEX_V0.1_SCOPE_CORRECTION_AUDIT_09211027.md",
+    "sha256": "607D517D7F02B1F868827E4EDD552B7BF941CB28D6F6F5C2E83787A30831E152",
+    "bytes": 18965,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_SINGLE_AI_IMPLEMENTATION_AUDIT10132239.md",
+    "sha256": "ABA9478D03B1C8F1BFE1C8595C6382C915C73F5F76D1B0DA98069160F03D20E6",
+    "bytes": 8444,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_SINGLE_AI_IMPLEMENTATION_AUDIT10132327.md",
+    "sha256": "BBB2D6F62DC90C9B7CB3796DC7F8B36A7557AA1CAFA5D4DD9C9C250AF8F8489C",
+    "bytes": 6023,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_SINGLE_AI_MIGRATION_PLAN10132240.md",
+    "sha256": "93DB0C67E5D857D3B126C93AF54E63D2858C80DB5B3C4CFA5981EC6B6C04A751",
+    "bytes": 10238,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_SINGLE_AI_MIGRATION_PLAN10132328.md",
+    "sha256": "F6C8D17584478A3E6D3437B3A6A8AD093E8FA25AD114AA7E81B237F6BF7777D0",
+    "bytes": 10737,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_SINGLE_AI_MIGRATION_PLAN10140155.md",
+    "sha256": "032A1E1654C2BBB06FADA8D6474CFFAA7E651ED5D89413CB843BFA0B51A33415",
+    "bytes": 11162,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_SINGLE_AI_MIGRATION_PLAN10141222.md",
+    "sha256": "382E72CBD0ADD5C96680109423419CCC336DB7F9200BA0895993831DF97AEADD",
+    "bytes": 6524,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_SINGLE_AI_MIGRATION_PLAN10141246.md",
+    "sha256": "CA63EBD1EAA886FDEB0BF56AB1A5A8D44E116835CC129D06AFFBA84E9DCAD0DB",
+    "bytes": 6766,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_SINGLE_AI_MIGRATION_PLAN10141317.md",
+    "sha256": "6E39F6831BB5EAF74D373B1B2BDDA64D4B93C9102DDF2411566E486B7981CF88",
+    "bytes": 3437,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_SINGLE_AI_MIGRATION_PLAN10141350.md",
+    "sha256": "4B5130B3656E42D4B74C5CD07C40950FAE4565216ED8CE52BFF87A7EA4ABA73D",
+    "bytes": 4633,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_SINGLE_AI_MIGRATION_PLAN10141420.md",
+    "sha256": "28AF9CE297F064ADF657DD428E755196931DB464D605C2738628ADAFAC1B4348",
+    "bytes": 4143,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_V010_SINGLE_AI_SCOPE_CHANGE10132237.md",
+    "sha256": "81147CCDF8433571A33F974349BF4885B14005822C6DCF535092481509B7ED15",
+    "bytes": 15222,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_V010_SINGLE_AI_SCOPE_CHANGE10132326.md",
+    "sha256": "B60BEBBFA5A6C2E49DE4967321884D5A5956DF77450B8FC7D47C66250C3A6D64",
+    "bytes": 11683,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_WP2A_FINAL_AMENDMENT10141726.md",
+    "sha256": "B5B02EBC9D6AE93090E6941D09026C7757A63DED0D2BD51F6C2FBC02A66B8962",
+    "bytes": 19912,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_WP2A_IMPLEMENTATION_NOTES10150058.md",
+    "sha256": "E9E862E076DF71EED5CE6F7AA20A122A56F8C5BFD8B1AB4705E4DE9F157F454F",
+    "bytes": 4933,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_WP2A_SELF_CHECK_SPEC10140153.md",
+    "sha256": "16EDC8C01484558EDF93CC4148A64417C67867B001B33C7C8BD163B64176E96A",
+    "bytes": 14792,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_WP2A_SELF_CHECK_SPEC10141220.md",
+    "sha256": "0D292F0A67B1EB1B7EB8A36FB873C78835A9D0E11F1C3B5BD1D708AE081C0932",
+    "bytes": 24608,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_WP2A_SELF_CHECK_SPEC10141243.md",
+    "sha256": "86521EC4D98BC874D7A12847EC1748CD7A53D260565FA4BBFD83C995B39ADDBD",
+    "bytes": 26264,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_WP2A_SELF_CHECK_SPEC10141315.md",
+    "sha256": "FA4338D4896E4EACC5FF14911796373363462916E82563CE7E72CAF862B1D62E",
+    "bytes": 29641,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_WP2A_SELF_CHECK_SPEC10141347.md",
+    "sha256": "0799B1B00C5A03AD540D16300DA37CFE4FE60C46ED790327549ECD365451EFF8",
+    "bytes": 32235,
+    "tracked": false
+  },
+  {
+    "path": "docs/release-v0.1.0/NOVA_WP2A_SELF_CHECK_SPEC10141417.md",
+    "sha256": "AAFA632EAC24A26614C1D7AFFCDCDBE68AF702B632772217190679FA8B60D489",
+    "bytes": 28971,
+    "tracked": false
+  },
+  {
+    "path": "docs/reports/CLAUDE_WP2A_FINAL_AMENDMENT_REPORT10141728.md",
+    "sha256": "B4FC2ADC572096A58FF57013D6A8F60063C4696212B2717E0DD9C6328D1CE6CE",
+    "bytes": 5868,
+    "tracked": false
+  },
+  {
+    "path": "docs/reports/CLAUDE_WP2A_IMPLEMENTATION_REPORT10150058.md",
+    "sha256": "307B092A8F055C5188619DC90AA6222F6726CDB854B2C97C504A016A3926844E",
+    "bytes": 20700,
+    "tracked": false
+  },
+  {
+    "path": "docs/reports/CLAUDE_WP2A_SPEC_REMEDIATION10141248.md",
+    "sha256": "C5E16ABA92D268C2BCC638CA79860100BC910FB3750B561F94F7030BC7D5D75E",
+    "bytes": 7720,
+    "tracked": false
+  },
+  {
+    "path": "docs/reports/CLAUDE_WP2A_SPEC_REMEDIATION10141318.md",
+    "sha256": "A6268357E7066F48F431109216A2B6F364F9B400529C2F90E07316970554439B",
+    "bytes": 8133,
+    "tracked": false
+  },
+  {
+    "path": "docs/reports/CLAUDE_WP2A_SPEC_REMEDIATION10141351.md",
+    "sha256": "90F04D442C7EBE688F909D14563ECB5BB0976A9CF1D091512E0562564D1B11CD",
+    "bytes": 6272,
+    "tracked": false
+  },
+  {
+    "path": "docs/reports/CLAUDE_WP2A_SPEC_REMEDIATION10141421.md",
+    "sha256": "5807F17CC56F97D58B8AA69EFD1EDE6F589EC8C01D890F32242F83EC07B6AFD6",
+    "bytes": 5914,
+    "tracked": false
+  },
+  {
+    "path": "docs/reports/PHASE3_ACCEPTANCE_REMEDIATION_REPORT09181744.md",
+    "sha256": "CB8F256E792113AB4801411233D30077317CAF7F856D09C10DF4ACCBE32EFC34",
+    "bytes": 24089,
+    "tracked": false
+  },
+  {
+    "path": "docs/reports/PHASE3_BUILD_CANCELLATION_STABILITY_REMEDIATION_REPORT09241633.md",
+    "sha256": "7EDF5A8FE35DF121E2747FEFD8F5321E517E358D55B05805526ED8C4DB6FE2E2",
+    "bytes": 18193,
+    "tracked": false
+  },
+  {
+    "path": "docs/reports/PHASE3_FINAL_NO_TESTS_AND_PROCESS_STABILITY_REMEDIATION_REPORT09250003.md",
+    "sha256": "111E7307C02BE8C0298999812382D6C90A8D8A867E17F3BBE6FDEFE8125510E9",
+    "bytes": 28138,
+    "tracked": false
+  },
+  {
+    "path": "docs/reports/PHASE3_NO_BUILD_CONFIRMATION_RECOVERY_REPORT09241006.md",
+    "sha256": "A1EC2EAA000F600862A45708AF5878F9B7BCD08FAA9215DD2CEE9CB9B1F654D8",
+    "bytes": 16357,
+    "tracked": false
+  },
+  {
+    "path": "docs/reports/PHASE3_NO_BUILD_CONFIRMATION_REMEDIATION_REPORT09240851.md",
+    "sha256": "3DC74974B41C7C0B088EB6D1D60628DE2C29C8E855FD2B7E2C577EE06DA5B1B7",
+    "bytes": 19139,
+    "tracked": false
+  },
+  {
+    "path": "docs/reports/PHASE3_SINGLE_AI_FINAL_ACCEPTANCE_EVIDENCE_REPORT09242012.md",
+    "sha256": "1252D43088DE248640A6F47E1ED1415A7E5843B2440161DDFAC342A63D57819E",
+    "bytes": 30331,
+    "tracked": false
+  },
+  {
+    "path": "docs/reports/PHASE3_SINGLE_AI_RUNTIME_FINAL_REMEDIATION_REPORT09230940.md",
+    "sha256": "933FC6B063091358B5235CAB7C8258CF3D6D9B90C5D08F03E2259FFA003850EA",
+    "bytes": 23838,
+    "tracked": false
+  },
+  {
+    "path": "docs/reports/PHASE3_SINGLE_AI_RUNTIME_REMEDIATION_REPORT09211305.md",
+    "sha256": "3D0600B63C545945577F35DAC58B78C86D07476BB9187283F6A4EA87A5996B28",
+    "bytes": 14675,
+    "tracked": false
+  },
+  {
+    "path": "docs/reports/PHASE3_SINGLE_AI_RUNTIME_REVIEW_REMEDIATION_REPORT09211649.md",
+    "sha256": "815FFB5C9D26D847E2F7799C1102A90629CE19249CC3AA5DBF426C3147E28C22",
+    "bytes": 27011,
+    "tracked": false
+  },
+  {
+    "path": "docs/reports/PHASE3_SINGLE_AI_UI_REPORT_SCOPE_CORRECTION_REMEDIATION_REPORT09241458.md",
+    "sha256": "C5FF75B89DFA4BE6E1CD06A9802B93854BAC50E6BF99ED0B69F08CD0953D45E7",
+    "bytes": 20752,
+    "tracked": false
+  },
+  {
+    "path": "docs/reports/PHASE3_SINGLE_AI_UI_REPORT_SCOPE_CORRECTION_REPORT09241150.md",
+    "sha256": "CE2325C6548C32923921147048A3F9970F0ADFB8F04B174445E7125D873EDFA6",
+    "bytes": 18584,
+    "tracked": false
+  },
+  {
+    "path": "docs/reviews/CODEX_WP2A_AMENDMENT_REVIEW10141751.md",
+    "sha256": "B804326F8A0F65C5186A77A11A28FF47481F2AF9D09DD1677BA9CD633B430190",
+    "bytes": 7040,
+    "tracked": false
+  },
+  {
+    "path": "docs/reviews/CODEX_WP2A_IMPLEMENTATION_REVIEW10151053.md",
+    "sha256": "7B2389B5789021C5B4240389C0CDD9FB7DF16383B1A2742224968922814EDFA7",
+    "bytes": 20383,
+    "tracked": false
+  },
+  {
+    "path": "docs/reviews/CODEX_WP2A_SPEC_CLOSURE_REVIEW10141407.md",
+    "sha256": "9A400B2759E4F7FC3C396FFE8D9DC2D47FF56304A3619266586877ACE5543C7A",
+    "bytes": 15952,
+    "tracked": false
+  },
+  {
+    "path": "docs/reviews/CODEX_WP2A_SPEC_FINAL_CLOSURE_REVIEW10141613.md",
+    "sha256": "0A2A99F3AD179DE47E5A83AD8B388CD38F2452F1176622B553A5AA3497CC0D74",
+    "bytes": 13024,
+    "tracked": false
+  },
+  {
+    "path": "docs/reviews/CODEX_WP2A_SPEC_REREVIEW10141259.md",
+    "sha256": "A285A934DAF08791759C79C50D10AB66472A6DD957779DCA4BEEDFB811EAB20B",
+    "bytes": 14957,
+    "tracked": false
+  },
+  {
+    "path": "docs/reviews/CODEX_WP2A_SPEC_TARGETED_REVIEW10141332.md",
+    "sha256": "395A67F1DCE15AE6395A9D5F0818722E262AB4E30C035EA9FC3BACC93A4693F3",
+    "bytes": 15043,
+    "tracked": false
+  }
+]

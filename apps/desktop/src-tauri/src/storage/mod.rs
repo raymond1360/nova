@@ -9,7 +9,9 @@ pub mod no_build_confirmation;
 pub mod no_tests_confirmation;
 pub mod projects;
 pub mod recovery;
+pub mod requirement_items;
 pub mod reviews;
+pub mod self_check;
 pub mod tasks;
 
 pub(crate) fn now() -> String {

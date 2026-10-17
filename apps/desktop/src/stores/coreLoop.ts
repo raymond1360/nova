@@ -3,10 +3,12 @@ import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import type {
   CliBinaryTrustStatus,
+  CompletionPrecheck,
   CoreLoopReadiness,
   NoBuildConfirmation,
   NoTestsConfirmation,
   Project,
+  SelfCheck,
   Task,
   TaskDocumentContent,
   TaskDocumentInfo,
@@ -113,6 +115,20 @@ export const useCoreLoopStore = defineStore('coreLoop', {
     evidenceRequestToken: 0 as number,
     taskDocuments: [] as TaskDocumentInfo[],
     documentsRequestToken: 0 as number,
+    // WP2A: the read-only "would 标记完成 currently succeed" precheck —
+    // same full-replace, stale-response-guarded pattern as
+    // `evidenceOverview`. See `loadCompletionPrecheck`.
+    completionPrecheck: null as CompletionPrecheck | null,
+    completionPrecheckRequestToken: 0 as number,
+    completionPrecheckError: '',
+    selfChecksError: '',
+    snapshotRequestToken: 0,
+    snapshotGenerating: false,
+    snapshotMessage: '',
+    // WP2A: every self-check ever recorded for the current task, oldest
+    // first — audit/technical-detail display only. See `loadSelfChecks`.
+    selfChecks: [] as SelfCheck[],
+    selfChecksRequestToken: 0 as number,
     // The currently-expanded document's redacted content, if the user has
     // asked to view one — cleared on every task/project switch so a slow
     // response for a previously-viewed document can never render under a
@@ -195,6 +211,8 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       this.evidenceOverview = null
       this.taskDocuments = []
       this.selectedDocument = null
+      this.completionPrecheck = null
+      this.selfChecks = []
       // v0.1.0 scope correction (Work Package 2 remediation, Major 1) /
       // Work Package 3 final review remediation (Major 1): invalidates any
       // in-flight no-build/no-tests query from whatever project was
@@ -207,6 +225,15 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       this.evidenceRequestToken += 1
       this.documentsRequestToken += 1
       this.selectedDocumentRequestToken += 1
+      // WP2A: same stale-response invalidation for the precheck/self-check
+      // queries below.
+      this.completionPrecheckRequestToken += 1
+      this.selfChecksRequestToken += 1
+      this.snapshotRequestToken += 1
+      this.snapshotGenerating = false
+      this.snapshotMessage = ''
+      this.completionPrecheckError = ''
+      this.selfChecksError = ''
       await invoke('set_last_active_project', { projectId: project.id }).catch(() => {})
     },
     async loadTasks() {
@@ -250,6 +277,8 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       this.evidenceOverview = null
       this.taskDocuments = []
       this.selectedDocument = null
+      this.completionPrecheck = null
+      this.selfChecks = []
       // v0.1.0 scope correction (Work Package 2 remediation, Major 1) /
       // Work Package 3 final review remediation (Major 1): invalidates any
       // no-build/no-tests query still in flight for whatever task was
@@ -262,6 +291,13 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       this.evidenceRequestToken += 1
       this.documentsRequestToken += 1
       this.selectedDocumentRequestToken += 1
+      this.completionPrecheckRequestToken += 1
+      this.selfChecksRequestToken += 1
+      this.snapshotRequestToken += 1
+      this.snapshotGenerating = false
+      this.snapshotMessage = ''
+      this.completionPrecheckError = ''
+      this.selfChecksError = ''
       // Both require a real backend query — selecting a task that is
       // already sitting at `needs_user_action` (e.g. after reopening the
       // project) must still surface the right prompt without waiting for
@@ -278,6 +314,11 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       // for whichever task the user just selected.
       this.loadEvidenceOverview().catch(() => {})
       this.loadTaskDocuments().catch(() => {})
+      // WP2A: same reasoning — the precheck and self-check history are
+      // relevant regardless of task state (e.g. reviewing why a past
+      // completion attempt was refused).
+      this.loadCompletionPrecheck().catch(() => {})
+      this.loadSelfChecks().catch(() => {})
     },
     async detectTestCommand() {
       if (!this.currentProject) return
@@ -587,6 +628,10 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       // while a task is running can never duplicate a timeline entry.
       await this.loadEvidenceOverview().catch(() => {})
       await this.loadTaskDocuments().catch(() => {})
+      // WP2A: same reasoning for the completion precheck and self-check
+      // history.
+      await this.loadCompletionPrecheck().catch(() => {})
+      await this.loadSelfChecks().catch(() => {})
       if (this.currentTask?.state === 'needs_user_action') {
         await this.detectTestCommand().catch(() => {})
         await this.loadNoBuildConfirmationNeeded().catch(() => {})
@@ -666,6 +711,67 @@ export const useCoreLoopStore = defineStore('coreLoop', {
         this.currentTask?.id === taskId
       ) {
         this.evidenceOverview = overview
+      }
+    },
+    // WP2A: the read-only "would 标记完成 currently succeed" precheck — same
+    // stale-response guard as `loadEvidenceOverview`. Never attempts the
+    // real transition itself.
+    async loadCompletionPrecheck() {
+      const requestToken = ++this.completionPrecheckRequestToken
+      this.completionPrecheck = null
+      this.completionPrecheckError = ''
+      if (!this.currentTask || !this.currentProject) return
+      const projectId = this.currentProject.id
+      const taskId = this.currentTask.id
+      const generation = this.currentTask.result_generation
+      const state = this.currentTask.state
+      const current = () => this.completionPrecheckRequestToken === requestToken &&
+        this.currentProject?.id === projectId && this.currentTask?.id === taskId &&
+        this.currentTask?.result_generation === generation && this.currentTask?.state === state
+      try {
+        const precheck = await invoke<CompletionPrecheck>('get_completion_precheck', { projectId, taskId })
+        if (current()) this.completionPrecheck = precheck
+      } catch (error) {
+        if (current()) this.completionPrecheckError = `完工预检读取失败：${String(error)}`
+      }
+    },
+    async loadSelfChecks() {
+      const requestToken = ++this.selfChecksRequestToken
+      this.selfChecks = []
+      this.selfChecksError = ''
+      if (!this.currentTask || !this.currentProject) return
+      const projectId = this.currentProject.id
+      const taskId = this.currentTask.id
+      const generation = this.currentTask.result_generation
+      const current = () => this.selfChecksRequestToken === requestToken &&
+        this.currentProject?.id === projectId && this.currentTask?.id === taskId &&
+        this.currentTask?.result_generation === generation
+      try {
+        const checks = await invoke<SelfCheck[]>('list_task_self_checks', { projectId, taskId })
+        if (current()) this.selfChecks = checks
+      } catch (error) {
+        if (current()) this.selfChecksError = `自检记录读取失败：${String(error)}`
+      }
+    },
+    // Only called by the explicit read-only requirement confirmation button.
+    async generateRequirementSnapshot() {
+      if (!this.currentTask || !this.currentProject || this.snapshotGenerating) return
+      const projectId = this.currentProject.id
+      const taskId = this.currentTask.id
+      const token = ++this.snapshotRequestToken
+      this.snapshotGenerating = true
+      this.snapshotMessage = ''
+      const current = () => this.snapshotRequestToken === token && this.currentProject?.id === projectId && this.currentTask?.id === taskId
+      try {
+        const items = await invoke<unknown[]>('generate_requirement_snapshot', { projectId, taskId })
+        if (current()) {
+          this.snapshotMessage = `需求清单已确认，共 ${items.length} 项；原需求及历史冻结状态保持不变。`
+          await this.loadCompletionPrecheck()
+        }
+      } catch (error) {
+        if (current()) this.lastError = String(error)
+      } finally {
+        if (current()) this.snapshotGenerating = false
       }
     },
     // Phase 4: lists the seven result documents' display metadata (never
@@ -749,6 +855,10 @@ export const useCoreLoopStore = defineStore('coreLoop', {
           // evidence/document view an app restart should never hide.
           await this.loadEvidenceOverview().catch(() => {})
           await this.loadTaskDocuments().catch(() => {})
+          // WP2A: same reasoning for the completion precheck and
+          // self-check history.
+          await this.loadCompletionPrecheck().catch(() => {})
+          await this.loadSelfChecks().catch(() => {})
         }
       } catch (error) {
         this.lastError = String(error)

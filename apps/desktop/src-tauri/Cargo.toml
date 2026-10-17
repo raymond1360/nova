@@ -21,11 +21,23 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [features]
 default = []
 nova-test-helper = []
+wp2a-desktop-validation = []
 
 [[bin]]
 name = "nova_test_helper"
 path = "tests/fixtures/nova_test_helper.rs"
 required-features = ["nova-test-helper"]
+
+# Deliberately outside src/bin; never auto-discovered or bundled by defaults.
+[[bin]]
+name = "nova_wp2a_validation"
+path = "tests/fixtures/wp2a_validation_main.rs"
+required-features = ["wp2a-desktop-validation"]
+
+[[bin]]
+name = "nova_wp2a_fake_cli"
+path = "tests/fixtures/wp2a_fake_cli.rs"
+required-features = ["wp2a-desktop-validation"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

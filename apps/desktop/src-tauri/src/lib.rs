@@ -1,3 +1,10 @@
+#[cfg(all(feature = "wp2a-desktop-validation", not(debug_assertions)))]
+compile_error!("wp2a-desktop-validation is debug-only and must never ship");
+#[cfg(feature = "wp2a-desktop-validation")]
+mod isolated_validation;
+#[cfg(feature = "wp2a-desktop-validation")]
+pub use isolated_validation::run_validation;
+
 mod api;
 mod app_paths;
 mod commands;
@@ -19,7 +26,9 @@ use std::time::Duration;
 use tauri::Manager;
 use tokio_util::sync::CancellationToken;
 
-use credential::{CredentialStore, SystemCredentialStore};
+use credential::CredentialStore;
+#[cfg(not(feature = "wp2a-desktop-validation"))]
+use credential::SystemCredentialStore;
 use db::Database;
 use models::RecoverySummary;
 use runtime::detection_slot::DetectionSlot;
@@ -71,9 +80,22 @@ impl AppState {
 }
 
 pub fn run() {
+    #[cfg(feature = "wp2a-desktop-validation")]
+    isolated_validation::require_active();
+    #[allow(unused_mut)]
+    let mut context = tauri::generate_context!();
+    #[cfg(feature = "wp2a-desktop-validation")]
+    {
+        context.config_mut().app.windows.clear();
+        context.config_mut().identifier = "com.sdkmax.nova.wp2a.validation".into();
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            #[cfg(feature = "wp2a-desktop-validation")]
+            { return isolated_validation::setup(app); }
+            #[cfg(not(feature = "wp2a-desktop-validation"))]
+            {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
             let db_path = app_data_dir.join("nova.sqlite3");
@@ -93,8 +115,10 @@ pub fn run() {
                 startup_recovery_summary,
             ));
             Ok(())
+            }
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler({
+            let real: Arc<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> = std::sync::Arc::new(tauri::generate_handler![
             commands::initialize_app,
             commands::get_provider,
             commands::save_provider,
@@ -147,10 +171,20 @@ pub fn run() {
             commands::accept_task_result,
             commands::resync_task_documents,
             commands::get_task_evidence_overview,
+            commands::get_completion_precheck,
+            commands::generate_requirement_snapshot,
+            commands::list_task_self_checks,
             commands::list_task_documents,
             commands::read_task_document,
-        ])
-        .build(tauri::generate_context!())
+            ]);
+            move |invoke| {
+                #[cfg(feature = "wp2a-desktop-validation")]
+                { isolated_validation::dispatch(invoke, real.clone()) }
+                #[cfg(not(feature = "wp2a-desktop-validation"))]
+                { real(invoke) }
+            }
+        })
+        .build(context)
         .expect("error while building Nova")
         .run(|app_handle, event| {
             // Major 4: on app shutdown, every core-loop task still in

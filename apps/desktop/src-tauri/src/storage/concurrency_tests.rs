@@ -706,13 +706,14 @@ fn concurrent_finish_action_for_the_same_started_action_only_one_wins() {
     setup
         .plan_action(&task.id, "git_commit", "finish-race-key")
         .unwrap();
-    setup
+    let started = setup
         .start_action(&task.id, "finish-race-key", false)
         .unwrap();
     drop(setup);
 
     let barrier = Arc::new(Barrier::new(2));
     let task_id = task.id.clone();
+    let expected_attempt = started.attempt_number;
     let handles: Vec<_> = [ActionStatus::Succeeded, ActionStatus::Failed]
         .into_iter()
         .map(|status| {
@@ -722,7 +723,7 @@ fn concurrent_finish_action_for_the_same_started_action_only_one_wins() {
             thread::spawn(move || {
                 let db = Database::open(&path).unwrap();
                 barrier.wait();
-                db.finish_action(&task_id, "finish-race-key", status, None, None)
+                db.finish_action(&task_id, "finish-race-key", status, None, None, expected_attempt)
             })
         })
         .collect();

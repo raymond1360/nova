@@ -689,6 +689,10 @@ pub mod mock {
         /// through the exact same code path `core_loop` uses for a real
         /// reviewer's stdout.
         pub raw_review_stdout_override: Mutex<Option<String>>,
+        /// Explicit adversarial stdout override. Without it the mock reads
+        /// the dispatched package and derives coverage from its actual items;
+        /// a missing contract never receives a fabricated valid self-check.
+        pub development_self_check_override: Mutex<Option<String>>,
     }
 
     #[derive(Clone)]
@@ -711,6 +715,7 @@ pub mod mock {
                 development_side_effect: Mutex::new(None),
                 review_findings_text: Mutex::new(None),
                 raw_review_stdout_override: Mutex::new(None),
+                development_self_check_override: Mutex::new(None),
             }
         }
 
@@ -795,16 +800,25 @@ pub mod mock {
             } else {
                 script.remove(0)
             };
-            // A real developer-AI invocation always produces some stdout;
-            // an empty string here would be an unrealistic test double and
-            // would hide a real regression (see Minor 1: every command
-            // evidence-producing invocation must be able to carry a real,
-            // non-`None` `stdout_ref` — the v0.1.0 single-AI path has no
-            // review step to fall back on for this proof anymore).
-            Self::synthetic_result(
-                matches!(outcome, MockOutcome::Success),
-                "mock development output",
-            )
+            // Derive coverage only from the actual dispatched contract. Missing
+            // package/schema must not magically produce a valid self-check.
+            let stdout = self.development_self_check_override.lock().unwrap().clone()
+                .unwrap_or_else(|| {
+                    let package = std::fs::read_to_string(&request.package_path).unwrap_or_default();
+                    let items = package.split_once("===NOVA_REQUIREMENT_ITEMS_START===")
+                        .and_then(|(_, tail)| tail.split_once("===NOVA_REQUIREMENT_ITEMS_END==="))
+                        .and_then(|(json, _)| serde_json::from_str::<Vec<serde_json::Value>>(json.trim()).ok());
+                    let required = ["===NOVA_SELF_CHECK_START===", "===NOVA_SELF_CHECK_END===", "requirement_coverage", "check_results", "unfinished_items", "blocking_issues", "self_reported_complete", "self_reported_incomplete", "self_reported_blocked", "stdout"];
+                    match items.filter(|items| !items.is_empty() && required.iter().all(|k| package.contains(k))) {
+                        Some(items) => {
+                            let coverage: Vec<_> = items.iter().map(|i| serde_json::json!({"item": i["item"], "status": "covered"})).collect();
+                            let check = serde_json::json!({"requirement_coverage": coverage, "check_results": ["inspected dispatched requirements"], "unfinished_items": [], "blocking_issues": [], "self_reported_status": "self_reported_complete"});
+                            format!("mock development output\n===NOVA_SELF_CHECK_START===\n{check}\n===NOVA_SELF_CHECK_END===")
+                        }
+                        None => "mock: missing or incomplete self-check contract".into(),
+                    }
+                });
+            Self::synthetic_result(matches!(outcome, MockOutcome::Success), &stdout)
         }
 
         fn run_review(

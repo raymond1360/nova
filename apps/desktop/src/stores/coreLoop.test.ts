@@ -1914,3 +1914,79 @@ describe('coreLoop store', () => {
     expect(store.selectedDocument).toBeNull()
   })
 })
+
+
+describe('WP2A remediation IPC store boundaries', () => {
+  beforeEach(() => { setActivePinia(createPinia()); mockedInvoke.mockReset() })
+
+  it('snapshot generation is explicit and sends only project/task, not editable text', async () => {
+    const store = useCoreLoopStore()
+    store.currentProject = fakeProject()
+    routeInvoke({ list_task_reviews: () => [], get_pending_round: () => 1,
+      get_completion_precheck: () => ({ ok: false, can_submit_acceptance: false, reason_code: 'no_adopted_evidence', message: 'no evidence' }),
+      list_task_self_checks: () => [], generate_requirement_snapshot: () => [{ item: 'goal:0' }],
+    })
+    store.selectTask(fakeTask({ state: 'confirmed', goal: 'original' }))
+    await flushMicrotasks()
+    expect(mockedInvoke.mock.calls.filter(([name]) => name === 'generate_requirement_snapshot')).toHaveLength(0)
+    await store.generateRequirementSnapshot()
+    expect(mockedInvoke).toHaveBeenCalledWith('generate_requirement_snapshot', { projectId: 'proj-1', taskId: 'task-1' })
+    expect(store.snapshotMessage).toContain('1 项')
+    expect(store.currentTask?.goal).toBe('original')
+  })
+
+  it('snapshot delayed success or failure cannot overwrite a different task', async () => {
+    for (const fail of [false, true]) {
+      const store = useCoreLoopStore(); store.currentProject = fakeProject(); store.currentTask = fakeTask({ state: 'confirmed' })
+      const pending = deferred<unknown[]>()
+      routeInvoke({ generate_requirement_snapshot: () => pending.promise })
+      const call = store.generateRequirementSnapshot()
+      store.selectTask(fakeTask({ id: 'task-2', state: 'confirmed' }))
+      if (fail) pending.reject(new Error('old task failure')); else pending.resolve([])
+      await call
+      expect(store.currentTask.id).toBe('task-2')
+      expect(store.snapshotMessage).toBe(''); expect(store.lastError).not.toContain('old task failure')
+      expect(store.snapshotGenerating).toBe(false)
+    }
+  })
+
+  it.each(['precheck', 'selfcheck'] as const)('%s ignores stale successes and errors across task or generation changes', async (kind) => {
+    for (const fail of [false, true]) for (const change of ['task', 'generation']) {
+      const store = useCoreLoopStore(); store.currentProject = fakeProject(); store.currentTask = fakeTask({ state: 'awaiting_user_acceptance' })
+      const pending = deferred<never>()
+      routeInvoke({ [kind === 'precheck' ? 'get_completion_precheck' : 'list_task_self_checks']: () => pending.promise })
+      const call = kind === 'precheck' ? store.loadCompletionPrecheck() : store.loadSelfChecks()
+      store.currentTask = change === 'task' ? fakeTask({ id: 'task-2' }) : fakeTask({ state: 'awaiting_user_acceptance', result_generation: 2 })
+      if (fail) pending.reject(new Error('obsolete')); else pending.resolve((kind === 'precheck' ? { ok: true, can_submit_acceptance: true } : [{ id: 'obsolete' }]) as never)
+      await call
+      expect(store.completionPrecheck).toBeNull(); expect(store.selfChecks).toEqual([])
+      expect(store.completionPrecheckError).toBe(''); expect(store.selfChecksError).toBe('')
+    }
+  })
+
+  it('newer precheck response wins and a current query failure clears old success', async () => {
+    const store = useCoreLoopStore(); store.currentProject = fakeProject(); store.currentTask = fakeTask({ state: 'awaiting_user_acceptance' })
+    const first = deferred<unknown>(); const second = deferred<unknown>(); let count = 0
+    routeInvoke({ get_completion_precheck: () => ++count === 1 ? first.promise : second.promise })
+    const a = store.loadCompletionPrecheck(); const b = store.loadCompletionPrecheck()
+    second.resolve({ ok: false, can_submit_acceptance: false, reason_code: 'self_check_invalid_format', message: 'invalid' }); await b
+    first.resolve({ ok: true, can_submit_acceptance: true, reason_code: null, message: null }); await a
+    expect(store.completionPrecheck?.can_submit_acceptance).toBe(false)
+    routeInvoke({ get_completion_precheck: () => { throw new Error('current failure') } })
+    await store.loadCompletionPrecheck()
+    expect(store.completionPrecheck).toBeNull(); expect(store.completionPrecheckError).toContain('current failure')
+  })
+
+  it('Case C backend query surfaces retry and click resumes to queued without starting AI', async () => {
+    const store = useCoreLoopStore(); store.currentProject = fakeProject(); store.currentTask = fakeTask({ state: 'needs_user_action' })
+    routeInvoke({ get_no_build_confirmation_needed: () => true,
+      confirm_no_build_applicable: () => ({ id: 'existing-confirmation', result_attempt: 1 }),
+      list_tasks_for_project: () => [fakeTask({ state: 'queued' })], list_task_reviews: () => [], get_pending_round: () => 1,
+    })
+    await store.loadNoBuildConfirmationNeeded(); expect(store.noBuildConfirmationNeeded).toBe(true)
+    await store.confirmNoBuildApplicable('resume')
+    expect(store.currentTask?.state).toBe('queued'); expect(store.noBuildConfirmationNeeded).toBe(false)
+    expect(mockedInvoke.mock.calls.filter(([name]) => name === 'confirm_no_build_applicable')).toHaveLength(1)
+    expect(mockedInvoke.mock.calls.filter(([name]) => name === 'start_core_loop')).toHaveLength(0)
+  })
+})

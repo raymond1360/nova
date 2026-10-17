@@ -1,0 +1,102 @@
+[
+  {
+    "path": "apps/desktop/src-tauri/src/commands.rs",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop.rs",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop/documents.rs",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop/evidence_overview.rs",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop/self_check_parser.rs",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop/test_runner.rs",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/core_loop/wp2a_remediation_tests.rs",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/lib.rs",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/runtime/ai_adapter.rs",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/actions.rs",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/migrations.rs",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/no_build_confirmation.rs",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/no_tests_confirmation.rs",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/requirement_items.rs",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src-tauri/src/storage/tasks.rs",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src/components/CoreLoopView.text.test.ts",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src/components/CoreLoopView.vue",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src/stores/coreLoop.test.ts",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src/stores/coreLoop.ts",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  },
+  {
+    "path": "apps/desktop/src/types.ts",
+    "normalized_text_restored": true,
+    "actual_workspace_untouched": true
+  }
+]

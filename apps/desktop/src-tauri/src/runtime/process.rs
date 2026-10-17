@@ -74,6 +74,13 @@ pub fn execute_blocking(request: ExecutionRequest, cancel: CancellationToken) ->
     let started_at = Utc::now();
     let start_instant = Instant::now();
 
+    #[cfg(feature = "wp2a-desktop-validation")]
+    let mut request = request;
+    #[cfg(feature = "wp2a-desktop-validation")]
+    if let Err(detail) = crate::isolated_validation::guard_process(&mut request) {
+        return finished_without_process(&request, started_at, start_instant, ExecutionErrorKind::PathRejected, detail);
+    }
+
     let resolved_cwd = match &request.allowed_root {
         Some(root) => path_guard::validate_directory_boundary(&request.cwd, root),
         None => Err(PathRejection::OutsideAllowedRoot),

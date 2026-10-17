@@ -347,6 +347,17 @@ pub struct Task {
     /// accept_task_result` itself retries once on its own next call; a
     /// dedicated resync path can also drive this) succeeds.
     pub document_sync_pending: bool,
+    /// WP2A: one-time classification of a task's historical AI-mode, set
+    /// only by the schema-v11 migration itself for tasks that were already
+    /// non-terminal at that moment — `'dual_ai_evidenced'` |
+    /// `'single_ai_evidenced'` (never actually assigned under the current
+    /// schema — no positive single-AI evidence source exists) |
+    /// `'unknown_insufficient'`. `None` for every task created after the
+    /// migration (never recomputed live — that would wrongly freeze a
+    /// brand-new single-AI task that simply hasn't produced review signals
+    /// yet, since it never could). `Some(_)` of either frozen variant
+    /// blocks the entry points listed in `core_loop::is_legacy_frozen`.
+    pub legacy_classification: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -537,6 +548,13 @@ pub struct TestEvidence {
     /// `(result_generation, round)` pair, never a stale earlier run's.
     pub result_generation: i64,
     pub round: i64,
+    /// WP2A: the test action's own `attempt_number` at the moment this row
+    /// was written (captured before the command ran, never re-queried
+    /// afterward — see `core_loop::run_tests_for_round`). `None` only for
+    /// rows that predate this column (migration v11 backfill) — a `NULL`
+    /// here can never satisfy the completed gate's exact-match comparison,
+    /// so historical rows never again participate in a completion decision.
+    pub result_attempt: Option<i64>,
     /// `None` only for the `no_tests_applicable` status — every other
     /// status always carries the actual command that was run.
     pub test_command_redacted: Option<String>,
@@ -626,6 +644,9 @@ pub struct BuildEvidence {
     pub task_id: String,
     pub result_generation: i64,
     pub round: i64,
+    /// WP2A: the build action's own `attempt_number` at write time — same
+    /// semantics as [`TestEvidence::result_attempt`].
+    pub result_attempt: Option<i64>,
     /// `None` only for the `no_build_applicable` status — every other
     /// status always carries the actual command that was run.
     pub build_command_redacted: Option<String>,
@@ -713,6 +734,14 @@ pub struct NoTestsConfirmation {
     pub task_id: String,
     pub result_generation: i64,
     pub round: i64,
+    /// WP2A: the dev/fix action's `attempt_number` this confirmation was
+    /// written against. Part of the schema v11 unique key alongside
+    /// `(task_id, result_generation, round)` — relying on SQL's standard
+    /// "no two NULLs conflict" semantics so pre-v11 rows (`None`) never
+    /// block a new per-attempt confirmation, and a new attempt can never
+    /// reuse an older attempt's confirmation (lookups match this field
+    /// exactly).
+    pub result_attempt: Option<i64>,
     pub confirmed_by: String,
     pub reason: Option<String>,
     pub confirmed_at: String,
@@ -739,9 +768,83 @@ pub struct NoBuildConfirmation {
     pub task_id: String,
     pub result_generation: i64,
     pub round: i64,
+    /// WP2A: same semantics as [`NoTestsConfirmation::result_attempt`].
+    pub result_attempt: Option<i64>,
     pub confirmed_by: String,
     pub reason: Option<String>,
     pub confirmed_at: String,
+    pub created_at: String,
+}
+
+/// WP2A-0: one line-item split out of a task's `goal`/`in_scope`/
+/// `not_in_scope`/`done_criteria` free-text field at the moment the task
+/// left `Draft` (or, for a pre-existing task, via `generate_requirement_
+/// snapshot`). `(task_id, field, item_index)` is the stable identity —
+/// never renumbered, never edited, since the source fields themselves have
+/// no edit path anywhere in this codebase. This is the authoritative set
+/// the completed gate's `requirement_coverage` check compares a self-
+/// check's coverage list against.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfirmedRequirementItem {
+    pub id: String,
+    pub project_id: String,
+    pub task_id: String,
+    pub field: String,
+    pub item_index: i64,
+    pub item_text_redacted: String,
+    pub created_at: String,
+}
+
+/// WP2A: the developer AI's own structured self-assessment of one round's
+/// work, parsed from a fenced block it is required to append to
+/// `DEVELOPMENT_REPORT.md`/`FIX_REPORT.md`. Never a substitute for Nova's
+/// real test/build evidence or the user's acceptance — only one of several
+/// independent necessary conditions the completed gate checks. Rows are
+/// append-only (never updated/deleted); `(task_id, round, result_attempt)`
+/// plus `ORDER BY rowid DESC LIMIT 1` is how callers find the *current*
+/// one — a later row (e.g. a corrected re-parse) always supersedes an
+/// earlier one for the same key, which is why there is no `UNIQUE`
+/// constraint on this table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SelfCheck {
+    pub id: String,
+    pub project_id: String,
+    pub task_id: String,
+    pub round: i64,
+    /// The dev/fix action's `attempt_number` at the moment this self-check
+    /// was parsed — captured once, before the AI call, and threaded
+    /// through unchanged (see `core_loop::run_dev_and_test_round`), never
+    /// re-queried after the fact.
+    pub result_attempt: i64,
+    /// `"valid"` or `"invalid_format"` — the latter whenever the fenced
+    /// block is missing, empty, title-only, or fails to parse as the
+    /// expected structure. An invalid row still gets written (for audit)
+    /// but can never satisfy the completed gate.
+    pub parse_status: String,
+    /// Only meaningful when `parse_status == "valid"`. One of
+    /// `"self_reported_complete"` / `"self_reported_incomplete"` /
+    /// `"self_reported_blocked"`. The completed gate requires this to be
+    /// exactly `"self_reported_complete"` — `incomplete`/`blocked` block
+    /// completion regardless of whether the two item arrays below happen
+    /// to be empty.
+    pub self_reported_status: Option<String>,
+    /// JSON array of `{item, status, note}`, `item` being a
+    /// `"<field>:<item_index>"` string matching a
+    /// [`ConfirmedRequirementItem`] key. `None` when `parse_status ==
+    /// "invalid_format"`.
+    pub requirement_coverage_json: Option<String>,
+    /// JSON array of free-text strings — checks the developer AI claims to
+    /// have actually performed.
+    pub check_results_json: Option<String>,
+    /// JSON array of free-text strings, independent of
+    /// `self_reported_status` — the completed gate requires this to be an
+    /// empty array `[]`, never just absent.
+    pub unfinished_items_json: Option<String>,
+    /// Same shape/requirement as `unfinished_items_json`.
+    pub blocking_issues_json: Option<String>,
+    /// The raw fenced block text, redacted, kept for technical-detail
+    /// display regardless of `parse_status`.
+    pub raw_block_redacted: String,
     pub created_at: String,
 }
 

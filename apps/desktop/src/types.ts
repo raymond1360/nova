@@ -251,6 +251,7 @@ export interface TestEvidence {
 
 export interface TestEvidenceEntry extends TestEvidence {
   is_current_generation: boolean
+  is_current_attempt: boolean
 }
 
 export interface BuildEvidence {
@@ -270,6 +271,7 @@ export interface BuildEvidence {
 
 export interface BuildEvidenceEntry extends BuildEvidence {
   is_current_generation: boolean
+  is_current_attempt: boolean
 }
 
 export interface CommandEvidence {
@@ -333,6 +335,33 @@ export interface TaskEvidenceOverview {
   tests: TestEvidenceEntry[]
   builds: BuildEvidenceEntry[]
   acceptance_history: UserAcceptanceRecord[]
+}
+
+// --- WP2A: self-check contract + completion gate ---
+// Mirrors src-tauri/src/core_loop.rs::CompletionPrecheck and
+// src-tauri/src/models.rs::SelfCheck's serde output.
+
+export interface CompletionPrecheck {
+  ok: boolean
+  can_submit_acceptance: boolean
+  reason_code: string | null
+  message: string | null
+}
+
+export interface SelfCheck {
+  id: string
+  project_id: string
+  task_id: string
+  round: number
+  result_attempt: number
+  parse_status: 'valid' | 'invalid_format'
+  self_reported_status: 'self_reported_complete' | 'self_reported_incomplete' | 'self_reported_blocked' | null
+  requirement_coverage_json: string | null
+  check_results_json: string | null
+  unfinished_items_json: string | null
+  blocking_issues_json: string | null
+  raw_block_redacted: string
+  created_at: string
 }
 
 export interface TaskDocumentInfo {

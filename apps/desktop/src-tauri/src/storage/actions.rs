@@ -143,6 +143,21 @@ impl Database {
     /// `cancelled` — anything else is rejected before touching the
     /// database, since `planned`/`started`/`uncertain` are not valid
     /// finishing states.
+    /// WP2A: `expected_attempt` must be the `attempt_number` the caller
+    /// captured from `start_action`'s (or `plan_action`'s, for an
+    /// already-succeeded short-circuit) own return value *before* running
+    /// whatever command/AI call this action represents — never re-queried
+    /// afterward. The `UPDATE`'s `WHERE` clause folds this into the same
+    /// atomic compare-and-set `start_action` already uses: if this exact
+    /// attempt is no longer the row's current one (a crash-recovery/retry
+    /// bumped it in the meantime), `rows_affected` is `0` and this call
+    /// fails closed with [`NovaError::StaleActionAttempt`] — it never reads
+    /// the current row and reports it as if this call had finished it.
+    /// Distinguished from the two other `rows_affected == 0` causes (row
+    /// missing entirely, or not currently `started` for an unrelated
+    /// reason) purely for a clearer error message; the decision itself was
+    /// already made atomically by the `UPDATE` above, this follow-up read
+    /// is diagnostic only.
     pub fn finish_action(
         &self,
         task_id: &str,
@@ -150,6 +165,7 @@ impl Database {
         status: ActionStatus,
         evidence_ref: Option<&str>,
         error_summary: Option<&str>,
+        expected_attempt: i64,
     ) -> NovaResult<TaskAction> {
         if !matches!(
             status,
@@ -164,14 +180,23 @@ impl Database {
         let rows_affected = self.conn().execute(
             "UPDATE task_actions
              SET status = ?1, finished_at = ?2, evidence_ref = ?3, error_summary = ?4, updated_at = ?2
-             WHERE task_id = ?5 AND idempotency_key = ?6 AND status = 'started'",
-            params![status.as_str(), now, evidence_ref, error_summary, task_id, idempotency_key],
+             WHERE task_id = ?5 AND idempotency_key = ?6 AND status = 'started' AND attempt_number = ?7",
+            params![status.as_str(), now, evidence_ref, error_summary, task_id, idempotency_key, expected_attempt],
         )?;
 
         if rows_affected == 0 {
             return Err(match self.find_action(task_id, idempotency_key)? {
                 None => NovaError::Config("动作记录不存在".to_string()),
-                Some(_) => NovaError::Config("只有处于 started 状态的动作才能被结束".to_string()),
+                Some(action) if action.attempt_number != expected_attempt => NovaError::StaleActionAttempt(format!(
+                    "action {idempotency_key} 的 attempt {} 已替代 {expected_attempt}", action.attempt_number
+                )),
+                Some(action) if action.status != ActionStatus::Started => {
+                    NovaError::Config("只有处于 started 状态的动作才能被结束".to_string())
+                }
+                Some(action) => NovaError::StaleActionAttempt(format!(
+                    "action {idempotency_key} 的当前 attempt（{}）已不是预期的 {expected_attempt}，视为陈旧完成，已拒绝写入",
+                    action.attempt_number
+                )),
             });
         }
 
@@ -397,13 +422,14 @@ mod tests {
         let dir = temp_dir("no-double-success");
         let (db, task_id) = db_with_task(&dir);
         db.plan_action(&task_id, "git_commit", "key-1").unwrap();
-        db.start_action(&task_id, "key-1", false).unwrap();
+        let started = db.start_action(&task_id, "key-1", false).unwrap();
         db.finish_action(
             &task_id,
             "key-1",
             ActionStatus::Succeeded,
             Some("sha:abc"),
             None,
+            started.attempt_number,
         )
         .unwrap();
 
@@ -460,9 +486,16 @@ mod tests {
         let dir = temp_dir("read-only-retry");
         let (db, task_id) = db_with_task(&dir);
         db.plan_action(&task_id, "list_files", "key-1").unwrap();
-        db.start_action(&task_id, "key-1", true).unwrap();
-        db.finish_action(&task_id, "key-1", ActionStatus::Succeeded, None, None)
-            .unwrap();
+        let started = db.start_action(&task_id, "key-1", true).unwrap();
+        db.finish_action(
+            &task_id,
+            "key-1",
+            ActionStatus::Succeeded,
+            None,
+            None,
+            started.attempt_number,
+        )
+        .unwrap();
 
         let retried = db.start_action(&task_id, "key-1", true).unwrap();
         assert_eq!(retried.status, ActionStatus::Started);
@@ -510,8 +543,15 @@ mod tests {
         let dir = temp_dir("finish-rejects-non-terminal");
         let (db, task_id) = db_with_task(&dir);
         db.plan_action(&task_id, "write_file", "key-1").unwrap();
-        db.start_action(&task_id, "key-1", false).unwrap();
-        let result = db.finish_action(&task_id, "key-1", ActionStatus::Started, None, None);
+        let started = db.start_action(&task_id, "key-1", false).unwrap();
+        let result = db.finish_action(
+            &task_id,
+            "key-1",
+            ActionStatus::Started,
+            None,
+            None,
+            started.attempt_number,
+        );
         assert!(result.is_err());
         let _ = fs::remove_dir_all(&dir);
     }

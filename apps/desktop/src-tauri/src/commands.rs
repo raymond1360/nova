@@ -1277,6 +1277,43 @@ pub fn get_task_evidence_overview(
     })
 }
 
+/// WP2A: a read-only precheck for whether `accept_task_result(true, ...)`
+/// would currently succeed — see `core_loop::completion_precheck`. Never
+/// writes anything; purely lets the UI explain a disabled/likely-to-fail
+/// "标记完成" action ahead of time.
+#[tauri::command]
+pub fn get_completion_precheck(
+    project_id: String,
+    task_id: String,
+    state: State<'_, AppState>,
+) -> Result<crate::core_loop::CompletionPrecheck, String> {
+    with_db(&state, |db| {
+        crate::core_loop::completion_precheck(db, &project_id, &task_id)
+    })
+}
+
+#[tauri::command]
+pub fn generate_requirement_snapshot(
+    project_id: String,
+    task_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::models::ConfirmedRequirementItem>, String> {
+    with_db(&state, |db| db.generate_requirement_snapshot(&project_id, &task_id))
+}
+
+/// WP2A: every self-check ever recorded for a task, oldest first — audit/
+/// technical-detail display only, see `core_loop::list_self_checks`.
+#[tauri::command]
+pub fn list_task_self_checks(
+    project_id: String,
+    task_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::models::SelfCheck>, String> {
+    with_db(&state, |db| {
+        crate::core_loop::list_self_checks(db, &project_id, &task_id)
+    })
+}
+
 /// Phase 4 (evidence and document gate): lists the seven result documents'
 /// display metadata (never their content) for a task.
 #[tauri::command]

@@ -142,3 +142,27 @@ describe('CoreLoopView.vue single-AI copy', () => {
     expect(documentSection).not.toBeNull()
   })
 })
+
+
+describe('WP2A remediation user entry points', () => {
+  it('shows the original four requirement fields before the explicit snapshot action', () => {
+    for (const field of ['goal', 'in_scope', 'not_in_scope', 'done_criteria']) expect(source).toContain(`store.currentTask.${field}`)
+    expect(source).toContain('确认沿用，生成需求清单')
+    expect(source).toContain('@click="store.generateRequirementSnapshot"')
+  })
+  it('keeps result viewing and rejection available but gates acceptance on submission precheck', () => {
+    expect(source).toContain(':disabled="!store.completionPrecheck?.can_submit_acceptance"')
+    expect(source).toContain('store.acceptResult(false, acceptNote)')
+    expect(source).toContain('handleViewDocument')
+    expect(source).toContain('当前结果尚不满足提交验收条件')
+  })
+  it('makes an explicitly resumed queued task startable without an automatic AI call', () => {
+    expect(source).toContain("['confirmed', 'queued'].includes(store.currentTask.state)")
+    expect(source).toContain('store.noBuildConfirmationNeeded')
+    expect(source).toContain('handleConfirmNoBuild')
+  })
+  it('only labels evidence with both generation and dev-attempt match as current', () => {
+    expect(source).toContain('t.is_current_generation && t.is_current_attempt')
+    expect(source).toContain('b.is_current_generation && b.is_current_attempt')
+  })
+})

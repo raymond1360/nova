@@ -28,8 +28,11 @@
 pub(crate) mod documents;
 pub(crate) mod evidence_overview;
 mod review_isolation;
+pub(crate) mod self_check_parser;
 pub(crate) mod task_documents;
 pub(crate) mod test_runner;
+#[cfg(test)]
+mod wp2a_remediation_tests;
 
 #[cfg(test)]
 use std::fs;
@@ -40,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::db::Database;
 use crate::error::{NovaError, NovaResult};
-use crate::models::{ActionStatus, Actor, Task, TaskState};
+use crate::models::{ActionStatus, Actor, Task, TaskAction, TaskState};
 use crate::runtime::ai_adapter::{
     self, DevReviewAdapter, DevelopmentRequest, ReviewRequest, ReviewVerdict,
 };
@@ -73,6 +76,10 @@ enum RoundOutcome {
     /// transitioned to `failed` or `cancelled` directly (see
     /// [`was_cancelled`]); the caller must take no further action.
     Stopped,
+    /// WP2A: this round's own execution attempt was superseded before it
+    /// could finish — see [`DevTestOutcome::Stale`]. No state transition,
+    /// no evidence write.
+    Stale,
 }
 
 pub struct CoreLoopOutcome {
@@ -224,7 +231,9 @@ pub fn run_core_loop(
                     None,
                 )?;
             }
-            SingleAiRoundOutcome::ActionUncertain | SingleAiRoundOutcome::Stopped => {}
+            SingleAiRoundOutcome::ActionUncertain
+            | SingleAiRoundOutcome::Stopped
+            | SingleAiRoundOutcome::Stale => {}
         }
         documents::generate_result_documents(db, &project.id, task_id, app_data_dir)?;
         return Ok(CoreLoopOutcome {
@@ -281,10 +290,14 @@ pub fn run_core_loop(
                         None,
                     )?;
                 }
-                SingleAiRoundOutcome::ActionUncertain | SingleAiRoundOutcome::Stopped => {}
+                SingleAiRoundOutcome::ActionUncertain
+            | SingleAiRoundOutcome::Stopped
+            | SingleAiRoundOutcome::Stale => {}
             }
         }
-        SingleAiRoundOutcome::ActionUncertain | SingleAiRoundOutcome::Stopped => {}
+        SingleAiRoundOutcome::ActionUncertain
+            | SingleAiRoundOutcome::Stopped
+            | SingleAiRoundOutcome::Stale => {}
     }
 
     documents::generate_result_documents(db, &project.id, task_id, app_data_dir)?;
@@ -457,11 +470,11 @@ pub(crate) fn run_core_loop_dual_ai_v0_2(
                     )?;
                 }
                 RoundOutcome::IntegrityViolation => mark_integrity_violation(db, task_id)?,
-                RoundOutcome::ActionUncertain | RoundOutcome::Stopped => {}
+                RoundOutcome::ActionUncertain | RoundOutcome::Stopped | RoundOutcome::Stale => {}
             }
         }
         RoundOutcome::IntegrityViolation => mark_integrity_violation(db, task_id)?,
-        RoundOutcome::ActionUncertain | RoundOutcome::Stopped => {}
+        RoundOutcome::ActionUncertain | RoundOutcome::Stopped | RoundOutcome::Stale => {}
     }
 
     documents::generate_result_documents(db, &project.id, task_id, app_data_dir)?;
@@ -576,6 +589,9 @@ pub fn accept_task_result(
             "task_id 与 project_id 不匹配，已拒绝".to_string(),
         ));
     }
+    if crate::storage::tasks::is_legacy_frozen(&task) {
+        return Err(NovaError::Config(crate::storage::tasks::CompletionRejectReason::LegacyTaskFrozen.message().into()));
+    }
     let target_state = if accepted {
         TaskState::Completed
     } else {
@@ -624,6 +640,72 @@ pub fn task_evidence_overview(
     task_id: &str,
 ) -> NovaResult<evidence_overview::TaskEvidenceOverview> {
     evidence_overview::build_task_evidence_overview(db, project_id, task_id)
+}
+
+/// Read-only predictions: `ok` is direct completion (existing acceptance
+/// required); `can_submit_acceptance` predicts the explicit accept operation
+/// that will record the user's decision first. Reasons describe submission
+/// blockers, so a missing first-time acceptance is not a false warning.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompletionPrecheck {
+    pub ok: bool,
+    pub can_submit_acceptance: bool,
+    pub reason_code: Option<String>,
+    pub message: Option<String>,
+}
+
+/// WP2A: a read-only precheck for the `completed` gate — lets the UI
+/// explain why "标记完成" would currently be refused (or confirm it would
+/// not be) without attempting the real transition. Mirrors exactly what
+/// `Database::transition_task` itself re-checks, inside its own
+/// transaction, immediately before a real `to == Completed` attempt — this
+/// call never writes anything, so the UI may call it as often as it likes
+/// (e.g. every time it renders the acceptance panel).
+pub fn completion_precheck(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+) -> NovaResult<CompletionPrecheck> {
+    let task = db.task(task_id)?;
+    if task.project_id != project_id {
+        return Err(NovaError::Config(
+            "task_id 与 project_id 不匹配，已拒绝".to_string(),
+        ));
+    }
+    let direct_ok = db.evaluate_completion_gate(&task)?.is_ok();
+    match db.evaluate_acceptance_submission(&task)? {
+        Ok(()) => Ok(CompletionPrecheck {
+            ok: direct_ok,
+            can_submit_acceptance: true,
+            reason_code: None,
+            message: None,
+        }),
+        Err(reason) => Ok(CompletionPrecheck {
+            ok: false,
+            can_submit_acceptance: false,
+            reason_code: Some(reason.code().to_string()),
+            message: Some(reason.message().to_string()),
+        }),
+    }
+}
+
+/// WP2A: every self-check ever recorded for a task, oldest first — audit/
+/// technical-detail display only (see
+/// `Database::list_self_checks_for_task`'s own doc comment for why this
+/// must never drive a gate decision; the gate itself always re-derives the
+/// *current* one via `Database::current_self_check`).
+pub fn list_self_checks(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+) -> NovaResult<Vec<crate::models::SelfCheck>> {
+    let task = db.task(task_id)?;
+    if task.project_id != project_id {
+        return Err(NovaError::Config(
+            "task_id 与 project_id 不匹配，已拒绝".to_string(),
+        ));
+    }
+    db.list_self_checks_for_task(task_id)
 }
 
 /// Phase 4 (evidence and document gate): the safe, allowlisted listing of a
@@ -729,6 +811,18 @@ pub fn unblock_test_execution_for_retry(
     project_id: &str,
     task_id: &str,
 ) -> NovaResult<Task> {
+    // WP2A: a legacy-frozen task may never resume execution, including via
+    // this retry/unblock path. Checked before `reset_failed_action_for_retry`
+    // so a frozen task's stalled test/build action is never reset back to
+    // `planned` — that reset is what would let it actually run again.
+    let task = db.task(task_id)?;
+    if crate::storage::tasks::is_legacy_frozen(&task) {
+        return Err(NovaError::Config(
+            crate::storage::tasks::CompletionRejectReason::LegacyTaskFrozen
+                .message()
+                .to_string(),
+        ));
+    }
     let round = current_pending_round(db, project_id, task_id)?;
     let result_generation = db.task(task_id)?.result_generation;
     let test_key = test_action_key(task_id, result_generation, round);
@@ -821,6 +915,18 @@ pub fn confirm_no_build_applicable(
     task_id: &str,
     reason: Option<&str>,
 ) -> NovaResult<crate::models::NoBuildConfirmation> {
+    // WP2A (B4): checked before this call does *anything* else — before
+    // any confirmation write, any action reset, any transition — so a
+    // legacy-frozen task's audit trail is never touched by this command at
+    // all, not just blocked at the final `transition_task` step.
+    let task = db.task(task_id)?;
+    if task.project_id == project_id && crate::storage::tasks::is_legacy_frozen(&task) {
+        return Err(NovaError::Config(
+            crate::storage::tasks::CompletionRejectReason::LegacyTaskFrozen
+                .message()
+                .to_string(),
+        ));
+    }
     reconcile_no_build_confirmation(db, project_id, task_id, reason)
 }
 
@@ -947,6 +1053,26 @@ fn reconcile_no_build_confirmation(
     Err(last_err)
 }
 
+/// WP2A: a no-tests/no-build confirmation's `result_attempt` binds to the
+/// *dev round's* attempt — the same `dev_result_attempt` value
+/// `run_tests_for_round`/`run_build_for_round` thread through for the
+/// entire round (captured once from the dev action, never re-derived) —
+/// never to the test/build action's own `attempt_number`. This matters
+/// because [`Database::reset_failed_action_for_retry`] bumps the test/build
+/// action's own `attempt_number` every time a confirmation unblocks it,
+/// but the dev action is never reset in that process; binding to the dev
+/// attempt instead is what makes a confirmation keep matching across any
+/// number of test/build-only retries within the same round, and is also
+/// the exact value `run_tests_for_round`/`run_build_for_round` themselves
+/// query by. Returns `None` if no dev action exists yet for this round
+/// (should not happen once a test/build action exists for it, since dev
+/// always runs first — kept as a defensive `Option` rather than an
+/// assumption).
+fn dev_attempt_for_round(db: &Database, task_id: &str, round: i64) -> NovaResult<Option<i64>> {
+    let dev_key = format!("dev-{task_id}-round-{round}");
+    Ok(db.find_action(task_id, &dev_key)?.map(|a| a.attempt_number))
+}
+
 /// v0.1.0 scope correction (Work Package 2 remediation): the sole signal
 /// [`reconcile_no_build_confirmation`] trusts before retrying a failed
 /// attempt — re-reads the task fresh (never trusting anything read by the
@@ -977,8 +1103,11 @@ fn no_build_confirmation_likely_converging(
     }
     let result_generation = task.result_generation;
     let round = current_pending_round(db, project_id, task_id)?;
+    let Some(attempt) = dev_attempt_for_round(db, task_id, round)? else {
+        return Ok(false);
+    };
     Ok(db
-        .find_no_build_confirmation(project_id, task_id, result_generation, round)?
+        .find_no_build_confirmation(project_id, task_id, result_generation, round, attempt)?
         .is_some())
 }
 
@@ -1002,54 +1131,73 @@ fn reconcile_no_build_confirmation_attempt(
     let result_generation = task.result_generation;
     let round = current_pending_round(db, project_id, task_id)?;
     let build_key = build_action_key(task_id, result_generation, round);
+    let action = db.find_action(task_id, &build_key)?;
+    // WP2A: the confirmation binds to the *dev round's* attempt, never the
+    // build action's own `attempt_number` — see `dev_attempt_for_round`'s
+    // doc comment. Using the build action's own attempt here was the bug:
+    // `reset_failed_action_for_retry` below bumps it every time this exact
+    // function unblocks the build action, so a confirmation written
+    // against it could never be found again by a later idempotent call
+    // (which would see the already-bumped attempt) or by `run_build_for_
+    // round`'s own lookup (which queries by `dev_result_attempt`, not the
+    // build action's attempt).
+    let dev_attempt = dev_attempt_for_round(db, task_id, round)?;
 
-    let confirmation =
-        match db.find_no_build_confirmation(project_id, task_id, result_generation, round)? {
-            Some(existing) => existing,
-            None => {
-                // Case A (first genuine request): the full gate — never
-                // skipped, never weakened, identical to the third re-review's
-                // implementation — must hold before a confirmation is ever
-                // written for the first time.
-                if task.state != TaskState::NeedsUserAction {
-                    return Err(NovaError::Config(format!(
-                        "只有任务处于 needs_user_action 状态时才能确认无需构建，当前状态：{}",
-                        task.state
-                    )));
-                }
-                let action = db.find_action(task_id, &build_key)?.ok_or_else(|| {
-                    NovaError::Config("当前不存在待确认的构建检测停滞，拒绝记录确认".to_string())
-                })?;
-                if action.status != ActionStatus::Failed
-                    || action.error_summary.as_deref()
-                        != Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER)
-                {
-                    return Err(NovaError::Config(
-                        "当前卡点不是构建检测无法判断，拒绝记录无需构建确认".to_string(),
-                    ));
-                }
-                let evidence_ok = db
-                    .list_build_evidence_for_round(project_id, task_id, result_generation, round)?
-                    .iter()
-                    .any(|e| e.status == "insufficient_evidence");
-                if !evidence_ok {
-                    return Err(NovaError::Config(
-                        "找不到匹配的构建证据不足记录，拒绝记录无需构建确认".to_string(),
-                    ));
-                }
-                let effective_reason = match reason.map(str::trim) {
-                    Some(text) if !text.is_empty() => cap_text(text, MAX_NO_BUILD_REASON_LEN),
-                    _ => "用户确认该项目当前无需构建（未提供具体原因）".to_string(),
-                };
-                db.record_no_build_confirmation(
-                    project_id,
-                    task_id,
-                    result_generation,
-                    round,
-                    Some(&effective_reason),
-                )?
+    let confirmation = match dev_attempt
+        .and_then(|attempt| {
+            db.find_no_build_confirmation(project_id, task_id, result_generation, round, attempt)
+                .ok()
+                .flatten()
+        }) {
+        Some(existing) => existing,
+        None => {
+            // Case A (first genuine request): the full gate — never
+            // skipped, never weakened, identical to the third re-review's
+            // implementation — must hold before a confirmation is ever
+            // written for the first time.
+            if task.state != TaskState::NeedsUserAction {
+                return Err(NovaError::Config(format!(
+                    "只有任务处于 needs_user_action 状态时才能确认无需构建，当前状态：{}",
+                    task.state
+                )));
             }
-        };
+            let action = action.ok_or_else(|| {
+                NovaError::Config("当前不存在待确认的构建检测停滞，拒绝记录确认".to_string())
+            })?;
+            if action.status != ActionStatus::Failed
+                || action.error_summary.as_deref()
+                    != Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER)
+            {
+                return Err(NovaError::Config(
+                    "当前卡点不是构建检测无法判断，拒绝记录无需构建确认".to_string(),
+                ));
+            }
+            let evidence_ok = db
+                .list_build_evidence_for_round(project_id, task_id, result_generation, round)?
+                .iter()
+                .any(|e| e.status == "insufficient_evidence");
+            if !evidence_ok {
+                return Err(NovaError::Config(
+                    "找不到匹配的构建证据不足记录，拒绝记录无需构建确认".to_string(),
+                ));
+            }
+            let dev_attempt = dev_attempt.ok_or_else(|| {
+                NovaError::Config("当前任务缺少开发执行记录，拒绝记录无需构建确认".to_string())
+            })?;
+            let effective_reason = match reason.map(str::trim) {
+                Some(text) if !text.is_empty() => cap_text(text, MAX_NO_BUILD_REASON_LEN),
+                _ => "用户确认该项目当前无需构建（未提供具体原因）".to_string(),
+            };
+            db.record_no_build_confirmation(
+                project_id,
+                task_id,
+                result_generation,
+                round,
+                dev_attempt,
+                Some(&effective_reason),
+            )?
+        }
+    };
 
     // From here on, whether this call just wrote the confirmation (case A)
     // or found one already sitting there (cases B–F), the rest is the
@@ -1160,16 +1308,18 @@ pub fn no_build_confirmation_needed(
         Some(action) => action,
         None => return Ok(false),
     };
-    if action.status != ActionStatus::Failed
-        || action.error_summary.as_deref() != Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER)
-    {
-        return Ok(false);
+    let Some(dev_attempt) = dev_attempt_for_round(db, task_id, round)? else { return Ok(false); };
+    let evidence = db.list_build_evidence_for_round(project_id, task_id, result_generation, round)?;
+    // A genuine detection stall cannot carry contradictory outcomes for this result.
+    let relevant: Vec<_> = evidence.iter().filter(|e| e.result_attempt == Some(dev_attempt)).collect();
+    let evidence_ok = !relevant.is_empty() && relevant.iter().all(|e| e.status == "insufficient_evidence");
+    match action.status {
+        ActionStatus::Failed => Ok(evidence_ok && action.error_summary.as_deref() == Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER)),
+        ActionStatus::Planned => Ok(evidence_ok && db.find_no_build_confirmation(
+            project_id, task_id, result_generation, round, dev_attempt,
+        )?.is_some()),
+        _ => Ok(false),
     }
-    let evidence_ok = db
-        .list_build_evidence_for_round(project_id, task_id, result_generation, round)?
-        .iter()
-        .any(|e| e.status == "insufficient_evidence");
-    Ok(evidence_ok)
 }
 
 /// Maximum length (in bytes) Nova will store for a no-tests confirmation's
@@ -1207,6 +1357,15 @@ pub fn confirm_no_tests_applicable(
     task_id: &str,
     reason: Option<&str>,
 ) -> NovaResult<crate::models::NoTestsConfirmation> {
+    // WP2A (B4): see `confirm_no_build_applicable`'s identical guard.
+    let task = db.task(task_id)?;
+    if task.project_id == project_id && crate::storage::tasks::is_legacy_frozen(&task) {
+        return Err(NovaError::Config(
+            crate::storage::tasks::CompletionRejectReason::LegacyTaskFrozen
+                .message()
+                .to_string(),
+        ));
+    }
     reconcile_no_tests_confirmation(db, project_id, task_id, reason)
 }
 
@@ -1275,8 +1434,11 @@ fn no_tests_confirmation_likely_converging(
     }
     let result_generation = task.result_generation;
     let round = current_pending_round(db, project_id, task_id)?;
+    let Some(attempt) = dev_attempt_for_round(db, task_id, round)? else {
+        return Ok(false);
+    };
     Ok(db
-        .find_no_tests_confirmation(project_id, task_id, result_generation, round)?
+        .find_no_tests_confirmation(project_id, task_id, result_generation, round, attempt)?
         .is_some())
 }
 
@@ -1305,13 +1467,18 @@ fn reconcile_no_tests_confirmation_attempt(
     let result_generation = task.result_generation;
     let round = current_pending_round(db, project_id, task_id)?;
     let test_key = test_action_key(task_id, result_generation, round);
+    let action = db.find_action(task_id, &test_key)?;
+    // WP2A: the confirmation binds to the *dev round's* attempt, never the
+    // test action's own `attempt_number` — see `dev_attempt_for_round`'s
+    // doc comment and `reconcile_no_build_confirmation_attempt`'s
+    // identical fix for why.
+    let dev_attempt = dev_attempt_for_round(db, task_id, round)?;
 
-    let confirmation = match db.find_no_tests_confirmation(
-        project_id,
-        task_id,
-        result_generation,
-        round,
-    )? {
+    let confirmation = match dev_attempt.and_then(|attempt| {
+        db.find_no_tests_confirmation(project_id, task_id, result_generation, round, attempt)
+            .ok()
+            .flatten()
+    }) {
         Some(existing) => existing,
         None => {
             // Case A (first genuine request): the full gate — must hold
@@ -1322,7 +1489,7 @@ fn reconcile_no_tests_confirmation_attempt(
                     task.state
                 )));
             }
-            let action = db.find_action(task_id, &test_key)?.ok_or_else(|| {
+            let action = action.ok_or_else(|| {
                 NovaError::Config("当前不存在待确认的无测试停滞，拒绝记录确认".to_string())
             })?;
             if action.status != ActionStatus::Failed
@@ -1347,6 +1514,9 @@ fn reconcile_no_tests_confirmation_attempt(
                         "已存在该 generation/round 的测试证据，当前卡点并非无可用测试命令，拒绝记录无需测试确认".to_string(),
                     ));
             }
+            let dev_attempt = dev_attempt.ok_or_else(|| {
+                NovaError::Config("当前任务缺少开发执行记录，拒绝记录无需测试确认".to_string())
+            })?;
             let effective_reason = match reason.map(str::trim) {
                 Some(text) if !text.is_empty() => cap_text(text, MAX_NO_TESTS_REASON_LEN),
                 _ => "用户确认该项目当前没有适用测试（未提供具体原因）".to_string(),
@@ -1356,6 +1526,7 @@ fn reconcile_no_tests_confirmation_attempt(
                 task_id,
                 result_generation,
                 round,
+                dev_attempt,
                 Some(&effective_reason),
             )?
         }
@@ -1501,8 +1672,20 @@ pub fn no_tests_confirmation_needed(
             if !evidence_empty {
                 return Ok(false);
             }
+            // WP2A: the confirmation binds to the dev round's attempt, not
+            // this (already-reset, already-bumped) test action's own —
+            // see `dev_attempt_for_round`'s doc comment.
+            let Some(dev_attempt) = dev_attempt_for_round(db, task_id, round)? else {
+                return Ok(false);
+            };
             Ok(db
-                .find_no_tests_confirmation(project_id, task_id, result_generation, round)?
+                .find_no_tests_confirmation(
+                    project_id,
+                    task_id,
+                    result_generation,
+                    round,
+                    dev_attempt,
+                )?
                 .is_some())
         }
         _ => Ok(false),
@@ -1527,6 +1710,14 @@ enum DevTestOutcome {
     NeedsFix(String),
     ActionUncertain,
     Stopped,
+    /// WP2A: this call's own development attempt was superseded by a later
+    /// attempt before it could finish (CAS mismatch in `finish_action`) —
+    /// a crash-recovery/retry race, not a real failure. The caller must not
+    /// transition the task, write any self-check/test/build evidence, or
+    /// treat this attempt's AI output as the current result in any way;
+    /// whichever attempt actually holds the action's current state drives
+    /// the task forward instead.
+    Stale,
 }
 
 /// The developer-AI-plus-Nova's-own-verification portion of one round:
@@ -1551,7 +1742,7 @@ fn run_dev_and_test_round(
     app_data_dir: &Path,
 ) -> NovaResult<DevTestOutcome> {
     let dev_key = format!("dev-{task_id}-round-{round}");
-    match gate_action(db, task_id, "ai_development", &dev_key, false)? {
+    let result_attempt: i64 = match gate_action(db, task_id, "ai_development", &dev_key, false)? {
         ActionGate::Uncertain => {
             db.transition_task(
                 task_id,
@@ -1564,14 +1755,22 @@ fn run_dev_and_test_round(
             )?;
             return Ok(DevTestOutcome::ActionUncertain);
         }
-        ActionGate::AlreadySucceeded => {
+        ActionGate::AlreadySucceeded(action) => {
             // A prior attempt already completed this exact round's
             // development step (crash-recovery resume after the dev run
             // committed but before the review step finished) — proceed
             // straight to evidence collection/review without re-invoking
-            // the developer AI a second time for the same round.
+            // the developer AI a second time for the same round. Its
+            // attempt number is captured here, from this already-settled
+            // row, exactly as a freshly-`Started` attempt captures its own
+            // below — never re-queried later.
+            action.attempt_number
         }
-        ActionGate::Started => {
+        ActionGate::Started(action) => {
+            // WP2A (M1): captured *before* invoking the AI — this is what
+            // "bound at dispatch time, not re-queried after the fact"
+            // means in practice.
+            let captured_attempt = action.attempt_number;
             let package_path =
                 write_task_package(db, task_id, project_id, round, prior_findings, app_data_dir)?;
             let dev_request = DevelopmentRequest {
@@ -1583,7 +1782,26 @@ fn run_dev_and_test_round(
             let result = adapter.run_development(&dev_request, cancel.clone());
             record_command_evidence(db, project_id, task_id, &result, "ai_development")?;
             let succeeded = matches!(result.outcome, ExecutionOutcome::Success);
-            finish_gated_action(db, task_id, &dev_key, succeeded, &result)?;
+            let finished = match finish_gated_action(
+                db,
+                task_id,
+                &dev_key,
+                succeeded,
+                &result,
+                captured_attempt,
+            ) {
+                Ok(action) => action,
+                Err(NovaError::StaleActionAttempt(_)) => {
+                    // WP2A (M1): a later attempt already superseded this
+                    // one between dispatch and completion — this attempt's
+                    // output (even if the process itself "succeeded") must
+                    // never be written as self-check/test/build evidence,
+                    // never transition the task, and never be treated as
+                    // the current result in any way.
+                    return Ok(DevTestOutcome::Stale);
+                }
+                Err(other) => return Err(other),
+            };
             if !succeeded {
                 // Major 4: a user cancellation must be recorded distinctly
                 // from an ordinary process failure — never folded into the
@@ -1612,8 +1830,15 @@ fn run_dev_and_test_round(
                 }
                 return Ok(DevTestOutcome::Stopped);
             }
+            // WP2A: parse and persist this round's self-check from the
+            // developer AI's own captured output, using the same
+            // `result_attempt` captured above — written once, right here,
+            // for this attempt; never re-derived later. Only ever reached
+            // after a genuinely new (not `AlreadySucceeded`) dev run.
+            write_self_check_for_round(db, project_id, task_id, round, finished.attempt_number, &result.stdout)?;
+            finished.attempt_number
         }
-    }
+    };
 
     // Same reasoning as the review round's audit calls below: Nova's own
     // evidence-collection git commands must not be tied to the AI-process
@@ -1649,7 +1874,7 @@ fn run_dev_and_test_round(
     // means this round goes straight to `NeedsFix` — the reviewer is never
     // even asked, so its verdict can never "approve past" a real failure.
     let test_summary =
-        match run_tests_for_round(db, project_id, task_id, project_dir, round, cancel)? {
+        match run_tests_for_round(db, project_id, task_id, project_dir, round, result_attempt, cancel)? {
             TestRoundOutcome::Passed(summary) => summary,
             TestRoundOutcome::NoTestsApplicable(summary) => summary,
             TestRoundOutcome::Failed(findings) => return Ok(DevTestOutcome::NeedsFix(findings)),
@@ -1658,6 +1883,7 @@ fn run_dev_and_test_round(
             }
             TestRoundOutcome::ActionUncertain => return Ok(DevTestOutcome::ActionUncertain),
             TestRoundOutcome::Cancelled => return Ok(DevTestOutcome::Stopped),
+            TestRoundOutcome::Stale => return Ok(DevTestOutcome::Stale),
         };
 
     // Codex re-review remediation (Major 3): tests passing is not enough —
@@ -1666,14 +1892,70 @@ fn run_dev_and_test_round(
     // verified. Never runs when the test step above already failed/stalled
     // (those branches already returned), so a build is only ever attempted
     // against a round whose tests are already known-good.
-    match run_build_for_round(db, project_id, task_id, project_dir, round, cancel)? {
+    match run_build_for_round(db, project_id, task_id, project_dir, round, result_attempt, cancel)? {
         BuildRoundOutcome::Passed(_) | BuildRoundOutcome::NoBuildApplicable(_) => {}
         BuildRoundOutcome::Failed(findings) => return Ok(DevTestOutcome::NeedsFix(findings)),
         BuildRoundOutcome::ActionUncertain => return Ok(DevTestOutcome::ActionUncertain),
         BuildRoundOutcome::Cancelled => return Ok(DevTestOutcome::Stopped),
+        BuildRoundOutcome::Stale => return Ok(DevTestOutcome::Stale),
     }
 
     Ok(DevTestOutcome::Verified(test_summary))
+}
+
+/// WP2A: parses and persists one round's self-check (see
+/// `self_check_parser::parse_self_check`) from the developer AI's own
+/// captured stdout, tagged with the `result_attempt` the caller captured
+/// *before* invoking the AI. Called exactly once per genuinely-new dev/fix
+/// execution (never for an `ActionGate::AlreadySucceeded` resume, since
+/// there is no AI output available to parse in that case — see the design
+/// docs' acknowledged gap for the narrow crash window this leaves
+/// unresolved, deliberately not patched by inventing a fallback AI call).
+fn write_self_check_for_round(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    round: i64,
+    result_attempt: i64,
+    raw_output: &str,
+) -> NovaResult<()> {
+    use self_check_parser::ParsedSelfCheck;
+    let (parse_status, self_reported_status, requirement_coverage_json, check_results_json, unfinished_items_json, blocking_issues_json, raw_block_redacted) =
+        match self_check_parser::parse_self_check(raw_output) {
+            ParsedSelfCheck::Valid {
+                self_reported_status,
+                requirement_coverage_json,
+                check_results_json,
+                unfinished_items_json,
+                blocking_issues_json,
+                raw_block_redacted,
+            } => (
+                "valid",
+                Some(self_reported_status),
+                Some(requirement_coverage_json),
+                Some(check_results_json),
+                Some(unfinished_items_json),
+                Some(blocking_issues_json),
+                raw_block_redacted,
+            ),
+            ParsedSelfCheck::Invalid { raw_block_redacted } => {
+                ("invalid_format", None, None, None, None, None, raw_block_redacted)
+            }
+        };
+    db.record_self_check(&crate::storage::self_check::RecordSelfCheckRequest {
+        project_id,
+        task_id,
+        round,
+        result_attempt,
+        parse_status,
+        self_reported_status: self_reported_status.as_deref(),
+        requirement_coverage_json: requirement_coverage_json.as_deref(),
+        check_results_json: check_results_json.as_deref(),
+        unfinished_items_json: unfinished_items_json.as_deref(),
+        blocking_issues_json: blocking_issues_json.as_deref(),
+        raw_block_redacted: &raw_block_redacted,
+    })?;
+    Ok(())
 }
 
 /// The reviewer-round continuation of one dormant v0.2.0 dual-AI round —
@@ -1708,8 +1990,17 @@ fn run_review_round(
             )?;
             return Ok(RoundOutcome::ActionUncertain);
         }
-        ActionGate::AlreadySucceeded | ActionGate::Started => {}
+        ActionGate::AlreadySucceeded(_) | ActionGate::Started(_) => {}
     }
+    // Dormant v0.2.0 path: not subject to WP2A's result_attempt binding
+    // (that applies to the single-AI v0.1.0 production path's dev/test/
+    // build actions only) — a fixed placeholder is used below purely to
+    // satisfy `finish_action`'s CAS parameter, since this whole function
+    // is unreachable from any registered Tauri command.
+    let review_action_attempt = match db.find_action(task_id, &review_key) {
+        Ok(Some(action)) => action.attempt_number,
+        _ => 1,
+    };
 
     // Nova's own act of writing the review package must never itself be
     // mistaken for a reviewer write — the before/after snapshot brackets
@@ -1737,13 +2028,14 @@ fn run_review_round(
             Ok(workspace) => workspace,
             Err(error) => {
                 let error_summary = redact_sensitive_text(&error.to_string());
-                db.finish_action(
+                let _ = db.finish_action(
                     task_id,
                     &review_key,
                     ActionStatus::Failed,
                     None,
                     Some(&error_summary),
-                )?;
+                    review_action_attempt,
+                );
                 db.transition_task(
                     task_id,
                     TaskState::NeedsUserAction,
@@ -1805,6 +2097,7 @@ fn run_review_round(
         &review_key,
         process_succeeded && integrity_ok,
         &result,
+        review_action_attempt,
     )?;
 
     if !integrity_ok {
@@ -1945,6 +2238,7 @@ fn run_one_round(
         DevTestOutcome::NeedsFix(findings) => Ok(RoundOutcome::NeedsFix(findings)),
         DevTestOutcome::ActionUncertain => Ok(RoundOutcome::ActionUncertain),
         DevTestOutcome::Stopped => Ok(RoundOutcome::Stopped),
+        DevTestOutcome::Stale => Ok(RoundOutcome::Stale),
     }
 }
 
@@ -1957,6 +2251,8 @@ enum SingleAiRoundOutcome {
     NeedsFix(String),
     ActionUncertain,
     Stopped,
+    /// WP2A: see [`DevTestOutcome::Stale`].
+    Stale,
 }
 
 /// v0.1.0 scope correction: one development-AI-plus-Nova-verification
@@ -1996,6 +2292,7 @@ fn run_single_ai_round(
         DevTestOutcome::NeedsFix(findings) => Ok(SingleAiRoundOutcome::NeedsFix(findings)),
         DevTestOutcome::ActionUncertain => Ok(SingleAiRoundOutcome::ActionUncertain),
         DevTestOutcome::Stopped => Ok(SingleAiRoundOutcome::Stopped),
+        DevTestOutcome::Stale => Ok(SingleAiRoundOutcome::Stale),
     }
 }
 
@@ -2024,6 +2321,10 @@ enum TestRoundOutcome {
     AwaitingNoTestsConfirmation,
     ActionUncertain,
     Cancelled,
+    /// WP2A: this call's own test-action attempt was superseded before it
+    /// could finish — see [`DevTestOutcome::Stale`]. No evidence written,
+    /// no state transition.
+    Stale,
 }
 
 /// Work Package 3 remediation (Minor 3 carried from the build-cancellation
@@ -2052,17 +2353,19 @@ fn test_action_key(task_id: &str, result_generation: i64, round: i64) -> String 
 /// gets its own fresh key, and a stale `succeeded` action from an earlier
 /// generation can never be mistaken for proof the *current* generation's
 /// test already ran.
+#[allow(clippy::too_many_arguments)]
 fn run_tests_for_round(
     db: &Database,
     project_id: &str,
     task_id: &str,
     project_dir: &Path,
     round: i64,
+    dev_result_attempt: i64,
     cancel: &CancellationToken,
 ) -> NovaResult<TestRoundOutcome> {
     let result_generation = db.task(task_id)?.result_generation;
     let test_key = test_action_key(task_id, result_generation, round);
-    match gate_action(db, task_id, "test_execution", &test_key, false)? {
+    let test_action_attempt = match gate_action(db, task_id, "test_execution", &test_key, false)? {
         ActionGate::Uncertain => {
             db.transition_task(
                 task_id,
@@ -2075,57 +2378,31 @@ fn run_tests_for_round(
             )?;
             return Ok(TestRoundOutcome::ActionUncertain);
         }
-        ActionGate::AlreadySucceeded => {
+        ActionGate::AlreadySucceeded(_action) => {
             // A prior attempt already recorded this exact round's test
             // evidence (crash-recovery resume) — reuse it rather than
             // re-running, but only ever for *this* round's own key, never
             // an earlier round's (Blocker 3's "第二轮必须重新运行测试" is
             // satisfied structurally: round 2 always uses a different key).
             //
-            // Work Package 3 remediation: an `AlreadySucceeded` action alone
-            // is not sufficient proof — it must be corroborated by a real
-            // `test_evidence` row for this *exact* (result_generation,
-            // round). Since the key itself is now generation-aware, a
-            // mismatch here would mean the Action Ledger and evidence
-            // tables have drifted out of sync (should not happen under
-            // normal operation) — fail closed rather than ever reporting
-            // `NoTestsApplicable` on missing evidence (mirrors
-            // `run_build_for_round`'s identical fix).
+            // WP2A (B1): corroboration now also requires the cached
+            // evidence's `result_attempt` to match the *current* dev
+            // attempt — a cached "passed" from an older dev attempt must
+            // never be mistaken for proof the current attempt's result is
+            // verified, even though the test action itself legitimately
+            // succeeded once already.
             let existing =
                 db.list_test_evidence_for_round(project_id, task_id, result_generation, round)?;
             if let Some(evidence) = existing.into_iter().next_back() {
-                return Ok(test_round_outcome_from_status(&evidence));
+                if evidence.result_attempt == Some(dev_result_attempt) {
+                    return Ok(test_round_outcome_from_status(&evidence));
+                }
+                return fail_closed_stale_test_evidence(db, project_id, task_id, result_generation, round);
             }
-            db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
-                project_id,
-                task_id,
-                result_generation,
-                round,
-                test_command_redacted: None,
-                status: "insufficient_evidence",
-                passed_count: 0,
-                failed_count: 0,
-                skipped_count: 0,
-                exit_code: None,
-                reason: Some(
-                    "测试动作已记录为成功，但找不到对应 generation/round 的测试证据，已按不确定处理",
-                ),
-                stdout_ref: None,
-                stderr_ref: None,
-            })?;
-            db.transition_task(
-                task_id,
-                TaskState::NeedsUserAction,
-                Actor::System,
-                Some("测试证据缺失，无法确认本轮测试结果，需要用户处理"),
-                None,
-                false,
-                Some("test action succeeded but no matching test_evidence found"),
-            )?;
-            return Ok(TestRoundOutcome::ActionUncertain);
+            return fail_closed_missing_test_evidence(db, project_id, task_id, result_generation, round);
         }
-        ActionGate::Started => {}
-    }
+        ActionGate::Started(action) => action.attempt_number,
+    };
 
     let task = db.task(task_id)?;
 
@@ -2137,21 +2414,29 @@ fn run_tests_for_round(
     let Some(command) = command else {
         // Second re-review (Blocker 3): a missing test command may only
         // become `no_tests_applicable` evidence once a real, persisted user
-        // confirmation exists for *this exact* generation/round — never on
-        // Nova's own detection failure alone, and never reused from a prior
-        // round or a prior result generation (schema `UNIQUE(task_id,
-        // result_generation, round)` plus this exact-match lookup enforce
-        // that no wider reuse is even possible).
-        let confirmation =
-            db.find_no_tests_confirmation(project_id, task_id, result_generation, round)?;
+        // confirmation exists for *this exact* generation/round/attempt —
+        // never on Nova's own detection failure alone, and never reused
+        // from a prior round, generation, or dev attempt.
+        let confirmation = db.find_no_tests_confirmation(
+            project_id,
+            task_id,
+            result_generation,
+            round,
+            dev_result_attempt,
+        )?;
         let Some(confirmation) = confirmation else {
-            db.finish_action(
+            match db.finish_action(
                 task_id,
                 &test_key,
                 ActionStatus::Failed,
                 None,
                 Some(NO_TESTS_AWAITING_CONFIRMATION_MARKER),
-            )?;
+                test_action_attempt,
+            ) {
+                Ok(_) => {}
+                Err(NovaError::StaleActionAttempt(_)) => return Ok(TestRoundOutcome::Stale),
+                Err(other) => return Err(other),
+            }
             db.transition_task(
                 task_id,
                 TaskState::NeedsUserAction,
@@ -2165,6 +2450,22 @@ fn run_tests_for_round(
             )?;
             return Ok(TestRoundOutcome::AwaitingNoTestsConfirmation);
         };
+        // WP2A (M1): CAS the test action *before* writing any evidence a
+        // future completed-gate check could ever read as "passed" —
+        // a stale/superseded test attempt must never leave behind
+        // gate-eligible evidence, regardless of how far it got.
+        match db.finish_action(
+            task_id,
+            &test_key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            test_action_attempt,
+        ) {
+            Ok(_) => {}
+            Err(NovaError::StaleActionAttempt(_)) => return Ok(TestRoundOutcome::Stale),
+            Err(other) => return Err(other),
+        }
         let reason = format!(
             "用户已确认该项目当前没有适用测试（确认记录 {}，确认时间 {}）",
             confirmation.id, confirmation.confirmed_at
@@ -2175,6 +2476,7 @@ fn run_tests_for_round(
                 task_id,
                 result_generation,
                 round,
+                result_attempt: dev_result_attempt,
                 test_command_redacted: None,
                 status: "no_tests_applicable",
                 passed_count: 0,
@@ -2185,18 +2487,30 @@ fn run_tests_for_round(
                 stdout_ref: None,
                 stderr_ref: None,
             })?;
-        db.finish_action(task_id, &test_key, ActionStatus::Succeeded, None, None)?;
         return Ok(TestRoundOutcome::NoTestsApplicable(
             evidence.reason.unwrap_or_default(),
         ));
     };
 
     if !test_runner::is_allowlisted(&command.program, &command.args) {
+        match db.finish_action(
+            task_id,
+            &test_key,
+            ActionStatus::Failed,
+            None,
+            Some("test command not allowlisted"),
+            test_action_attempt,
+        ) {
+            Ok(_) => {}
+            Err(NovaError::StaleActionAttempt(_)) => return Ok(TestRoundOutcome::Stale),
+            Err(other) => return Err(other),
+        }
         db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
             project_id,
             task_id,
             result_generation,
             round,
+            result_attempt: dev_result_attempt,
             test_command_redacted: Some(&command.display()),
             status: "insufficient_evidence",
             passed_count: 0,
@@ -2207,13 +2521,6 @@ fn run_tests_for_round(
             stdout_ref: None,
             stderr_ref: None,
         })?;
-        db.finish_action(
-            task_id,
-            &test_key,
-            ActionStatus::Failed,
-            None,
-            Some("test command not allowlisted"),
-        )?;
         db.transition_task(
             task_id,
             TaskState::NeedsUserAction,
@@ -2236,11 +2543,24 @@ fn run_tests_for_round(
 
     let command_display = command.display();
     if outcome.cancelled {
+        match db.finish_action(
+            task_id,
+            &test_key,
+            ActionStatus::Cancelled,
+            None,
+            Some("user cancellation during test execution"),
+            test_action_attempt,
+        ) {
+            Ok(_) => {}
+            Err(NovaError::StaleActionAttempt(_)) => return Ok(TestRoundOutcome::Stale),
+            Err(other) => return Err(other),
+        }
         db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
             project_id,
             task_id,
             result_generation,
             round,
+            result_attempt: dev_result_attempt,
             test_command_redacted: Some(&command_display),
             status: "cancelled",
             passed_count: 0,
@@ -2251,13 +2571,6 @@ fn run_tests_for_round(
             stdout_ref: None,
             stderr_ref: None,
         })?;
-        db.finish_action(
-            task_id,
-            &test_key,
-            ActionStatus::Cancelled,
-            None,
-            Some("user cancellation during test execution"),
-        )?;
         db.transition_task(
             task_id,
             TaskState::Cancelled,
@@ -2277,6 +2590,22 @@ fn run_tests_for_round(
     } else {
         "passed"
     };
+    match db.finish_action(
+        task_id,
+        &test_key,
+        if status == "passed" {
+            ActionStatus::Succeeded
+        } else {
+            ActionStatus::Failed
+        },
+        None,
+        None,
+        test_action_attempt,
+    ) {
+        Ok(_) => {}
+        Err(NovaError::StaleActionAttempt(_)) => return Ok(TestRoundOutcome::Stale),
+        Err(other) => return Err(other),
+    }
     let stdout_ref = redact_sensitive_text(&cap_text(&outcome.stdout, 2000));
     let stderr_ref = redact_sensitive_text(&cap_text(&outcome.stderr, 2000));
     db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
@@ -2284,6 +2613,7 @@ fn run_tests_for_round(
         task_id,
         result_generation,
         round,
+        result_attempt: dev_result_attempt,
         test_command_redacted: Some(&command_display),
         status,
         passed_count: outcome.passed.unwrap_or(0),
@@ -2298,17 +2628,6 @@ fn run_tests_for_round(
         stdout_ref: Some(&stdout_ref),
         stderr_ref: Some(&stderr_ref),
     })?;
-    db.finish_action(
-        task_id,
-        &test_key,
-        if status == "passed" {
-            ActionStatus::Succeeded
-        } else {
-            ActionStatus::Failed
-        },
-        None,
-        None,
-    )?;
 
     let summary = format!(
         "命令：{command_display}\n实际程序：{}\nargv：{:?}\n工作目录：{}\n结果：{status}\n通过：{}，失败：{}，跳过：{}\n退出码：{}",
@@ -2327,6 +2646,86 @@ fn run_tests_for_round(
             "独立测试执行未通过，需要在下一轮修复：\n{summary}"
         ))))
     }
+}
+
+/// WP2A (B1): shared fail-closed path for the `AlreadySucceeded` branch
+/// when no test evidence at all exists for this `(result_generation,
+/// round)` — mirrors the pre-existing "action succeeded but no matching
+/// evidence" repair path exactly (never fabricates evidence, never
+/// auto-reruns, never reports completion).
+fn fail_closed_missing_test_evidence(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    result_generation: i64,
+    round: i64,
+) -> NovaResult<TestRoundOutcome> {
+    db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+        project_id,
+        task_id,
+        result_generation,
+        round,
+        result_attempt: 0,
+        test_command_redacted: None,
+        status: "insufficient_evidence",
+        passed_count: 0,
+        failed_count: 0,
+        skipped_count: 0,
+        exit_code: None,
+        reason: Some("测试动作已记录为成功，但找不到对应 generation/round 的测试证据，已按不确定处理"),
+        stdout_ref: None,
+        stderr_ref: None,
+    })?;
+    db.transition_task(
+        task_id,
+        TaskState::NeedsUserAction,
+        Actor::System,
+        Some("测试证据缺失，无法确认本轮测试结果，需要用户处理"),
+        None,
+        false,
+        Some("test action succeeded but no matching test_evidence found"),
+    )?;
+    Ok(TestRoundOutcome::ActionUncertain)
+}
+
+/// WP2A (B1): shared fail-closed path for the `AlreadySucceeded` branch
+/// when test evidence exists for this `(result_generation, round)` but
+/// belongs to an earlier dev attempt — the test action itself legitimately
+/// succeeded once, but not for the result the task is currently trying to
+/// verify.
+fn fail_closed_stale_test_evidence(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    result_generation: i64,
+    round: i64,
+) -> NovaResult<TestRoundOutcome> {
+    db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
+        project_id,
+        task_id,
+        result_generation,
+        round,
+        result_attempt: 0,
+        test_command_redacted: None,
+        status: "insufficient_evidence",
+        passed_count: 0,
+        failed_count: 0,
+        skipped_count: 0,
+        exit_code: None,
+        reason: Some("测试证据来自更早的一次开发执行，当前执行尚未产生对应证据"),
+        stdout_ref: None,
+        stderr_ref: None,
+    })?;
+    db.transition_task(
+        task_id,
+        TaskState::NeedsUserAction,
+        Actor::System,
+        Some("测试证据与当前开发结果不匹配，需要用户处理"),
+        None,
+        false,
+        Some("cached test evidence belongs to a superseded dev attempt"),
+    )?;
+    Ok(TestRoundOutcome::ActionUncertain)
 }
 
 fn test_round_outcome_from_status(evidence: &crate::models::TestEvidence) -> TestRoundOutcome {
@@ -2358,6 +2757,8 @@ enum BuildRoundOutcome {
     Failed(String),
     ActionUncertain,
     Cancelled,
+    /// WP2A: see [`TestRoundOutcome::Stale`].
+    Stale,
 }
 
 /// Codex re-review remediation (Major 3, second re-review): the build
@@ -2389,17 +2790,19 @@ fn build_action_key(task_id: &str, result_generation: i64, round: i64) -> String
 /// before it may be treated as "no build needed"; the latter is a
 /// mechanically-verified fact from `Cargo.toml`/`package.json` itself and
 /// needs no confirmation.
+#[allow(clippy::too_many_arguments)]
 fn run_build_for_round(
     db: &Database,
     project_id: &str,
     task_id: &str,
     project_dir: &Path,
     round: i64,
+    dev_result_attempt: i64,
     cancel: &CancellationToken,
 ) -> NovaResult<BuildRoundOutcome> {
     let result_generation = db.task(task_id)?.result_generation;
     let build_key = build_action_key(task_id, result_generation, round);
-    match gate_action(db, task_id, "build_execution", &build_key, false)? {
+    let build_action_attempt = match gate_action(db, task_id, "build_execution", &build_key, false)? {
         ActionGate::Uncertain => {
             db.transition_task(
                 task_id,
@@ -2412,57 +2815,43 @@ fn run_build_for_round(
             )?;
             return Ok(BuildRoundOutcome::ActionUncertain);
         }
-        ActionGate::AlreadySucceeded => {
-            // Codex re-review remediation (Major 3): an `AlreadySucceeded`
-            // action alone is not sufficient proof — it must be
-            // corroborated by a real build_evidence row for this *exact*
-            // (result_generation, round). Since the key itself is now
-            // generation-aware, a mismatch here would mean the Action
-            // Ledger and evidence tables have drifted out of sync (should
-            // not happen under normal operation) — fail closed rather than
-            // ever reporting `NoBuildApplicable` on missing evidence.
+        ActionGate::AlreadySucceeded(_action) => {
+            // WP2A (B1): same corroboration + attempt-match discipline as
+            // `run_tests_for_round`'s identical branch.
             let existing =
                 db.list_build_evidence_for_round(project_id, task_id, result_generation, round)?;
             if let Some(evidence) = existing.into_iter().next_back() {
-                return Ok(build_round_outcome_from_status(&evidence));
+                if evidence.result_attempt == Some(dev_result_attempt) {
+                    return Ok(build_round_outcome_from_status(&evidence));
+                }
+                return fail_closed_stale_build_evidence(db, project_id, task_id, result_generation, round);
             }
-            db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
-                project_id,
-                task_id,
-                result_generation,
-                round,
-                build_command_redacted: None,
-                status: "insufficient_evidence",
-                authorization_source: None,
-                exit_code: None,
-                reason: Some(
-                    "构建动作已记录为成功，但找不到对应 generation/round 的构建证据，已按不确定处理",
-                ),
-                stdout_ref: None,
-                stderr_ref: None,
-            })?;
-            db.transition_task(
-                task_id,
-                TaskState::NeedsUserAction,
-                Actor::System,
-                Some("构建证据缺失，无法确认本轮构建结果，需要用户处理"),
-                None,
-                false,
-                Some("build action succeeded but no matching build_evidence found"),
-            )?;
-            return Ok(BuildRoundOutcome::ActionUncertain);
+            return fail_closed_missing_build_evidence(db, project_id, task_id, result_generation, round);
         }
-        ActionGate::Started => {}
-    }
+        ActionGate::Started(action) => action.attempt_number,
+    };
 
     let command = match test_runner::detect_build_command(project_dir) {
         test_runner::BuildDetection::NotApplicable(reason) => {
+            match db.finish_action(
+                task_id,
+                &build_key,
+                ActionStatus::Succeeded,
+                None,
+                None,
+                build_action_attempt,
+            ) {
+                Ok(_) => {}
+                Err(NovaError::StaleActionAttempt(_)) => return Ok(BuildRoundOutcome::Stale),
+                Err(other) => return Err(other),
+            }
             let evidence =
                 db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
                     project_id,
                     task_id,
                     result_generation,
                     round,
+                    result_attempt: dev_result_attempt,
                     build_command_redacted: None,
                     status: "no_build_applicable",
                     // Phase 4 remediation (second re-review): persisted at
@@ -2479,7 +2868,6 @@ fn run_build_for_round(
                     stdout_ref: None,
                     stderr_ref: None,
                 })?;
-            db.finish_action(task_id, &build_key, ActionStatus::Succeeded, None, None)?;
             return Ok(BuildRoundOutcome::NoBuildApplicable(
                 evidence.reason.unwrap_or_default(),
             ));
@@ -2489,9 +2877,25 @@ fn run_build_for_round(
             // never be treated as "no build needed" on its own — only a
             // real, persisted user confirmation (mirroring Blocker 3's
             // no-tests-applicable mechanism) may unblock this.
-            if let Some(confirmation) =
-                db.find_no_build_confirmation(project_id, task_id, result_generation, round)?
-            {
+            if let Some(confirmation) = db.find_no_build_confirmation(
+                project_id,
+                task_id,
+                result_generation,
+                round,
+                dev_result_attempt,
+            )? {
+                match db.finish_action(
+                    task_id,
+                    &build_key,
+                    ActionStatus::Succeeded,
+                    None,
+                    None,
+                    build_action_attempt,
+                ) {
+                    Ok(_) => {}
+                    Err(NovaError::StaleActionAttempt(_)) => return Ok(BuildRoundOutcome::Stale),
+                    Err(other) => return Err(other),
+                }
                 let confirmed_reason = format!(
                     "用户已确认该项目当前无需构建（确认记录 {}，确认时间 {}）",
                     confirmation.id, confirmation.confirmed_at
@@ -2502,6 +2906,7 @@ fn run_build_for_round(
                         task_id,
                         result_generation,
                         round,
+                        result_attempt: dev_result_attempt,
                         build_command_redacted: None,
                         status: "no_build_applicable",
                         // A real, persisted `no_build_confirmations` row was
@@ -2517,16 +2922,28 @@ fn run_build_for_round(
                         stderr_ref: None,
                     },
                 )?;
-                db.finish_action(task_id, &build_key, ActionStatus::Succeeded, None, None)?;
                 return Ok(BuildRoundOutcome::NoBuildApplicable(
                     evidence.reason.unwrap_or_default(),
                 ));
+            }
+            match db.finish_action(
+                task_id,
+                &build_key,
+                ActionStatus::Failed,
+                None,
+                Some("build detection insufficient, awaiting user confirmation"),
+                build_action_attempt,
+            ) {
+                Ok(_) => {}
+                Err(NovaError::StaleActionAttempt(_)) => return Ok(BuildRoundOutcome::Stale),
+                Err(other) => return Err(other),
             }
             db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
                 project_id,
                 task_id,
                 result_generation,
                 round,
+                result_attempt: dev_result_attempt,
                 build_command_redacted: None,
                 status: "insufficient_evidence",
                 authorization_source: None,
@@ -2535,13 +2952,6 @@ fn run_build_for_round(
                 stdout_ref: None,
                 stderr_ref: None,
             })?;
-            db.finish_action(
-                task_id,
-                &build_key,
-                ActionStatus::Failed,
-                None,
-                Some("build detection insufficient, awaiting user confirmation"),
-            )?;
             db.transition_task(
                 task_id,
                 TaskState::NeedsUserAction,
@@ -2559,11 +2969,24 @@ fn run_build_for_round(
     };
 
     if !test_runner::is_build_allowlisted(&command.program, &command.args) {
+        match db.finish_action(
+            task_id,
+            &build_key,
+            ActionStatus::Failed,
+            None,
+            Some("build command not allowlisted"),
+            build_action_attempt,
+        ) {
+            Ok(_) => {}
+            Err(NovaError::StaleActionAttempt(_)) => return Ok(BuildRoundOutcome::Stale),
+            Err(other) => return Err(other),
+        }
         db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
             project_id,
             task_id,
             result_generation,
             round,
+            result_attempt: dev_result_attempt,
             build_command_redacted: Some(&command.display()),
             status: "insufficient_evidence",
             authorization_source: None,
@@ -2572,13 +2995,6 @@ fn run_build_for_round(
             stdout_ref: None,
             stderr_ref: None,
         })?;
-        db.finish_action(
-            task_id,
-            &build_key,
-            ActionStatus::Failed,
-            None,
-            Some("build command not allowlisted"),
-        )?;
         db.transition_task(
             task_id,
             TaskState::NeedsUserAction,
@@ -2601,11 +3017,24 @@ fn run_build_for_round(
 
     let command_display = command.display();
     if outcome.cancelled {
+        match db.finish_action(
+            task_id,
+            &build_key,
+            ActionStatus::Cancelled,
+            None,
+            Some("user cancellation during build execution"),
+            build_action_attempt,
+        ) {
+            Ok(_) => {}
+            Err(NovaError::StaleActionAttempt(_)) => return Ok(BuildRoundOutcome::Stale),
+            Err(other) => return Err(other),
+        }
         db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
             project_id,
             task_id,
             result_generation,
             round,
+            result_attempt: dev_result_attempt,
             build_command_redacted: Some(&command_display),
             status: "cancelled",
             authorization_source: None,
@@ -2614,13 +3043,6 @@ fn run_build_for_round(
             stdout_ref: None,
             stderr_ref: None,
         })?;
-        db.finish_action(
-            task_id,
-            &build_key,
-            ActionStatus::Cancelled,
-            None,
-            Some("user cancellation during build execution"),
-        )?;
         db.transition_task(
             task_id,
             TaskState::Cancelled,
@@ -2640,6 +3062,22 @@ fn run_build_for_round(
     } else {
         "passed"
     };
+    match db.finish_action(
+        task_id,
+        &build_key,
+        if status == "passed" {
+            ActionStatus::Succeeded
+        } else {
+            ActionStatus::Failed
+        },
+        None,
+        None,
+        build_action_attempt,
+    ) {
+        Ok(_) => {}
+        Err(NovaError::StaleActionAttempt(_)) => return Ok(BuildRoundOutcome::Stale),
+        Err(other) => return Err(other),
+    }
     let stdout_ref = redact_sensitive_text(&cap_text(&outcome.stdout, 2000));
     let stderr_ref = redact_sensitive_text(&cap_text(&outcome.stderr, 2000));
     db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
@@ -2647,6 +3085,7 @@ fn run_build_for_round(
         task_id,
         result_generation,
         round,
+        result_attempt: dev_result_attempt,
         build_command_redacted: Some(&command_display),
         status,
         authorization_source: None,
@@ -2659,17 +3098,6 @@ fn run_build_for_round(
         stdout_ref: Some(&stdout_ref),
         stderr_ref: Some(&stderr_ref),
     })?;
-    db.finish_action(
-        task_id,
-        &build_key,
-        if status == "passed" {
-            ActionStatus::Succeeded
-        } else {
-            ActionStatus::Failed
-        },
-        None,
-        None,
-    )?;
 
     let summary = format!(
         "命令：{command_display}\n实际程序：{}\nargv：{:?}\n工作目录：{}\n结果：{status}\n退出码：{}",
@@ -2688,6 +3116,74 @@ fn run_build_for_round(
             "独立构建执行未通过，需要在下一轮修复：\n{summary}"
         ))))
     }
+}
+
+/// WP2A (B1): mirrors `fail_closed_missing_test_evidence` exactly.
+fn fail_closed_missing_build_evidence(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    result_generation: i64,
+    round: i64,
+) -> NovaResult<BuildRoundOutcome> {
+    db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+        project_id,
+        task_id,
+        result_generation,
+        round,
+        result_attempt: 0,
+        build_command_redacted: None,
+        status: "insufficient_evidence",
+        authorization_source: None,
+        exit_code: None,
+        reason: Some("构建动作已记录为成功，但找不到对应 generation/round 的构建证据，已按不确定处理"),
+        stdout_ref: None,
+        stderr_ref: None,
+    })?;
+    db.transition_task(
+        task_id,
+        TaskState::NeedsUserAction,
+        Actor::System,
+        Some("构建证据缺失，无法确认本轮构建结果，需要用户处理"),
+        None,
+        false,
+        Some("build action succeeded but no matching build_evidence found"),
+    )?;
+    Ok(BuildRoundOutcome::ActionUncertain)
+}
+
+/// WP2A (B1): mirrors `fail_closed_stale_test_evidence` exactly.
+fn fail_closed_stale_build_evidence(
+    db: &Database,
+    project_id: &str,
+    task_id: &str,
+    result_generation: i64,
+    round: i64,
+) -> NovaResult<BuildRoundOutcome> {
+    db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+        project_id,
+        task_id,
+        result_generation,
+        round,
+        result_attempt: 0,
+        build_command_redacted: None,
+        status: "insufficient_evidence",
+        authorization_source: None,
+        exit_code: None,
+        reason: Some("构建证据来自更早的一次开发执行，当前执行尚未产生对应证据"),
+        stdout_ref: None,
+        stderr_ref: None,
+    })?;
+    db.transition_task(
+        task_id,
+        TaskState::NeedsUserAction,
+        Actor::System,
+        Some("构建证据与当前开发结果不匹配，需要用户处理"),
+        None,
+        false,
+        Some("cached build evidence belongs to a superseded dev attempt"),
+    )?;
+    Ok(BuildRoundOutcome::ActionUncertain)
 }
 
 fn build_round_outcome_from_status(evidence: &crate::models::BuildEvidence) -> BuildRoundOutcome {
@@ -2732,10 +3228,15 @@ fn cap_text(text: &str, max_len: usize) -> String {
 enum ActionGate {
     /// The action was already `planned` and has just been marked
     /// `started` by this call — the caller must actually perform the work.
-    Started,
+    /// WP2A: carries the full [`TaskAction`] `start_action` returned (i.e.
+    /// *before* the caller does anything), so `attempt_number` is captured
+    /// at dispatch time, never by re-querying "the current row" after the
+    /// fact.
+    Started(TaskAction),
     /// The action already reached `succeeded` in an earlier attempt — the
-    /// caller must not repeat the underlying side effect.
-    AlreadySucceeded,
+    /// caller must not repeat the underlying side effect. Carries that
+    /// attempt's own `TaskAction`.
+    AlreadySucceeded(TaskAction),
     /// The action is `uncertain` (crash-recovery) and cannot be
     /// automatically retried — the caller must stop for the user.
     Uncertain,
@@ -2753,17 +3254,17 @@ fn gate_action(
         return Ok(ActionGate::Uncertain);
     }
     if planned.status == ActionStatus::Succeeded {
-        return Ok(ActionGate::AlreadySucceeded);
+        return Ok(ActionGate::AlreadySucceeded(planned));
     }
     match db.start_action(task_id, key, is_read_only) {
-        Ok(_) => Ok(ActionGate::Started),
-        Err(_) => {
+        Ok(action) => Ok(ActionGate::Started(action)),
+        Err(NovaError::Config(_)) => {
             // Re-check: a concurrent/earlier run may have already finished
             // this action between the plan_action read above and this
             // start_action attempt.
             match db.find_action(task_id, key)? {
                 Some(action) if action.status == ActionStatus::Succeeded => {
-                    Ok(ActionGate::AlreadySucceeded)
+                    Ok(ActionGate::AlreadySucceeded(action))
                 }
                 Some(action) if action.status == ActionStatus::Uncertain => {
                     Ok(ActionGate::Uncertain)
@@ -2771,6 +3272,7 @@ fn gate_action(
                 _ => Ok(ActionGate::Uncertain),
             }
         }
+        Err(other) => Err(other),
     }
 }
 
@@ -2793,7 +3295,8 @@ fn finish_gated_action(
     key: &str,
     succeeded: bool,
     result: &crate::runtime::types::ExecutionResult,
-) -> NovaResult<()> {
+    expected_attempt: i64,
+) -> NovaResult<TaskAction> {
     // Re-review Major 4: a user cancellation must land on the Action
     // Ledger's own `cancelled` terminal status, never `failed` — folding
     // the two together made a cancelled action indistinguishable from a
@@ -2817,8 +3320,7 @@ fn finish_gated_action(
         ExecutionOutcome::Failed { detail, .. } => Some(redact_sensitive_text(detail)),
         ExecutionOutcome::Success => None,
     };
-    db.finish_action(task_id, key, status, None, error_summary.as_deref())?;
-    Ok(())
+    db.finish_action(task_id, key, status, None, error_summary.as_deref(), expected_attempt)
 }
 
 /// Minor fix: `stdout_ref`/`stderr_ref` are now real, redacted, length-capped
@@ -3059,6 +3561,21 @@ fn write_task_package(
         body.push('\n');
     }
     body.push_str("\nDo not expand this task's scope beyond what is written above. Do not touch files unrelated to this task.\n");
+
+    let items = db.list_confirmed_requirement_items(task_id)?;
+    if items.is_empty() {
+        return Err(NovaError::Config("缺少已确认需求快照，请先明确确认并生成需求清单".into()));
+    }
+    let snapshot: Vec<_> = items.iter().map(|item| serde_json::json!({
+        "item": format!("{}:{}", item.field, item.item_index),
+        "text": item.item_text_redacted,
+    })).collect();
+    body.push_str("\n## Confirmed requirement items (authoritative identifiers and text)\n");
+    body.push_str("===NOVA_REQUIREMENT_ITEMS_START===\n");
+    body.push_str(&serde_json::to_string_pretty(&snapshot).map_err(|e| NovaError::Config(e.to_string()))?);
+    body.push_str("\n===NOVA_REQUIREMENT_ITEMS_END===\n");
+    body.push_str("\n## Required self-check output contract\nAfter development or repair, emit exactly ONE self-check block in stdout in this SAME invocation. Do not make another AI call. Use every confirmed item identifier exactly once; do not fabricate or merge identifiers, including duplicate requirement text. Coverage status must be covered, partial, or not_covered, and must truthfully reflect this result. Check explicit exclusions as well as positive requirements. All four arrays are required. check_results lists checks actually performed (an empty array is allowed); list every unfinished item and blocking issue. Do not claim independent Nova test/build success. self_reported_status must be self_reported_complete, self_reported_incomplete, or self_reported_blocked. Use self_reported_complete only when all items are covered and both issue arrays are empty. Unknown JSON fields, extra blocks, missing fields, or invalid JSON are rejected. Replace the example coverage with the entire authoritative item list.\n");
+    body.push_str("===NOVA_SELF_CHECK_START===\n{\"requirement_coverage\":[{\"item\":\"field:index\",\"status\":\"covered\"}],\"check_results\":[],\"unfinished_items\":[],\"blocking_issues\":[],\"self_reported_status\":\"self_reported_complete\"}\n===NOVA_SELF_CHECK_END===\n");
 
     crate::app_paths::atomic_write(&path, body.as_bytes()).map_err(NovaError::from)?;
     Ok(path)
@@ -3303,11 +3820,127 @@ mod tests {
         rounds: &[i64],
     ) {
         for round in rounds {
-            db.record_no_tests_confirmation(project_id, task_id, generation, *round, None)
+            db.record_no_tests_confirmation(project_id, task_id, generation, *round, 1, None)
                 .unwrap();
-            db.record_no_build_confirmation(project_id, task_id, generation, *round, None)
+            db.record_no_build_confirmation(project_id, task_id, generation, *round, 1, None)
                 .unwrap();
         }
+    }
+
+    /// WP2A fixture helper: satisfies every piece of
+    /// `Database::evaluate_completion_gate` except user acceptance —
+    /// records a succeeded `dev-{task_id}-round-{round}` action, passing
+    /// test+build evidence bound to that action's own attempt number, and a
+    /// valid/complete self-check whose `requirement_coverage` exactly
+    /// matches the task's confirmed requirement items (from
+    /// `db.list_confirmed_requirement_items`). Used by hand-rolled
+    /// `transition_task`-driven tests in this module that need a task to
+    /// legitimately reach `Completed` without going through
+    /// `run_core_loop`/`MockAdapter`. Callers still need their own
+    /// `db.record_user_acceptance(...)` for the relevant
+    /// `result_generation` before the `Completed` transition itself.
+    fn satisfy_completion_gate_evidence_and_self_check(
+        db: &Database,
+        project_id: &str,
+        task_id: &str,
+        generation: i64,
+        round: i64,
+    ) {
+        use crate::storage::evidence::{RecordBuildEvidenceRequest, RecordTestEvidenceRequest};
+
+        let dev_key = format!("dev-{task_id}-round-{round}");
+        let planned = db.plan_action(task_id, "ai_development", &dev_key).unwrap();
+        let started = db
+            .start_action(task_id, &dev_key, false)
+            .unwrap_or(planned);
+        let attempt = started.attempt_number;
+        db.finish_action(
+            task_id,
+            &dev_key,
+            crate::models::ActionStatus::Succeeded,
+            None,
+            None,
+            attempt,
+        )
+        .unwrap();
+
+        db.record_test_evidence(&RecordTestEvidenceRequest {
+            project_id,
+            task_id,
+            result_generation: generation,
+            round,
+            result_attempt: attempt,
+            test_command_redacted: Some("cargo test"),
+            status: "passed",
+            passed_count: 1,
+            failed_count: 0,
+            skipped_count: 0,
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        db.record_build_evidence(&RecordBuildEvidenceRequest {
+            project_id,
+            task_id,
+            result_generation: generation,
+            round,
+            result_attempt: attempt,
+            build_command_redacted: Some("cargo build"),
+            status: "passed",
+            authorization_source: None,
+            exit_code: Some(0),
+            reason: None,
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+
+        satisfy_self_check_only(db, project_id, task_id, round);
+    }
+
+    /// Just the self-check half of
+    /// `satisfy_completion_gate_evidence_and_self_check` — for a fixture
+    /// that already has its own succeeded dev action and passing/
+    /// authorized test+build evidence in place (e.g. via a real
+    /// `run_core_loop` call, or evidence recorded by hand to mirror a real
+    /// resumed round) and only needs the still-missing valid/complete
+    /// self-check to satisfy the gate. Looks up the dev action's current
+    /// attempt number itself (via `dev_attempt_for_round`) rather than
+    /// requiring the caller to track it, and builds `requirement_coverage`
+    /// from the task's real confirmed requirement items, exactly like the
+    /// combined helper does.
+    fn satisfy_self_check_only(db: &Database, project_id: &str, task_id: &str, round: i64) {
+        use crate::storage::self_check::RecordSelfCheckRequest;
+
+        let attempt = dev_attempt_for_round(db, task_id, round)
+            .unwrap()
+            .expect("a dev action must already exist for this round");
+        let items = db.list_confirmed_requirement_items(task_id).unwrap();
+        let coverage: Vec<serde_json::Value> = items
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "item": format!("{}:{}", item.field, item.item_index),
+                    "status": "covered",
+                })
+            })
+            .collect();
+        db.record_self_check(&RecordSelfCheckRequest {
+            project_id,
+            task_id,
+            round,
+            result_attempt: attempt,
+            parse_status: "valid",
+            self_reported_status: Some("self_reported_complete"),
+            requirement_coverage_json: Some(&serde_json::to_string(&coverage).unwrap()),
+            check_results_json: Some("[]"),
+            unfinished_items_json: Some("[]"),
+            blocking_issues_json: Some("[]"),
+            raw_block_redacted: "mock self-check",
+        })
+        .unwrap();
     }
 
     // --- Work Package 3: full single-AI closed loop, either developer AI --
@@ -3794,9 +4427,16 @@ mod tests {
         let dev_key = format!("dev-{task_id}-round-1");
         db.plan_action(&task_id, "ai_development", &dev_key)
             .unwrap();
-        db.start_action(&task_id, &dev_key, false).unwrap();
-        db.finish_action(&task_id, &dev_key, ActionStatus::Succeeded, None, None)
-            .unwrap();
+        let dev_started = db.start_action(&task_id, &dev_key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &dev_key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            dev_started.attempt_number,
+        )
+        .unwrap();
         // Simulate the real crash-recovery shape: `running -> interrupted`
         // (what `Database::interrupt_all_in_flight_tasks` does on startup),
         // then `interrupted -> queued` (the real "user resumes" edge) —
@@ -4335,14 +4975,22 @@ mod tests {
         let build_key = build_action_key(&task_id, 0, 1);
         db.plan_action(&task_id, "build_execution", &build_key)
             .unwrap();
-        db.start_action(&task_id, &build_key, false).unwrap();
-        db.finish_action(&task_id, &build_key, ActionStatus::Succeeded, None, None)
-            .unwrap();
+        let build_started = db.start_action(&task_id, &build_key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &build_key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            build_started.attempt_number,
+        )
+        .unwrap();
         db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
             project_id: &project_id,
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: build_started.attempt_number,
             build_command_redacted: Some("cargo build"),
             status: "passed",
             authorization_source: None,
@@ -4359,6 +5007,7 @@ mod tests {
             &task_id,
             &dir,
             1,
+            build_started.attempt_number,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -4385,7 +5034,7 @@ mod tests {
         // Only confirm no-tests, deliberately not no-build — proves the
         // build gate's own confirmation requirement is independent of the
         // test gate's.
-        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
 
@@ -4417,7 +5066,7 @@ mod tests {
     fn user_confirming_no_build_applicable_unblocks_the_stalled_task_to_success() {
         let dir = git_project_dir("build-insufficient-then-confirmed");
         let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
-        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
         let app_data_dir = test_app_data_dir();
@@ -4516,13 +5165,13 @@ mod tests {
                 Actor::User,
             )
             .unwrap();
-        db1.record_no_build_confirmation(&project.id, &task.id, 0, 1, Some("restart test"))
+        db1.record_no_build_confirmation(&project.id, &task.id, 0, 1, 1, Some("restart test"))
             .unwrap();
         drop(db1);
 
         let db2 = Database::open(&db_path).unwrap();
         let found = db2
-            .find_no_build_confirmation(&project.id, &task.id, 0, 1)
+            .find_no_build_confirmation(&project.id, &task.id, 0, 1, 1)
             .unwrap();
         assert!(
             found.is_some(),
@@ -4535,10 +5184,10 @@ mod tests {
     fn a_no_build_confirmation_does_not_carry_forward_to_a_different_generation() {
         let dir = git_project_dir("build-confirmation-wrong-generation");
         let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         let found = db
-            .find_no_build_confirmation(&project_id, &task_id, 1, 1)
+            .find_no_build_confirmation(&project_id, &task_id, 1, 1, 1)
             .unwrap();
         assert!(
             found.is_none(),
@@ -4562,7 +5211,7 @@ mod tests {
     ) -> (PathBuf, Database, String, String) {
         let dir = git_project_dir(name);
         let (db, project_id, task_id) = db_with_confirmed_task(&dir, dev_kind);
-        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
         let outcome = run_core_loop(
@@ -4620,15 +5269,23 @@ mod tests {
             ("test_execution", test_action_key(&task_id, 0, 1)),
         ] {
             db.plan_action(&task_id, kind, &key).unwrap();
-            db.start_action(&task_id, &key, false).unwrap();
-            db.finish_action(&task_id, &key, ActionStatus::Succeeded, None, None)
-                .unwrap();
+            let started = db.start_action(&task_id, &key, false).unwrap();
+            db.finish_action(
+                &task_id,
+                &key,
+                ActionStatus::Succeeded,
+                None,
+                None,
+                started.attempt_number,
+            )
+            .unwrap();
         }
         db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
             project_id: &project_id,
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("cargo test"),
             status: "passed",
             passed_count: 1,
@@ -4643,14 +5300,22 @@ mod tests {
         let build_key_r1 = build_action_key(&task_id, 0, 1);
         db.plan_action(&task_id, "build_execution", &build_key_r1)
             .unwrap();
-        db.start_action(&task_id, &build_key_r1, false).unwrap();
-        db.finish_action(&task_id, &build_key_r1, ActionStatus::Succeeded, None, None)
-            .unwrap();
+        let build_r1_started = db.start_action(&task_id, &build_key_r1, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &build_key_r1,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            build_r1_started.attempt_number,
+        )
+        .unwrap();
         db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
             project_id: &project_id,
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             build_command_redacted: Some("cargo build"),
             status: "passed",
             authorization_source: None,
@@ -4661,20 +5326,32 @@ mod tests {
         })
         .unwrap();
 
+        let mut dev_round2_attempt = 1;
         for (kind, key) in [
             ("ai_development", format!("dev-{task_id}-round-2")),
             ("test_execution", test_action_key(&task_id, 0, 2)),
         ] {
             db.plan_action(&task_id, kind, &key).unwrap();
-            db.start_action(&task_id, &key, false).unwrap();
-            db.finish_action(&task_id, &key, ActionStatus::Succeeded, None, None)
-                .unwrap();
+            let started = db.start_action(&task_id, &key, false).unwrap();
+            if kind == "ai_development" {
+                dev_round2_attempt = started.attempt_number;
+            }
+            db.finish_action(
+                &task_id,
+                &key,
+                ActionStatus::Succeeded,
+                None,
+                None,
+                started.attempt_number,
+            )
+            .unwrap();
         }
         db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
             project_id: &project_id,
             task_id: &task_id,
             result_generation: 0,
             round: 2,
+            result_attempt: dev_round2_attempt,
             test_command_redacted: Some("cargo test"),
             status: "passed",
             passed_count: 1,
@@ -4703,6 +5380,7 @@ mod tests {
             &task_id,
             &dir,
             2,
+            dev_round2_attempt,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -4795,7 +5473,7 @@ mod tests {
         // able to detect that a (retry) confirmation is what is needed.
         let (dir, db, project_id, task_id) =
             stall_task_at_round_1_build_insufficient("nbc-needed-true-half-success", "codex_cli");
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         assert_eq!(db.task(&task_id).unwrap().state, TaskState::NeedsUserAction);
         assert!(no_build_confirmation_needed(&db, &project_id, &task_id).unwrap());
@@ -4874,7 +5552,7 @@ mod tests {
         // Round 1's own confirmation slot must remain empty — this call
         // was genuinely about round 2.
         let round1_confirmation = db
-            .find_no_build_confirmation(&project_id, &task_id, 0, 1)
+            .find_no_build_confirmation(&project_id, &task_id, 0, 1, 1)
             .unwrap();
         assert!(round1_confirmation.is_none());
         let _ = fs::remove_dir_all(&dir);
@@ -5141,7 +5819,7 @@ mod tests {
                 &CreateTaskRequest {
                     project_id: project.id.clone(),
                     title: "Completed".to_string(),
-                    goal: None,
+                    goal: Some("goal".to_string()),
                     in_scope: None,
                     not_in_scope: None,
                     done_criteria: None,
@@ -5170,6 +5848,13 @@ mod tests {
             )
             .unwrap();
         }
+        satisfy_completion_gate_evidence_and_self_check(
+            &db,
+            &project.id,
+            &completed_task.id,
+            1,
+            1,
+        );
         db.record_user_acceptance(&project.id, &completed_task.id, true, None)
             .unwrap();
         db.transition_task(
@@ -5359,14 +6044,22 @@ mod tests {
         let build_key = build_action_key(&task_id, 0, 1);
         db.plan_action(&task_id, "build_execution", &build_key)
             .unwrap();
-        db.start_action(&task_id, &build_key, false).unwrap();
-        db.finish_action(&task_id, &build_key, ActionStatus::Failed, None, None)
-            .unwrap();
+        let build_started = db.start_action(&task_id, &build_key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &build_key,
+            ActionStatus::Failed,
+            None,
+            None,
+            build_started.attempt_number,
+        )
+        .unwrap();
         db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
             project_id: &project_id,
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: build_started.attempt_number,
             build_command_redacted: Some("cargo build"),
             status: "timed_out",
             authorization_source: None,
@@ -5432,13 +6125,14 @@ mod tests {
         let build_key = build_action_key(&task_id, 0, 1);
         db.plan_action(&task_id, "build_execution", &build_key)
             .unwrap();
-        db.start_action(&task_id, &build_key, false).unwrap();
+        let build_started = db.start_action(&task_id, &build_key, false).unwrap();
         db.finish_action(
             &task_id,
             &build_key,
             ActionStatus::Cancelled,
             None,
             Some("user cancellation during build execution"),
+            build_started.attempt_number,
         )
         .unwrap();
         db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
@@ -5446,6 +6140,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: build_started.attempt_number,
             build_command_redacted: Some("cargo build"),
             status: "cancelled",
             authorization_source: None,
@@ -5518,13 +6213,14 @@ mod tests {
         let build_key = build_action_key(&task_id, 0, 1);
         db.plan_action(&task_id, "build_execution", &build_key)
             .unwrap();
-        db.start_action(&task_id, &build_key, false).unwrap();
+        let build_started = db.start_action(&task_id, &build_key, false).unwrap();
         db.finish_action(
             &task_id,
             &build_key,
             ActionStatus::Failed,
             None,
             Some("build command not allowlisted"),
+            build_started.attempt_number,
         )
         .unwrap();
         db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
@@ -5532,6 +6228,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: build_started.attempt_number,
             build_command_redacted: Some("cargo build --release"),
             status: "insufficient_evidence",
             authorization_source: None,
@@ -5645,16 +6342,30 @@ mod tests {
             db1.transition_task(&task.id, state, Actor::User, None, None, false, None)
                 .unwrap();
         }
+        let dev_key = format!("dev-{}-round-1", task.id);
+        db1.plan_action(&task.id, "ai_development", &dev_key)
+            .unwrap();
+        let dev_started = db1.start_action(&task.id, &dev_key, false).unwrap();
+        db1.finish_action(
+            &task.id,
+            &dev_key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            dev_started.attempt_number,
+        )
+        .unwrap();
         let build_key = build_action_key(&task.id, 0, 1);
         db1.plan_action(&task.id, "build_execution", &build_key)
             .unwrap();
-        db1.start_action(&task.id, &build_key, false).unwrap();
+        let build_started = db1.start_action(&task.id, &build_key, false).unwrap();
         db1.finish_action(
             &task.id,
             &build_key,
             ActionStatus::Failed,
             None,
             Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER),
+            build_started.attempt_number,
         )
         .unwrap();
         db1.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
@@ -5662,6 +6373,7 @@ mod tests {
             task_id: &task.id,
             result_generation: 0,
             round: 1,
+            result_attempt: build_started.attempt_number,
             build_command_redacted: None,
             status: "insufficient_evidence",
             authorization_source: None,
@@ -5802,7 +6514,7 @@ mod tests {
         confirm_no_build_applicable(&db, &project_id, &task_id, None).unwrap();
 
         let generation_1_confirmation = db
-            .find_no_build_confirmation(&project_id, &task_id, 1, 1)
+            .find_no_build_confirmation(&project_id, &task_id, 1, 1, 1)
             .unwrap();
         assert!(
             generation_1_confirmation.is_none(),
@@ -5947,7 +6659,7 @@ mod tests {
             stall_task_at_round_1_build_insufficient("nr-case-b-full-repair", "codex_cli");
         let build_key = build_action_key(&task_id, 0, 1);
         let seeded = db
-            .record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("half-success seed"))
+            .record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, Some("half-success seed"))
             .unwrap();
         assert_eq!(
             db.find_action(&task_id, &build_key)
@@ -5985,7 +6697,7 @@ mod tests {
         let (dir, db, project_id, task_id) =
             stall_task_at_round_1_build_insufficient("nr-case-c-transition-only", "codex_cli");
         let build_key = build_action_key(&task_id, 0, 1);
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("half-success seed"))
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, Some("half-success seed"))
             .unwrap();
         db.reset_failed_action_for_retry(&task_id, &build_key)
             .unwrap();
@@ -6010,7 +6722,7 @@ mod tests {
             stall_task_at_round_1_build_insufficient("nr-case-d-full-noop", "codex_cli");
         let build_key = build_action_key(&task_id, 0, 1);
         let seeded = db
-            .record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("already complete"))
+            .record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, Some("already complete"))
             .unwrap();
         db.reset_failed_action_for_retry(&task_id, &build_key)
             .unwrap();
@@ -6046,7 +6758,7 @@ mod tests {
             stall_task_at_round_1_build_insufficient("nr-case-e-running", "codex_cli");
         let build_key = build_action_key(&task_id, 0, 1);
         let seeded = db
-            .record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+            .record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         db.reset_failed_action_for_retry(&task_id, &build_key)
             .unwrap();
@@ -6080,7 +6792,7 @@ mod tests {
         let (dir, db, project_id, task_id) =
             stall_task_at_round_1_build_insufficient("nr-case-e-preview-ready", "codex_cli");
         let build_key = build_action_key(&task_id, 0, 1);
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         db.reset_failed_action_for_retry(&task_id, &build_key)
             .unwrap();
@@ -6155,10 +6867,33 @@ mod tests {
         let (dir, db, project_id, task_id) =
             stall_task_at_round_1_build_insufficient("nr-case-e-completed", "codex_cli");
         let build_key = build_action_key(&task_id, 0, 1);
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         db.reset_failed_action_for_retry(&task_id, &build_key)
             .unwrap();
+        // Mirrors what a real resumed `run_build_for_round` would write
+        // once the no-build confirmation above unblocks it — the
+        // completion gate now requires an actual `no_build_applicable`
+        // evidence row (bound to the dev round's attempt) to exist, not
+        // just the confirmation row itself.
+        db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
+            project_id: &project_id,
+            task_id: &task_id,
+            result_generation: 0,
+            round: 1,
+            result_attempt: 1,
+            build_command_redacted: None,
+            status: "no_build_applicable",
+            authorization_source: Some(
+                crate::models::BuildEvidenceAuthorizationSource::UserConfirmedNotApplicable,
+            ),
+            exit_code: None,
+            reason: Some("用户已确认无需构建"),
+            stdout_ref: None,
+            stderr_ref: None,
+        })
+        .unwrap();
+        satisfy_self_check_only(&db, &project_id, &task_id, 1);
         db.transition_task(
             &task_id,
             TaskState::Verifying,
@@ -6229,6 +6964,7 @@ mod tests {
             &task_id,
             0,
             1,
+            1,
             Some("crashed right after this write"),
         )
         .unwrap();
@@ -6261,7 +6997,7 @@ mod tests {
         let (dir, db, project_id, task_id) =
             stall_task_at_round_1_build_insufficient("nr-repair-transition", "codex_cli");
         let build_key = build_action_key(&task_id, 0, 1);
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("crashed after reset"))
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, Some("crashed after reset"))
             .unwrap();
         db.reset_failed_action_for_retry(&task_id, &build_key)
             .unwrap();
@@ -6308,7 +7044,7 @@ mod tests {
     fn confirm_no_build_applicable_retry_never_inserts_a_second_confirmation_row() {
         let (dir, db, project_id, task_id) =
             stall_task_at_round_1_build_insufficient("nr-no-duplicate-insert", "codex_cli");
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("seed"))
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, Some("seed"))
             .unwrap();
 
         for _ in 0..3 {
@@ -6335,7 +7071,7 @@ mod tests {
         let (dir, db, project_id, task_id) =
             stall_task_at_round_1_build_insufficient("nr-no-reset-test-action", "codex_cli");
         let test_key = test_action_key(&task_id, 0, 1);
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         let test_action_before = db.find_action(&task_id, &test_key).unwrap().unwrap();
         assert_eq!(test_action_before.status, ActionStatus::Succeeded);
@@ -6357,7 +7093,7 @@ mod tests {
         let (dir, db, project_id, task_id) =
             stall_task_at_round_1_build_insufficient("nr-no-reset-dev-action", "codex_cli");
         let dev_key = format!("dev-{task_id}-round-1");
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         let dev_action_before = db.find_action(&task_id, &dev_key).unwrap().unwrap();
         assert_eq!(dev_action_before.status, ActionStatus::Succeeded);
@@ -6382,6 +7118,7 @@ mod tests {
             &project_id,
             &task_id,
             0,
+            1,
             1,
             Some("crashed before reset/transition"),
         )
@@ -6415,7 +7152,7 @@ mod tests {
             .list_test_evidence_for_round(&project_id, &task_id, 0, 1)
             .unwrap();
         assert_eq!(test_evidence_before.len(), 1);
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
 
         confirm_no_build_applicable(&db, &project_id, &task_id, None).unwrap();
@@ -6452,7 +7189,7 @@ mod tests {
         let round1_evidence_before = db
             .list_build_evidence_for_round(&project_id, &task_id, 0, 1)
             .unwrap();
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 2, None)
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 2, 1, None)
             .unwrap();
 
         confirm_no_build_applicable(&db, &project_id, &task_id, None).unwrap();
@@ -6479,7 +7216,7 @@ mod tests {
             stall_task_at_round_1_build_insufficient("nr-wrong-generation", "codex_cli");
         // A confirmation genuinely exists for the task's real generation
         // (0)/round (1) combination...
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         // ...but the task's own `result_generation` is then externally
         // corrupted to a value that does not match where the real stalled
@@ -6512,7 +7249,7 @@ mod tests {
     fn confirm_no_build_applicable_fails_closed_on_a_round_mismatch() {
         let (dir, db, project_id, task_id) =
             stall_task_at_round_1_build_insufficient("nr-wrong-round", "codex_cli");
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         // Seed a round-2 development action directly — this alone makes
         // `current_pending_round` compute round 2 on the very next call,
@@ -6578,13 +7315,14 @@ mod tests {
         let build_key = build_action_key(&task_id, 0, 1);
         db.plan_action(&task_id, "build_execution", &build_key)
             .unwrap();
-        db.start_action(&task_id, &build_key, false).unwrap();
+        let build_started = db.start_action(&task_id, &build_key, false).unwrap();
         db.finish_action(
             &task_id,
             &build_key,
             ActionStatus::Failed,
             None,
             Some("build command not allowlisted"),
+            build_started.attempt_number,
         )
         .unwrap();
         db.transition_task(
@@ -6597,8 +7335,15 @@ mod tests {
             None,
         )
         .unwrap();
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
-            .unwrap();
+        db.record_no_build_confirmation(
+            &project_id,
+            &task_id,
+            0,
+            1,
+            build_started.attempt_number,
+            None,
+        )
+        .unwrap();
 
         let result = confirm_no_build_applicable(&db, &project_id, &task_id, None);
         assert!(
@@ -6622,7 +7367,7 @@ mod tests {
     fn confirm_no_build_applicable_fails_closed_on_a_confirmation_project_mismatch() {
         let (dir, db, project_id, task_id) =
             stall_task_at_round_1_build_insufficient("nr-wrong-project", "codex_cli");
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         let other_dir = temp_dir("nr-wrong-project-other");
         let other_project = db
@@ -6707,16 +7452,30 @@ mod tests {
             db1.transition_task(&task.id, state, Actor::User, None, None, false, None)
                 .unwrap();
         }
+        let dev_key = format!("dev-{}-round-1", task.id);
+        db1.plan_action(&task.id, "ai_development", &dev_key)
+            .unwrap();
+        let dev_started = db1.start_action(&task.id, &dev_key, false).unwrap();
+        db1.finish_action(
+            &task.id,
+            &dev_key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            dev_started.attempt_number,
+        )
+        .unwrap();
         let build_key = build_action_key(&task.id, 0, 1);
         db1.plan_action(&task.id, "build_execution", &build_key)
             .unwrap();
-        db1.start_action(&task.id, &build_key, false).unwrap();
+        let build_started = db1.start_action(&task.id, &build_key, false).unwrap();
         db1.finish_action(
             &task.id,
             &build_key,
             ActionStatus::Failed,
             None,
             Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER),
+            build_started.attempt_number,
         )
         .unwrap();
         db1.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
@@ -6724,6 +7483,7 @@ mod tests {
             task_id: &task.id,
             result_generation: 0,
             round: 1,
+            result_attempt: build_started.attempt_number,
             build_command_redacted: None,
             status: "insufficient_evidence",
             authorization_source: None,
@@ -6801,7 +7561,7 @@ mod tests {
                 &CreateTaskRequest {
                     project_id: project.id.clone(),
                     title: "T".to_string(),
-                    goal: None,
+                    goal: Some("goal".to_string()),
                     in_scope: None,
                     not_in_scope: None,
                     done_criteria: None,
@@ -6820,16 +7580,30 @@ mod tests {
             db1.transition_task(&task.id, state, Actor::User, None, None, false, None)
                 .unwrap();
         }
+        let dev_key = format!("dev-{}-round-1", task.id);
+        db1.plan_action(&task.id, "ai_development", &dev_key)
+            .unwrap();
+        let dev_started = db1.start_action(&task.id, &dev_key, false).unwrap();
+        db1.finish_action(
+            &task.id,
+            &dev_key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            dev_started.attempt_number,
+        )
+        .unwrap();
         let build_key = build_action_key(&task.id, 0, 1);
         db1.plan_action(&task.id, "build_execution", &build_key)
             .unwrap();
-        db1.start_action(&task.id, &build_key, false).unwrap();
+        let build_started = db1.start_action(&task.id, &build_key, false).unwrap();
         db1.finish_action(
             &task.id,
             &build_key,
             ActionStatus::Failed,
             None,
             Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER),
+            build_started.attempt_number,
         )
         .unwrap();
         db1.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
@@ -6837,6 +7611,7 @@ mod tests {
             task_id: &task.id,
             result_generation: 0,
             round: 1,
+            result_attempt: build_started.attempt_number,
             build_command_redacted: None,
             status: "insufficient_evidence",
             authorization_source: None,
@@ -6862,7 +7637,7 @@ mod tests {
         // brand new `Database` handle is opened against the same on-disk
         // file.
         let seeded = db1
-            .record_no_build_confirmation(&project.id, &task.id, 0, 1, Some("before restart"))
+            .record_no_build_confirmation(&project.id, &task.id, 0, 1, 1, Some("before restart"))
             .unwrap();
         drop(db1);
 
@@ -6936,16 +7711,30 @@ mod tests {
             db.transition_task(&task.id, state, Actor::User, None, None, false, None)
                 .unwrap();
         }
+        let dev_key = format!("dev-{}-round-1", task.id);
+        db.plan_action(&task.id, "ai_development", &dev_key)
+            .unwrap();
+        let dev_started = db.start_action(&task.id, &dev_key, false).unwrap();
+        db.finish_action(
+            &task.id,
+            &dev_key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            dev_started.attempt_number,
+        )
+        .unwrap();
         let build_key = build_action_key(&task.id, 0, 1);
         db.plan_action(&task.id, "build_execution", &build_key)
             .unwrap();
-        db.start_action(&task.id, &build_key, false).unwrap();
+        let build_started = db.start_action(&task.id, &build_key, false).unwrap();
         db.finish_action(
             &task.id,
             &build_key,
             ActionStatus::Failed,
             None,
             Some(BUILD_INSUFFICIENT_AWAITING_CONFIRMATION_MARKER),
+            build_started.attempt_number,
         )
         .unwrap();
         db.record_build_evidence(&crate::storage::evidence::RecordBuildEvidenceRequest {
@@ -6953,6 +7742,7 @@ mod tests {
             task_id: &task.id,
             result_generation: 0,
             round: 1,
+            result_attempt: build_started.attempt_number,
             build_command_redacted: None,
             status: "insufficient_evidence",
             authorization_source: None,
@@ -7207,6 +7997,7 @@ mod tests {
                 &task_id_a,
                 &dir_a,
                 1,
+                1,
                 &CancellationToken::new(),
             )
         });
@@ -7224,7 +8015,7 @@ mod tests {
             // not a realistic generation-2 product flow).
             let key = test_action_key(&task_id_b, 1, 1);
             db.plan_action(&task_id_b, "test_execution", &key).unwrap();
-            db.start_action(&task_id_b, &key, false).unwrap();
+            let started = db.start_action(&task_id_b, &key, false).unwrap();
             barrier_b.wait();
             let outcome = test_runner::run_tests(
                 "node",
@@ -7238,6 +8029,7 @@ mod tests {
                 task_id: &task_id_b,
                 result_generation: 1,
                 round: 1,
+                result_attempt: started.attempt_number,
                 test_command_redacted: Some("node -e ..."),
                 status: if outcome.process_succeeded {
                     "passed"
@@ -7253,8 +8045,15 @@ mod tests {
                 stderr_ref: None,
             })
             .unwrap();
-            db.finish_action(&task_id_b, &key, ActionStatus::Succeeded, None, None)
-                .unwrap();
+            db.finish_action(
+                &task_id_b,
+                &key,
+                ActionStatus::Succeeded,
+                None,
+                None,
+                started.attempt_number,
+            )
+            .unwrap();
         });
 
         let result_a = handle_a.join().unwrap().unwrap();
@@ -7315,13 +8114,14 @@ mod tests {
         let build_key = build_action_key(&task_id, 0, 1);
         db.plan_action(&task_id, "build_execution", &build_key)
             .unwrap();
-        db.start_action(&task_id, &build_key, false).unwrap();
+        let build_started = db.start_action(&task_id, &build_key, false).unwrap();
         db.finish_action(
             &task_id,
             &build_key,
             ActionStatus::Failed,
             None,
             Some("build command not allowlisted"),
+            build_started.attempt_number,
         )
         .unwrap();
         db.transition_task(
@@ -7334,8 +8134,15 @@ mod tests {
             None,
         )
         .unwrap();
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, None)
-            .unwrap();
+        db.record_no_build_confirmation(
+            &project_id,
+            &task_id,
+            0,
+            1,
+            build_started.attempt_number,
+            None,
+        )
+        .unwrap();
 
         let result = confirm_no_build_applicable(&db, &project_id, &task_id, None);
         assert!(
@@ -7398,7 +8205,7 @@ mod tests {
             .unwrap();
         assert_eq!(action_after.status, ActionStatus::Planned);
         let found = db_after_restart
-            .find_no_build_confirmation(&project_id, &task_id, 0, 1)
+            .find_no_build_confirmation(&project_id, &task_id, 0, 1, 1)
             .unwrap()
             .unwrap();
         assert_eq!(found.id, confirmation_a.id);
@@ -7452,9 +8259,16 @@ mod tests {
         let stale_key = build_action_key(&task_id, 1, 1);
         db.plan_action(&task_id, "build_execution", &stale_key)
             .unwrap();
-        db.start_action(&task_id, &stale_key, false).unwrap();
-        db.finish_action(&task_id, &stale_key, ActionStatus::Succeeded, None, None)
-            .unwrap();
+        let stale_started = db.start_action(&task_id, &stale_key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &stale_key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            stale_started.attempt_number,
+        )
+        .unwrap();
         // Deliberately no `record_build_evidence` call for generation 1.
 
         // The task's *actual* current result_generation is still 0 (no
@@ -7468,6 +8282,7 @@ mod tests {
             &project_id,
             &task_id,
             &dir,
+            1,
             1,
             &CancellationToken::new(),
         )
@@ -7536,9 +8351,16 @@ mod tests {
         .unwrap();
         let key = build_action_key(&task_id, 0, 1);
         db.plan_action(&task_id, "build_execution", &key).unwrap();
-        db.start_action(&task_id, &key, false).unwrap();
-        db.finish_action(&task_id, &key, ActionStatus::Succeeded, None, None)
-            .unwrap();
+        let started = db.start_action(&task_id, &key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            started.attempt_number,
+        )
+        .unwrap();
 
         let result = run_build_for_round(
             &db,
@@ -7546,6 +8368,7 @@ mod tests {
             &task_id,
             &dir,
             1,
+            started.attempt_number,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -7573,6 +8396,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             build_command_redacted: None,
             status: "no_build_applicable",
             authorization_source: Some(
@@ -8225,9 +9049,16 @@ mod tests {
             let dev_key = format!("dev-{task_id}-round-1");
             db.plan_action(&task_id, "ai_development", &dev_key)
                 .unwrap();
-            db.start_action(&task_id, &dev_key, false).unwrap();
-            db.finish_action(&task_id, &dev_key, ActionStatus::Succeeded, None, None)
-                .unwrap();
+            let dev_started = db.start_action(&task_id, &dev_key, false).unwrap();
+            db.finish_action(
+                &task_id,
+                &dev_key,
+                ActionStatus::Succeeded,
+                None,
+                None,
+                dev_started.attempt_number,
+            )
+            .unwrap();
             // Simulate the crash: the test-execution action (generation-
             // aware key) was planned and started, but the process died
             // before it could ever finish — no test_evidence row exists.
@@ -8360,18 +9191,26 @@ mod tests {
             let dev_key = format!("dev-{task_id}-round-1");
             db.plan_action(&task_id, "ai_development", &dev_key)
                 .unwrap();
-            db.start_action(&task_id, &dev_key, false).unwrap();
-            db.finish_action(&task_id, &dev_key, ActionStatus::Succeeded, None, None)
-                .unwrap();
+            let dev_started = db.start_action(&task_id, &dev_key, false).unwrap();
+            db.finish_action(
+                &task_id,
+                &dev_key,
+                ActionStatus::Succeeded,
+                None,
+                None,
+                dev_started.attempt_number,
+            )
+            .unwrap();
             let test_key = test_action_key(&task_id, 0, 1);
             db.plan_action(&task_id, "test_execution", &test_key)
                 .unwrap();
-            db.start_action(&task_id, &test_key, false).unwrap();
+            let test_started = db.start_action(&task_id, &test_key, false).unwrap();
             db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
                 project_id: &project_id,
                 task_id: &task_id,
                 result_generation: 0,
                 round: 1,
+                result_attempt: test_started.attempt_number,
                 test_command_redacted: Some("npm test"),
                 status: "passed",
                 passed_count: 1,
@@ -8383,8 +9222,15 @@ mod tests {
                 stderr_ref: None,
             })
             .unwrap();
-            db.finish_action(&task_id, &test_key, ActionStatus::Succeeded, None, None)
-                .unwrap();
+            db.finish_action(
+                &task_id,
+                &test_key,
+                ActionStatus::Succeeded,
+                None,
+                None,
+                test_started.attempt_number,
+            )
+            .unwrap();
             // Crash exactly while the build action was in flight.
             let build_key = build_action_key(&task_id, 0, 1);
             db.plan_action(&task_id, "build_execution", &build_key)
@@ -8582,6 +9428,7 @@ mod tests {
                 db.transition_task(&task_id, to, Actor::System, None, None, false, None)
                     .unwrap();
             }
+            satisfy_completion_gate_evidence_and_self_check(&db, &project_id, &task_id, 1, 1);
             db.record_user_acceptance(&project_id, &task_id, true, None)
                 .unwrap();
             db.transition_task(
@@ -8653,9 +9500,16 @@ mod tests {
         let dev_key = format!("dev-{task_id}-round-1");
         db.plan_action(&task_id, "ai_development", &dev_key)
             .unwrap();
-        db.start_action(&task_id, &dev_key, false).unwrap();
-        db.finish_action(&task_id, &dev_key, ActionStatus::Succeeded, None, None)
-            .unwrap();
+        let dev_started = db.start_action(&task_id, &dev_key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &dev_key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            dev_started.attempt_number,
+        )
+        .unwrap();
         confirm_no_tests(&db, &_project_id, &task_id, 0, &[1]);
 
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
@@ -9512,7 +10366,7 @@ mod tests {
         assert_eq!(stuck.task.state, TaskState::NeedsUserAction);
 
         confirm_no_tests_applicable(&db, &project_id, &task_id, Some("no tests yet")).unwrap();
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("no build yet"))
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, Some("no build yet"))
             .unwrap();
         let test_key = test_action_key(&task_id, 0, 1);
         assert_eq!(
@@ -9674,7 +10528,7 @@ mod tests {
         let result = confirm_no_tests_applicable(&db, &other_project.id, &task_id, None);
         assert!(result.is_err());
         assert!(db
-            .find_no_tests_confirmation(&other_project.id, &task_id, 0, 1)
+            .find_no_tests_confirmation(&other_project.id, &task_id, 0, 1, 1)
             .unwrap()
             .is_none());
         let _ = fs::remove_dir_all(&dir);
@@ -9689,7 +10543,7 @@ mod tests {
         let result = confirm_no_tests_applicable(&db, &project_id, &task_id, None);
         assert!(result.is_err());
         assert!(db
-            .find_no_tests_confirmation(&project_id, &task_id, 0, 1)
+            .find_no_tests_confirmation(&project_id, &task_id, 0, 1, 1)
             .unwrap()
             .is_none());
         let _ = fs::remove_dir_all(&dir);
@@ -9732,12 +10586,13 @@ mod tests {
         let test_key = test_action_key(&task_id, 0, 1);
         db.plan_action(&task_id, "test_execution", &test_key)
             .unwrap();
-        db.start_action(&task_id, &test_key, false).unwrap();
+        let test_started = db.start_action(&task_id, &test_key, false).unwrap();
         db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
             project_id: &project_id,
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: test_started.attempt_number,
             test_command_redacted: Some("npm test"),
             status: "failed",
             passed_count: 0,
@@ -9749,8 +10604,15 @@ mod tests {
             stderr_ref: None,
         })
         .unwrap();
-        db.finish_action(&task_id, &test_key, ActionStatus::Failed, None, None)
-            .unwrap();
+        db.finish_action(
+            &task_id,
+            &test_key,
+            ActionStatus::Failed,
+            None,
+            None,
+            test_started.attempt_number,
+        )
+        .unwrap();
         db.transition_task(
             &task_id,
             TaskState::NeedsUserAction,
@@ -9803,13 +10665,14 @@ mod tests {
         let test_key = test_action_key(&task_id, 0, 1);
         db.plan_action(&task_id, "test_execution", &test_key)
             .unwrap();
-        db.start_action(&task_id, &test_key, false).unwrap();
+        let test_started = db.start_action(&task_id, &test_key, false).unwrap();
         db.finish_action(
             &task_id,
             &test_key,
             ActionStatus::Failed,
             None,
             Some(NO_TESTS_AWAITING_CONFIRMATION_MARKER),
+            test_started.attempt_number,
         )
         .unwrap();
         db.record_test_evidence(&crate::storage::evidence::RecordTestEvidenceRequest {
@@ -9817,6 +10680,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: test_started.attempt_number,
             test_command_redacted: Some("npm test"),
             status: "timed_out",
             passed_count: 0,
@@ -9924,13 +10788,14 @@ mod tests {
         let test_key = test_action_key(&task_id, 0, 1);
         db.plan_action(&task_id, "test_execution", &test_key)
             .unwrap();
-        db.start_action(&task_id, &test_key, false).unwrap();
+        let test_started = db.start_action(&task_id, &test_key, false).unwrap();
         db.finish_action(
             &task_id,
             &test_key,
             ActionStatus::Failed,
             None,
             Some("test command not allowlisted"),
+            test_started.attempt_number,
         )
         .unwrap();
         db.transition_task(
@@ -10020,6 +10885,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("npm test"),
             status: "failed",
             passed_count: 0,
@@ -10069,16 +10935,37 @@ mod tests {
             .current_dir(&dir)
             .status()
             .unwrap();
+        // `confirm_no_tests_applicable`'s first-write gate (WP2A) now also
+        // requires a real dev action for this round to exist, since the
+        // confirmation binds to the dev round's attempt number, not the
+        // test action's own — `create_confirmed_task_in`/
+        // `bump_result_generation_via_real_transitions` only drive raw
+        // state transitions and never actually run a development round.
+        let dev_key_round1 = format!("dev-{task_id}-round-1");
+        db.plan_action(&task_id, "ai_development", &dev_key_round1)
+            .unwrap();
+        let dev_round1_started = db.start_action(&task_id, &dev_key_round1, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &dev_key_round1,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            dev_round1_started.attempt_number,
+        )
+        .unwrap();
+
         let test_key_gen1 = test_action_key(&task_id, 1, 1);
         db.plan_action(&task_id, "test_execution", &test_key_gen1)
             .unwrap();
-        db.start_action(&task_id, &test_key_gen1, false).unwrap();
+        let test_gen1_started = db.start_action(&task_id, &test_key_gen1, false).unwrap();
         db.finish_action(
             &task_id,
             &test_key_gen1,
             ActionStatus::Failed,
             None,
             Some(NO_TESTS_AWAITING_CONFIRMATION_MARKER),
+            test_gen1_started.attempt_number,
         )
         .unwrap();
         db.transition_task(
@@ -10114,6 +11001,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("npm test"),
             status: "failed",
             passed_count: 0,
@@ -10128,25 +11016,27 @@ mod tests {
         let round2_dev_key = format!("dev-{task_id}-round-2");
         db.plan_action(&task_id, "ai_development", &round2_dev_key)
             .unwrap();
-        db.start_action(&task_id, &round2_dev_key, false).unwrap();
+        let round2_dev_started = db.start_action(&task_id, &round2_dev_key, false).unwrap();
         db.finish_action(
             &task_id,
             &round2_dev_key,
             ActionStatus::Succeeded,
             None,
             None,
+            round2_dev_started.attempt_number,
         )
         .unwrap();
         let test_key_round2 = test_action_key(&task_id, 0, 2);
         db.plan_action(&task_id, "test_execution", &test_key_round2)
             .unwrap();
-        db.start_action(&task_id, &test_key_round2, false).unwrap();
+        let test_round2_started = db.start_action(&task_id, &test_key_round2, false).unwrap();
         db.finish_action(
             &task_id,
             &test_key_round2,
             ActionStatus::Failed,
             None,
             Some(NO_TESTS_AWAITING_CONFIRMATION_MARKER),
+            test_round2_started.attempt_number,
         )
         .unwrap();
         db.transition_task(
@@ -10247,6 +11137,13 @@ mod tests {
                     .unwrap();
             }
             if label == "completed" {
+                satisfy_completion_gate_evidence_and_self_check(
+                    &db,
+                    &project_id,
+                    &task_id,
+                    1,
+                    1,
+                );
                 db.record_user_acceptance(&project_id, &task_id, true, None)
                     .unwrap();
                 db.transition_task(
@@ -10268,7 +11165,7 @@ mod tests {
                  state: {result:?}"
             );
             assert!(
-                db.find_no_tests_confirmation(&project_id, &task_id, 0, 1)
+                db.find_no_tests_confirmation(&project_id, &task_id, 0, 1, 1)
                     .unwrap()
                     .is_none()
                     || db
@@ -10316,7 +11213,7 @@ mod tests {
                 Actor::User,
             )
             .unwrap();
-        db.record_no_tests_confirmation(&project.id, &task.id, 0, 1, Some("first"))
+        db.record_no_tests_confirmation(&project.id, &task.id, 0, 1, 1, Some("first"))
             .unwrap();
         let count: i64 = db
             .conn()
@@ -10363,10 +11260,10 @@ mod tests {
             )
             .unwrap();
         let first = db
-            .record_no_tests_confirmation(&project.id, &task.id, 0, 1, Some("first reason"))
+            .record_no_tests_confirmation(&project.id, &task.id, 0, 1, 1, Some("first reason"))
             .unwrap();
         let second = db
-            .record_no_tests_confirmation(&project.id, &task.id, 0, 1, Some("second reason"))
+            .record_no_tests_confirmation(&project.id, &task.id, 0, 1, 1, Some("second reason"))
             .unwrap();
         assert_eq!(
             first.id, second.id,
@@ -10403,7 +11300,7 @@ mod tests {
         // transition, not error out or create a second confirmation.
         let (dir, db, project_id, task_id) =
             stall_task_at_round_1_no_tests("no-tests-recover-after-insert-crash", "codex_cli");
-        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, Some("pre-seeded"))
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, 1, Some("pre-seeded"))
             .unwrap();
 
         let confirmation =
@@ -10435,7 +11332,7 @@ mod tests {
         // the transition, never repeat the reset.
         let (dir, db, project_id, task_id) =
             stall_task_at_round_1_no_tests("no-tests-recover-after-reset-crash", "codex_cli");
-        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         let test_key = test_action_key(&task_id, 0, 1);
         db.reset_failed_action_for_retry(&task_id, &test_key)
@@ -10463,7 +11360,7 @@ mod tests {
     fn no_tests_confirmation_needed_is_true_for_case_c_confirmed_reset_but_not_yet_transitioned() {
         let (dir, db, project_id, task_id) =
             stall_task_at_round_1_no_tests("no-tests-needed-case-c-true", "codex_cli");
-        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, Some("case c"))
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, 1, Some("case c"))
             .unwrap();
         let test_key = test_action_key(&task_id, 0, 1);
         db.reset_failed_action_for_retry(&task_id, &test_key)
@@ -10528,6 +11425,7 @@ mod tests {
                 &task_id,
                 confirm_generation,
                 confirm_round,
+                1,
                 None,
             )
             .unwrap();
@@ -10552,7 +11450,7 @@ mod tests {
             "no-tests-needed-case-c-contradicting-evidence",
             "codex_cli",
         );
-        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         let test_key = test_action_key(&task_id, 0, 1);
         db.reset_failed_action_for_retry(&task_id, &test_key)
@@ -10566,6 +11464,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("npm test"),
             status: "passed",
             passed_count: 1,
@@ -10591,7 +11490,7 @@ mod tests {
     fn no_tests_confirmation_needed_is_false_once_the_action_has_advanced_past_planned() {
         let (dir, db, project_id, task_id) =
             stall_task_at_round_1_no_tests("no-tests-needed-advanced-past-planned", "codex_cli");
-        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         let test_key = test_action_key(&task_id, 0, 1);
         db.reset_failed_action_for_retry(&task_id, &test_key)
@@ -10615,7 +11514,7 @@ mod tests {
     fn no_tests_confirmation_needed_rejects_a_project_id_that_does_not_own_the_task_for_case_c() {
         let (dir, db, _project_id, task_id) =
             stall_task_at_round_1_no_tests("no-tests-needed-case-c-wrong-project", "codex_cli");
-        db.record_no_tests_confirmation(&_project_id, &task_id, 0, 1, None)
+        db.record_no_tests_confirmation(&_project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         let test_key = test_action_key(&task_id, 0, 1);
         db.reset_failed_action_for_retry(&task_id, &test_key)
@@ -10703,7 +11602,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(outcome.task.state, TaskState::NeedsUserAction);
-            db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, Some("pre-reopen"))
+            db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, 1, Some("pre-reopen"))
                 .unwrap();
         } // connection closed here — simulates a real process restart.
 
@@ -10733,9 +11632,16 @@ mod tests {
         let build_key = build_action_key(&task_id, 0, 5);
         db.plan_action(&task_id, "build_execution", &build_key)
             .unwrap();
-        db.start_action(&task_id, &build_key, false).unwrap();
-        db.finish_action(&task_id, &build_key, ActionStatus::Succeeded, None, None)
-            .unwrap();
+        let build_started = db.start_action(&task_id, &build_key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &build_key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            build_started.attempt_number,
+        )
+        .unwrap();
 
         confirm_no_tests_applicable(&db, &project_id, &task_id, None).unwrap();
 
@@ -10920,9 +11826,9 @@ mod tests {
              never fall back to round 1 the way the old task_reviews-based logic did"
         );
 
-        db.record_no_tests_confirmation(&project_id, &task_id, 0, 2, Some("removed by the fix"))
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 2, 1, Some("removed by the fix"))
             .unwrap();
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 2, Some("removed by the fix"))
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 2, 1, Some("removed by the fix"))
             .unwrap();
         let unblocked = unblock_test_execution_for_retry(&db, &project_id, &task_id).unwrap();
         assert_eq!(unblocked.state, TaskState::Queued);
@@ -10989,9 +11895,9 @@ mod tests {
     fn a_project_with_no_detectable_test_framework_and_a_real_confirmation_proceeds_and_succeeds() {
         let dir = git_project_dir("no-test-framework-confirmed");
         let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
-        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, Some("brand new project"))
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, 1, Some("brand new project"))
             .unwrap();
-        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, Some("brand new project"))
+        db.record_no_build_confirmation(&project_id, &task_id, 0, 1, 1, Some("brand new project"))
             .unwrap();
         let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![ReviewVerdict::Approve]);
 
@@ -11028,7 +11934,7 @@ mod tests {
         // own confirmation rather than silently inheriting round 1's.
         let dir = git_project_dir("no-test-framework-stale-confirmation");
         let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
-        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, None)
+        db.record_no_tests_confirmation(&project_id, &task_id, 0, 1, 1, None)
             .unwrap();
         let adapter = MockAdapter::new(
             vec![MockOutcome::Success, MockOutcome::Success],
@@ -11210,9 +12116,16 @@ mod tests {
         let stale_key = test_action_key(&task_id, 1, 1);
         db.plan_action(&task_id, "test_execution", &stale_key)
             .unwrap();
-        db.start_action(&task_id, &stale_key, false).unwrap();
-        db.finish_action(&task_id, &stale_key, ActionStatus::Succeeded, None, None)
-            .unwrap();
+        let stale_started = db.start_action(&task_id, &stale_key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &stale_key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            stale_started.attempt_number,
+        )
+        .unwrap();
         // Deliberately no `record_test_evidence` call for generation 1.
 
         // The task's actual current `result_generation` is still 0 — a
@@ -11224,6 +12137,7 @@ mod tests {
             &project_id,
             &task_id,
             &dir,
+            1,
             1,
             &CancellationToken::new(),
         )
@@ -11282,9 +12196,16 @@ mod tests {
         .unwrap();
         let key = test_action_key(&task_id, 0, 1);
         db.plan_action(&task_id, "test_execution", &key).unwrap();
-        db.start_action(&task_id, &key, false).unwrap();
-        db.finish_action(&task_id, &key, ActionStatus::Succeeded, None, None)
-            .unwrap();
+        let started = db.start_action(&task_id, &key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            started.attempt_number,
+        )
+        .unwrap();
 
         let result = run_tests_for_round(
             &db,
@@ -11292,6 +12213,7 @@ mod tests {
             &task_id,
             &dir,
             1,
+            started.attempt_number,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -11324,6 +12246,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("cargo test"),
             status: "passed",
             passed_count: 1,
@@ -11365,9 +12288,16 @@ mod tests {
 
         let key = test_action_key(&task_id, 1, 1);
         db.plan_action(&task_id, "test_execution", &key).unwrap();
-        db.start_action(&task_id, &key, false).unwrap();
-        db.finish_action(&task_id, &key, ActionStatus::Succeeded, None, None)
-            .unwrap();
+        let started = db.start_action(&task_id, &key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            started.attempt_number,
+        )
+        .unwrap();
 
         let result = run_tests_for_round(
             &db,
@@ -11375,6 +12305,7 @@ mod tests {
             &task_id,
             &dir,
             1,
+            started.attempt_number,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -11402,6 +12333,7 @@ mod tests {
             task_id: &task_id,
             result_generation: 0,
             round: 1,
+            result_attempt: 1,
             test_command_redacted: Some("cargo test"),
             status: "passed",
             passed_count: 1,
@@ -11435,9 +12367,16 @@ mod tests {
         .unwrap();
         let key = test_action_key(&task_id, 0, 2);
         db.plan_action(&task_id, "test_execution", &key).unwrap();
-        db.start_action(&task_id, &key, false).unwrap();
-        db.finish_action(&task_id, &key, ActionStatus::Succeeded, None, None)
-            .unwrap();
+        let started = db.start_action(&task_id, &key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            started.attempt_number,
+        )
+        .unwrap();
 
         let result = run_tests_for_round(
             &db,
@@ -11445,6 +12384,7 @@ mod tests {
             &task_id,
             &dir,
             2,
+            started.attempt_number,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -11471,13 +12411,14 @@ mod tests {
         let failed_key = test_action_key(&task_id, 1, 1);
         db.plan_action(&task_id, "test_execution", &failed_key)
             .unwrap();
-        db.start_action(&task_id, &failed_key, false).unwrap();
+        let failed_started = db.start_action(&task_id, &failed_key, false).unwrap();
         db.finish_action(
             &task_id,
             &failed_key,
             ActionStatus::Failed,
             None,
             Some("unrelated failure"),
+            failed_started.attempt_number,
         )
         .unwrap();
 
@@ -11485,13 +12426,14 @@ mod tests {
         let cancelled_key = test_action_key(&task_id, 2, 1);
         db.plan_action(&task_id, "test_execution", &cancelled_key)
             .unwrap();
-        db.start_action(&task_id, &cancelled_key, false).unwrap();
+        let cancelled_started = db.start_action(&task_id, &cancelled_key, false).unwrap();
         db.finish_action(
             &task_id,
             &cancelled_key,
             ActionStatus::Cancelled,
             None,
             None,
+            cancelled_started.attempt_number,
         )
         .unwrap();
 
@@ -11516,6 +12458,7 @@ mod tests {
             &project_id,
             &task_id,
             &dir,
+            1,
             1,
             &CancellationToken::new(),
         )
@@ -11544,15 +12487,23 @@ mod tests {
         let legacy_key = format!("test-{task_id}-round-1");
         db.plan_action(&task_id, "test_execution", &legacy_key)
             .unwrap();
-        db.start_action(&task_id, &legacy_key, false).unwrap();
-        db.finish_action(&task_id, &legacy_key, ActionStatus::Succeeded, None, None)
-            .unwrap();
+        let legacy_started = db.start_action(&task_id, &legacy_key, false).unwrap();
+        db.finish_action(
+            &task_id,
+            &legacy_key,
+            ActionStatus::Succeeded,
+            None,
+            None,
+            legacy_started.attempt_number,
+        )
+        .unwrap();
 
         let result = run_tests_for_round(
             &db,
             &project_id,
             &task_id,
             &dir,
+            1,
             1,
             &CancellationToken::new(),
         )
@@ -11602,6 +12553,7 @@ mod tests {
             &task_id,
             &dir,
             1,
+            1,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -11615,6 +12567,7 @@ mod tests {
             &project_id,
             &task_id,
             &dir,
+            1,
             1,
             &CancellationToken::new(),
         )
@@ -11736,6 +12689,7 @@ mod tests {
             "a refused completion must leave the task exactly where it was"
         );
 
+        satisfy_completion_gate_evidence_and_self_check(&db, &project_id, &task_id, 2, 1);
         db.record_user_acceptance(&project_id, &task_id, true, None)
             .unwrap();
         let completed = db

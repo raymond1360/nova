@@ -128,6 +128,8 @@ pub enum BuildDetection {
 }
 
 pub fn detect_build_command(project_dir: &Path) -> BuildDetection {
+    #[cfg(test)]
+    if let Some(detection) = BUILD_DETECTION_OVERRIDE.with(|v| v.borrow_mut().take()) { return detection; }
     if project_dir.join("Cargo.toml").is_file() {
         return BuildDetection::Detected(DetectedCommand {
             program: "cargo".to_string(),
@@ -281,6 +283,13 @@ pub struct TestRunOutcome {
     pub stderr: String,
 }
 
+#[cfg(test)]
+thread_local! {
+    // Scoped to the invoking test thread; production has no override path.
+    pub(crate) static RUN_OUTCOME_OVERRIDE: std::cell::RefCell<Option<TestRunOutcome>> = std::cell::RefCell::new(None);
+    pub(crate) static BUILD_DETECTION_OVERRIDE: std::cell::RefCell<Option<BuildDetection>> = std::cell::RefCell::new(None);
+}
+
 /// Runs `program args` in `project_dir` through Phase 1's safe process
 /// boundary and classifies the outcome. Callers must have already checked
 /// [`is_allowlisted`] — this function does not re-check it, so it must never
@@ -292,6 +301,8 @@ pub fn run_tests(
     timeout: Duration,
     cancel: CancellationToken,
 ) -> TestRunOutcome {
+    #[cfg(test)]
+    if let Some(outcome) = RUN_OUTCOME_OVERRIDE.with(|v| v.borrow_mut().take()) { return outcome; }
     let request = ExecutionRequest::new(
         program.to_string(),
         args.to_vec(),

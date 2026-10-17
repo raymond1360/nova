@@ -9,6 +9,24 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useCoreLoopStore } from '../stores/coreLoop'
 import type { Project, TimelineEntry } from '../types'
 
+// WP2A: labels for the self-check's own `self_reported_status` field —
+// a distinct vocabulary from `statusLabels` below (that one is evidence/
+// action-ledger statuses, this one is the developer AI's own self-report).
+const selfReportedStatusLabels: Record<string, string> = {
+  self_reported_complete: '自评已完成',
+  self_reported_incomplete: '自评未完成',
+  self_reported_blocked: '自评被阻断',
+}
+function parseJsonStringArray(raw: string | null): string[] {
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : []
+  } catch {
+    return []
+  }
+}
+
 const store = useCoreLoopStore()
 
 const newProjectName = ref('')
@@ -212,10 +230,10 @@ const latestGitEvent = computed(() => {
   return events && events.length > 0 ? events[events.length - 1] : null
 })
 const currentTests = computed(() =>
-  (store.evidenceOverview?.tests ?? []).filter((t) => t.is_current_generation),
+  (store.evidenceOverview?.tests ?? []).filter((t) => t.is_current_generation && t.is_current_attempt),
 )
 const currentBuilds = computed(() =>
-  (store.evidenceOverview?.builds ?? []).filter((b) => b.is_current_generation),
+  (store.evidenceOverview?.builds ?? []).filter((b) => b.is_current_generation && b.is_current_attempt),
 )
 const currentTestStatusLabel = computed(() => {
   const list = currentTests.value
@@ -225,6 +243,19 @@ const currentBuildStatusLabel = computed(() => {
   const list = currentBuilds.value
   return list.length > 0 ? statusLabel(list[list.length - 1].status) : '尚未运行'
 })
+
+// WP2A: `store.selfChecks` is oldest-first and append-only (see
+// `Database::list_self_checks_for_task`'s own doc comment) — the last
+// element is always the most recently recorded self-check, which is what
+// this display cares about. Never used for any gate decision here, purely
+// for showing the developer AI's own self-assessment to the user.
+const latestSelfCheck = computed(() => {
+  const list = store.selfChecks
+  return list.length > 0 ? list[list.length - 1] : null
+})
+const latestSelfCheckUnfinishedItems = computed(() => parseJsonStringArray(latestSelfCheck.value?.unfinished_items_json ?? null))
+const latestSelfCheckBlockingIssues = computed(() => parseJsonStringArray(latestSelfCheck.value?.blocking_issues_json ?? null))
+const latestSelfCheckCheckResults = computed(() => parseJsonStringArray(latestSelfCheck.value?.check_results_json ?? null))
 
 async function handleViewDocument(documentType: string) {
   await store.viewTaskDocument(documentType)
@@ -331,6 +362,19 @@ async function handleViewDocument(documentType: string) {
         <button @click="store.confirmRequirement">我已确认需求，继续</button>
       </p>
 
+      <details v-if="!['draft', 'completed', 'failed', 'cancelled'].includes(store.currentTask.state)">
+        <summary>查看原需求并确认沿用</summary>
+        <p>仅将已有需求生成结构化清单，不改写原文，也不解除历史任务冻结。</p>
+        <p><strong>目标：</strong><span class="requirement-text">{{ store.currentTask.goal || '（空）' }}</span></p>
+        <p><strong>本次范围：</strong><span class="requirement-text">{{ store.currentTask.in_scope || '（空）' }}</span></p>
+        <p><strong>不包含：</strong><span class="requirement-text">{{ store.currentTask.not_in_scope || '（空）' }}</span></p>
+        <p><strong>完成标准：</strong><span class="requirement-text">{{ store.currentTask.done_criteria || '（空）' }}</span></p>
+        <button :disabled="store.snapshotGenerating" @click="store.generateRequirementSnapshot">
+          {{ store.snapshotGenerating ? '生成中…' : '确认沿用，生成需求清单' }}
+        </button>
+        <p v-if="store.snapshotMessage">{{ store.snapshotMessage }}</p>
+      </details>
+
       <div v-if="store.currentTask.test_command_source">
         <p><strong>测试命令（{{ store.currentTask.test_command_source === 'auto' ? '自动检测' : '用户确认' }}）：</strong>
           {{ store.currentTask.test_command_redacted }}</p>
@@ -396,7 +440,7 @@ async function handleViewDocument(documentType: string) {
       </div>
     </section>
 
-    <section v-if="store.currentTask && store.currentTask.state === 'confirmed'" class="block">
+    <section v-if="store.currentTask && ['confirmed', 'queued'].includes(store.currentTask.state)" class="block">
       <h3>4. CLI 就绪检查与启动</h3>
       <button @click="store.checkReadiness">检查 Codex / Claude CLI 就绪状态</button>
       <div v-if="store.readiness" class="readiness">
@@ -447,10 +491,62 @@ async function handleViewDocument(documentType: string) {
         <p v-if="store.reviews.length === 0" class="hint">暂无审核记录。</p>
       </details>
 
+      <!-- WP2A: a read-only precheck of the backend's `completed` gate,
+           shown ahead of the real accept/reject decision so the user is
+           not surprised by a refusal only after clicking "通过验收". Never
+           itself blocks the buttons below — `accept_task_result` always
+           re-checks the same gate authoritatively at the moment of the
+           real attempt; this is purely an early, non-authoritative
+           explanation. -->
+      <p
+        v-if="store.currentTask.state === 'awaiting_user_acceptance' && store.completionPrecheck && !store.completionPrecheck.can_submit_acceptance"
+        class="bad precheck-banner"
+      >
+        ⚠ 当前结果尚不满足提交验收条件：{{ store.completionPrecheck.message }}
+      </p>
+
+      <!-- WP2A: the developer AI's own structured self-assessment of the
+           adopted round — audit/context display only, never a gate
+           decision made on the frontend. -->
+      <p v-if="store.completionPrecheckError" class="bad">{{ store.completionPrecheckError }}</p>
+      <p v-if="store.selfChecksError" class="bad">{{ store.selfChecksError }}</p>
+      <details v-if="latestSelfCheck" class="reviews-diagnostic">
+        <summary>开发 AI 自检摘要（第 {{ latestSelfCheck.round }} 轮，仅供参考）</summary>
+        <p v-if="latestSelfCheck.parse_status === 'invalid_format'" class="bad">
+          自检记录格式无效，无法解析（不满足完工条件）。
+        </p>
+        <template v-else>
+          <p>
+            自评状态：
+            <span :class="latestSelfCheck.self_reported_status === 'self_reported_complete' ? 'ok' : 'bad'">
+              {{ selfReportedStatusLabels[latestSelfCheck.self_reported_status ?? ''] ?? latestSelfCheck.self_reported_status }}
+            </span>
+          </p>
+          <p v-if="latestSelfCheckCheckResults.length > 0">
+            已执行检查：
+            <ul class="self-check-list">
+              <li v-for="(item, index) in latestSelfCheckCheckResults" :key="index">{{ item }}</li>
+            </ul>
+          </p>
+          <p v-if="latestSelfCheckUnfinishedItems.length > 0" class="bad">
+            未完成项：
+            <ul class="self-check-list">
+              <li v-for="(item, index) in latestSelfCheckUnfinishedItems" :key="index">{{ item }}</li>
+            </ul>
+          </p>
+          <p v-if="latestSelfCheckBlockingIssues.length > 0" class="bad">
+            阻断问题：
+            <ul class="self-check-list">
+              <li v-for="(item, index) in latestSelfCheckBlockingIssues" :key="index">{{ item }}</li>
+            </ul>
+          </p>
+        </template>
+      </details>
+
       <div v-if="store.currentTask.state === 'awaiting_user_acceptance'" class="accept-block">
         <textarea v-model="acceptNote" placeholder="验收备注（可选）"></textarea>
         <div class="row">
-          <button @click="store.acceptResult(true, acceptNote)">通过验收</button>
+          <button :disabled="!store.completionPrecheck?.can_submit_acceptance" @click="store.acceptResult(true, acceptNote)">通过验收</button>
           <button @click="store.acceptResult(false, acceptNote)">不通过</button>
         </div>
       </div>
@@ -503,8 +599,8 @@ async function handleViewDocument(documentType: string) {
         <p>测试：<span :class="badStatuses.has(currentTests[currentTests.length - 1]?.status) ? 'bad' : 'ok'">{{ currentTestStatusLabel }}</span></p>
         <p>构建：<span :class="badStatuses.has(currentBuilds[currentBuilds.length - 1]?.status) ? 'bad' : 'ok'">{{ currentBuildStatusLabel }}</span></p>
         <p>
-          是否可以验收：
-          <span :class="store.evidenceOverview.acceptance_ready ? 'ok' : 'hint'">{{ store.evidenceOverview.acceptance_ready ? '可以验收' : '尚不可验收' }}</span>
+          是否满足提交用户验收条件：
+          <span :class="store.evidenceOverview.acceptance_ready ? 'ok' : 'hint'">{{ store.evidenceOverview.acceptance_ready ? '可以提交验收' : '尚不满足验收条件' }}</span>
         </p>
         <details class="evidence-detail">
           <summary>技术详情（Nova 执行过的命令，已脱敏）</summary>
@@ -542,6 +638,7 @@ async function handleViewDocument(documentType: string) {
 </template>
 
 <style scoped>
+.requirement-text { white-space: pre-wrap; }
 .core-loop-view {
   padding: 16px;
   max-width: 720px;
@@ -603,6 +700,16 @@ async function handleViewDocument(documentType: string) {
 .readiness .bad,
 .bad {
   color: #d9534f;
+}
+.precheck-banner {
+  border: 1px solid #d9534f;
+  border-radius: 4px;
+  padding: 8px;
+  font-weight: bold;
+}
+.self-check-list {
+  margin: 4px 0 4px 20px;
+  padding: 0;
 }
 .review-item {
   border: 1px solid #444;

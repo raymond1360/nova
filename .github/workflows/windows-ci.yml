@@ -1,0 +1,202 @@
+name: WP2A Windows validation (unsigned, not a release)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-validation:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CI: 'true'
+      RUSTUP_TOOLCHAIN: 1.98.0-x86_64-pc-windows-msvc
+      CARGO_TERM_COLOR: never
+    steps:
+      # Official release refs verified before pinning; see implementation report.
+      - name: Checkout selected commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up pinned Node x64
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.14.0'
+          architecture: x64
+          package-manager-cache: false
+
+      - name: Pin and verify tools and checkout inputs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Set-Location $env:GITHUB_WORKSPACE
+          if ((git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA) { throw 'Checkout SHA mismatch' }
+          if ((node --version).Trim() -ne 'v24.14.0') { throw 'Node version mismatch' }
+          if ((node -p 'process.arch').Trim() -ne 'x64') { throw 'Node architecture mismatch' }
+          npm install --global npm@11.9.0 --ignore-scripts --no-audit --no-fund
+          if ((npm --version).Trim() -ne '11.9.0') { throw 'npm version mismatch' }
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+          if ((rustc --version) -notmatch '^rustc 1\.98\.0 ') { throw 'Rust version mismatch' }
+          if ((cargo --version) -notmatch '^cargo 1\.98\.0 ') { throw 'Cargo version mismatch' }
+          if ((rustc -vV) -notcontains 'host: x86_64-pc-windows-msvc') { throw 'Rust host mismatch' }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'MSVC x64 tools not found' }
+          if (-not (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots')) { throw 'Windows SDK not found' }
+          git --version
+          $logs = Join-Path $env:RUNNER_TEMP 'wp2a-ci-logs'
+          New-Item -ItemType Directory -Path $logs -ErrorAction Stop | Out-Null
+          $locks = @('apps/desktop/package-lock.json', 'apps/desktop/src-tauri/Cargo.lock')
+          $hashes = @{}
+          foreach ($file in $locks) {
+            git ls-files --error-unmatch -- $file | Out-Null
+            $hashes[$file] = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+          }
+          $hashes | ConvertTo-Json | Set-Content (Join-Path $logs 'locks-before.json') -Encoding utf8
+          @{
+            purpose = 'Validation only; unsigned; not a release; installation acceptance NOT RUN'
+            sha = $env:GITHUB_SHA; ref = $env:GITHUB_REF; run_id = $env:GITHUB_RUN_ID
+            node = (node --version); npm = (npm --version); rust = (rustc --version); cargo = (cargo --version)
+            rust_host = 'x86_64-pc-windows-msvc'; visual_studio = $vs
+            image_os = $env:ImageOS; image_version = $env:ImageVersion
+            lockfile_sha256 = $hashes
+          } | ConvertTo-Json | Set-Content (Join-Path $logs 'build-info.json') -Encoding utf8
+
+      - name: Install locked frontend and run frontend tests
+        working-directory: apps/desktop
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm ci --no-audit --no-fund
+          npm test 2>&1 | Tee-Object (Join-Path $env:RUNNER_TEMP 'wp2a-ci-logs/frontend-tests.log')
+
+      - name: Build test helper and prewarm nested test target
+        working-directory: apps/desktop/src-tauri
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo build --locked --features nova-test-helper --bin nova_test_helper
+          # Same default feature set and exact temp path as the production test.
+          # Do not export CARGO_TARGET_DIR: helper lookup uses current_exe().
+          $nestedTarget = Join-Path ([System.IO.Path]::GetTempPath()) 'nova-self-referential-cargo-test-cache'
+          cargo test --locked --lib app_paths::tests::accepts_ordinary_uuid_like_components --target-dir $nestedTarget
+
+      - name: Run complete default backend library tests
+        working-directory: apps/desktop/src-tauri
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo test --locked --lib 2>&1 | Tee-Object (Join-Path $env:RUNNER_TEMP 'wp2a-ci-logs/backend-tests.log')
+
+      - name: Run isolated validation facility unit tests
+        working-directory: apps/desktop/src-tauri
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo test --locked --features wp2a-desktop-validation --lib isolated_validation::tests 2>&1 |
+            Tee-Object (Join-Path $env:RUNNER_TEMP 'wp2a-ci-logs/facility-tests.log')
+          $log = Get-Content (Join-Path $env:RUNNER_TEMP 'wp2a-ci-logs/facility-tests.log') -Raw
+          if ($log -notmatch 'test result: ok\. 3 passed; 0 failed') { throw 'Expected three facility tests' }
+
+      - name: Build normal release application and unsigned NSIS once
+        working-directory: apps/desktop
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $cli = Get-Content 'node_modules/@tauri-apps/cli/package.json' -Raw | ConvertFrom-Json
+          if ($cli.version -ne '2.11.4') { throw 'Locked Tauri CLI version mismatch' }
+          $config = Join-Path $env:RUNNER_TEMP 'wp2a-ci-bundle.json'
+          # Temporary overlay only: do not edit the committed formal config.
+          '{"bundle":{"active":true}}' | Set-Content -LiteralPath $config -Encoding utf8
+          # No feature flags here. beforeBuildCommand performs vue-tsc + Vite.
+          npm run tauri -- build --ci --no-sign --config $config --bundles nsis -- --locked 2>&1 |
+            Tee-Object (Join-Path $env:RUNNER_TEMP 'wp2a-ci-logs/normal-build.log')
+
+      - name: Require the exact release validation-feature rejection
+        working-directory: apps/desktop/src-tauri
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # This one command must fail. Restore fail-fast before inspecting it.
+          $PSNativeCommandUseErrorActionPreference = $false
+          cargo build --locked --release --features wp2a-desktop-validation --bin nova --message-format=json 2>&1 |
+            Tee-Object (Join-Path $env:RUNNER_TEMP 'wp2a-ci-logs/release-guard.log')
+          $guardExit = $LASTEXITCODE
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expected = 'wp2a-desktop-validation is debug-only and must never ship'
+          $errors = @(
+            Get-Content (Join-Path $env:RUNNER_TEMP 'wp2a-ci-logs/release-guard.log') | ForEach-Object {
+              if ($_.StartsWith('{')) {
+                $item = $_ | ConvertFrom-Json -ErrorAction Stop
+                if ($item.reason -eq 'compiler-message' -and $item.message.level -eq 'error') { $item }
+              }
+            }
+          )
+          if ($guardExit -ne 101 -or $errors.Count -ne 1 -or
+              $errors[0].target.name -ne 'nova_lib' -or $errors[0].message.message -cne $expected -or
+              $null -ne $errors[0].message.code) {
+            throw 'Expected only the deliberate debug-only compile_error; other failures do not pass'
+          }
+          # GitHub's pwsh wrapper propagates LASTEXITCODE at script end.
+          # The deliberate failure is now validated, so this step succeeds.
+          $global:LASTEXITCODE = 0
+
+      - name: Verify locks and stage only approved validation artifacts
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Set-Location $env:GITHUB_WORKSPACE
+          $logs = Join-Path $env:RUNNER_TEMP 'wp2a-ci-logs'
+          $before = Get-Content (Join-Path $logs 'locks-before.json') -Raw | ConvertFrom-Json -AsHashtable
+          foreach ($file in $before.Keys) {
+            if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne $before[$file]) { throw "Lock changed: $file" }
+          }
+          git diff --exit-code -- apps/desktop/package-lock.json apps/desktop/src-tauri/Cargo.lock
+          git diff --exit-code -- apps/desktop/src-tauri/tauri.conf.json
+          $root = Join-Path $env:RUNNER_TEMP 'wp2a-validation-artifacts'
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+          $products = @(
+            'apps/desktop/src-tauri/target/release/nova.exe',
+            'apps/desktop/src-tauri/target/release/bundle/nsis/Nova_0.1.0_x64-setup.exe'
+          )
+          $manifest = @()
+          foreach ($file in $products) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf) -or (Get-Item -LiteralPath $file).Length -eq 0) {
+              throw "Missing or empty expected artifact: $file"
+            }
+            if ((Get-AuthenticodeSignature -LiteralPath $file).Status -ne 'NotSigned') { throw "Expected unsigned artifact: $file" }
+            $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            $manifest += @{ source = $file; name = (Split-Path $file -Leaf); sha256 = $hash; bytes = (Get-Item $file).Length }
+            Copy-Item -LiteralPath $file -Destination $root
+          }
+          $manifest | ConvertTo-Json | Set-Content (Join-Path $root 'SHA256.json') -Encoding utf8
+          Copy-Item -LiteralPath (Join-Path $logs 'build-info.json') -Destination $root
+          'Validation only; unsigned; NOT A RELEASE. Installation/startup, native input and visual acceptance NOT RUN.' |
+            Set-Content (Join-Path $root 'VALIDATION-ONLY.txt') -Encoding utf8
+          foreach ($name in @('frontend-tests.log', 'backend-tests.log', 'facility-tests.log', 'normal-build.log', 'release-guard.log')) {
+            Copy-Item -LiteralPath (Join-Path $logs $name) -Destination $root
+          }
+
+      - name: Upload unsigned validation artifacts (not a release)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: WP2A-validation-only-unsigned-NOT-A-RELEASE-${{ github.sha }}
+          retention-days: 7
+          if-no-files-found: error
+          include-hidden-files: false
+          path: |
+            ${{ runner.temp }}/wp2a-validation-artifacts/nova.exe
+            ${{ runner.temp }}/wp2a-validation-artifacts/Nova_0.1.0_x64-setup.exe
+            ${{ runner.temp }}/wp2a-validation-artifacts/SHA256.json
+            ${{ runner.temp }}/wp2a-validation-artifacts/build-info.json
+            ${{ runner.temp }}/wp2a-validation-artifacts/VALIDATION-ONLY.txt
+            ${{ runner.temp }}/wp2a-validation-artifacts/frontend-tests.log
+            ${{ runner.temp }}/wp2a-validation-artifacts/backend-tests.log
+            ${{ runner.temp }}/wp2a-validation-artifacts/facility-tests.log
+            ${{ runner.temp }}/wp2a-validation-artifacts/normal-build.log
+            ${{ runner.temp }}/wp2a-validation-artifacts/release-guard.log

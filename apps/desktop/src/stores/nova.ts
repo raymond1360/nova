@@ -121,7 +121,9 @@ export const useNovaStore = defineStore('nova', {
       this.activeConversationId = conversationId
       this.messages = await invoke<ChatMessage[]>('list_messages', { conversationId })
     },
-    async sendMessage(content: string) {
+    // ID = request accepted by Rust; undefined = busy no-op; throw = refused
+    // with lastError published. Post-acceptance refresh must not reject sends.
+    async sendMessage(content: string): Promise<string | undefined> {
       // Reentrancy guard: a stream is already in flight (either actively
       // streaming, or between invoke() and the backend emitting its first
       // chat:// event). Silently no-op instead of starting a second
@@ -134,7 +136,8 @@ export const useNovaStore = defineStore('nova', {
         return
       }
       if (!this.selectedModelId) {
-        throw new Error('请先选择模型')
+        this.lastError = '请先选择模型后再发送消息'
+        throw new Error(this.lastError)
       }
       this.sending = true
       this.lastError = ''
@@ -171,7 +174,11 @@ export const useNovaStore = defineStore('nova', {
       // listeners in App.vue) — do not reset it here even if this
       // best-effort refresh fails, or a still-running stream would look
       // finished and let a second send race with it.
-      await this.loadMessages(this.activeConversationId!)
+      try {
+        await this.loadMessages(this.activeConversationId!)
+      } catch (error) {
+        this.lastError = `消息已发送，刷新消息列表失败：${String(error)}`
+      }
       return assistantMessageId
     },
     async stopGeneration() {

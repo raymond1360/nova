@@ -235,14 +235,22 @@ const currentTests = computed(() =>
 const currentBuilds = computed(() =>
   (store.evidenceOverview?.builds ?? []).filter((b) => b.is_current_generation && b.is_current_attempt),
 )
-const currentTestStatusLabel = computed(() => {
-  const list = currentTests.value
-  return list.length > 0 ? statusLabel(list[list.length - 1].status) : '尚未运行'
-})
-const currentBuildStatusLabel = computed(() => {
-  const list = currentBuilds.value
-  return list.length > 0 ? statusLabel(list[list.length - 1].status) : '尚未运行'
-})
+function evidenceStatus(status: string | undefined): { label: string; tone: string } {
+  if (!status || status === 'not_run') return { label: '尚未运行', tone: 'hint' }
+  if (status === 'passed') return { label: '已通过', tone: 'ok' }
+  // Only the backend's normalized status certifies its authorization checks.
+  // A raw skip row alone is never enough to infer an exemption.
+  if (status === 'not_applicable') return { label: '不适用（依据已核验）', tone: 'hint' }
+  if (status === 'no_tests_applicable' || status === 'no_build_applicable') {
+    return { label: '不适用依据尚未核验', tone: 'bad' }
+  }
+  if (badStatuses.has(status)) return { label: statusLabel(status), tone: 'bad' }
+  if (status === 'planned') return { label: '已计划', tone: 'hint' }
+  if (['started', 'running', 'queued'].includes(status)) return { label: '进行中', tone: 'hint' }
+  return { label: `未知状态（${status}）`, tone: 'hint' }
+}
+const currentTestStatus = computed(() => evidenceStatus(currentTests.value.at(-1)?.status))
+const currentBuildStatus = computed(() => evidenceStatus(currentBuilds.value.at(-1)?.status))
 
 // WP2A: `store.selfChecks` is oldest-first and append-only (see
 // `Database::list_self_checks_for_task`'s own doc comment) — the last
@@ -324,7 +332,7 @@ async function handleViewDocument(documentType: string) {
     </section>
 
     <section v-if="store.currentProject" class="block">
-      <h3>2. 新建任务（自然语言需求）</h3>
+      <h3>2. 新建任务（独立表单）</h3>
       <div class="form-grid">
         <input v-model="taskTitle" placeholder="任务标题" />
         <textarea v-model="taskGoal" placeholder="目标 / 需求描述"></textarea>
@@ -362,13 +370,16 @@ async function handleViewDocument(documentType: string) {
         <button @click="store.confirmRequirement">我已确认需求，继续</button>
       </p>
 
+      <div class="original-requirements" aria-label="当前任务原需求（只读）">
+        <h4>当前任务原需求（只读）</h4>
+        <p><strong>目标：</strong><span class="requirement-text">{{ store.currentTask.goal ?? '（空）' }}</span></p>
+        <p><strong>本次范围：</strong><span class="requirement-text">{{ store.currentTask.in_scope ?? '（空）' }}</span></p>
+        <p><strong>不包含：</strong><span class="requirement-text">{{ store.currentTask.not_in_scope ?? '（空）' }}</span></p>
+        <p><strong>完成标准：</strong><span class="requirement-text">{{ store.currentTask.done_criteria ?? '（空）' }}</span></p>
+      </div>
       <details v-if="!['draft', 'completed', 'failed', 'cancelled'].includes(store.currentTask.state)">
-        <summary>查看原需求并确认沿用</summary>
+        <summary>补建已确认需求清单</summary>
         <p>仅将已有需求生成结构化清单，不改写原文，也不解除历史任务冻结。</p>
-        <p><strong>目标：</strong><span class="requirement-text">{{ store.currentTask.goal || '（空）' }}</span></p>
-        <p><strong>本次范围：</strong><span class="requirement-text">{{ store.currentTask.in_scope || '（空）' }}</span></p>
-        <p><strong>不包含：</strong><span class="requirement-text">{{ store.currentTask.not_in_scope || '（空）' }}</span></p>
-        <p><strong>完成标准：</strong><span class="requirement-text">{{ store.currentTask.done_criteria || '（空）' }}</span></p>
         <button :disabled="store.snapshotGenerating" @click="store.generateRequirementSnapshot">
           {{ store.snapshotGenerating ? '生成中…' : '确认沿用，生成需求清单' }}
         </button>
@@ -596,8 +607,8 @@ async function handleViewDocument(documentType: string) {
           Git：{{ latestGitEvent.branch ?? '（未知分支）' }} · {{ latestGitEvent.commit_sha ?? '（无提交）' }}
           <span v-if="latestGitEvent.diff_stat"> · {{ latestGitEvent.diff_stat }}</span>
         </p>
-        <p>测试：<span :class="badStatuses.has(currentTests[currentTests.length - 1]?.status) ? 'bad' : 'ok'">{{ currentTestStatusLabel }}</span></p>
-        <p>构建：<span :class="badStatuses.has(currentBuilds[currentBuilds.length - 1]?.status) ? 'bad' : 'ok'">{{ currentBuildStatusLabel }}</span></p>
+        <p>测试：<span :class="currentTestStatus.tone">{{ currentTestStatus.label }}</span></p>
+        <p>构建：<span :class="currentBuildStatus.tone">{{ currentBuildStatus.label }}</span></p>
         <p>
           是否满足提交用户验收条件：
           <span :class="store.evidenceOverview.acceptance_ready ? 'ok' : 'hint'">{{ store.evidenceOverview.acceptance_ready ? '可以提交验收' : '尚不满足验收条件' }}</span>

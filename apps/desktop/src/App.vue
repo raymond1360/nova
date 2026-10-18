@@ -12,6 +12,7 @@ const baseUrl = ref('https://api.sdkmax.com')
 const apiKey = ref('')
 const modelSearch = ref('')
 const prompt = ref('')
+const sendPending = ref(false)
 const statusText = ref('')
 const usageLoading = ref(false)
 const modelLoading = computed(() => store.loadingModels)
@@ -99,10 +100,23 @@ async function refreshUsage() {
 }
 
 async function send() {
+  if (sendPending.value || store.sending) return
+  const draft = prompt.value
   const text = prompt.value.trim()
-  if (!text) return
-  prompt.value = ''
-  await store.sendMessage(text)
+  // Missing-model feedback also applies to an empty draft; the store rejects
+  // it before any IPC. With a model selected, empty messages remain a no-op.
+  if (!text && store.selectedModelId) return
+  sendPending.value = true
+  try {
+    const acceptedMessageId = await store.sendMessage(text)
+    // Only an accepted request consumes this draft. Preserve any new text
+    // entered while awaiting IPC; refusals and busy no-ops keep the input.
+    if (acceptedMessageId && prompt.value === draft) prompt.value = ''
+  } catch {
+    // The store publishes the rejection through lastError; keep the draft.
+  } finally {
+    sendPending.value = false
+  }
 }
 
 async function openEnvironmentTab() {
@@ -248,7 +262,7 @@ const environmentDiagnostics = computed(() => {
       </div>
       <footer class="composer">
         <textarea v-model="prompt" placeholder="输入消息" @keydown.ctrl.enter.prevent="send" />
-        <button v-if="!store.sending" @click="send">发送</button>
+        <button v-if="!store.sending" :disabled="sendPending" @click="send">发送</button>
         <button v-else @click="store.stopGeneration">停止</button>
       </footer>
       <p v-if="store.lastError" class="error">{{ store.lastError }}</p>

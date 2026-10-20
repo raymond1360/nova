@@ -277,8 +277,10 @@ pub struct TestRunOutcome {
     pub skipped: Option<i64>,
     pub timed_out: bool,
     pub cancelled: bool,
-    /// True only for a real, clean-exit (`exit_code == Some(0)`) run.
+    /// True only for a real clean-exit run whose result processing completed.
     pub process_succeeded: bool,
+    /// Spawn/executor/parser infrastructure failure; never a project assertion.
+    pub infrastructure_error: Option<String>,
     pub stdout: String,
     pub stderr: String,
 }
@@ -289,6 +291,7 @@ thread_local! {
     pub(crate) static RUN_OUTCOME_OVERRIDE: std::cell::RefCell<Option<TestRunOutcome>> = std::cell::RefCell::new(None);
     pub(crate) static BUILD_DETECTION_OVERRIDE: std::cell::RefCell<Option<BuildDetection>> = std::cell::RefCell::new(None);
     static PANIC_BEFORE_TEST_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PANIC_DURING_TEST_PARSE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Runs `program args` in `project_dir` through Phase 1's safe process
@@ -311,68 +314,76 @@ pub fn run_tests(
         Some(project_dir.to_path_buf()),
     )
     .with_timeout(timeout);
+    let stage = std::cell::Cell::new("测试进程启动/执行");
+    let mut captured = None;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         #[cfg(test)]
         if PANIC_BEFORE_TEST_SPAWN.with(|flag| flag.replace(false)) {
             panic!("injected test worker failure");
         }
-        process::execute_blocking(request, cancel)
+        captured = Some(process::execute_blocking(request, cancel));
+        stage.set("测试结果解析");
+        #[cfg(test)]
+        if let Some(message) = PANIC_DURING_TEST_PARSE.with(|slot| slot.borrow_mut().take()) {
+            std::panic::panic_any(message);
+        }
+        classify_test_result(captured.as_ref().expect("captured process result"))
     }));
-    let result = match result {
-        Ok(result) => result,
-        Err(_) => return interrupted_test_outcome(program, args, project_dir),
-    };
+    match result {
+        Ok(outcome) => outcome,
+        Err(payload) => {
+            let diagnostic = format!("{}异常：{}", stage.get(),
+                crate::security::panic_diagnostic(payload.as_ref()));
+            interrupted_test_outcome(program, args, project_dir, captured.as_ref(), &diagnostic)
+        }
+    }
+}
 
-    let timed_out = matches!(
-        result.outcome,
-        ExecutionOutcome::Failed {
-            kind: ExecutionErrorKind::TimedOut,
-            ..
-        }
-    );
-    let cancelled = matches!(
-        result.outcome,
-        ExecutionOutcome::Failed {
-            kind: ExecutionErrorKind::Cancelled,
-            ..
-        }
-    );
+fn classify_test_result(result: &crate::runtime::types::ExecutionResult) -> TestRunOutcome {
+    let timed_out = matches!(result.outcome,
+        ExecutionOutcome::Failed { kind: ExecutionErrorKind::TimedOut, .. });
+    let cancelled = matches!(result.outcome,
+        ExecutionOutcome::Failed { kind: ExecutionErrorKind::Cancelled, .. });
     let process_succeeded = matches!(result.outcome, ExecutionOutcome::Success);
     let combined = format!("{}\n{}", result.stdout, result.stderr);
     let (passed, failed, skipped) = parse_counts(&combined);
-
     let diagnostic = match &result.outcome {
         ExecutionOutcome::Failed { detail, .. } => {
             crate::security::redact_sensitive_text(&format!("{}\n{}", detail, result.stderr))
         }
         ExecutionOutcome::Success => result.stderr.clone(),
     };
+    let infrastructure_error = match &result.outcome {
+        ExecutionOutcome::Failed { kind, .. }
+            if !matches!(kind, ExecutionErrorKind::NonZeroExit | ExecutionErrorKind::TimedOut | ExecutionErrorKind::Cancelled) => Some(diagnostic.clone()),
+        _ => None,
+    };
     TestRunOutcome {
-        program: result.program,
-        args: result.args,
-        cwd: result.cwd,
-        exit_code: result.exit_code,
-        passed,
-        failed,
-        skipped,
-        timed_out,
-        cancelled,
-        process_succeeded,
-        stdout: result.stdout,
-        stderr: diagnostic,
+        program: result.program.clone(), args: result.args.clone(), cwd: result.cwd.clone(),
+        exit_code: result.exit_code, passed, failed, skipped, timed_out, cancelled,
+        process_succeeded, infrastructure_error, stdout: result.stdout.clone(), stderr: diagnostic,
     }
 }
 
-fn interrupted_test_outcome(program: &str, args: &[String], project_dir: &Path) -> TestRunOutcome {
+fn interrupted_test_outcome(
+    program: &str, args: &[String], project_dir: &Path,
+    captured: Option<&crate::runtime::types::ExecutionResult>, diagnostic: &str,
+) -> TestRunOutcome {
     TestRunOutcome {
-        program: program.into(), args: args.to_vec(), cwd: project_dir.to_string_lossy().into_owned(),
-        exit_code: None, passed: None, failed: None, skipped: None,
-        timed_out: false, cancelled: false, process_succeeded: false,
-        stdout: String::new(), stderr: "测试执行线程异常终止，未获得有效结果".into(),
+        program: crate::security::redact_sensitive_text(program),
+        args: args.iter().map(|arg| crate::security::redact_sensitive_text(arg)).collect(),
+        cwd: project_dir.to_string_lossy().into_owned(),
+        // Keep a real process exit (including 0) without claiming parsed test success.
+        exit_code: captured.and_then(|result| result.exit_code),
+        passed: None, failed: None, skipped: None, timed_out: false, cancelled: false,
+        process_succeeded: false, infrastructure_error: Some(diagnostic.into()),
+        stdout: captured.map(|result| result.stdout.clone()).unwrap_or_default(),
+        stderr: format!("{}\n{}", diagnostic, captured.map(|result| result.stderr.as_str()).unwrap_or("")),
     }
 }
 
-/// Best-effort, framework-agnostic pass/fail/skip count extraction. Looks
+/// Best-effort, framework-agnostic pass/fail/skip count extraction. Supports
+/// Node native/TAP whole-line summaries (`ℹ pass 2`, `# skipped 0`) and looks
 /// for the last `<number> <label>` occurrence for each of `passed`/`failed`/
 /// (`skipped` or `ignored`) — a single generic pattern that happens to match
 /// `cargo test`'s `"3 passed; 0 failed; 1 ignored"`, pytest's `"5 passed, 2
@@ -382,11 +393,26 @@ fn interrupted_test_outcome(program: &str, args: &[String], project_dir: &Path) 
 /// rather than `Some(0)`, so "no parseable summary" is never confused with
 /// "zero tests ran".
 fn parse_counts(text: &str) -> (Option<i64>, Option<i64>, Option<i64>) {
-    let passed = extract_count_before(text, "passed");
-    let failed = extract_count_before(text, "failed");
-    let skipped =
-        extract_count_before(text, "skipped").or_else(|| extract_count_before(text, "ignored"));
+    let passed = extract_count_before(text, "passed").or_else(|| extract_node_count(text, "pass"));
+    let failed = extract_count_before(text, "failed").or_else(|| extract_node_count(text, "fail"));
+    let skipped = extract_count_before(text, "skipped")
+        .or_else(|| extract_count_before(text, "ignored"))
+        .or_else(|| extract_node_count(text, "skipped"));
     (passed, failed, skipped)
+}
+
+// Node's native reporter uses "ℹ pass 2"; TAP uses "# pass 2".
+// Require a whole summary line, not a matching word in a test title.
+fn extract_node_count(text: &str, label: &str) -> Option<i64> {
+    text.lines().rev().find_map(|line| {
+        let line = line.trim();
+        let line = line.strip_prefix('ℹ').or_else(|| line.strip_prefix('#')).unwrap_or(line).trim();
+        let mut words = line.split_whitespace();
+        if words.next()? != label { return None; }
+        let count = words.next()?;
+        if !count.chars().all(|c| c.is_ascii_digit()) || words.next().is_some() { return None; }
+        count.parse().ok()
+    })
 }
 
 /// Scans every occurrence of `label` in `text`, from the last to the first,
@@ -403,9 +429,9 @@ fn extract_count_before(text: &str, label: &str) -> Option<i64> {
     while let Some(idx) = text[..search_end].rfind(label) {
         let before = &text[..idx];
         let trimmed = before.trim_end();
-        let digits_start = trimmed
-            .rfind(|c: char| !c.is_ascii_digit())
-            .map(|i| i + 1)
+        let digits_start = trimmed.char_indices()
+            .rfind(|(_, c)| !c.is_ascii_digit())
+            .map(|(i, c)| i + c.len_utf8())
             .unwrap_or(0);
         let digits = &trimmed[digits_start..];
         if !digits.is_empty() {
@@ -422,6 +448,54 @@ fn extract_count_before(text: &str, label: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn rav01_node_native_summary_with_unicode_prefix_is_parsed() {
+        // Captured from the isolated copy of RAV01's Node 24 fixture.
+        // A count-before parser must not slice into the UTF-8 prefix.
+        let output = "✔ document title is exactly the agreed result\n✔ visible h1 is exactly the agreed result\nℹ tests 2\nℹ suites 0\nℹ pass 2\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\n";
+        assert_eq!(parse_counts(output), (Some(2), Some(0), Some(0)));
+    }
+
+    #[test]
+    fn rav01_unicode_and_tap_summaries_do_not_invent_counts() {
+        assert_eq!(parse_counts("中文3 passed; 1 failed; 0 skipped"), (Some(3), Some(1), Some(0)));
+        assert_eq!(parse_counts("# pass 2\n# fail 0\n# skipped 1\n"), (Some(2), Some(0), Some(1)));
+        assert_eq!(parse_counts("ℹ pass 1\nℹ fail 1\nℹ skipped 0\n"), (Some(1), Some(1), Some(0)));
+        assert_eq!(parse_counts("中文 failed\nℹ skipped unknown\npass 2 is a test name"), (None, None, None));
+    }
+
+    #[test]
+    fn rav01_parser_panic_keeps_real_exit_and_redacted_stage() {
+        let dir = temp_dir("rav01-parse-panic");
+        let secret = format!("sk-{}", "x".repeat(32));
+        PANIC_DURING_TEST_PARSE.with(|slot| *slot.borrow_mut() = Some(format!("byte boundary parser fault; token={secret}")));
+        let result = run_tests("git", &["--version".into()], &dir,
+            Duration::from_secs(10), CancellationToken::new());
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!result.process_succeeded);
+        assert!(result.stdout.contains("git version"));
+        assert_eq!((result.passed, result.failed, result.skipped), (None, None, None));
+        assert!(result.infrastructure_error.as_deref().unwrap().contains("测试结果解析异常"));
+        assert!(result.stderr.contains("byte boundary parser fault"));
+        assert!(!result.stderr.contains(&secret));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rav01_real_npm_node_summary_in_isolated_fixture() {
+        let dir = temp_dir("rav01-native-node-summary");
+        fs::write(dir.join("package.json"), r#"{"private":true,"type":"module","scripts":{"test":"node --test acceptance.test.mjs"}}"#).unwrap();
+        fs::write(dir.join("index.html"), "<title>Nova Single AI PASS</title><h1>Nova Single AI PASS</h1>").unwrap();
+        fs::write(dir.join("acceptance.test.mjs"), "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport {readFileSync} from 'node:fs';\nconst html=readFileSync(new URL('./index.html',import.meta.url),'utf8');\ntest('title',()=>assert.equal(html.match(/<title>(.*?)<\\/title>/)[1],'Nova Single AI PASS'));\ntest('h1',()=>assert.equal(html.match(/<h1>(.*?)<\\/h1>/)[1],'Nova Single AI PASS'));\n").unwrap();
+        let result = run_tests("npm", &["test".into()], &dir,
+            Duration::from_secs(30), CancellationToken::new());
+        assert_eq!(result.exit_code, Some(0), "{}", result.stderr);
+        assert!(result.process_succeeded, "{}", result.stderr);
+        assert_eq!((result.passed, result.failed, result.skipped), (Some(2), Some(0), Some(0)));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn rav01_spawn_failure_keeps_diagnostic_and_never_passes() {
@@ -442,7 +516,8 @@ mod tests {
             Duration::from_secs(1), CancellationToken::new());
         assert!(!result.process_succeeded);
         assert_eq!(result.exit_code, None);
-        assert!(result.stderr.contains("异常终止"));
+        assert!(result.stderr.contains("测试进程启动/执行异常"));
+        assert!(result.stderr.contains("injected test worker failure"));
         fs::remove_dir_all(dir).unwrap();
     }
 

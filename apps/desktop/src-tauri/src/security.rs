@@ -60,6 +60,15 @@ pub fn redact_sensitive_text(input: &str) -> String {
     redact_prefixed_tokens(&text)
 }
 
+/// Keep useful caught-panic diagnostics without logging an unredacted
+/// payload or installing a process-global panic hook. Cap after redaction.
+pub(crate) fn panic_diagnostic(payload: &(dyn std::any::Any + Send)) -> String {
+    let message = payload.downcast_ref::<String>().map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("非文本 panic；未获得具体错误内容");
+    redact_sensitive_text(message).chars().take(2000).collect()
+}
+
 /// Markers whose value is redacted to the end of the current line — real
 /// HTTP header values for these can legitimately contain whitespace,
 /// commas, or semicolons that are still part of the sensitive value
@@ -449,5 +458,21 @@ mod tests {
         let truncated = &fake_prefix[..fake_prefix.len() - 3];
         let cleaned = redact_sensitive_text(truncated);
         assert!(!cleaned.contains(truncated));
+    }
+}
+
+
+#[cfg(test)]
+mod panic_diagnostic_tests {
+    use super::panic_diagnostic;
+    #[test]
+    fn rav01_panic_payloads_are_redacted_utf8_safe_and_bounded() {
+        let message = format!("parser fault token={} {}", "sensitive-value", "界".repeat(3000));
+        let output = panic_diagnostic(&message);
+        assert!(output.contains("parser fault"));
+        assert!(!output.contains("sensitive-value"));
+        assert!(output.chars().count() <= 2000);
+        assert!(panic_diagnostic(&"borrowed parser fault").contains("borrowed parser fault"));
+        assert!(panic_diagnostic(&42u32).contains("非文本"));
     }
 }

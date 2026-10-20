@@ -320,7 +320,8 @@ fn report_run_failure(
     run: impl FnOnce() -> NovaResult<CoreLoopOutcome>,
 ) -> NovaResult<CoreLoopOutcome> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
-        .unwrap_or_else(|_| Err(NovaError::Config("核心循环执行线程异常终止，未获得有效结果".into())));
+        .unwrap_or_else(|payload| Err(NovaError::Config(format!(
+            "核心循环执行线程异常终止：{}", crate::security::panic_diagnostic(payload.as_ref())))));
     if let Err(error) = &result {
         let task = db.task(task_id)?;
         if matches!(task.state, TaskState::Queued | TaskState::Running | TaskState::Verifying | TaskState::SafeFixing) {
@@ -2660,6 +2661,9 @@ fn run_tests_for_round(
         None
     } else if outcome.timed_out {
         Some("测试执行超时".to_string())
+    } else if let Some(error) = &outcome.infrastructure_error {
+        Some(redact_sensitive_text(&cap_text(
+            &format!("独立测试基础设施异常（进程退出码 {:?}）：{}", outcome.exit_code, error), 2000)))
     } else {
         Some(redact_sensitive_text(&cap_text(
             &format!("测试进程未成功完成（退出码 {:?}）：{}", outcome.exit_code, outcome.stderr), 2000)))
@@ -2701,7 +2705,9 @@ fn run_tests_for_round(
 
     // An infrastructure failure is not a failing project assertion and must
     // never trigger the automatic developer repair/paid invocation branch.
-    if !outcome.process_succeeded && outcome.exit_code.is_none() && !outcome.timed_out {
+    if outcome.infrastructure_error.is_some()
+        || (!outcome.process_succeeded && outcome.exit_code.is_none() && !outcome.timed_out)
+    {
         db.transition_task(task_id, TaskState::NeedsUserAction, Actor::System,
             failure_reason.as_deref(), None, false, Some("test process unavailable; no automatic AI retry"))?;
         return Ok(TestRoundOutcome::ActionUncertain);

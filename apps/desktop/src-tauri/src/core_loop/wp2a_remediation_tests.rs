@@ -621,7 +621,7 @@ fn prepare_evidence_branch(f: &Fixture, branch: &str) {
             let timed_out = branch.ends_with("timed_out");
             let success = branch.ends_with("passed");
             test_runner::RUN_OUTCOME_OVERRIDE.with(|v| {
-                *v.borrow_mut() = Some(test_runner::TestRunOutcome {
+                *v.borrow_mut() = Some(test_runner::TestRunOutcome { infrastructure_error: None,
                     program: "fake-controlled-runner".into(),
                     args: vec![],
                     cwd: f.dir.to_string_lossy().into_owned(),
@@ -1365,7 +1365,7 @@ fn rav01_unexpected_run_error_and_panic_are_visible() {
 fn rav01_failed_test_settles_ledger_and_keeps_spawn_reason() {
     let f = Fixture::new(false); fs::write(f.dir.join("package.json"), "{}").unwrap();
     f.transition(TaskState::Queued); f.transition(TaskState::Running); f.transition(TaskState::Verifying);
-    test_runner::RUN_OUTCOME_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(test_runner::TestRunOutcome {
+    test_runner::RUN_OUTCOME_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(test_runner::TestRunOutcome { infrastructure_error: None,
         program: "npm".into(), args: vec!["test".into()], cwd: f.dir.to_string_lossy().into_owned(),
         exit_code: None, passed: None, failed: None, skipped: None, timed_out: false,
         cancelled: false, process_succeeded: false, stdout: String::new(), stderr: "cannot start process".into(),
@@ -1387,7 +1387,7 @@ fn rav01_test_start_failure_never_invokes_automatic_ai_repair() {
     let f = Fixture::new(false);
     fs::write(f.dir.join("package.json"), r#"{"scripts":{"test":"node absent.mjs","build":"node absent.mjs"}}"#).unwrap();
     let adapter = MockAdapter::new(vec![MockOutcome::Success, MockOutcome::Success], vec![]);
-    test_runner::RUN_OUTCOME_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(test_runner::TestRunOutcome {
+    test_runner::RUN_OUTCOME_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(test_runner::TestRunOutcome { infrastructure_error: None,
         program: "npm".into(), args: vec!["test".into()], cwd: f.dir.to_string_lossy().into_owned(),
         exit_code: None, passed: None, failed: None, skipped: None, timed_out: false,
         cancelled: false, process_succeeded: false, stdout: String::new(), stderr: "process unavailable".into(),
@@ -1397,4 +1397,48 @@ fn rav01_test_start_failure_never_invokes_automatic_ai_repair() {
     assert_eq!(adapter.development_call_count(), 1);
     assert_eq!(adapter.review_call_count(), 0);
     assert!(f.db.list_actions_for_task(&f.task).unwrap().iter().all(|a| a.status != ActionStatus::Started));
+}
+
+
+#[test]
+fn rav01_parser_fault_after_exit_zero_is_saved_without_ai_retry() {
+    let f = Fixture::new(false);
+    fs::write(f.dir.join("package.json"), r#"{"scripts":{"test":"node absent.mjs","build":"node absent.mjs"}}"#).unwrap();
+    let adapter = MockAdapter::new(vec![MockOutcome::Success, MockOutcome::Success], vec![]);
+    let diagnostic = "测试结果解析异常：byte index is not a char boundary";
+    test_runner::RUN_OUTCOME_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(test_runner::TestRunOutcome {
+        program: "npm".into(), args: vec!["test".into()], cwd: f.dir.to_string_lossy().into_owned(),
+        exit_code: Some(0), passed: None, failed: None, skipped: None, timed_out: false,
+        cancelled: false, process_succeeded: false, infrastructure_error: Some(diagnostic.into()),
+        stdout: "test process finished".into(), stderr: diagnostic.into(),
+    }));
+    let outcome = run_core_loop(&f.db, &f.task, &adapter, &CancellationToken::new(), &f.dir).unwrap();
+    assert_eq!(outcome.task.state, TaskState::NeedsUserAction);
+    assert_eq!(adapter.development_call_count(), 1);
+    let action = f.db.find_action(&f.task, &test_action_key(&f.task, 0, 1)).unwrap().unwrap();
+    assert_eq!(action.status, ActionStatus::Failed);
+    assert!(action.finished_at.is_some());
+    assert!(action.error_summary.as_deref().unwrap().contains(diagnostic));
+    let evidence = f.db.list_test_evidence_for_round(&f.project, &f.task, 0, 1).unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].status, "failed");
+    assert_eq!(evidence[0].exit_code, Some(0));
+    assert_eq!(evidence[0].test_command_redacted.as_deref(), Some("npm test"));
+    assert!(evidence[0].reason.as_deref().unwrap().contains(diagnostic));
+}
+
+#[test]
+fn rav01_outer_panic_reports_redacted_payload() {
+    let f = Fixture::new(false); f.transition(TaskState::Queued); f.transition(TaskState::Running);
+    let secret = format!("sk-{}", "q".repeat(32));
+    let panic_message = format!("evidence write fault; token={secret}");
+    let error = match report_run_failure(&f.db, &f.task, || std::panic::panic_any(panic_message)) {
+        Ok(_) => panic!("panic must not become success"), Err(error) => error,
+    };
+    assert!(error.public_message().contains("evidence write fault"));
+    assert!(!error.public_message().contains(&secret));
+    let events = f.db.list_task_state_events(&f.project, &f.task).unwrap();
+    let reason = events.last().unwrap().reason.as_deref().unwrap();
+    assert!(reason.contains("evidence write fault"));
+    assert!(!reason.contains(&secret));
 }

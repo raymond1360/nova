@@ -31,6 +31,7 @@ mod review_isolation;
 pub(crate) mod self_check_parser;
 pub(crate) mod task_documents;
 pub(crate) mod test_runner;
+pub(crate) mod verify_only;
 #[cfg(test)]
 mod wp2a_remediation_tests;
 

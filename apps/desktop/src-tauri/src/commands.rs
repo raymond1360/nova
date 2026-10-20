@@ -981,6 +981,54 @@ pub fn cancel_core_loop(task_id: String, state: State<'_, AppState>) -> Result<(
 }
 
 #[tauri::command]
+pub fn get_verify_only_eligibility(project_id: String, task_id: String, state: State<'_, AppState>)
+    -> Result<Option<crate::core_loop::verify_only::Eligibility>, String> {
+    with_db(&state, |db| match crate::core_loop::verify_only::eligibility(db, &project_id, &task_id) {
+        Ok(value) => Ok(Some(value)),
+        Err(NovaError::Config(_)) => Ok(None),
+        Err(error) => Err(error),
+    })
+}
+
+/// Separate from start_core_loop: no CLI probing, adapter, or AI dispatch.
+#[tauri::command]
+pub fn verify_existing_changes(project_id: String, task_id: String,
+    expected: crate::core_loop::verify_only::Eligibility, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let cancel = CancellationToken::new();
+    {
+        let mut runs = state.core_loop_cancel.lock().unwrap();
+        if runs.contains_key(&task_id) { return Err("该任务正在执行，请勿重复操作".into()); }
+        runs.insert(task_id.clone(), cancel.clone());
+    }
+    let checked = with_db(&state, |db| {
+        let current = crate::core_loop::verify_only::eligibility(db, &project_id, &task_id)?;
+        if current != expected { return Err(NovaError::Config("任务验证条件已变化，请刷新后重试".into())); }
+        Ok(())
+    });
+    if let Err(error) = checked {
+        state.core_loop_cancel.lock().unwrap().remove(&task_id);
+        return Err(error);
+    }
+    let db_path = state.app_data_dir.join("nova.sqlite3");
+    let data_dir = state.app_data_dir.clone();
+    let runs = state.core_loop_cancel.clone();
+    tauri::async_runtime::spawn(async move {
+        let id = task_id.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let db = crate::db::Database::open(&db_path)?;
+            crate::core_loop::verify_only::run(&db, &project_id, &id, &expected, &cancel, &data_dir)
+        }).await.unwrap_or_else(|error| Err(NovaError::Config(format!("仅验证线程异常：{}", crate::security::redact_sensitive_text(&error.to_string())))));
+        runs.lock().unwrap().remove(&task_id);
+        let payload = match result {
+            Ok(value) => serde_json::json!({"task_id": task_id, "state": value.task.state}),
+            Err(error) => serde_json::json!({"task_id": task_id, "error": crate::security::redact_sensitive_text(&error.public_message())}),
+        };
+        let _ = app.emit("core-loop://done", payload);
+    });
+    Ok(())
+}
+
+#[tauri::command]
 pub fn list_task_reviews(
     project_id: String,
     task_id: String,

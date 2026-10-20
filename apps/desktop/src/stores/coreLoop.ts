@@ -1,6 +1,12 @@
 import { defineStore } from 'pinia'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
+export interface VerifyOnlyEligibility {
+  result_generation: number
+  round: number
+  dev_attempt: number
+  test_command: string
+}
 import type {
   CliBinaryTrustStatus,
   CompletionPrecheck,
@@ -27,6 +33,10 @@ import type {
 // result through one atomic backend call.
 export const useCoreLoopStore = defineStore('coreLoop', {
   state: () => ({
+    verifyOnlyEligibility: null as VerifyOnlyEligibility | null,
+    verifyOnlyTaskKey: '',
+    verifyOnlyQuery: 0,
+    verifyingOnly: false,
     projects: [] as Project[],
     currentProject: null as Project | null,
     tasks: [] as Task[],
@@ -165,6 +175,48 @@ export const useCoreLoopStore = defineStore('coreLoop', {
     },
   },
   actions: {
+    async loadVerifyOnlyEligibility() {
+      const token = ++this.verifyOnlyQuery
+      this.verifyOnlyEligibility = null
+      const task = this.currentTask
+      const project = this.currentProject
+      if (!task || !project || task.state !== 'needs_user_action') return
+      const key = `${project.id}:${task.id}:${task.result_generation}`
+      try {
+        const value = await invoke<VerifyOnlyEligibility | null>('get_verify_only_eligibility', {
+          projectId: project.id, taskId: task.id,
+        })
+        if (token !== this.verifyOnlyQuery || this.currentProject?.id !== project.id ||
+            this.currentTask?.id !== task.id || this.currentTask.state !== 'needs_user_action' ||
+            this.currentTask.result_generation !== task.result_generation) return
+        this.verifyOnlyTaskKey = key
+        this.verifyOnlyEligibility = value
+      } catch (error) {
+        if (token === this.verifyOnlyQuery && this.currentTask?.id === task.id && this.currentProject?.id === project.id) {
+          this.lastError = `无法检查仅验证条件：${String(error)}`
+        }
+      }
+    },
+    async verifyExistingChanges() {
+      const task = this.currentTask
+      const project = this.currentProject
+      const expected = this.verifyOnlyEligibility
+      if (!task || !project || !expected || task.state !== 'needs_user_action' || this.verifyingOnly || this.starting ||
+          this.verifyOnlyTaskKey !== `${project.id}:${task.id}:${task.result_generation}`) return
+      this.verifyingOnly = true
+      this.lastError = ''
+      try {
+        await invoke('verify_existing_changes', { projectId: project.id, taskId: task.id, expected })
+        if (this.currentTask?.id === task.id && this.currentProject?.id === project.id) {
+          this.verifyOnlyEligibility = null
+          await this.refreshCurrentTask()
+        }
+      } catch (error) {
+        if (this.currentTask?.id === task.id && this.currentProject?.id === project.id) this.lastError = String(error)
+      } finally {
+        this.verifyingOnly = false
+      }
+    },
     async loadProjects() {
       this.projects = await invoke<Project[]>('list_projects')
     },
@@ -641,6 +693,7 @@ export const useCoreLoopStore = defineStore('coreLoop', {
           await this.detectTestCommand().catch(() => {})
           await this.loadNoBuildConfirmationNeeded().catch(() => {})
           await this.loadNoTestsConfirmationNeeded().catch(() => {})
+          await this.loadVerifyOnlyEligibility()
         } else {
           this.noBuildConfirmationNeeded = false
           this.noTestsConfirmationNeeded = false

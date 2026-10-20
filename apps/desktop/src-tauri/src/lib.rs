@@ -155,6 +155,8 @@ pub fn run() {
             commands::get_startup_recovery_summary,
             commands::resolve_recovery_checkpoint,
             commands::start_core_loop,
+            commands::get_verify_only_eligibility,
+            commands::verify_existing_changes,
             commands::cancel_core_loop,
             commands::get_core_loop_readiness,
             commands::get_pending_round,

@@ -5,7 +5,7 @@
 // nothing here is a static demo. Deliberately does NOT implement: the full
 // Phase 4 timeline, the evidence center, GitHub import, Create Product,
 // auto-deployment, or push/PR — those are out of this round's scope.
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { useCoreLoopStore } from '../stores/coreLoop'
 import type { Project, TimelineEntry } from '../types'
@@ -29,6 +29,8 @@ function parseJsonStringArray(raw: string | null): string[] {
 }
 
 const store = useCoreLoopStore()
+watch(() => [store.currentProject?.id, store.currentTask?.id, store.currentTask?.state,
+  store.currentTask?.result_generation], () => { void store.loadVerifyOnlyEligibility() }, { immediate: true })
 const refreshMessage = ref('')
 async function handleRefreshTask() {
   refreshMessage.value = ''
@@ -429,6 +431,15 @@ async function handleViewDocument(documentType: string) {
           <input v-model="testCommandDraft" placeholder="手动输入测试命令，例如 cargo test" />
           <button @click="handleConfirmTestCommand('user')">确认使用此命令</button>
         </div>
+      </div>
+      <div v-if="store.currentTask.state === 'needs_user_action' && store.verifyOnlyEligibility &&
+        store.verifyOnlyTaskKey === `${store.currentProject?.id}:${store.currentTask.id}:${store.currentTask.result_generation}`"
+        class="verify-only-recovery">
+        <p>沿用测试命令：<code>{{ store.verifyOnlyEligibility.test_command }}</code></p>
+        <p>仅验证现有修改：不调用开发 AI、审核 AI 或自动返修。验证失败即停止；通过后仍需用户验收。</p>
+        <button :disabled="store.verifyingOnly || store.starting || store.isRunning" @click="store.verifyExistingChanges">
+          {{ store.verifyingOnly ? '正在请求仅验证…' : '重新验证现有修改' }}
+        </button>
       </div>
     </section>
 

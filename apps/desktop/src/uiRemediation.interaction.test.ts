@@ -32,6 +32,7 @@ function route(extra: Record<string, (args: any) => any> = {}) {
     list_task_reviews: () => [], list_task_documents: () => [], list_task_self_checks: () => [],
     get_task_evidence_overview: () => overview(),
     get_completion_precheck: () => ({ ok: false, can_submit_acceptance: false }),
+    get_verify_only_eligibility: () => null,
     list_messages: () => [], ...extra,
   }
   mockedInvoke.mockImplementation(async (command, args) => {
@@ -84,7 +85,7 @@ function expectNoWrites(allowCreate = false) {
   const calls = mockedInvoke.mock.calls.map(c => c[0])
   const reads = ['get_last_active_project', 'list_tasks_for_project', 'detect_test_command',
     'list_task_reviews', 'list_task_documents', 'list_task_self_checks',
-    'get_task_evidence_overview', 'get_completion_precheck']
+    'get_task_evidence_overview', 'get_completion_precheck', 'get_verify_only_eligibility']
   for (const command of calls) {
     expect([...reads, ...(allowCreate ? ['create_task'] : [])]).toContain(command)
   }
@@ -304,5 +305,51 @@ describe('RAV-01 background failure notification', () => {
     await settle()
     expect(root.textContent).not.toContain('foreign failure')
     expect(store.currentTask.state).toBe('running')
+  })
+})
+
+
+describe('RAV-01 verify-only recovery', () => {
+  const eligible = { result_generation: 0, round: 1, dev_attempt: 1, test_command: 'npm test' }
+  it('shows an entry for an already confirmed command and dispatches only verify-only once', async () => {
+    const pending = deferred<void>()
+    route({ get_verify_only_eligibility: () => eligible, verify_existing_changes: () => pending.promise,
+      list_tasks_for_project: () => [task({ state: 'verifying' })], get_pending_round: () => 1 })
+    const { root, store } = await core()
+    store.currentTask = task({ state: 'needs_user_action', test_command_source: 'user', test_command_redacted: 'npm test' })
+    await settle()
+    expect(root.textContent).toContain('沿用测试命令：npm test')
+    const action = button(root, '重新验证现有修改')
+    const request = click(action)
+    await settle()
+    expect(store.verifyingOnly).toBe(true)
+    await store.verifyExistingChanges()
+    expect(mockedInvoke.mock.calls.filter(c => c[0] === 'verify_existing_changes')).toHaveLength(1)
+    expect(mockedInvoke.mock.calls.find(c => c[0] === 'verify_existing_changes')?.[1]).toEqual({ projectId: 'project', taskId: 'task', expected: eligible })
+    pending.resolve(); await request
+    expect(store.currentTask.state).toBe('verifying')
+    expect(mockedInvoke.mock.calls.some(c => ['start_core_loop', 'get_core_loop_readiness', 'confirm_task_test_command'].includes(c[0]))).toBe(false)
+  })
+  it('hides the entry when backend rejects eligibility and discards late foreign-task results', async () => {
+    const pending = deferred<typeof eligible>()
+    route({ get_verify_only_eligibility: () => pending.promise })
+    const { root, store } = await core()
+    store.currentTask = task({ state: 'needs_user_action' }); await settle()
+    store.currentTask = task({ id: 'other', state: 'completed' }); await settle()
+    pending.resolve(eligible); await settle()
+    expect(store.verifyOnlyEligibility).toBeNull()
+    expect(all(root, n => n.kind === 'button' && n.textContent === '重新验证现有修改')).toHaveLength(0)
+    await store.verifyExistingChanges()
+    expect(mockedInvoke.mock.calls.some(c => c[0] === 'verify_existing_changes')).toBe(false)
+  })
+  it('shows request errors and never falls back to ordinary development', async () => {
+    route({ get_verify_only_eligibility: () => eligible,
+      verify_existing_changes: () => { throw new Error('任务验证条件已变化') } })
+    const { root, store } = await core()
+    store.currentTask = task({ state: 'needs_user_action', test_command_source: 'user', test_command_redacted: 'npm test' })
+    await settle(); await click(button(root, '重新验证现有修改'))
+    expect(root.textContent).toContain('任务验证条件已变化')
+    expect(store.verifyingOnly).toBe(false)
+    expect(mockedInvoke.mock.calls.some(c => c[0] === 'start_core_loop')).toBe(false)
   })
 })

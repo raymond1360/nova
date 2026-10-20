@@ -1442,3 +1442,141 @@ fn rav01_outer_panic_reports_redacted_payload() {
     assert!(reason.contains("evidence write fault"));
     assert!(!reason.contains(&secret));
 }
+
+
+fn verify_only_fixture() -> Fixture {
+    let f = Fixture::new(false);
+    fs::write(f.dir.join("package.json"), r#"{"scripts":{"test":"node --test"}}"#).unwrap();
+    f.db.set_task_test_command(&f.task, "npm test", "user").unwrap();
+    f.dev(1);
+    f.check(1);
+    authorized_round(&f, 1);
+    for state in [TaskState::Queued, TaskState::Running, TaskState::Verifying, TaskState::NeedsUserAction] { f.transition(state); }
+    let key = test_action_key(&f.task, 0, 1);
+    f.db.plan_action(&f.task, "test_execution", &key).unwrap();
+    let a = f.db.start_action(&f.task, &key, false).unwrap();
+    f.db.finish_action(&f.task, &key, ActionStatus::Failed, None, Some("previous parser fault"), a.attempt_number).unwrap();
+    f
+}
+fn verify_only_outcome(success: bool, infra: bool) -> test_runner::TestRunOutcome {
+    test_runner::TestRunOutcome { program: "npm".into(), args: vec!["test".into()], cwd: "isolated".into(),
+        exit_code: Some(if success || infra { 0 } else { 1 }), passed: Some(if success {2} else {0}),
+        failed: Some(if success {0} else {2}), skipped: Some(0), timed_out: false, cancelled: false,
+        process_succeeded: success, infrastructure_error: if infra {Some("测试结果解析：injected fault".into())} else {None},
+        stdout: "fixture output".into(), stderr: String::new() }
+}
+fn assert_verify_only_no_ai(f: &Fixture) {
+    let actions = f.db.list_actions_for_task(&f.task).unwrap();
+    assert_eq!(actions.iter().filter(|a| a.action_type == "ai_development").count(), 1);
+    assert_eq!(actions.iter().find(|a| a.action_type == "ai_development").unwrap().attempt_number, 1);
+    assert!(!actions.iter().any(|a| a.action_type.contains("review")));
+    assert!(!f.db.list_task_state_events(&f.project, &f.task).unwrap().iter().any(|e| e.new_state == TaskState::SafeFixing));
+}
+#[test]
+fn rav01_verify_only_success_preserves_development_and_requires_user_acceptance() {
+    let f = verify_only_fixture();
+    let expected = verify_only::eligibility(&f.db, &f.project, &f.task).unwrap();
+    let history = f.db.list_actions_for_task(&f.task).unwrap();
+    test_runner::RUN_OUTCOME_OVERRIDE.with(|v| *v.borrow_mut() = Some(verify_only_outcome(true, false)));
+    let result = verify_only::run(&f.db, &f.project, &f.task, &expected, &CancellationToken::new(), &f.dir).unwrap();
+    assert_eq!(result.task.state, TaskState::AwaitingUserAcceptance);
+    assert_verify_only_no_ai(&f);
+    let dev = f.db.find_action(&f.task, &format!("dev-{}-round-1",f.task)).unwrap().unwrap();
+    assert_eq!(serde_json::to_value(dev).unwrap(), serde_json::to_value(&history[0]).unwrap());
+    assert!(verify_only::run(&f.db, &f.project, &f.task, &expected, &CancellationToken::new(), &f.dir).is_err());
+}
+#[test]
+fn rav01_verify_only_assertion_and_infrastructure_failures_stop_without_ai() {
+    for infra in [false, true] {
+        let f = verify_only_fixture();
+        let expected = verify_only::eligibility(&f.db, &f.project, &f.task).unwrap();
+        test_runner::RUN_OUTCOME_OVERRIDE.with(|v| *v.borrow_mut() = Some(verify_only_outcome(false, infra)));
+        let result = verify_only::run(&f.db, &f.project, &f.task, &expected, &CancellationToken::new(), &f.dir).unwrap();
+        assert_eq!(result.task.state, TaskState::NeedsUserAction);
+        assert_verify_only_no_ai(&f);
+        let records = f.db.list_test_evidence_for_round(&f.project, &f.task, 0, 1).unwrap();
+        assert_eq!(records.len(), 1); assert_eq!(records[0].status, "failed");
+        assert_eq!(records[0].exit_code, Some(if infra {0} else {1}));
+        assert!(f.db.list_build_evidence_for_round(&f.project, &f.task, 0, 1).unwrap().is_empty());
+    }
+}
+#[test]
+fn rav01_verify_only_rejects_stale_identity_missing_or_blocked_self_check_and_uncertain_actions() {
+    for scenario in 0..12 {
+        let f = verify_only_fixture();
+        let mut expected = verify_only::eligibility(&f.db, &f.project, &f.task).unwrap();
+        match scenario {
+            0 => expected.result_generation += 1,
+            1 => { f.db.conn().execute("DELETE FROM self_checks WHERE task_id=?1", [&f.task]).unwrap(); },
+            2 => { f.db.conn().execute("UPDATE self_checks SET self_reported_status='self_reported_blocked' WHERE task_id=?1", [&f.task]).unwrap(); },
+            3 => { f.db.conn().execute("UPDATE task_actions SET status='uncertain' WHERE task_id=?1 AND action_type='test_execution'", [&f.task]).unwrap(); },
+            4 => { f.db.conn().execute("UPDATE tasks SET legacy_classification='unknown_insufficient' WHERE id=?1", [&f.task]).unwrap(); },
+            5 => { expected.dev_attempt += 1; },
+            6 => { expected.round += 1; },
+            7 => { f.db.conn().execute("UPDATE task_actions SET status='failed' WHERE task_id=?1 AND action_type='ai_development'", [&f.task]).unwrap(); },
+            8 => { f.db.conn().execute("UPDATE tasks SET state='completed' WHERE id=?1", [&f.task]).unwrap(); },
+            9 => { f.db.conn().execute("UPDATE self_checks SET unfinished_items_json='[\"unfinished\"]' WHERE task_id=?1", [&f.task]).unwrap(); },
+            10 => { f.db.conn().execute("UPDATE self_checks SET requirement_coverage_json='[]' WHERE task_id=?1", [&f.task]).unwrap(); },
+            _ => { f.db.conn().execute("UPDATE tasks SET result_generation=1 WHERE id=?1", [&f.task]).unwrap(); },
+        }
+        let before = f.events();
+        assert!(verify_only::run(&f.db, &f.project, &f.task, &expected, &CancellationToken::new(), &f.dir).is_err(), "scenario {scenario}");
+        assert_eq!(before, f.events()); assert_verify_only_no_ai(&f);
+    }
+}
+#[test]
+fn rav01_verify_only_duplicate_operation_is_not_dispatched() {
+    let f = verify_only_fixture();
+    let expected = verify_only::eligibility(&f.db, &f.project, &f.task).unwrap();
+    let key = format!("verify-only-{}-g0-r1-a1", f.task);
+    f.db.plan_action(&f.task, "verification_only", &key).unwrap();
+    f.db.start_action(&f.task, &key, false).unwrap();
+    assert!(verify_only::run(&f.db, &f.project, &f.task, &expected, &CancellationToken::new(), &f.dir).is_err());
+    assert_eq!(f.db.find_action(&f.task, &test_action_key(&f.task,0,1)).unwrap().unwrap().attempt_number, 1);
+    assert_verify_only_no_ai(&f);
+}
+
+
+#[test]
+fn rav01_verify_only_real_isolated_build_success_and_failure_never_dispatch_ai() {
+    for success in [true, false] {
+        let f = verify_only_fixture();
+        fs::write(f.dir.join("package.json"), r#"{"scripts":{"test":"node --test","build":"node build.mjs"}}"#).unwrap();
+        fs::write(f.dir.join("build.mjs"), if success {"process.exit(0)"} else {"process.exit(1)"}).unwrap();
+        let expected = verify_only::eligibility(&f.db, &f.project, &f.task).unwrap();
+        test_runner::RUN_OUTCOME_OVERRIDE.with(|v| *v.borrow_mut() = Some(verify_only_outcome(true, false)));
+        let result = verify_only::run(&f.db, &f.project, &f.task, &expected, &CancellationToken::new(), &f.dir).unwrap();
+        assert_eq!(result.task.state, if success {TaskState::AwaitingUserAcceptance} else {TaskState::NeedsUserAction});
+        assert_verify_only_no_ai(&f);
+        let evidence = f.db.list_build_evidence_for_round(&f.project,&f.task,0,1).unwrap();
+        assert_eq!(evidence.len(),1);
+        assert_eq!(evidence[0].status, if success {"passed"} else {"failed"});
+        assert_eq!(evidence[0].exit_code, Some(if success {0} else {1}));
+    }
+}
+#[test]
+fn rav01_verify_only_two_connections_cannot_claim_same_operation() {
+    let f = verify_only_fixture();
+    let dbfile = f.dir.join("copy.sqlite3");
+    f.db.conn().execute("VACUUM INTO ?1", [dbfile.to_string_lossy().as_ref()]).unwrap();
+    let expected = verify_only::eligibility(&f.db,&f.project,&f.task).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let path=dbfile.clone(); let task=f.task.clone(); let project=f.project.clone();
+        let expected=expected.clone(); let barrier=barrier.clone(); let dir=f.dir.clone();
+        workers.push(std::thread::spawn(move || {
+            let db=Database::open(&path).unwrap();
+            test_runner::RUN_OUTCOME_OVERRIDE.with(|v| *v.borrow_mut()=Some(verify_only_outcome(true,false)));
+            barrier.wait();
+            verify_only::run(&db,&project,&task,&expected,&CancellationToken::new(),&dir).is_ok()
+        }));
+    }
+    let successes=workers.into_iter().map(|w|w.join().unwrap() as usize).sum::<usize>();
+    assert_eq!(successes,1);
+    let db=Database::open(&dbfile).unwrap();
+    let evidence=db.list_test_evidence_for_round(&f.project,&f.task,0,1).unwrap();
+    assert_eq!(evidence.len(),1);
+    let actions=db.list_actions_for_task(&f.task).unwrap();
+    assert_eq!(actions.iter().filter(|a|a.action_type=="verification_only").count(),1);
+}

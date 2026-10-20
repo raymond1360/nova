@@ -5,6 +5,7 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }))
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }))
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import App from './App.vue'
 import CoreLoopView from './components/CoreLoopView.vue'
 import { useNovaStore } from './stores/nova'
@@ -229,5 +230,79 @@ describe('IA-03 existing requirements are independent read-only data', () => {
     expect(root.textContent).not.toContain('确认沿用，生成需求清单')
     expect(all(root, n => n.kind === 'button' && n.textContent === '我已确认需求，继续')).toHaveLength(0)
     expectNoWrites()
+  })
+})
+
+
+describe('RAV-01 progress and blocking feedback', () => {
+  it('refresh evidence also updates the task state and exposes blocked details', async () => {
+    const updated = task({ state: 'needs_user_action' })
+    route({
+      list_tasks_for_project: () => [updated],
+      get_pending_round: () => 1,
+      get_task_evidence_overview: () => ({ ...overview(), task_state: 'needs_user_action' }),
+      list_task_self_checks: () => [{ id: 'check', task_id: 'task', round: 1, result_attempt: 1,
+        parse_status: 'valid', self_reported_status: 'self_reported_blocked',
+        blocking_issues_json: '["helper_unknown_error: setup refresh had errors"]',
+        unfinished_items_json: '[]', check_results_json: '[]', created_at: 'now' }],
+    })
+    const { root, store } = await core()
+    store.currentTask = task({ state: 'running' })
+    store.evidenceOverview = overview()
+    await nextTick()
+    await click(button(root, '刷新时间线与证据'))
+    await settle()
+    expect(store.currentTask.state).toBe('needs_user_action')
+    expect(root.textContent).toContain('需要用户处理')
+    expect(root.textContent).toContain('helper_unknown_error: setup refresh had errors')
+    expect(root.textContent).toContain('已刷新任务状态、时间线与证据')
+    expect(mockedInvoke.mock.calls.some(c => c[0] === 'start_core_loop')).toBe(false)
+  })
+
+  it('shows refresh failure instead of silently swallowing it', async () => {
+    route({ list_tasks_for_project: () => { throw new Error('read failed') } })
+    const { root, store } = await core()
+    store.currentTask = task({ state: 'running' })
+    store.evidenceOverview = overview()
+    await nextTick()
+    await click(button(root, '刷新时间线与证据'))
+    await settle()
+    expect(root.textContent).toContain('刷新任务失败')
+    expect(root.textContent).toContain('read failed')
+    expect(root.textContent).not.toContain('已刷新任务状态、时间线与证据')
+  })
+})
+
+
+describe('RAV-01 background failure notification', () => {
+  it('shows the selected task error and refreshes without starting a task', async () => {
+    let notify: ((event: any) => void) | undefined
+    vi.mocked(listen).mockImplementationOnce(async (_name, handler) => {
+      notify = handler
+      return () => {}
+    })
+    route({ list_tasks_for_project: () => [task({ state: 'needs_user_action' })] })
+    const { root, store } = await core()
+    store.currentTask = task({ state: 'verifying' })
+    notify?.({ payload: { task_id: 'task', error: '核心循环执行线程异常终止' } })
+    await settle()
+    expect(root.textContent).toContain('核心循环执行线程异常终止')
+    expect(store.currentTask.state).toBe('needs_user_action')
+    expect(mockedInvoke.mock.calls.some(c => c[0] === 'start_core_loop')).toBe(false)
+  })
+
+  it('ignores notifications from another task', async () => {
+    let notify: ((event: any) => void) | undefined
+    vi.mocked(listen).mockImplementationOnce(async (_name, handler) => {
+      notify = handler
+      return () => {}
+    })
+    route()
+    const { root, store } = await core()
+    store.currentTask = task({ state: 'running' })
+    notify?.({ payload: { task_id: 'other-task', error: 'foreign failure' } })
+    await settle()
+    expect(root.textContent).not.toContain('foreign failure')
+    expect(store.currentTask.state).toBe('running')
   })
 })

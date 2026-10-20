@@ -618,34 +618,43 @@ export const useCoreLoopStore = defineStore('coreLoop', {
     },
     async refreshCurrentTask() {
       if (!this.currentTask || !this.currentProject) return
-      await this.loadTasks()
-      const refreshed = this.tasks.find((t) => t.id === this.currentTask!.id)
-      if (refreshed) this.currentTask = refreshed
-      await this.loadReviews()
-      await this.loadPendingRound().catch(() => {})
-      // Phase 4: every refresh re-derives the timeline/evidence/documents
-      // from the backend's current truth — never appended to, so polling
-      // while a task is running can never duplicate a timeline entry.
-      await this.loadEvidenceOverview().catch(() => {})
-      await this.loadTaskDocuments().catch(() => {})
-      // WP2A: same reasoning for the completion precheck and self-check
-      // history.
-      await this.loadCompletionPrecheck().catch(() => {})
-      await this.loadSelfChecks().catch(() => {})
-      if (this.currentTask?.state === 'needs_user_action') {
-        await this.detectTestCommand().catch(() => {})
-        await this.loadNoBuildConfirmationNeeded().catch(() => {})
-        await this.loadNoTestsConfirmationNeeded().catch(() => {})
-      } else {
-        this.noBuildConfirmationNeeded = false
-        this.noTestsConfirmationNeeded = false
-        // v0.1.0 scope correction (Work Package 2 remediation, Major 1) /
-        // Work Package 3 final review remediation (Major 1): the task just
-        // left `needs_user_action` (or there is no current task) —
-        // invalidate any no-build/no-tests query still in flight for it so
-        // a late response cannot resurrect the prompt.
-        this.noBuildConfirmationRequestToken += 1
-        this.noTestsConfirmationRequestToken += 1
+      const taskId = this.currentTask.id
+      const projectId = this.currentProject.id
+      const isCurrent = () => this.currentTask?.id === taskId && this.currentProject?.id === projectId
+      try {
+        await this.loadTasks()
+        if (!isCurrent()) return
+        const refreshed = this.tasks.find((t) => t.id === taskId)
+        if (refreshed) this.currentTask = refreshed
+        await this.loadReviews()
+        await this.loadPendingRound().catch(() => {})
+        // Phase 4: every refresh re-derives the timeline/evidence/documents
+        // from the backend's current truth — never appended to, so polling
+        // while a task is running can never duplicate a timeline entry.
+        await this.loadEvidenceOverview()
+        await this.loadTaskDocuments().catch(() => {})
+        // WP2A: same reasoning for the completion precheck and self-check
+        // history.
+        await this.loadCompletionPrecheck().catch(() => {})
+        await this.loadSelfChecks()
+        if (this.currentTask?.state === 'needs_user_action') {
+          await this.detectTestCommand().catch(() => {})
+          await this.loadNoBuildConfirmationNeeded().catch(() => {})
+          await this.loadNoTestsConfirmationNeeded().catch(() => {})
+        } else {
+          this.noBuildConfirmationNeeded = false
+          this.noTestsConfirmationNeeded = false
+          // v0.1.0 scope correction (Work Package 2 remediation, Major 1) /
+          // Work Package 3 final review remediation (Major 1): the task just
+          // left `needs_user_action` (or there is no current task) —
+          // invalidate any no-build/no-tests query still in flight for it so
+          // a late response cannot resurrect the prompt.
+          this.noBuildConfirmationRequestToken += 1
+          this.noTestsConfirmationRequestToken += 1
+        }
+      } catch (error) {
+        if (isCurrent()) this.lastError = `刷新任务失败：${String(error)}`
+        throw error
       }
     },
     async loadReviews() {

@@ -17,6 +17,12 @@ const mockedInvoke = vi.mocked(invoke)
 const mockedOpen = vi.mocked(open)
 
 function routeInvoke(handlers: Record<string, (args: unknown) => unknown>) {
+  // Refresh now requires authoritative evidence instead of ignoring errors.
+  handlers = {
+    get_task_evidence_overview: () => null,
+    list_task_self_checks: () => [],
+    ...handlers,
+  }
   mockedInvoke.mockImplementation(async (command: string, args?: unknown) => {
     if (!(command in handlers)) {
       throw new Error(`unexpected invoke: ${command}`)

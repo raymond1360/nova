@@ -306,6 +306,32 @@ pub fn run_core_loop(
     })
 }
 
+/// Background-command boundary: unexpected errors/panics must be observable,
+/// rather than silently discarded by the fire-and-forget Tauri task.
+pub(crate) fn run_core_loop_guarded(
+    db: &Database, task_id: &str, adapter: &dyn DevReviewAdapter,
+    cancel: &CancellationToken, app_data_dir: &Path,
+) -> NovaResult<CoreLoopOutcome> {
+    report_run_failure(db, task_id, || run_core_loop(db, task_id, adapter, cancel, app_data_dir))
+}
+
+fn report_run_failure(
+    db: &Database, task_id: &str,
+    run: impl FnOnce() -> NovaResult<CoreLoopOutcome>,
+) -> NovaResult<CoreLoopOutcome> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+        .unwrap_or_else(|_| Err(NovaError::Config("核心循环执行线程异常终止，未获得有效结果".into())));
+    if let Err(error) = &result {
+        let task = db.task(task_id)?;
+        if matches!(task.state, TaskState::Queued | TaskState::Running | TaskState::Verifying | TaskState::SafeFixing) {
+            let reason = redact_sensitive_text(&format!("执行受阻：{}", error.public_message()));
+            db.transition_task(task_id, TaskState::NeedsUserAction, Actor::System,
+                Some(&reason), None, false, Some("core loop returned an error; no automatic retry"))?;
+        }
+    }
+    result
+}
+
 /// v0.1.0 scope correction (`CODEX_V0.1_SCOPE_CORRECTION_AUDIT_09211027.md`):
 /// the dormant v0.2.0 dual-AI orchestration — developer AI -> independent
 /// evidence -> read-only reviewer -> at most one fix pass -> second review
@@ -1840,6 +1866,23 @@ fn run_dev_and_test_round(
         }
     };
 
+    // A zero CLI exit only proves the invocation ended normally. Its own
+    // explicit blocking report must stop this exact round/attempt, including
+    // a crash-recovery resume; it is never permission to test/build/retry AI.
+    if let Some(check) = db.current_self_check(task_id, round, result_attempt)? {
+        if check.parse_status == "valid"
+            && check.self_reported_status.as_deref() == Some("self_reported_blocked")
+        {
+            let issues: Vec<String> = check.blocking_issues_json.as_deref()
+                .and_then(|text| serde_json::from_str(text).ok()).unwrap_or_default();
+            let reason = redact_sensitive_text(&cap_text(
+                &format!("开发 AI 自检报告受阻，已停止后续验证：{}", issues.join("；")), 2000));
+            db.transition_task(task_id, TaskState::NeedsUserAction, Actor::System,
+                Some(&reason), None, false, Some("developer self-check blocked"))?;
+            return Ok(DevTestOutcome::Stopped);
+        }
+    }
+
     // Same reasoning as the review round's audit calls below: Nova's own
     // evidence-collection git commands must not be tied to the AI-process
     // cancellation token.
@@ -2353,6 +2396,22 @@ fn test_action_key(task_id: &str, result_generation: i64, round: i64) -> String 
 /// gets its own fresh key, and a stale `succeeded` action from an earlier
 /// generation can never be mistaken for proof the *current* generation's
 /// test already ran.
+struct TestActionGuard<'a> {
+    db: &'a Database,
+    task_id: &'a str,
+    key: &'a str,
+    attempt: i64,
+}
+
+impl Drop for TestActionGuard<'_> {
+    fn drop(&mut self) {
+        // A terminal row/new attempt makes this CAS fail harmlessly. This
+        // is cleanup of our own dispatch, never a retry or success claim.
+        let _ = self.db.finish_action(self.task_id, self.key, ActionStatus::Failed,
+            None, Some("测试执行提前结束或异常终止，未获得有效结果"), self.attempt);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_tests_for_round(
     db: &Database,
@@ -2402,6 +2461,13 @@ fn run_tests_for_round(
             return fail_closed_missing_test_evidence(db, project_id, task_id, result_generation, round);
         }
         ActionGate::Started(action) => action.attempt_number,
+    };
+
+    // If preparation/evidence persistence unwinds or returns early, never
+    // leave this dispatch's action at started. CAS binds cleanup to the
+    // captured attempt; it cannot overwrite a newer attempt or terminal row.
+    let _test_action_guard = TestActionGuard {
+        db, task_id, key: &test_key, attempt: test_action_attempt,
     };
 
     let task = db.task(task_id)?;
@@ -2590,6 +2656,14 @@ fn run_tests_for_round(
     } else {
         "passed"
     };
+    let failure_reason = if status == "passed" {
+        None
+    } else if outcome.timed_out {
+        Some("测试执行超时".to_string())
+    } else {
+        Some(redact_sensitive_text(&cap_text(
+            &format!("测试进程未成功完成（退出码 {:?}）：{}", outcome.exit_code, outcome.stderr), 2000)))
+    };
     match db.finish_action(
         task_id,
         &test_key,
@@ -2599,7 +2673,7 @@ fn run_tests_for_round(
             ActionStatus::Failed
         },
         None,
-        None,
+        failure_reason.as_deref(),
         test_action_attempt,
     ) {
         Ok(_) => {}
@@ -2620,14 +2694,18 @@ fn run_tests_for_round(
         failed_count: outcome.failed.unwrap_or(0),
         skipped_count: outcome.skipped.unwrap_or(0),
         exit_code: outcome.exit_code.map(i64::from),
-        reason: if outcome.timed_out {
-            Some("测试执行超时")
-        } else {
-            None
-        },
+        reason: failure_reason.as_deref(),
         stdout_ref: Some(&stdout_ref),
         stderr_ref: Some(&stderr_ref),
     })?;
+
+    // An infrastructure failure is not a failing project assertion and must
+    // never trigger the automatic developer repair/paid invocation branch.
+    if !outcome.process_succeeded && outcome.exit_code.is_none() && !outcome.timed_out {
+        db.transition_task(task_id, TaskState::NeedsUserAction, Actor::System,
+            failure_reason.as_deref(), None, false, Some("test process unavailable; no automatic AI retry"))?;
+        return Ok(TestRoundOutcome::ActionUncertain);
+    }
 
     let summary = format!(
         "命令：{command_display}\n实际程序：{}\nargv：{:?}\n工作目录：{}\n结果：{status}\n通过：{}，失败：{}，跳过：{}\n退出码：{}",

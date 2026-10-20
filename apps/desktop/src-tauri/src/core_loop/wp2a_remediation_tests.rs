@@ -323,25 +323,15 @@ fn wp2a_self_check_rejection_matrix_uses_real_stdout_and_accept_entry() {
         *adapter.development_self_check_override.lock().unwrap() = Some(stdout);
         f.transition(TaskState::Queued);
         f.transition(TaskState::Running);
-        assert!(
-            matches!(
-                run_dev_and_test_round(
-                    &f.db,
-                    &f.task,
-                    &f.project,
-                    &f.dir,
-                    ToolKind::CodexCli,
-                    &adapter,
-                    &CancellationToken::new(),
-                    1,
-                    None,
-                    &f.dir
-                )
-                .unwrap(),
-                DevTestOutcome::Verified(_)
-            ),
-            "{case}"
-        );
+        let outcome = run_dev_and_test_round(&f.db, &f.task, &f.project, &f.dir,
+            ToolKind::CodexCli, &adapter, &CancellationToken::new(), 1, None, &f.dir).unwrap();
+        if case == "blocked" {
+            assert!(matches!(outcome, DevTestOutcome::Stopped));
+            assert_eq!(f.db.task(&f.task).unwrap().state, TaskState::NeedsUserAction);
+            assert!(accept_task_result(&f.db, &f.project, &f.task, true, None, &f.dir).is_err());
+            continue;
+        }
+        assert!(matches!(outcome, DevTestOutcome::Verified(_)), "{case}");
         finish_success_path(&f.db, &f.project, &f.task, 1).unwrap();
         assert!(
             !completion_precheck(&f.db, &f.project, &f.task)
@@ -1313,4 +1303,98 @@ fn wp2a_b3_two_connection_generation_aba_rechecks_current_acceptance() {
     );
     assert!(f.db.user_acceptance_for_task(&f.task).unwrap().is_none());
     assert_eq!(events, f.events());
+}
+
+
+#[test]
+fn rav01_exit_zero_but_blocked_stops_before_tests_and_resume() {
+    let f = Fixture::new(false);
+    let mut check = complete_check(&f);
+    check["self_reported_status"] = "self_reported_blocked".into();
+    check["blocking_issues"] = serde_json::json!(["helper_unknown_error: setup refresh had errors"]);
+    let adapter = MockAdapter::new(vec![MockOutcome::Success], vec![]);
+    *adapter.development_self_check_override.lock().unwrap() = Some(wrap_check(&check));
+    f.transition(TaskState::Queued); f.transition(TaskState::Running);
+    for n in 0..2 {
+        if n == 1 { f.transition(TaskState::Queued); f.transition(TaskState::Running); }
+        assert!(matches!(run_dev_and_test_round(&f.db, &f.task, &f.project,
+            &f.dir, ToolKind::CodexCli, &adapter, &CancellationToken::new(), 1, None, &f.dir).unwrap(),
+            DevTestOutcome::Stopped));
+        assert_eq!(f.db.task(&f.task).unwrap().state, TaskState::NeedsUserAction);
+        assert_eq!(f.db.list_actions_for_task(&f.task).unwrap().len(), 1);
+        assert!(f.db.list_test_evidence_for_round(&f.project, &f.task, 0, 1).unwrap().is_empty());
+    }
+    assert_eq!(adapter.development_call_count(), 1); assert_eq!(adapter.review_call_count(), 0);
+    assert!(f.db.list_task_state_events(&f.project, &f.task).unwrap().iter()
+        .any(|e| e.reason.as_deref().unwrap_or("").contains("helper_unknown_error")));
+}
+
+#[test]
+fn rav01_test_cleanup_cannot_overwrite_a_new_attempt_or_terminal_row() {
+    let f = Fixture::new(false); let key = test_action_key(&f.task, 0, 1);
+    f.db.plan_action(&f.task, "test_execution", &key).unwrap();
+    let first = f.db.start_action(&f.task, &key, false).unwrap();
+    drop(TestActionGuard { db: &f.db, task_id: &f.task, key: &key, attempt: first.attempt_number });
+    let stopped = f.db.find_action(&f.task, &key).unwrap().unwrap();
+    assert_eq!(stopped.status, ActionStatus::Failed); assert!(stopped.finished_at.is_some());
+    assert!(stopped.error_summary.is_some());
+    f.db.reset_failed_action_for_retry(&f.task, &key).unwrap();
+    let second = f.db.start_action(&f.task, &key, false).unwrap();
+    drop(TestActionGuard { db: &f.db, task_id: &f.task, key: &key, attempt: first.attempt_number });
+    assert_eq!(f.db.find_action(&f.task, &key).unwrap().unwrap().status, ActionStatus::Started);
+    f.db.finish_action(&f.task, &key, ActionStatus::Succeeded, None, None, second.attempt_number).unwrap();
+    drop(TestActionGuard { db: &f.db, task_id: &f.task, key: &key, attempt: second.attempt_number });
+    assert_eq!(f.db.find_action(&f.task, &key).unwrap().unwrap().status, ActionStatus::Succeeded);
+}
+
+#[test]
+fn rav01_unexpected_run_error_and_panic_are_visible() {
+    for panic in [false, true] {
+        let f = Fixture::new(false); f.transition(TaskState::Queued); f.transition(TaskState::Running);
+        let result = report_run_failure(&f.db, &f.task, || {
+            if panic { panic!("injected failure") }
+            Err(NovaError::Config("injected worker error".into()))
+        });
+        assert!(result.is_err()); assert_eq!(f.db.task(&f.task).unwrap().state, TaskState::NeedsUserAction);
+        let events = f.db.list_task_state_events(&f.project, &f.task).unwrap();
+        assert!(events.last().unwrap().reason.as_deref().unwrap().contains("执行受阻"));
+    }
+}
+
+#[test]
+fn rav01_failed_test_settles_ledger_and_keeps_spawn_reason() {
+    let f = Fixture::new(false); fs::write(f.dir.join("package.json"), "{}").unwrap();
+    f.transition(TaskState::Queued); f.transition(TaskState::Running); f.transition(TaskState::Verifying);
+    test_runner::RUN_OUTCOME_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(test_runner::TestRunOutcome {
+        program: "npm".into(), args: vec!["test".into()], cwd: f.dir.to_string_lossy().into_owned(),
+        exit_code: None, passed: None, failed: None, skipped: None, timed_out: false,
+        cancelled: false, process_succeeded: false, stdout: String::new(), stderr: "cannot start process".into(),
+    }));
+    assert!(matches!(run_tests_for_round(&f.db, &f.project, &f.task, &f.dir, 1, 1,
+        &CancellationToken::new()).unwrap(), TestRoundOutcome::ActionUncertain));
+    assert_eq!(f.db.task(&f.task).unwrap().state, TaskState::NeedsUserAction);
+    let action = f.db.find_action(&f.task, &test_action_key(&f.task, 0, 1)).unwrap().unwrap();
+    assert_eq!(action.status, ActionStatus::Failed); assert!(action.finished_at.is_some());
+    assert!(action.error_summary.unwrap().contains("cannot start process"));
+    let evidence = f.db.list_test_evidence_for_round(&f.project, &f.task, 0, 1).unwrap();
+    assert_eq!(evidence[0].status, "failed");
+    assert!(evidence[0].reason.as_deref().unwrap().contains("cannot start process"));
+}
+
+
+#[test]
+fn rav01_test_start_failure_never_invokes_automatic_ai_repair() {
+    let f = Fixture::new(false);
+    fs::write(f.dir.join("package.json"), r#"{"scripts":{"test":"node absent.mjs","build":"node absent.mjs"}}"#).unwrap();
+    let adapter = MockAdapter::new(vec![MockOutcome::Success, MockOutcome::Success], vec![]);
+    test_runner::RUN_OUTCOME_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(test_runner::TestRunOutcome {
+        program: "npm".into(), args: vec!["test".into()], cwd: f.dir.to_string_lossy().into_owned(),
+        exit_code: None, passed: None, failed: None, skipped: None, timed_out: false,
+        cancelled: false, process_succeeded: false, stdout: String::new(), stderr: "process unavailable".into(),
+    }));
+    let outcome = run_core_loop(&f.db, &f.task, &adapter, &CancellationToken::new(), &f.dir).unwrap();
+    assert_eq!(outcome.task.state, TaskState::NeedsUserAction);
+    assert_eq!(adapter.development_call_count(), 1);
+    assert_eq!(adapter.review_call_count(), 0);
+    assert!(f.db.list_actions_for_task(&f.task).unwrap().iter().all(|a| a.status != ActionStatus::Started));
 }

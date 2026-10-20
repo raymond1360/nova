@@ -6,6 +6,7 @@
 // Phase 4 timeline, the evidence center, GitHub import, Create Product,
 // auto-deployment, or push/PR — those are out of this round's scope.
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { listen } from '@tauri-apps/api/event'
 import { useCoreLoopStore } from '../stores/coreLoop'
 import type { Project, TimelineEntry } from '../types'
 
@@ -28,6 +29,16 @@ function parseJsonStringArray(raw: string | null): string[] {
 }
 
 const store = useCoreLoopStore()
+const refreshMessage = ref('')
+async function handleRefreshTask() {
+  refreshMessage.value = ''
+  try {
+    await store.refreshCurrentTask()
+    refreshMessage.value = '已刷新任务状态、时间线与证据'
+  } catch {
+    // Store displays a scoped, visible error; never leave an unhandled click.
+  }
+}
 
 const newProjectName = ref('')
 const taskTitle = ref('')
@@ -49,6 +60,8 @@ const codexPathDraft = ref('codex')
 const claudePathDraft = ref('claude')
 
 let pollHandle: ReturnType<typeof setInterval> | null = null
+let unlistenCoreDone: (() => void) | null = null
+let disposed = false
 
 function startPolling() {
   stopPolling()
@@ -69,12 +82,24 @@ function stopPolling() {
 }
 
 onMounted(async () => {
+  try {
+    const stop = await listen<{ task_id: string; error?: string }>('core-loop://done', (event) => {
+      if (store.currentTask?.id !== event.payload.task_id) return
+      if (event.payload.error) store.lastError = event.payload.error
+      void store.refreshCurrentTask().catch(() => {})
+    })
+    if (disposed) stop()
+    else unlistenCoreDone = stop
+  } catch (error) {
+    store.lastError = `任务状态通知不可用：${String(error)}`
+  }
+  if (disposed) return
   // UI restart/restore: re-load the last active project and its unfinished
   // task (if any) so an app restart does not lose the user's place.
   await store.restoreLastSession()
   startPolling()
 })
-onUnmounted(stopPolling)
+onUnmounted(() => { disposed = true; stopPolling(); unlistenCoreDone?.() })
 
 async function handlePickFolder() {
   await store.pickAndOpenProjectFolder(newProjectName.value)
@@ -274,7 +299,11 @@ async function handleViewDocument(documentType: string) {
   <div class="core-loop-view">
     <h2>项目与任务（Phase 3 最小闭环）</h2>
     <p v-if="store.restoring" class="hint">正在恢复上次会话…</p>
-    <p v-if="store.lastError" class="error-banner">{{ store.lastError }}</p>
+    <p v-if="store.lastError" class="error-banner" role="alert">{{ store.lastError }}</p>
+    <p v-if="refreshMessage" role="status">{{ refreshMessage }}</p>
+    <p v-if="latestSelfCheck?.self_reported_status === 'self_reported_blocked'" class="error-banner" role="alert">
+      最近一次开发 AI 自检报告受阻：{{ latestSelfCheckBlockingIssues.join('；') || '未提供详细原因' }}。尚不能视为开发完成。
+    </p>
 
     <section class="block">
       <h3>1. 选择或打开本地项目</h3>
@@ -480,7 +509,7 @@ async function handleViewDocument(documentType: string) {
       <h3>5. 运行中</h3>
       <p>当前状态：{{ stateLabels[store.currentTask.state] ?? store.currentTask.state }}</p>
       <button @click="store.cancelTask">取消任务</button>
-      <button class="link-button" @click="store.refreshCurrentTask">手动刷新状态</button>
+      <button class="link-button" @click="handleRefreshTask">手动刷新状态</button>
     </section>
 
     <section
@@ -621,7 +650,7 @@ async function handleViewDocument(documentType: string) {
           <p v-if="store.evidenceOverview.commands.length === 0" class="hint">暂无命令记录。</p>
         </details>
       </div>
-      <button class="link-button" @click="store.loadEvidenceOverview">刷新时间线与证据</button>
+      <button class="link-button" @click="handleRefreshTask">刷新时间线与证据</button>
     </section>
 
     <!-- Phase 4: the seven result documents, listed by their real

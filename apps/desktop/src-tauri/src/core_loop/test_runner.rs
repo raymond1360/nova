@@ -288,6 +288,7 @@ thread_local! {
     // Scoped to the invoking test thread; production has no override path.
     pub(crate) static RUN_OUTCOME_OVERRIDE: std::cell::RefCell<Option<TestRunOutcome>> = std::cell::RefCell::new(None);
     pub(crate) static BUILD_DETECTION_OVERRIDE: std::cell::RefCell<Option<BuildDetection>> = std::cell::RefCell::new(None);
+    static PANIC_BEFORE_TEST_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Runs `program args` in `project_dir` through Phase 1's safe process
@@ -310,7 +311,17 @@ pub fn run_tests(
         Some(project_dir.to_path_buf()),
     )
     .with_timeout(timeout);
-    let result = process::execute_blocking(request, cancel);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if PANIC_BEFORE_TEST_SPAWN.with(|flag| flag.replace(false)) {
+            panic!("injected test worker failure");
+        }
+        process::execute_blocking(request, cancel)
+    }));
+    let result = match result {
+        Ok(result) => result,
+        Err(_) => return interrupted_test_outcome(program, args, project_dir),
+    };
 
     let timed_out = matches!(
         result.outcome,
@@ -330,6 +341,12 @@ pub fn run_tests(
     let combined = format!("{}\n{}", result.stdout, result.stderr);
     let (passed, failed, skipped) = parse_counts(&combined);
 
+    let diagnostic = match &result.outcome {
+        ExecutionOutcome::Failed { detail, .. } => {
+            crate::security::redact_sensitive_text(&format!("{}\n{}", detail, result.stderr))
+        }
+        ExecutionOutcome::Success => result.stderr.clone(),
+    };
     TestRunOutcome {
         program: result.program,
         args: result.args,
@@ -342,7 +359,16 @@ pub fn run_tests(
         cancelled,
         process_succeeded,
         stdout: result.stdout,
-        stderr: result.stderr,
+        stderr: diagnostic,
+    }
+}
+
+fn interrupted_test_outcome(program: &str, args: &[String], project_dir: &Path) -> TestRunOutcome {
+    TestRunOutcome {
+        program: program.into(), args: args.to_vec(), cwd: project_dir.to_string_lossy().into_owned(),
+        exit_code: None, passed: None, failed: None, skipped: None,
+        timed_out: false, cancelled: false, process_succeeded: false,
+        stdout: String::new(), stderr: "测试执行线程异常终止，未获得有效结果".into(),
     }
 }
 
@@ -396,6 +422,29 @@ fn extract_count_before(text: &str, label: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn rav01_spawn_failure_keeps_diagnostic_and_never_passes() {
+        let dir = temp_dir("rav01-missing-program");
+        let result = run_tests("nova-rav01-nonexistent-executable", &[], &dir,
+            Duration::from_secs(1), CancellationToken::new());
+        assert!(!result.process_succeeded);
+        assert_eq!(result.exit_code, None);
+        assert!(!result.stderr.trim().is_empty(), "spawn detail must survive even without stderr");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rav01_worker_panic_becomes_a_failed_test_result() {
+        let dir = temp_dir("rav01-worker-panic");
+        PANIC_BEFORE_TEST_SPAWN.with(|flag| flag.set(true));
+        let result = run_tests("npm", &["test".into()], &dir,
+            Duration::from_secs(1), CancellationToken::new());
+        assert!(!result.process_succeeded);
+        assert_eq!(result.exit_code, None);
+        assert!(result.stderr.contains("异常终止"));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let mut dir = std::env::temp_dir();

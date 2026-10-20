@@ -926,16 +926,15 @@ pub fn start_core_loop(
     let core_loop_cancel = state.core_loop_cancel.clone();
     tauri::async_runtime::spawn(async move {
         let outcome = tokio::task::spawn_blocking(move || {
-            let db = crate::db::Database::open(&db_path).ok()?;
+            let db = crate::db::Database::open(&db_path)?;
             let adapter = crate::runtime::ai_adapter::DualCliAdapter::new(
                 crate::runtime::ai_adapter::CliConfig::from_binary_name(&codex_binary),
                 crate::runtime::ai_adapter::CliConfig::from_binary_name(&claude_binary),
             );
-            crate::core_loop::run_core_loop(&db, &task_id, &adapter, &cancel, &app_data_dir).ok()
+            crate::core_loop::run_core_loop_guarded(&db, &task_id, &adapter, &cancel, &app_data_dir)
         })
         .await
-        .ok()
-        .flatten();
+        .unwrap_or_else(|_| Err(NovaError::Config("核心循环后台线程异常终止".into())));
 
         // The run handle is only ever meant to exist while the loop is
         // genuinely in flight — remove it now that it has returned
@@ -951,15 +950,12 @@ pub fn start_core_loop(
         // step-by-step progress stream, matching Phase 3's "no more than
         // the minimal interface" scope. Callers can still poll
         // `list_task_state_events`/`list_task_reviews` for detail.
-        if let Some(outcome) = outcome {
-            let _ = app.emit(
-                "core-loop://done",
-                serde_json::json!({
-                    "task_id": task_id_for_event,
-                    "state": outcome.task.state,
-                }),
-            );
-        }
+        let payload = match outcome {
+            Ok(outcome) => serde_json::json!({"task_id": task_id_for_event, "state": outcome.task.state}),
+            Err(error) => serde_json::json!({"task_id": task_id_for_event,
+                "error": crate::security::redact_sensitive_text(&error.public_message())}),
+        };
+        let _ = app.emit("core-loop://done", payload);
     });
     Ok(())
 }

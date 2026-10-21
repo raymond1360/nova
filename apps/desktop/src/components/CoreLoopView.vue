@@ -256,12 +256,16 @@ const latestGitEvent = computed(() => {
   const events = store.evidenceOverview?.git_events
   return events && events.length > 0 ? events[events.length - 1] : null
 })
-const currentTests = computed(() =>
-  (store.evidenceOverview?.tests ?? []).filter((t) => t.is_current_generation && t.is_current_attempt),
-)
-const currentBuilds = computed(() =>
-  (store.evidenceOverview?.builds ?? []).filter((b) => b.is_current_generation && b.is_current_attempt),
-)
+const currentTests = computed(() => {
+  const rows = store.evidenceOverview?.tests ?? []
+  const adopted = rows.filter(t => t.is_adopted)
+  return adopted.length ? adopted : rows.filter(t => t.is_current_generation && t.is_current_attempt)
+})
+const currentBuilds = computed(() => {
+  const rows = store.evidenceOverview?.builds ?? []
+  const adopted = rows.filter(b => b.is_adopted)
+  return adopted.length ? adopted : rows.filter(b => b.is_current_generation && b.is_current_attempt)
+})
 function evidenceStatus(status: string | undefined): { label: string; tone: string } {
   if (!status || status === 'not_run') return { label: '尚未运行', tone: 'hint' }
   if (status === 'passed') return { label: '已通过', tone: 'ok' }
@@ -276,8 +280,8 @@ function evidenceStatus(status: string | undefined): { label: string; tone: stri
   if (['started', 'running', 'queued'].includes(status)) return { label: '进行中', tone: 'hint' }
   return { label: `未知状态（${status}）`, tone: 'hint' }
 }
-const currentTestStatus = computed(() => evidenceStatus(currentTests.value.at(-1)?.status))
-const currentBuildStatus = computed(() => evidenceStatus(currentBuilds.value.at(-1)?.status))
+const currentTestStatus = computed(() => evidenceStatus(currentTests.value.at(-1)?.display_status ?? currentTests.value.at(-1)?.status))
+const currentBuildStatus = computed(() => evidenceStatus(currentBuilds.value.at(-1)?.display_status ?? currentBuilds.value.at(-1)?.status))
 
 // WP2A: `store.selfChecks` is oldest-first and append-only (see
 // `Database::list_self_checks_for_task`'s own doc comment) — the last
@@ -642,7 +646,7 @@ async function handleViewDocument(documentType: string) {
         </details>
 
         <h4>Nova 验证摘要</h4>
-        <p>改动文件：{{ store.evidenceOverview.file_changes.length }} 个</p>
+        <p>改动文件：{{ store.evidenceOverview.file_snapshot_available ? `${store.evidenceOverview.current_file_changes?.length ?? 0} 个` : '（当前快照未知）' }}</p>
         <p v-if="latestGitEvent">
           Git：{{ latestGitEvent.branch ?? '（未知分支）' }} · {{ latestGitEvent.commit_sha ?? '（无提交）' }}
           <span v-if="latestGitEvent.diff_stat"> · {{ latestGitEvent.diff_stat }}</span>
@@ -659,6 +663,22 @@ async function handleViewDocument(documentType: string) {
             <code>{{ cmd.command_redacted }}</code> — exit {{ cmd.exit_code ?? '(无)' }}
           </div>
           <p v-if="store.evidenceOverview.commands.length === 0" class="hint">暂无命令记录。</p>
+          <details v-for="item in store.evidenceOverview.tests" :key="`test-${item.id}`" class="validation-evidence">
+            <summary>独立测试：{{ item.test_command_redacted ?? '无命令' }} — exit {{ item.exit_code ?? '(无)' }}
+              · {{ item.is_adopted ? '当前结果依据' : '执行记录（非当前采用）' }}</summary>
+            <p>项目：{{ item.project_id }} · 任务：{{ item.task_id }} · generation {{ item.result_generation }}
+              · round {{ item.round }} · 开发 attempt {{ item.result_attempt ?? '未知' }} · {{ statusLabel(item.display_status ?? item.status) }}</p>
+            <p v-if="item.reason">{{ item.reason }}</p>
+            <pre>stdout: {{ item.stdout_redacted ?? '（无）' }}</pre><pre>stderr: {{ item.stderr_redacted ?? '（无）' }}</pre>
+          </details>
+          <details v-for="item in store.evidenceOverview.builds" :key="`build-${item.id}`" class="validation-evidence">
+            <summary>独立构建：{{ item.build_command_redacted ?? '无命令' }} — exit {{ item.exit_code ?? '(无)' }}
+              · {{ item.is_adopted ? '当前结果依据' : '执行记录（非当前采用）' }}</summary>
+            <p>项目：{{ item.project_id }} · 任务：{{ item.task_id }} · generation {{ item.result_generation }}
+              · round {{ item.round }} · 开发 attempt {{ item.result_attempt ?? '未知' }} · {{ statusLabel(item.display_status ?? item.status) }}</p>
+            <p v-if="item.reason">{{ item.reason }}</p>
+            <pre>stdout: {{ item.stdout_redacted ?? '（无）' }}</pre><pre>stderr: {{ item.stderr_redacted ?? '（无）' }}</pre>
+          </details>
         </details>
       </div>
       <button class="link-button" @click="handleRefreshTask">刷新时间线与证据</button>
@@ -689,6 +709,7 @@ async function handleViewDocument(documentType: string) {
 </template>
 
 <style scoped>
+.validation-evidence pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; }
 .requirement-text { white-space: pre-wrap; }
 .core-loop-view {
   padding: 16px;

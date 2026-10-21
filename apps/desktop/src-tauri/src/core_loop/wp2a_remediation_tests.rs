@@ -1580,3 +1580,110 @@ fn rav01_verify_only_two_connections_cannot_claim_same_operation() {
     let actions=db.list_actions_for_task(&f.task).unwrap();
     assert_eq!(actions.iter().filter(|a|a.action_type=="verification_only").count(),1);
 }
+
+
+#[test]
+fn rav01_presentation_preview_adopts_execution_generation_and_reports_real_round_one() {
+    let f=Fixture::new(false); f.dev(1); f.evidence(0,1,1); f.check(1); f.awaiting();
+    let task=f.db.task(&f.task).unwrap(); assert_eq!(task.result_generation,1);
+    let adopted=result_evidence::adopted(&f.db,&f.project,&f.task,&task).unwrap().unwrap();
+    assert_eq!((adopted.generation,adopted.round,adopted.dev_attempt),(0,1,1));
+    let overview=evidence_overview::build_task_evidence_overview(&f.db,&f.project,&f.task).unwrap();
+    assert!(overview.acceptance_ready);
+    assert!(overview.tests[0].is_adopted); assert!(overview.builds[0].is_adopted);
+    assert!(!overview.timeline.iter().find(|e|e.event_type=="test_evidence").unwrap().is_historical);
+    documents::generate_result_documents(&f.db,&f.project,&f.task,&f.dir).unwrap();
+    let root=f.dir.join("result-documents").join(&f.project).join(&f.task);
+    let report=fs::read_to_string(root.join("TEST_REPORT.md")).unwrap();
+    assert!(report.contains("exit_code: 0")); assert!(report.contains("generation: 0"));
+    assert!(report.contains("development_attempt: Some(1)"));
+    assert!(report.contains("## Round 2\n\n（尚未触发）"));
+    let final_doc=fs::read_to_string(root.join("FINAL_RESULT.md")).unwrap();
+    assert!(final_doc.contains("result_generation=0, round=1"));
+}
+#[test]
+fn rav01_presentation_mismatched_attempts_and_incompatible_pairs_never_adopt() {
+    for scenario in 0..5 {
+        let f=Fixture::new(false); f.dev(1); f.evidence(0,1,1); f.check(1); f.awaiting();
+        match scenario {
+            0=> { f.db.conn().execute("UPDATE test_evidence SET result_attempt=99 WHERE task_id=?1",[&f.task]).unwrap(); },
+            1=> { f.db.conn().execute("UPDATE build_evidence SET result_attempt=99 WHERE task_id=?1",[&f.task]).unwrap(); },
+            2=> { f.db.conn().execute("UPDATE build_evidence SET round=2 WHERE task_id=?1",[&f.task]).unwrap(); },
+            3=> { f.db.conn().execute("UPDATE build_evidence SET result_generation=1 WHERE task_id=?1",[&f.task]).unwrap(); },
+            _=> { f.db.conn().execute("UPDATE test_evidence SET exit_code=1 WHERE task_id=?1",[&f.task]).unwrap(); },
+        }
+        let task=f.db.task(&f.task).unwrap();
+        assert!(result_evidence::adopted(&f.db,&f.project,&f.task,&task).unwrap().is_none());
+        assert!(!evidence_overview::build_task_evidence_overview(&f.db,&f.project,&f.task).unwrap().acceptance_ready);
+    }
+}
+#[test]
+fn rav01_presentation_new_results_supersede_old_without_falling_back_on_failure() {
+    let f=Fixture::new(false);f.dev(1);f.evidence(0,1,1);f.check(1);f.awaiting();
+    f.evidence(1,1,1);
+    let view=evidence_overview::build_task_evidence_overview(&f.db,&f.project,&f.task).unwrap();
+    assert_eq!(view.tests.iter().filter(|e|e.is_adopted).count(),1);
+    assert_eq!(view.tests.iter().find(|e|e.is_adopted).unwrap().evidence.result_generation,1);
+    assert!(view.timeline.iter().find(|e|e.event_type=="test_evidence" && e.result_generation==Some(0)).unwrap().is_historical);
+    f.db.conn().execute("UPDATE test_evidence SET status='failed',exit_code=1 WHERE task_id=?1 AND result_generation=1",[&f.task]).unwrap();
+    let task=f.db.task(&f.task).unwrap();
+    assert!(result_evidence::adopted(&f.db,&f.project,&f.task,&task).unwrap().is_none());
+    assert!(!evidence_overview::build_task_evidence_overview(&f.db,&f.project,&f.task).unwrap().acceptance_ready);
+}
+#[test]
+fn rav01_presentation_self_check_failures_remain_blocked_and_do_not_accept() {
+    for status in ["self_reported_blocked","self_reported_incomplete"] {
+        let f=Fixture::new(false);f.dev(1);f.evidence(0,1,1);f.check(1);f.awaiting();
+        f.db.conn().execute("UPDATE self_checks SET self_reported_status=?1 WHERE task_id=?2",rusqlite::params![status,f.task]).unwrap();
+        let overview=evidence_overview::build_task_evidence_overview(&f.db,&f.project,&f.task).unwrap();
+        assert!(!overview.acceptance_ready);assert!(!overview.is_completed);
+        assert!(accept_task_result(&f.db,&f.project,&f.task,true,None,&f.dir).is_err());
+    }
+}
+#[test]
+fn rav01_presentation_file_count_uses_latest_snapshot_unique_paths_keeps_history() {
+    let f=Fixture::new(false);
+    f.db.record_git_evidence(&f.project,&f.task,"post_development_diff",None,None,None).unwrap();
+    f.db.record_file_change_evidence(&f.project,&f.task,"old.txt","modified",None).unwrap();
+    f.db.record_git_evidence(&f.project,&f.task,"post_development_diff",None,None,None).unwrap();
+    for _ in 0..2 { f.db.record_file_change_evidence(&f.project,&f.task,"index.html","modified",None).unwrap(); }
+    let view=evidence_overview::build_task_evidence_overview(&f.db,&f.project,&f.task).unwrap();
+    assert!(view.file_snapshot_available);assert_eq!(view.current_file_changes.len(),1);
+    assert_eq!(view.current_file_changes[0].file_path,"index.html"); assert_eq!(view.file_changes.len(),3);
+    f.db.record_git_evidence(&f.project,&f.task,"post_development_diff",None,None,Some("empty")).unwrap();
+    let view=evidence_overview::build_task_evidence_overview(&f.db,&f.project,&f.task).unwrap();
+    assert!(view.current_file_changes.is_empty());assert_eq!(view.file_changes.len(),3);
+}
+
+
+#[test]
+fn rav01_presentation_validation_output_is_redacted_at_read_boundary() {
+    let f=Fixture::new(false);f.dev(1);f.evidence(0,1,1);f.check(1);f.awaiting();
+    let secret=format!("sk-{}","q".repeat(32));
+    f.db.conn().execute("UPDATE test_evidence SET stdout_ref=?1 WHERE task_id=?2",rusqlite::params![format!("tests 2; token={secret}"),f.task]).unwrap();
+    f.db.conn().execute("UPDATE build_evidence SET stderr_ref=?1 WHERE task_id=?2",rusqlite::params![format!("build diagnostic {secret}"),f.task]).unwrap();
+    let view=evidence_overview::build_task_evidence_overview(&f.db,&f.project,&f.task).unwrap();
+    let output=view.tests[0].stdout_redacted.as_ref().unwrap();assert!(output.contains("tests 2"));assert!(!output.contains(&secret));
+    assert!(!view.builds[0].stderr_redacted.as_ref().unwrap().contains(&secret));
+}
+
+
+#[test]
+fn rav01_presentation_confirmed_not_applicable_uses_verified_display_status() {
+    let f=Fixture::new(false);f.dev(1);authorized_round(&f,1);
+    f.db.record_test_evidence(&RecordTestEvidenceRequest {
+        project_id:&f.project,task_id:&f.task,result_generation:0,round:1,result_attempt:1,
+        test_command_redacted:None,status:"no_tests_applicable",passed_count:0,failed_count:0,skipped_count:0,
+        exit_code:None,reason:None,stdout_ref:None,stderr_ref:None }).unwrap();
+    f.db.record_build_evidence(&RecordBuildEvidenceRequest {
+        project_id:&f.project,task_id:&f.task,result_generation:0,round:1,result_attempt:1,
+        build_command_redacted:None,status:"no_build_applicable",
+        authorization_source:Some(crate::models::BuildEvidenceAuthorizationSource::UserConfirmedNotApplicable),
+        exit_code:None,reason:None,stdout_ref:None,stderr_ref:None }).unwrap();
+    f.check(1);f.awaiting();
+    let view=evidence_overview::build_task_evidence_overview(&f.db,&f.project,&f.task).unwrap();
+    assert!(view.tests[0].is_adopted && view.builds[0].is_adopted);
+    assert_eq!(view.tests[0].display_status,"not_applicable");
+    assert_eq!(view.builds[0].display_status,"not_applicable");
+    assert!(view.acceptance_ready);
+}

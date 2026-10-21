@@ -31,6 +31,7 @@ mod review_isolation;
 pub(crate) mod self_check_parser;
 pub(crate) mod task_documents;
 pub(crate) mod test_runner;
+pub(crate) mod result_evidence;
 pub(crate) mod verify_only;
 #[cfg(test)]
 mod wp2a_remediation_tests;
@@ -3485,7 +3486,7 @@ fn collect_git_evidence(
 ) -> NovaResult<()> {
     let branch = git_output(project_dir, &["rev-parse", "--abbrev-ref", "HEAD"], cancel)?;
     let diff_stat = git_output(project_dir, &["diff", "--stat"], cancel)?;
-    db.record_git_evidence(
+    let snapshot = db.record_git_evidence(
         project_id,
         task_id,
         "post_development_diff",
@@ -3508,7 +3509,7 @@ fn collect_git_evidence(
             } else {
                 "modified"
             };
-            let _ = db.record_file_change_evidence(project_id, task_id, path, change_kind, None);
+            let _ = db.record_file_change_evidence(project_id, task_id, path, change_kind, Some(&format!("git_snapshot:{}", snapshot.id)));
         }
     }
     Ok(())

@@ -135,9 +135,14 @@ fn test_report_doc(
     task: &Task,
 ) -> NovaResult<String> {
     let mut body = String::from("# TEST_REPORT\n\n");
+    let adopted = super::result_evidence::adopted(db, project_id, task_id, task)?;
+    let display_generation = adopted.as_ref().map(|a| a.generation).unwrap_or(task.result_generation);
+    if let Some(adopted) = &adopted {
+        body.push_str(&format!("当前结果依据：generation={}, round={}, development_attempt={}\n\n", adopted.generation, adopted.round, adopted.dev_attempt));
+    }
     for round in [1_i64, 2] {
         let evidence =
-            db.list_test_evidence_for_round(project_id, task_id, task.result_generation, round)?;
+            db.list_test_evidence_for_round(project_id, task_id, display_generation, round)?;
         body.push_str(&format!("## Round {round}\n\n"));
         if evidence.is_empty() {
             body.push_str(NOT_TRIGGERED_ZH);
@@ -146,13 +151,15 @@ fn test_report_doc(
         }
         for row in &evidence {
             body.push_str(&format!(
-                "- status: {}\n  command: {}\n  passed: {}, failed: {}, skipped: {}\n  reason: {}\n\n",
+                "- status: {}\n  command: {}\n  passed: {}, failed: {}, skipped: {}\n  reason: {}\n  exit_code: {}\n  project: {}\n  task: {}\n  generation: {}\n  round: {}\n  development_attempt: {:?}\n  attribution: {}\n\n",
                 row.status,
                 row.test_command_redacted.as_deref().unwrap_or("(none)"),
                 row.passed_count,
                 row.failed_count,
                 row.skipped_count,
                 row.reason.as_deref().unwrap_or("-"),
+                row.exit_code.map(|v| v.to_string()).unwrap_or_else(|| "unknown".into()), row.project_id, row.task_id, row.result_generation, row.round, row.result_attempt,
+                if adopted.as_ref().is_some_and(|a| a.test.id == row.id) { "当前结果依据" } else { "执行记录（非当前采用）" },
             ));
         }
     }
@@ -235,6 +242,15 @@ fn fix_report_doc(db: &Database, task_id: &str) -> NovaResult<String> {
 /// acceptance_exists` and `final_result_shows_test_and_build_evidence_
 /// separately` below, which still assert on the exact same rendered output.
 pub(crate) fn adopted_passing_generation_round(
+    db: &Database, project_id: &str, task_id: &str, task: &Task,
+) -> NovaResult<Option<(i64, i64)>> {
+    Ok(super::result_evidence::adopted(db, project_id, task_id, task)?
+        .map(|a| (a.generation, a.round)))
+}
+
+// Candidate selection is intentionally separate from validation: never fall
+// back to a different generation/round when its development attempt is invalid.
+pub(super) fn candidate_passing_generation_round(
     db: &Database,
     project_id: &str,
     task_id: &str,
@@ -398,8 +414,9 @@ fn final_result_doc(
     // written under the same `result_generation`, so this is never a
     // mismatched combination across rounds), and that exact pair drives
     // both the status line and the evidence breakdown below.
-    let adopted = adopted_passing_generation_round(db, project_id, task_id, task)?;
-    let gate_ok = adopted.is_some();
+    let adopted_details = super::result_evidence::adopted(db, project_id, task_id, task)?;
+    let adopted = adopted_details.as_ref().map(|a| (a.generation, a.round));
+    let gate_ok = adopted.is_some() && db.evaluate_acceptance_submission(task)?.is_ok();
 
     let status_line = if task.state == TaskState::Completed && accepted_current_generation {
         "已完成（用户已验收）"
@@ -442,18 +459,22 @@ fn final_result_doc(
         evidence_breakdown.push('\n');
     }
     for round in [1_i64, 2] {
-        let test_status = db
+        let mut test_status = db
             .list_test_evidence_for_round(project_id, task_id, display_generation, round)?
             .into_iter()
             .next_back()
             .map(|e| e.status)
             .unwrap_or_else(|| "(尚未触发)".to_string());
-        let build_status = db
+        let mut build_status = db
             .list_build_evidence_for_round(project_id, task_id, display_generation, round)?
             .into_iter()
             .next_back()
             .map(|e| e.status)
             .unwrap_or_else(|| "(尚未触发)".to_string());
+        if let Some(selected) = adopted_details.as_ref().filter(|a| a.round == round) {
+            test_status = selected.test.status.clone();
+            build_status = selected.build.status.clone();
+        }
         evidence_breakdown.push_str(&format!(
             "- Round {round}: 测试={test_status}, 构建={build_status}\n"
         ));
@@ -520,6 +541,15 @@ mod tests {
 
     use crate::storage::evidence::{RecordBuildEvidenceRequest, RecordTestEvidenceRequest};
 
+    fn ensure_dev_fixture(db: &Database, task_id: &str, round: i64) {
+        let key = format!("dev-{task_id}-round-{round}");
+        if db.find_action(task_id, &key).unwrap().is_none() {
+            db.plan_action(task_id, "ai_development", &key).unwrap();
+            let started = db.start_action(task_id, &key, false).unwrap();
+            db.finish_action(task_id, &key, crate::models::ActionStatus::Succeeded, None, None, started.attempt_number).unwrap();
+        }
+    }
+
     fn record_no_tests_applicable(
         db: &Database,
         project_id: &str,
@@ -527,6 +557,7 @@ mod tests {
         generation: i64,
         round: i64,
     ) {
+        if round == 1 { ensure_dev_fixture(db, task_id, round); }
         db.record_test_evidence(&RecordTestEvidenceRequest {
             project_id,
             task_id,
@@ -584,6 +615,7 @@ mod tests {
         generation: i64,
         round: i64,
     ) {
+        if round == 1 { ensure_dev_fixture(db, task_id, round); }
         db.record_build_evidence(&RecordBuildEvidenceRequest {
             project_id,
             task_id,
@@ -610,6 +642,7 @@ mod tests {
         generation: i64,
         round: i64,
     ) {
+        if round == 1 { ensure_dev_fixture(db, task_id, round); }
         db.record_build_evidence(&RecordBuildEvidenceRequest {
             project_id,
             task_id,
@@ -668,6 +701,7 @@ mod tests {
         generation: i64,
         round: i64,
     ) {
+        if round == 1 { ensure_dev_fixture(db, task_id, round); }
         db.record_test_evidence(&RecordTestEvidenceRequest {
             project_id,
             task_id,
@@ -694,6 +728,7 @@ mod tests {
         generation: i64,
         round: i64,
     ) {
+        if round == 1 { ensure_dev_fixture(db, task_id, round); }
         db.record_build_evidence(&RecordBuildEvidenceRequest {
             project_id,
             task_id,
@@ -712,9 +747,8 @@ mod tests {
     }
 
     fn task_at_generation(db: &Database, task_id: &str, generation: i64) -> Task {
-        let mut task = db.task(task_id).unwrap();
-        task.result_generation = generation;
-        task
+        db.conn().execute("UPDATE tasks SET result_generation=?1 WHERE id=?2", rusqlite::params![generation, task_id]).unwrap();
+        db.task(task_id).unwrap()
     }
 
     /// WP2A fixture helper (mirrors `core_loop::tests::satisfy_completion_
@@ -741,6 +775,7 @@ mod tests {
             .start_action(task_id, &dev_key, false)
             .unwrap_or(planned);
         let attempt = started.attempt_number;
+        if started.status != crate::models::ActionStatus::Succeeded {
         db.finish_action(
             task_id,
             &dev_key,
@@ -750,6 +785,7 @@ mod tests {
             attempt,
         )
         .unwrap();
+        }
 
         let items = db.list_confirmed_requirement_items(task_id).unwrap();
         let coverage: Vec<serde_json::Value> = items
@@ -1709,6 +1745,12 @@ mod tests {
     // generation ------------------------------------------------------
 
     fn drive_to_awaiting_user_acceptance_at_generation_zero(db: &Database, task_id: &str) {
+        let task = db.task(task_id).unwrap();
+        for round in [1, 2] {
+            if !db.list_test_evidence_for_round(&task.project_id, task_id, task.result_generation, round).unwrap().is_empty() {
+                ensure_dev_fixture(db, task_id, round);
+            }
+        }
         for state in [
             TaskState::AwaitingConfirmation,
             TaskState::Confirmed,
@@ -1728,6 +1770,13 @@ mod tests {
                 None,
             )
             .unwrap();
+        }
+        // Valid result fixtures include the same self-check prerequisites
+        // as the production acceptance gate; keep all existing assertions.
+        for round in [1, 2] {
+            if db.find_action(task_id, &format!("dev-{task_id}-round-{round}")).unwrap().is_some() {
+                satisfy_dev_action_and_self_check(db, &task.project_id, task_id, round);
+            }
         }
     }
 

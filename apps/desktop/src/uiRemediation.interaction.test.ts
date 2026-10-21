@@ -353,3 +353,38 @@ describe('RAV-01 verify-only recovery', () => {
     expect(mockedInvoke.mock.calls.some(c => c[0] === 'start_core_loop')).toBe(false)
   })
 })
+
+
+describe('RAV01 adopted evidence presentation', () => {
+  it('shows adopted generation-zero verification and inspectable output at result generation one', async () => {
+    const {root,store}=await core()
+    store.currentTask=task({state:'awaiting_user_acceptance',result_generation:1})
+    const view=overview(); view.result_generation=1;view.task_state='awaiting_user_acceptance'
+    view.tests=[{id:'test',task_id:'task',project_id:'project',result_generation:0,round:1,result_attempt:1,
+      status:'passed',test_command_redacted:'npm test',exit_code:0,stdout_redacted:'tests 2; pass 2',stderr_redacted:'',
+      is_current_generation:false,is_current_attempt:true,is_adopted:true} as TestEvidenceEntry]
+    view.builds=[{id:'build',task_id:'task',project_id:'project',result_generation:0,round:1,result_attempt:1,
+      status:'passed',build_command_redacted:'npm run build',exit_code:0,stdout_redacted:'Built dist/index.html',stderr_redacted:'',
+      is_current_generation:false,is_current_attempt:true,is_adopted:true} as BuildEvidenceEntry]
+    view.file_changes=[{file_path:'index.html'},{file_path:'index.html'}] as any
+    view.current_file_changes=[{file_path:'index.html'}] as any;view.file_snapshot_available=true
+    store.evidenceOverview=view;await settle()
+    expect(root.textContent).toContain('测试：已通过');expect(root.textContent).toContain('构建：已通过')
+    expect(root.textContent).toContain('改动文件：1 个')
+    expect(root.textContent).toContain('独立测试：npm test — exit 0')
+    expect(root.textContent).toContain('独立构建：npm run build — exit 0')
+    expect(root.textContent).toContain('当前结果依据')
+    expect(root.textContent).toContain('tests 2; pass 2');expect(root.textContent).toContain('Built dist/index.html')
+    expect(root.textContent).toContain('generation 0');expect(root.textContent).toContain('开发 attempt 1')
+    expectNoWrites()
+  })
+  it('does not turn non-adopted historical passes into current success', async () => {
+    const {root,store}=await core();store.currentTask=task({state:'needs_user_action',result_generation:2})
+    const view=overview();view.tests=[{status:'passed',is_adopted:false,is_current_generation:false,is_current_attempt:true} as TestEvidenceEntry]
+    view.builds=[{status:'passed',is_adopted:false,is_current_generation:false,is_current_attempt:false} as BuildEvidenceEntry]
+    store.evidenceOverview=view;await settle()
+    expect(root.textContent).toContain('测试：尚未运行');expect(root.textContent).toContain('构建：尚未运行')
+    expect(root.textContent).toContain('执行记录（非当前采用）')
+    expect(mockedInvoke.mock.calls.some(c=>['start_core_loop','verify_existing_changes','accept_task_result'].includes(c[0]))).toBe(false)
+  })
+})

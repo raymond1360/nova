@@ -232,6 +232,7 @@ export interface TimelineEntry {
 }
 
 export interface TestEvidence {
+  result_attempt?: number | null
   id: string
   project_id: string
   task_id: string
@@ -252,9 +253,14 @@ export interface TestEvidence {
 export interface TestEvidenceEntry extends TestEvidence {
   is_current_generation: boolean
   is_current_attempt: boolean
+  is_adopted?: boolean
+  display_status?: string
+  stdout_redacted?: string | null
+  stderr_redacted?: string | null
 }
 
 export interface BuildEvidence {
+  result_attempt?: number | null
   id: string
   project_id: string
   task_id: string
@@ -272,6 +278,10 @@ export interface BuildEvidence {
 export interface BuildEvidenceEntry extends BuildEvidence {
   is_current_generation: boolean
   is_current_attempt: boolean
+  is_adopted?: boolean
+  display_status?: string
+  stdout_redacted?: string | null
+  stderr_redacted?: string | null
 }
 
 export interface CommandEvidence {
@@ -330,6 +340,8 @@ export interface TaskEvidenceOverview {
   is_completed: boolean
   timeline: TimelineEntry[]
   file_changes: FileChangeEvidence[]
+  current_file_changes?: FileChangeEvidence[]
+  file_snapshot_available?: boolean
   git_events: GitEvidence[]
   commands: CommandEvidence[]
   tests: TestEvidenceEntry[]

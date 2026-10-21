@@ -52,9 +52,9 @@ pub struct TimelineEntry {
     pub result_generation: Option<i64>,
     pub round: Option<i64>,
     pub needs_user_action: bool,
-    /// True when `result_generation` is a strictly earlier generation than
-    /// the task's *current* one — real history, always shown, but never a
-    /// signal this entry may be used to authorize the current result.
+    /// Superseded evidence stays historical; the validated adopted row is
+    /// current even when preview_ready advanced the task generation.
+    /// This presentation flag never grants acceptance permission.
     pub is_historical: bool,
     /// Internal-only sort key: `(created_at, tie_break_rank, id)` — never
     /// serialized, exists purely so ties at identical timestamps (the same
@@ -70,6 +70,10 @@ pub struct TestEvidenceEntry {
     pub evidence: TestEvidence,
     pub is_current_generation: bool,
     pub is_current_attempt: bool,
+    pub is_adopted: bool,
+    pub display_status: String,
+    pub stdout_redacted: Option<String>,
+    pub stderr_redacted: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +82,10 @@ pub struct BuildEvidenceEntry {
     pub evidence: BuildEvidence,
     pub is_current_generation: bool,
     pub is_current_attempt: bool,
+    pub is_adopted: bool,
+    pub display_status: String,
+    pub stdout_redacted: Option<String>,
+    pub stderr_redacted: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,6 +106,8 @@ pub struct TaskEvidenceOverview {
     pub is_completed: bool,
     pub timeline: Vec<TimelineEntry>,
     pub file_changes: Vec<FileChangeEvidence>,
+    pub current_file_changes: Vec<FileChangeEvidence>,
+    pub file_snapshot_available: bool,
     pub git_events: Vec<GitEvidence>,
     pub commands: Vec<CommandEvidence>,
     pub tests: Vec<TestEvidenceEntry>,
@@ -260,6 +270,7 @@ pub fn build_task_evidence_overview(
     let tests = collect_test_entries(db, project_id, task_id, &task)?;
     let builds = collect_build_entries(db, project_id, task_id, &task)?;
 
+    let (current_file_changes, file_snapshot_available) = current_file_snapshot(db, project_id, task_id, &task)?;
     Ok(TaskEvidenceOverview {
         project_id: project_id.to_string(),
         task_id: task_id.to_string(),
@@ -271,6 +282,7 @@ pub fn build_task_evidence_overview(
         is_completed,
         timeline,
         file_changes: db.list_file_change_evidence_for_task(task_id)?,
+        current_file_changes, file_snapshot_available,
         git_events: db.list_git_evidence_for_task(task_id)?,
         commands: db.list_command_evidence_for_task(task_id)?,
         tests,
@@ -377,7 +389,9 @@ fn push_test_entries(
     round: i64,
     timeline: &mut Vec<TimelineEntry>,
 ) -> NovaResult<()> {
-    let is_historical = generation < task.result_generation;
+    let adopted = super::result_evidence::adopted(db, project_id, task_id, task)?;
+    let adopted_pair = adopted.as_ref().is_some_and(|a| a.generation == generation && a.round == round);
+    let is_historical = generation < task.result_generation && !adopted_pair;
     let key = super::test_action_key(task_id, generation, round);
     let action = db.find_action(task_id, &key)?;
     let dev_attempt = super::dev_attempt_for_round(db, task_id, round)?;
@@ -386,13 +400,17 @@ fn push_test_entries(
         return Ok(());
     }
     let title = format!("第{round}轮独立测试（第 {generation} 代）");
-    if let Some(latest) = evidence.last() {
-        let is_historical = is_historical || latest.result_attempt.is_none() || latest.result_attempt != dev_attempt;
+    if !evidence.is_empty() {
+      for latest in &evidence {
+        let is_adopted = adopted.as_ref().is_some_and(|a| a.test.id == latest.id);
+        let is_historical = !is_adopted && (adopted.is_some() || is_historical ||
+            latest.result_attempt.is_none() || latest.result_attempt != dev_attempt ||
+            evidence.last().is_some_and(|last| last.id != latest.id));
         let status = normalize_test_evidence_status(db, project_id, task_id, latest)?;
         timeline.push(TimelineEntry {
             id: format!("test-evidence-{}", latest.id),
             event_type: "test_evidence".to_string(),
-            title,
+            title: if is_adopted { format!("{title}（当前结果依据）") } else { title.clone() },
             status,
             started_at: Some(latest.created_at.clone()),
             finished_at: Some(latest.created_at.clone()),
@@ -406,6 +424,7 @@ fn push_test_entries(
                 latest.id.clone(),
             ),
         });
+      }
     } else if let Some(action) = action {
         let needs_user_action =
             action.status == ActionStatus::Failed && task.state == TaskState::NeedsUserAction;
@@ -465,7 +484,9 @@ fn push_build_entries(
     round: i64,
     timeline: &mut Vec<TimelineEntry>,
 ) -> NovaResult<()> {
-    let is_historical = generation < task.result_generation;
+    let adopted = super::result_evidence::adopted(db, project_id, task_id, task)?;
+    let adopted_pair = adopted.as_ref().is_some_and(|a| a.generation == generation && a.round == round);
+    let is_historical = generation < task.result_generation && !adopted_pair;
     let key = super::build_action_key(task_id, generation, round);
     let action = db.find_action(task_id, &key)?;
     let dev_attempt = super::dev_attempt_for_round(db, task_id, round)?;
@@ -474,13 +495,17 @@ fn push_build_entries(
         return Ok(());
     }
     let title = format!("第{round}轮独立构建（第 {generation} 代）");
-    if let Some(latest) = evidence.last() {
-        let is_historical = is_historical || latest.result_attempt.is_none() || latest.result_attempt != dev_attempt;
+    if !evidence.is_empty() {
+      for latest in &evidence {
+        let is_adopted = adopted.as_ref().is_some_and(|a| a.build.id == latest.id);
+        let is_historical = !is_adopted && (adopted.is_some() || is_historical ||
+            latest.result_attempt.is_none() || latest.result_attempt != dev_attempt ||
+            evidence.last().is_some_and(|last| last.id != latest.id));
         let status = normalize_build_evidence_status(db, project_id, task_id, latest)?;
         timeline.push(TimelineEntry {
             id: format!("build-evidence-{}", latest.id),
             event_type: "build_evidence".to_string(),
-            title,
+            title: if is_adopted { format!("{title}（当前结果依据）") } else { title.clone() },
             status,
             started_at: Some(latest.created_at.clone()),
             finished_at: Some(latest.created_at.clone()),
@@ -494,6 +519,7 @@ fn push_build_entries(
                 latest.id.clone(),
             ),
         });
+      }
     } else if let Some(action) = action {
         let needs_user_action =
             action.status == ActionStatus::Failed && task.state == TaskState::NeedsUserAction;
@@ -589,12 +615,15 @@ fn collect_test_entries(
     let mut out = Vec::new();
     for generation in 0..=task.result_generation {
         for round in [1_i64, 2] {
-            for evidence in
+            for mut evidence in
                 db.list_test_evidence_for_round(project_id, task_id, generation, round)?
             {
+                evidence.stdout_ref = evidence.stdout_ref.map(|s| super::cap_text(&crate::security::redact_sensitive_text(&s), 2000));
+                evidence.stderr_ref = evidence.stderr_ref.map(|s| super::cap_text(&crate::security::redact_sensitive_text(&s), 2000));
                 let is_current_generation = evidence.result_generation == task.result_generation;
                 let is_current_attempt = evidence.result_attempt.is_some() && evidence.result_attempt == super::dev_attempt_for_round(db, task_id, round)?;
-                out.push(TestEvidenceEntry { evidence, is_current_generation, is_current_attempt });
+                let is_adopted = super::result_evidence::adopted_test(db, project_id, task_id, task, &evidence.id)?;
+                out.push(TestEvidenceEntry { display_status: normalize_test_evidence_status(db, project_id, task_id, &evidence)?, stdout_redacted: evidence.stdout_ref.clone(), stderr_redacted: evidence.stderr_ref.clone(), evidence, is_current_generation, is_current_attempt, is_adopted });
             }
         }
     }
@@ -610,16 +639,39 @@ fn collect_build_entries(
     let mut out = Vec::new();
     for generation in 0..=task.result_generation {
         for round in [1_i64, 2] {
-            for evidence in
+            for mut evidence in
                 db.list_build_evidence_for_round(project_id, task_id, generation, round)?
             {
+                evidence.stdout_ref = evidence.stdout_ref.map(|s| super::cap_text(&crate::security::redact_sensitive_text(&s), 2000));
+                evidence.stderr_ref = evidence.stderr_ref.map(|s| super::cap_text(&crate::security::redact_sensitive_text(&s), 2000));
                 let is_current_generation = evidence.result_generation == task.result_generation;
                 let is_current_attempt = evidence.result_attempt.is_some() && evidence.result_attempt == super::dev_attempt_for_round(db, task_id, round)?;
-                out.push(BuildEvidenceEntry { evidence, is_current_generation, is_current_attempt });
+                let is_adopted = super::result_evidence::adopted_build(db, project_id, task_id, task, &evidence.id)?;
+                out.push(BuildEvidenceEntry { display_status: normalize_build_evidence_status(db, project_id, task_id, &evidence)?, stdout_redacted: evidence.stdout_ref.clone(), stderr_redacted: evidence.stderr_ref.clone(), evidence, is_current_generation, is_current_attempt, is_adopted });
             }
         }
     }
     Ok(out)
+}
+
+/// Select the latest persisted Git snapshot at or before the adopted test.
+/// Rows from an earlier collection never inflate the current path count.
+fn current_file_snapshot(db: &Database, project_id: &str, task_id: &str, task: &Task)
+    -> NovaResult<(Vec<FileChangeEvidence>, bool)> {
+    let adopted = super::result_evidence::adopted(db, project_id, task_id, task)?;
+    let events = db.list_git_evidence_for_task(task_id)?;
+    let snapshots: Vec<_> = events.iter().filter(|g| g.project_id == project_id && g.event_kind == "post_development_diff").collect();
+    let snapshot = snapshots.iter().copied().filter(|g| adopted.as_ref().map(|a| g.created_at <= a.test.created_at).unwrap_or(true)).next_back();
+    let Some(snapshot) = snapshot else { return Ok((Vec::new(), false)); };
+    let next = snapshots.iter().find(|g| g.created_at > snapshot.created_at);
+    let marker = format!("git_snapshot:{}", snapshot.id);
+    let mut unique = std::collections::BTreeMap::new();
+    for row in db.list_file_change_evidence_for_task(task_id)? {
+        let belongs = row.summary.as_deref().filter(|s| s.starts_with("git_snapshot:")).map(|s| s == marker).unwrap_or_else(||
+            row.created_at >= snapshot.created_at && next.map(|g| row.created_at < g.created_at).unwrap_or(true));
+        if row.project_id == project_id && belongs { unique.insert(row.file_path.clone(), row); }
+    }
+    Ok((unique.into_values().collect(), true))
 }
 
 #[cfg(test)]

@@ -7,6 +7,9 @@
 // auto-deployment, or push/PR — those are out of this round's scope.
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
+import RequirementWorkspace from './RequirementWorkspace.vue'
+import { invoke } from '@tauri-apps/api/core'
+import type { Binding } from '../stores/workspace'
 import { useCoreLoopStore } from '../stores/coreLoop'
 import type { Project, TimelineEntry } from '../types'
 
@@ -28,7 +31,25 @@ function parseJsonStringArray(raw: string | null): string[] {
   }
 }
 
+const showRequirementDraft = ref(false)
 const store = useCoreLoopStore()
+async function openBoundTask(binding: Binding) {
+  const project = store.currentProject?.id
+  const previousTask = store.currentTask?.id
+  if (!project) return
+  try {
+    const tasks = await invoke<import('../types').Task[]>('list_tasks_for_project', { projectId: project })
+    if (store.currentProject?.id !== project || store.currentTask?.id !== previousTask) return
+    const task = tasks.find(task => task.id === binding.task_id)
+    if (task) { store.tasks = tasks; store.selectTask(task) }
+    else store.lastError = '未找到已绑定任务，请刷新项目任务列表。'
+  } catch {
+    if (store.currentProject?.id === project && store.currentTask?.id === previousTask) {
+      store.lastError = '无法读取已绑定任务；需求绑定仍保留，请手动刷新后查看。'
+    }
+  }
+}
+
 watch(() => [store.currentProject?.id, store.currentTask?.id, store.currentTask?.state,
   store.currentTask?.result_generation], () => { void store.loadVerifyOnlyEligibility() }, { immediate: true })
 const refreshMessage = ref('')
@@ -365,6 +386,11 @@ async function handleViewDocument(documentType: string) {
         </div>
       </div>
     </section>
+
+    <div v-if="store.currentProject">
+      <button @click="showRequirementDraft = !showRequirementDraft">{{ showRequirementDraft ? '收起需求草稿' : '打开需求草稿与版本确认' }}</button>
+      <RequirementWorkspace v-if="showRequirementDraft" :project-id="store.currentProject.id" :task-id="store.currentTask?.id" @select-task="openBoundTask" />
+    </div>
 
     <section v-if="store.currentProject" class="block">
       <h3>2. 新建任务（独立表单）</h3>

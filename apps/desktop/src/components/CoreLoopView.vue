@@ -398,8 +398,8 @@ async function handleViewDocument(documentType: string) {
       <h3>3. 确认需求与测试命令</h3>
       <p><strong>当前任务状态：</strong>{{ stateLabels[store.currentTask.state] ?? store.currentTask.state }}</p>
       <p v-if="store.currentTask.document_sync_pending" class="hint">
-        文档同步中/失败，将自动重试。
-        <button class="link-button" @click="store.resyncDocuments">立即重试文档同步</button>
+        文档同步未完成，可手动重试。
+        <button class="link-button" :disabled="store.syncingDocuments || !!store.documentSyncDisabledReason" @click="store.resyncDocuments">立即重试文档同步</button>
       </p>
       <p v-if="store.currentTask.state === 'draft'">
         <button @click="store.confirmRequirement">我已确认需求，继续</button>
@@ -689,6 +689,11 @@ async function handleViewDocument(documentType: string) {
          — no arbitrary file path is ever accepted from the UI. -->
     <section v-if="store.currentTask" class="block">
       <h3>8. 任务文档</h3>
+      <button :disabled="store.syncingDocuments || !!store.documentSyncDisabledReason" @click="store.resyncDocuments">{{ store.syncingDocuments ? '正在更新…' : '重新生成任务文档' }}</button>
+      <p class="hint">根据已有执行证据更新报告，不会重新开发、运行测试或构建。</p>
+      <p v-if="store.documentSyncDisabledReason" class="hint">{{ store.documentSyncDisabledReason }}</p>
+      <p v-if="store.documentSyncMessage" role="status">{{ store.documentSyncMessage }}</p>
+      <p v-if="store.documentSyncError" role="alert" class="bad">{{ store.documentSyncError }}</p>
       <ul class="document-list">
         <li v-for="doc in store.taskDocuments" :key="doc.document_type">
           <span>{{ doc.display_name }}</span>

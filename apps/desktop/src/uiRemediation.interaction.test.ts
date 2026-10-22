@@ -29,6 +29,7 @@ function route(extra: Record<string, (args: any) => any> = {}) {
     list_conversations: () => [], get_setting: () => null,
     get_last_active_project: () => null,
     list_tasks_for_project: () => [], detect_test_command: () => null,
+    set_last_active_project: () => undefined,
     list_task_reviews: () => [], list_task_documents: () => [], list_task_self_checks: () => [],
     get_task_evidence_overview: () => overview(),
     get_completion_precheck: () => ({ ok: false, can_submit_acceptance: false }),
@@ -387,4 +388,108 @@ describe('RAV01 adopted evidence presentation', () => {
     expect(root.textContent).toContain('执行记录（非当前采用）')
     expect(mockedInvoke.mock.calls.some(c=>['start_core_loop','verify_existing_changes','accept_task_result'].includes(c[0]))).toBe(false)
   })
+})
+
+
+describe('RAV01 document regeneration entry', () => {
+  const doc = { document_type: 'TEST_REPORT', display_name: '测试报告', exists: true, is_optional_diagnostic: false }
+  async function ready() {
+    const result = await core()
+    result.store.currentTask = task({ state: 'awaiting_user_acceptance' })
+    result.store.taskDocuments = [doc]
+    await settle()
+    return result
+  }
+  function onlyDocumentWrites() {
+    const writes = mockedInvoke.mock.calls.map(c => c[0]).filter(c => !c.startsWith('get_') && !c.startsWith('list_') && c !== 'read_task_document' && c !== 'set_last_active_project')
+    expect(writes).toEqual(['resync_task_documents'])
+  }
+  it('is visible without pending, shares one in-flight request with retry, refreshes list and open content', async () => {
+    const gate = deferred<Task>()
+    route({ resync_task_documents: () => gate.promise, list_task_documents: () => [doc],
+      read_task_document: () => ({ ...doc, content: 'fresh exit0 pass2', error: null }) })
+    const {root, store} = await ready()
+    store.selectedDocument = {...doc, content: 'old 尚未触发', error: null}
+    const request = click(button(root, '重新生成任务文档'))
+    await settle()
+    expect(button(root, '正在更新…').props.disabled).toBe(true)
+    await store.resyncDocuments()
+    expect(mockedInvoke.mock.calls.filter(c => c[0] === 'resync_task_documents')).toHaveLength(1)
+    gate.resolve(task({state:'awaiting_user_acceptance'})); await request
+    expect(root.textContent).toContain('任务文档已更新')
+    expect(store.selectedDocument?.content).toBe('fresh exit0 pass2')
+    expect(mockedInvoke.mock.calls.filter(c => c[0] === 'resync_task_documents')[0][1]).toEqual({projectId:'project',taskId:'task'})
+    onlyDocumentWrites()
+  })
+  it('shows a failure, restores retry and never starts any execution', async () => {
+    route({resync_task_documents: () => {throw new Error('磁盘不可写')} })
+    const {root} = await ready()
+    await click(button(root,'重新生成任务文档'))
+    expect(root.textContent).toContain('磁盘不可写')
+    expect(button(root,'重新生成任务文档').props.disabled).toBe(false)
+    onlyDocumentWrites()
+  })
+  it.each(['task','project'])('discards old success/error and loading state after switching %s', async kind => {
+    const gate = deferred<Task>()
+    route({resync_task_documents: () => gate.promise})
+    const {store} = await ready()
+    const request = store.resyncDocuments()
+    if (kind === 'task') store.selectTask(task({id:'other',state:'completed'}))
+    else await store.selectProject({...project,id:'other-project'})
+    await settle()
+    expect(store.syncingDocuments).toBe(false)
+    gate.resolve(task({document_sync_pending:true})); await request
+    expect(store.documentSyncMessage).toBe('')
+    expect(store.documentSyncError).toBe('')
+    expect(store.taskDocuments).toEqual([])
+    expect(store.selectedDocument).toBeNull()
+    expect(store.currentTask?.id).not.toBe('task')
+    onlyDocumentWrites()
+  })
+  it('discards a stale failure after switching task', async () => {
+    const gate = deferred<Task>(); route({resync_task_documents: () => gate.promise})
+    const {store} = await ready(); const request = store.resyncDocuments()
+    store.selectTask(task({id:'other'})); gate.reject(new Error('old failure')); await request
+    expect(store.documentSyncError).toBe(''); expect(store.syncingDocuments).toBe(false)
+  })
+  it.each(['queued','running','verifying','safe_fixing','draft','confirmed'] as const)('disables unsupported state %s even with documents', async state => {
+    const {root,store} = await ready(); store.currentTask = task({state}); await settle()
+    expect(button(root,'重新生成任务文档').props.disabled).toBe(true)
+    await store.resyncDocuments()
+    expect(mockedInvoke.mock.calls.map(c=>c[0])).not.toContain('resync_task_documents')
+  })
+  it('retains the existing pending retry even when all documents are missing', async () => {
+    const gate=deferred<Task>(); route({resync_task_documents:()=>gate.promise})
+    const {root,store}=await ready(); store.currentTask!.document_sync_pending=true; store.taskDocuments=[]; await settle()
+    const request=click(button(root,'立即重试文档同步')); await settle()
+    expect(button(root,'正在更新…').props.disabled).toBe(true)
+    await store.resyncDocuments(); gate.resolve(task({state:'completed'})); await request
+    onlyDocumentWrites()
+  })
+  it.each(['list', 'read'])('does not publish a late %s refresh after task navigation', async stage => {
+    const gate=deferred<any>()
+    route({resync_task_documents:()=>task({state:'completed'}),
+      list_task_documents:(args)=>args.taskId==='task'?(stage==='list'?gate.promise:[doc]):[],
+      read_task_document:()=>gate.promise})
+    const {store}=await ready()
+    store.selectedDocument={...doc,content:'old',error:null}
+    const request=store.resyncDocuments(); await settle()
+    store.selectTask(task({id:'other',state:'completed'})); await settle()
+    gate.resolve(stage==='list'?[doc]:{...doc,content:'late stale',error:null})
+    await request
+    expect(store.selectedDocument).toBeNull()
+    expect(store.loadingDocument).toBe(false)
+    expect(store.taskDocuments).toEqual([])
+    expect(store.documentSyncMessage).toBe('')
+    expect(store.documentSyncError).toBe('')
+    expect(store.syncingDocuments).toBe(false)
+  })
+  it('explains missing documents and rejects a programmatic invocation', async () => {
+    const {root,store}=await ready(); store.taskDocuments=[]; await settle()
+    expect(button(root,'重新生成任务文档').props.disabled).toBe(true)
+    expect(root.textContent).toContain('当前任务尚无结果文档可更新')
+    await store.resyncDocuments()
+    expect(mockedInvoke.mock.calls.map(c=>c[0])).not.toContain('resync_task_documents')
+  })
+
 })

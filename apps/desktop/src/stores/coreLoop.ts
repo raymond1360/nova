@@ -146,8 +146,23 @@ export const useCoreLoopStore = defineStore('coreLoop', {
     selectedDocument: null as TaskDocumentContent | null,
     selectedDocumentRequestToken: 0 as number,
     loadingDocument: false,
+    documentSyncRequests: {} as Record<string, boolean>,
+    documentSyncMessage: '',
+    documentSyncError: '',
+    documentSyncSelection: 0,
+
   }),
   getters: {
+    documentSyncKey(state): string {
+      return JSON.stringify([state.currentProject?.id, state.currentTask?.id])
+    },
+    syncingDocuments(): boolean { return !!this.documentSyncRequests[this.documentSyncKey] },
+    documentSyncDisabledReason(state): string {
+      if (!state.currentTask || !state.currentProject || state.currentTask.project_id !== state.currentProject.id) return '请先选择当前项目的任务'
+      if (!['preview_ready', 'awaiting_user_acceptance', 'completed', 'needs_user_action', 'interrupted', 'failed', 'cancelled'].includes(state.currentTask.state)) return '任务正在执行或尚不支持更新文档，请等待任务停止'
+      if (!state.currentTask.document_sync_pending && !state.taskDocuments.some(doc => doc.exists)) return '当前任务尚无结果文档可更新'
+      return ''
+    },
     reviewerAiKind(state): 'codex_cli' | 'claude_cli' {
       return state.devAiKind === 'codex_cli' ? 'claude_cli' : 'codex_cli'
     },
@@ -253,6 +268,11 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       }
     },
     async selectProject(project: Project) {
+      this.documentSyncSelection += 1
+      this.loadingDocument = false
+      this.documentSyncMessage = ''
+      this.documentSyncError = ''
+
       this.currentProject = project
       this.currentTask = null
       this.reviews = []
@@ -322,6 +342,11 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       }
     },
     selectTask(task: Task) {
+      this.documentSyncSelection += 1
+      this.loadingDocument = false
+      this.documentSyncMessage = ''
+      this.documentSyncError = ''
+
       this.currentTask = task
       this.reviews = []
       this.noBuildConfirmationNeeded = false
@@ -739,11 +764,34 @@ export const useCoreLoopStore = defineStore('coreLoop', {
       }
     },
     async resyncDocuments() {
-      if (!this.currentTask || !this.currentProject) return
-      this.currentTask = await invoke<Task>('resync_task_documents', {
-        projectId: this.currentProject.id,
-        taskId: this.currentTask.id,
-      })
+      if (this.documentSyncDisabledReason || this.syncingDocuments) return
+      const projectId = this.currentProject!.id
+      const taskId = this.currentTask!.id
+      const key = this.documentSyncKey
+      const selection = this.documentSyncSelection
+      const current = () => this.documentSyncSelection === selection && this.documentSyncKey === key
+      this.documentSyncRequests[key] = true
+      this.documentSyncMessage = ''
+      this.documentSyncError = ''
+      // Invalidate an older read so it cannot overwrite regenerated content.
+      this.selectedDocumentRequestToken += 1
+      this.loadingDocument = false
+      try {
+        const refreshed = await invoke<Task>('resync_task_documents', { projectId, taskId })
+        if (!current()) return
+        // Synchronization must never replace live execution/acceptance state.
+        this.currentTask!.document_sync_pending = refreshed.document_sync_pending
+        this.currentTask!.updated_at = refreshed.updated_at
+        await this.loadTaskDocuments()
+        if (!current()) return
+        const openType = this.selectedDocument?.document_type
+        if (openType) await this.viewTaskDocument(openType)
+        if (current()) this.documentSyncMessage = '任务文档已更新'
+      } catch (error) {
+        if (current()) this.documentSyncError = `任务文档更新失败：${String(error)}。请手动重试。`
+      } finally {
+        delete this.documentSyncRequests[key]
+      }
     },
     // Phase 4 (evidence and document gate): the one real, backend-derived
     // timeline + evidence summary + completion-gate view — never inferred

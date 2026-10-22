@@ -642,16 +642,27 @@ pub fn accept_task_result(
     db.task(task_id)
 }
 
-/// Retries seven-document regeneration for a task whose
-/// `document_sync_pending` flag is set — lets the UI (or a future
-/// app-startup sweep) retry without requiring another accept/reject
-/// decision.
+/// Regenerates existing result documents, including a failed-sync retry.
+/// Only stopped tasks are eligible; evidence and acceptance are read-only.
 pub fn resync_task_documents(
     db: &Database,
     project_id: &str,
     task_id: &str,
     app_data_dir: &Path,
 ) -> NovaResult<Task> {
+    let task = db.task(task_id)?;
+    if task.project_id != project_id {
+        return Err(NovaError::Config("任务与当前项目不匹配，已拒绝更新文档".into()));
+    }
+    if !matches!(task.state, TaskState::PreviewReady | TaskState::AwaitingUserAcceptance |
+        TaskState::Completed | TaskState::NeedsUserAction | TaskState::Interrupted |
+        TaskState::Failed | TaskState::Cancelled) {
+        return Err(NovaError::Config("任务正在执行或尚不支持更新文档，请等待任务停止".into()));
+    }
+    if !task.document_sync_pending && !task_documents::list_task_documents(db, project_id, task_id, app_data_dir)?
+        .iter().any(|doc| doc.exists) {
+        return Err(NovaError::Config("当前任务尚无结果文档可更新".into()));
+    }
     documents::generate_result_documents(db, project_id, task_id, app_data_dir)?;
     db.set_document_sync_pending(task_id, false)?;
     db.task(task_id)
@@ -8722,8 +8733,57 @@ mod tests {
         db.set_document_sync_pending(&task_id, true).unwrap();
         assert!(db.task(&task_id).unwrap().document_sync_pending);
 
+        let snapshot = || {
+            let mut q = db.conn().prepare("SELECT name FROM sqlite_master WHERE type='table' AND name != 'tasks' ORDER BY name").unwrap();
+            let names: Vec<String> = q.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+            names.into_iter().map(|name| {
+                let mut q = db.conn().prepare(&format!("SELECT * FROM [{}]", name)).unwrap();
+                let count = q.column_count();
+                let rows: Vec<Vec<rusqlite::types::Value>> = q.query_map([], |r| (0..count).map(|i| r.get(i)).collect()).unwrap().collect::<Result<_, _>>().unwrap();
+                (name, format!("{rows:?}"))
+            }).collect::<Vec<_>>()
+        };
+        let evidence_before = snapshot();
+        let before = db.task(&task_id).unwrap();
         let task = resync_task_documents(&db, &project_id, &task_id, &app_data_dir).unwrap();
         assert!(!task.document_sync_pending);
+        assert_eq!(snapshot(), evidence_before);
+        let mut before = serde_json::to_value(before).unwrap();
+        let mut after = serde_json::to_value(&task).unwrap();
+        for key in ["updated_at", "document_sync_pending"] {
+            before.as_object_mut().unwrap().remove(key);
+            after.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(before, after);
+        resync_task_documents(&db, &project_id, &task_id, &app_data_dir).unwrap();
+        assert_eq!(snapshot(), evidence_before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn document_resync_rejects_wrong_project_running_and_missing_documents() {
+        let dir = git_project_dir("doc-resync-guards");
+        let (db, project_id, task_id) = db_with_confirmed_task(&dir, "codex_cli");
+        let app = test_app_data_dir();
+        assert!(resync_task_documents(&db, "wrong-project", &task_id, &app).is_err());
+        for state in ["draft", "awaiting_confirmation", "confirmed", "queued", "running", "verifying", "safe_fixing"] {
+            db.conn().execute("UPDATE tasks SET state=?1, document_sync_pending=1 WHERE id=?2", rusqlite::params![state, task_id]).unwrap();
+            assert!(resync_task_documents(&db, &project_id, &task_id, &app).is_err(), "{state}");
+        }
+        db.conn().execute("UPDATE tasks SET state='needs_user_action', document_sync_pending=0 WHERE id=?1", [&task_id]).unwrap();
+        assert!(resync_task_documents(&db, &project_id, &task_id, &app).is_err());
+        db.set_document_sync_pending(&task_id, true).unwrap();
+        let before = serde_json::to_value(db.task(&task_id).unwrap()).unwrap();
+        resync_task_documents(&db, &project_id, &task_id, &app).unwrap();
+        assert_eq!(list_task_documents(&db, &project_id, &task_id, &app).unwrap().iter().filter(|d| d.exists).count(), 7);
+        let mut after = serde_json::to_value(db.task(&task_id).unwrap()).unwrap();
+        let mut before = before;
+        for key in ["updated_at", "document_sync_pending"] {
+            before.as_object_mut().unwrap().remove(key);
+            after.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(before, after);
+        resync_task_documents(&db, &project_id, &task_id, &app).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 

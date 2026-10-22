@@ -8,6 +8,7 @@ pub use isolated_validation::run_validation;
 mod api;
 mod app_paths;
 mod commands;
+mod workspace_commands;
 mod core_loop;
 mod credential;
 mod db;
@@ -38,13 +39,9 @@ pub struct AppState {
     client: reqwest::Client,
     credentials: Arc<dyn CredentialStore>,
     active_cancel: Arc<Mutex<Option<CancellationToken>>>,
-    /// Phase 3 remediation (Major 4): one cancellation handle per
-    /// currently-running core-loop task, keyed by `task_id`. Distinct from
-    /// `active_cancel` above (that one is chat-only). Only ever holds an
-    /// entry for a task that is genuinely mid-run; `commands::start_core_loop`
-    /// inserts it just before spawning the loop and removes it once the loop
-    /// returns (success, failure, or cancellation), so a stale entry can
-    /// never outlive its run.
+    /// Run reservations, including readiness checks before persisted running state.
+    /// Requirement confirmation and starts lock this map before the main DB mutex.
+    /// Presence blocks confirmation; absence is not an OS-wide liveness proof.
     core_loop_cancel: Arc<Mutex<HashMap<String, CancellationToken>>>,
     app_data_dir: PathBuf,
     detection_cancel: DetectionSlot,
@@ -120,6 +117,8 @@ pub fn run() {
         .invoke_handler({
             let real: Arc<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> = std::sync::Arc::new(tauri::generate_handler![
             commands::initialize_app,
+            workspace_commands::requirement_workspace,
+            workspace_commands::get_planning_capability,
             commands::get_provider,
             commands::save_provider,
             commands::delete_provider_credential,

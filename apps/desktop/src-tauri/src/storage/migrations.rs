@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// Current schema version this build of Nova understands. Bump this and
 /// append a new [`Migration`] to [`MIGRATIONS`] whenever the schema changes
 /// — never edit an already-shipped migration's SQL in place.
-pub const CURRENT_SCHEMA_VERSION: i64 = 11;
+pub const CURRENT_SCHEMA_VERSION: i64 = 12;
 
 #[derive(Debug)]
 pub enum MigrationError {
@@ -1021,6 +1021,8 @@ const V11_SQL: &str = "
         AND legacy_classification IS NULL;
 ";
 
+const V12_SQL: &str = include_str!("requirements_v12.sql");
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -1077,7 +1079,12 @@ const MIGRATIONS: &[Migration] = &[
         requires_backup: true,
         sql: V11_SQL,
     },
+    Migration { version: 12, requires_backup: true, sql: V12_SQL },
 ];
+
+#[cfg(test)]
+thread_local! { static LOCKED_MIGRATION_VERSIONS: std::cell::RefCell<Vec<(i64,i64)>> = const { std::cell::RefCell::new(Vec::new()) }; static BEFORE_MIGRATION_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
+
 
 /// Applies every migration the database hasn't seen yet, in order, each in
 /// its own transaction. `db_path` is `None` for an in-memory/test database,
@@ -1087,6 +1094,7 @@ const MIGRATIONS: &[Migration] = &[
 /// any failure, the offending step's transaction is rolled back and
 /// `user_version` is left at the last successfully-applied version — the
 /// database remains fully openable, just not yet upgraded.
+
 pub fn run(conn: &Connection, db_path: Option<&Path>) -> Result<(), MigrationError> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
@@ -1098,6 +1106,8 @@ pub fn run(conn: &Connection, db_path: Option<&Path>) -> Result<(), MigrationErr
     }
 
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    #[cfg(test)]
+    BEFORE_MIGRATION_LOCK.with(|hook| { if let Some(callback)=hook.borrow_mut().take(){callback();} });
 
     for migration in MIGRATIONS {
         if migration.version <= current {
@@ -1111,6 +1121,17 @@ pub fn run(conn: &Connection, db_path: Option<&Path>) -> Result<(), MigrationErr
         }
 
         conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let locked_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        #[cfg(test)]
+        LOCKED_MIGRATION_VERSIONS.with(|v| v.borrow_mut().push((migration.version,locked_version)));
+        if locked_version > CURRENT_SCHEMA_VERSION {
+            conn.execute_batch("ROLLBACK;")?;
+            return Err(MigrationError::VersionTooNew { found: locked_version, supported: CURRENT_SCHEMA_VERSION });
+        }
+        if migration.version <= locked_version {
+            conn.execute_batch("COMMIT;")?;
+            continue;
+        }
         let apply_result = (|| -> Result<(), rusqlite::Error> {
             if migration.version == 5 {
                 // Second re-review (Major 3, continued): v5's own SQL below
@@ -2707,7 +2728,7 @@ mod tests {
             .map(|iter| iter.filter_map(|e| e.ok()).count())
             .unwrap_or(0);
         assert_eq!(
-            count, 10,
+            count, 11,
             "reopening an already-fully-migrated database must not take any new backups"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -2732,8 +2753,8 @@ mod tests {
             .collect();
         assert_eq!(
             entries.len(),
-            10,
-            "expected exactly ten backups (migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, and 11 each require one): {entries:?}"
+            11,
+            "expected exactly eleven backups (migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, and 12 each require one): {entries:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2758,13 +2779,13 @@ mod tests {
             .collect();
         assert_eq!(
             names.len(),
-            10,
-            "migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, and 11 each produce their own backup"
+            11,
+            "migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, and 12 each produce their own backup"
         );
         let unique: std::collections::HashSet<&String> = names.iter().collect();
         assert_eq!(
             unique.len(),
-            10,
+            11,
             "all backups from the same run must have distinct names, never collide"
         );
         for name in &names {
@@ -2893,9 +2914,13 @@ mod tests {
         let backups_dir = dir.join("backups");
         let count = fs::read_dir(&backups_dir).unwrap().count();
         assert_eq!(
-            count, 10,
-            "already-applied migrations must not be re-run, so no extra backups beyond the ten produced by the first run"
+            count, 11,
+            "already-applied migrations must not be re-run, so no extra backups beyond the eleven produced by the first run"
         );
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+#[path = "workspace_migration_tests.rs"]
+mod workspace_migration_tests;

@@ -856,31 +856,23 @@ pub fn start_core_loop(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let dev_kind = with_db(&state, |db| {
-        let task = db.task(&task_id)?;
+    let dev_kind = crate::workspace_commands::reserve(&state.core_loop_cancel, &state.db,
+        &task_id, CancellationToken::new(), |db| {
+        let task = db.task(&task_id).map_err(public_error)?;
         if !matches!(task.state, TaskState::Confirmed | TaskState::Queued) {
-            return Err(NovaError::Config(format!(
+            return Err(format!(
                 "只能从 confirmed 或 queued 状态启动核心循环，当前状态：{}",
                 task.state
-            )));
+            ));
         }
         let dev_kind =
             crate::runtime::ai_adapter::ai_kind_from_str(task.ai_kind.as_deref().unwrap_or(""))
                 .ok_or_else(|| {
-                    NovaError::Config("任务未设置有效的开发 AI 类型（ai_kind）".to_string())
+                    "任务未设置有效的开发 AI 类型（ai_kind）".to_string()
                 })?;
+
         Ok(dev_kind)
     })?;
-
-    // Only one active run handle per task at a time: reserve the slot with
-    // a CAS-style check before doing anything else observable.
-    {
-        let mut guard = state.core_loop_cancel.lock().unwrap();
-        if guard.contains_key(&task_id) {
-            return Err("该任务已在运行核心循环，请勿重复启动".to_string());
-        }
-        guard.insert(task_id.clone(), CancellationToken::new());
-    }
 
     // v0.1.0 scope correction (Blocker 1): the *only* thing that may block
     // starting the loop is the readiness of the developer AI the user
@@ -898,9 +890,11 @@ pub fn start_core_loop(
             crate::runtime::types::ToolKind::Git => unreachable!(),
         }
     };
-    let dev_trust_message = with_db(&state, |db| {
+    let dev_trust_message = match with_db(&state, |db| {
         Ok(binary_trust_message(db, dev_kind, binary_for(dev_kind)))
-    })?;
+    }) { Ok(value) => value, Err(error) => {
+        state.core_loop_cancel.lock().unwrap().remove(&task_id); return Err(error);
+    }};
     if let Err(message) = dev_only_start_gate(
         dev_readiness.dev_ready(),
         dev_trust_message.as_deref(),
@@ -995,20 +989,11 @@ pub fn get_verify_only_eligibility(project_id: String, task_id: String, state: S
 pub fn verify_existing_changes(project_id: String, task_id: String,
     expected: crate::core_loop::verify_only::Eligibility, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let cancel = CancellationToken::new();
-    {
-        let mut runs = state.core_loop_cancel.lock().unwrap();
-        if runs.contains_key(&task_id) { return Err("该任务正在执行，请勿重复操作".into()); }
-        runs.insert(task_id.clone(), cancel.clone());
-    }
-    let checked = with_db(&state, |db| {
-        let current = crate::core_loop::verify_only::eligibility(db, &project_id, &task_id)?;
-        if current != expected { return Err(NovaError::Config("任务验证条件已变化，请刷新后重试".into())); }
+    crate::workspace_commands::reserve(&state.core_loop_cancel, &state.db, &task_id, cancel.clone(), |db| {
+        let current = crate::core_loop::verify_only::eligibility(db, &project_id, &task_id).map_err(public_error)?;
+        if current != expected { return Err("任务验证条件已变化，请刷新后重试".into()); }
         Ok(())
-    });
-    if let Err(error) = checked {
-        state.core_loop_cancel.lock().unwrap().remove(&task_id);
-        return Err(error);
-    }
+    })?;
     let db_path = state.app_data_dir.join("nova.sqlite3");
     let data_dir = state.app_data_dir.clone();
     let runs = state.core_loop_cancel.clone();

@@ -213,11 +213,30 @@ pub fn assert_fix_cycle_allowed(existing_count: u32) -> Result<(), String> {
 
 impl Database {
     pub fn create_task(&self, request: &CreateTaskRequest, actor: Actor) -> NovaResult<Task> {
+        self.conn().execute("BEGIN IMMEDIATE;", [])?;
+        let result = self.create_task_in_transaction(request, actor);
+        match result {
+            Ok(task) => {
+                self.conn().execute("COMMIT;", [])?;
+                Ok(task)
+            }
+            Err(error) => {
+                let _ = self.conn().execute("ROLLBACK;", []);
+                Err(error)
+            }
+        }
+    }
+
+    /// Caller owns the write transaction. Shared with requirement confirmation.
+    pub(crate) fn create_task_in_transaction(
+        &self,
+        request: &CreateTaskRequest,
+        actor: Actor,
+    ) -> NovaResult<Task> {
+        assert!(!self.conn().is_autocommit(), "requires write transaction");
         let id = new_id();
         let now = now();
-        self.conn().execute("BEGIN IMMEDIATE;", [])?;
-        let result = (|| -> NovaResult<()> {
-            self.conn().execute(
+        self.conn().execute(
                 "INSERT INTO tasks (id, project_id, title, goal, in_scope, not_in_scope, done_criteria, ai_kind, state, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
                 params![
@@ -233,23 +252,12 @@ impl Database {
                     now,
                 ],
             )?;
-            self.conn().execute(
+        self.conn().execute(
                 "INSERT INTO task_state_events (id, project_id, task_id, old_state, new_state, reason, actor, correlation_id, is_recovery, safety_summary, created_at)
                  VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, NULL, 0, NULL, ?7)",
                 params![new_id(), request.project_id, id, TaskState::Draft.as_str(), "任务已创建", actor.as_str(), now],
             )?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.conn().execute("COMMIT;", [])?;
-                self.task(&id)
-            }
-            Err(error) => {
-                let _ = self.conn().execute("ROLLBACK;", []);
-                Err(error)
-            }
-        }
+        self.task(&id)
     }
 
     pub fn task(&self, id: &str) -> NovaResult<Task> {
@@ -534,97 +542,139 @@ impl Database {
         is_recovery: bool,
         safety_summary: Option<&str>,
     ) -> NovaResult<Task> {
+        #[cfg(test)]
+        BEFORE_TRANSITION_LOCK.with(|hook| {
+            if let Some(callback) = hook.borrow_mut().take() {
+                callback();
+            }
+        });
+        self.conn().execute("BEGIN IMMEDIATE;", [])?;
+        let result = self.transition_task_in_transaction(
+            task_id,
+            to,
+            actor,
+            reason,
+            correlation_id,
+            is_recovery,
+            safety_summary,
+        );
+        match result {
+            Ok(task) => {
+                self.conn().execute("COMMIT;", [])?;
+                Ok(task)
+            }
+            Err(error) => {
+                let _ = self.conn().execute("ROLLBACK;", []);
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn transition_task_in_transaction(
+        &self,
+        task_id: &str,
+        to: TaskState,
+        actor: Actor,
+        reason: Option<&str>,
+        correlation_id: Option<&str>,
+        is_recovery: bool,
+        safety_summary: Option<&str>,
+    ) -> NovaResult<Task> {
+        assert!(!self.conn().is_autocommit(), "requires write transaction");
         let reason = reason.map(redact_sensitive_text);
         let safety_summary = safety_summary.map(redact_sensitive_text);
         let now = now();
-        #[cfg(test)]
-        BEFORE_TRANSITION_LOCK.with(|hook| {
-            if let Some(callback) = hook.borrow_mut().take() { callback(); }
-        });
-        self.conn().execute("BEGIN IMMEDIATE;", [])?;
-        let result = (|| -> NovaResult<()> {
-            let task = self.task(task_id)?;
-            let from = task.state;
+        let task = self.task(task_id)?;
+        let from = task.state;
 
-            if !is_legal_transition(from, to) {
-                return Err(NovaError::Config(format!(
-                    "非法的任务状态转换：{from} -> {to}"
-                )));
-            }
+        if !is_legal_transition(from, to) {
+            return Err(NovaError::Config(format!(
+                "非法的任务状态转换：{from} -> {to}"
+            )));
+        }
 
-            // Read and validate under the write lock. No state, event, action,
-            // or confirmation is changed by a rejected frozen transition.
-            if (to == TaskState::Queued || to == TaskState::Running) && is_legacy_frozen(&task) {
-                return Err(NovaError::Config(
-                    CompletionRejectReason::LegacyTaskFrozen.message().to_string(),
-                ));
-            }
+        // Read and validate under the write lock. No state, event, action,
+        // or confirmation is changed by a rejected frozen transition.
+        if (to == TaskState::Queued || to == TaskState::Running) && is_legacy_frozen(&task) {
+            return Err(NovaError::Config(
+                CompletionRejectReason::LegacyTaskFrozen
+                    .message()
+                    .to_string(),
+            ));
+        }
 
-            if to == TaskState::SafeFixing && actor != Actor::User && !is_recovery {
-                let existing = self.count_automatic_safe_fixing_entries(task_id)?;
-                assert_fix_cycle_allowed(existing).map_err(NovaError::Config)?;
-            }
+        if to == TaskState::SafeFixing && actor != Actor::User && !is_recovery {
+            let existing = self.count_automatic_safe_fixing_entries(task_id)?;
+            assert_fix_cycle_allowed(existing).map_err(NovaError::Config)?;
+        }
 
-            // WP2A (B2): the full completed gate is evaluated here, inside
-            // this same transaction, immediately before the `UPDATE`
-            // below — not as a separate, earlier, independently-committed
-            // step. Its boolean result is folded into the same `WHERE`
-            // clause the pre-existing user-acceptance check already used,
-            // preserving the exact TOCTOU-closing property that check's
-            // own comment describes: there is no window between "we
-            // decided completion is allowed" and "we wrote it" where a
-            // concurrent connection could invalidate the decision.
-            let completion_reason: Option<CompletionRejectReason> = if to == TaskState::Completed {
-                self.evaluate_completion_gate(&task)?.err()
-            } else {
-                None
-            };
-            let completion_ok = completion_reason.is_none();
+        // WP2A (B2): the full completed gate is evaluated here, inside
+        // this same transaction, immediately before the `UPDATE`
+        // below — not as a separate, earlier, independently-committed
+        // step. Its boolean result is folded into the same `WHERE`
+        // clause the pre-existing user-acceptance check already used,
+        // preserving the exact TOCTOU-closing property that check's
+        // own comment describes: there is no window between "we
+        // decided completion is allowed" and "we wrote it" where a
+        // concurrent connection could invalidate the decision.
+        let completion_reason: Option<CompletionRejectReason> = if to == TaskState::Completed {
+            self.evaluate_completion_gate(&task)?.err()
+        } else {
+            None
+        };
+        let completion_ok = completion_reason.is_none();
 
-            let rows_affected = self.conn().execute(
-                "UPDATE tasks
+        let rows_affected = self.conn().execute(
+            "UPDATE tasks
                  SET state = ?1, updated_at = ?2
                  WHERE id = ?3
                    AND state = ?4
                    AND (?1 <> 'completed' OR ?5 = 1)",
-                params![to.as_str(), now, task_id, from.as_str(), completion_ok as i64],
-            )?;
-            if rows_affected == 0 {
-                // Diagnose why, purely for a clear error message — this
-                // read is not authoritative for the decision itself, which
-                // was already made atomically above.
-                let current = self.task(task_id)?;
-                if current.state != from {
-                    return Err(NovaError::Config(format!(
-                        "任务状态已被并发修改，{from} -> {to} 已取消（当前状态不再是 {from}）"
-                    )));
-                }
-                if to == TaskState::Completed {
-                    let message = completion_reason
-                        .map(|r| r.message())
-                        .unwrap_or("无法进入 completed：完工门禁未通过");
-                    return Err(NovaError::Config(format!("无法进入 completed：{message}")));
-                }
+            params![
+                to.as_str(),
+                now,
+                task_id,
+                from.as_str(),
+                completion_ok as i64
+            ],
+        )?;
+        if rows_affected == 0 {
+            // Diagnose why, purely for a clear error message — this
+            // read is not authoritative for the decision itself, which
+            // was already made atomically above.
+            let current = self.task(task_id)?;
+            if current.state != from {
                 return Err(NovaError::Config(format!(
-                    "任务状态转换失败：{from} -> {to}"
+                    "任务状态已被并发修改，{from} -> {to} 已取消（当前状态不再是 {from}）"
                 )));
             }
-
-            // A fresh result supersedes any acceptance recorded for an
-            // earlier generation — bumping here, inside the same
-            // transaction as the state write, is what makes "old
-            // acceptance can't authorize a new result" hold even under
-            // concurrency: no other writer can observe the task as
-            // `preview_ready` with the old `result_generation` still in
-            // effect.
-            if to == TaskState::PreviewReady {
-                self.conn().execute(
-                    "UPDATE tasks SET result_generation = result_generation + 1 WHERE id = ?1",
-                    params![task_id],
-                )?;
+            if to == TaskState::Completed {
+                let message = completion_reason
+                    .map(|r| r.message())
+                    .unwrap_or("无法进入 completed：完工门禁未通过");
+                return Err(NovaError::Config(format!("无法进入 completed：{message}")));
             }
+            return Err(NovaError::Config(format!(
+                "任务状态转换失败：{from} -> {to}"
+            )));
+        }
 
+        // A fresh result supersedes any acceptance recorded for an
+        // earlier generation — bumping here, inside the same
+        // transaction as the state write, is what makes "old
+        // acceptance can't authorize a new result" hold even under
+        // concurrency: no other writer can observe the task as
+        // `preview_ready` with the old `result_generation` still in
+        // effect.
+        if to == TaskState::PreviewReady {
             self.conn().execute(
+                "UPDATE tasks SET result_generation = result_generation + 1 WHERE id = ?1",
+                params![task_id],
+            )?;
+        }
+
+        self.conn().execute(
                 "INSERT INTO task_state_events (id, project_id, task_id, old_state, new_state, reason, actor, correlation_id, is_recovery, safety_summary, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
@@ -642,31 +692,20 @@ impl Database {
                 ],
             )?;
 
-            // WP2A-0: the moment a task leaves `Draft` for `AwaitingConfirmation`
-            // *is* "the user confirmed the requirement" — this is the one
-            // and only place a fresh task's requirement snapshot is taken,
-            // in the same transaction as the state write itself. Silently
-            // a no-op if a snapshot already exists for this task (it never
-            // will yet, for a task taking this edge for the first and only
-            // legal time, but the check is defensive, not load-bearing).
-            if to == TaskState::AwaitingConfirmation {
-                self.insert_confirmed_requirement_items_if_absent(&task.project_id, &task)?;
-            }
-
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn().execute("COMMIT;", [])?;
-                self.task(task_id)
-            }
-            Err(error) => {
-                let _ = self.conn().execute("ROLLBACK;", []);
-                Err(error)
-            }
+        // WP2A-0: the moment a task leaves `Draft` for `AwaitingConfirmation`
+        // *is* "the user confirmed the requirement" — this is the one
+        // and only place a fresh task's requirement snapshot is taken,
+        // in the same transaction as the state write itself. Silently
+        // a no-op if a snapshot already exists for this task (it never
+        // will yet, for a task taking this edge for the first and only
+        // legal time, but the check is defensive, not load-bearing).
+        if to == TaskState::AwaitingConfirmation {
+            self.insert_confirmed_requirement_items_if_absent(&task.project_id, &task)?;
         }
+
+        self.task(task_id)
     }
+
 }
 
 /// Small helper trait so `query_row(...).optional()` composes with our

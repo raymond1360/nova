@@ -27,6 +27,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
           if ($LASTEXITCODE -ne 0) { throw 'Rust setup failed' }
+          # Fresh CI checkout only: Git autocrlf may change these licensed fixture bytes.
+          # Export their exact committed blobs before Rust include_bytes / independent verifier use.
+          node -e "const fs=require('node:fs'),cp=require('node:child_process'),crypto=require('node:crypto');const v=JSON.parse(fs.readFileSync('tools/t1-api-eval/fixture-provenance.json'));for(const [p,h]of [['tools/t1-api-eval/fixtures/Logo.tsx',v.logo.sha256],['tools/t1-api-eval/fixtures/PAYLOAD_LICENSE.md',v.license.sha256]]){const b=cp.execFileSync('git',['show','HEAD:'+p]);if(crypto.createHash('sha256').update(b).digest('hex')!==h)throw Error('fixture blob identity');fs.writeFileSync(p,b);}"
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned fixture blob export failed' }
           Push-Location apps/desktop/src-tauri
           try {
             cargo fetch --locked

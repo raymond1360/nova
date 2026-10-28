@@ -1,0 +1,13 @@
+{
+  "scope": "SYNTHETIC deterministic contract; not a blind coding test",
+  "target_id": "logo",
+  "old_literal": "alt=\"Payload Logo\"",
+  "new_literal": "alt=\"Northstar Studio logo\"",
+  "pre_bytes": 786,
+  "pre_sha256": "0821ae3bbb7e9d2085e9ae9031b4b7744bc191c84a6b7dda6b618b7c1b6ed58a",
+  "post_bytes": 795,
+  "post_sha256": "68fad18b5f5e14a50b0024e050d9b4d63612091a3d126de11326b3f19f909518",
+  "desktop_lock_blob_sha256": "097850e97d14a6280dbc2ca91b411ecc4aa6bebf327a5a97d8d647a07fe5b68a",
+  "node": "24.14.0",
+  "typescript": "5.9.3"
+}

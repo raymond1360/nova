@@ -1,0 +1,37 @@
+{
+  "scope": "Deterministic SYNTHETIC contract; not blind coding or Agent compatibility",
+  "payload_commit": "e6f7db8b71facd9ee5ef67feb3b065b2684370d2",
+  "logo": {
+    "url": "https://raw.githubusercontent.com/payloadcms/payload/e6f7db8b71facd9ee5ef67feb3b065b2684370d2/templates/website/src/components/Logo/Logo.tsx",
+    "bytes": 786,
+    "sha256": "0821ae3bbb7e9d2085e9ae9031b4b7744bc191c84a6b7dda6b618b7c1b6ed58a",
+    "source": "verified prior audit raw bytes"
+  },
+  "license": {
+    "url": "https://raw.githubusercontent.com/payloadcms/payload/e6f7db8b71facd9ee5ef67feb3b065b2684370d2/LICENSE.md",
+    "bytes": 1101,
+    "sha256": "f5622f480e4419ef6be7691d4b04521a5f18365ddedb9a160e92a4b365e94ecd",
+    "source": "fixed official commit fetched 2026-10-28; LICENSE path 404 retained in audit"
+  },
+  "synthetic_protocol_sources": [
+    {
+      "path": "opencode__packages__schema__src__v1__permission.ts.txt",
+      "sha256": "eaa6c288030c691429e9fd63db59b0609e55337c63d6fa932b30b3c1c6956d89",
+      "bytes": 2571,
+      "commit": "148842ef7cb1bc34192b3fff57d0f9721ab9c801"
+    },
+    {
+      "path": "opencode__packages__opencode__src__session__processor.ts.txt",
+      "sha256": "0b31e207beda56bd9a4b9b88c9e42d89a0651dd011773748c8e2938dfc3dcb74",
+      "bytes": 27266,
+      "commit": "148842ef7cb1bc34192b3fff57d0f9721ab9c801"
+    },
+    {
+      "path": "opencode__packages__opencode__src__session__message-v2.ts.txt",
+      "sha256": "b55648c31423ace5c730ca085ef5429a966486fcd7bf84ab25e59453a1a9417a",
+      "bytes": 26346,
+      "commit": "148842ef7cb1bc34192b3fff57d0f9721ab9c801"
+    }
+  ],
+  "release_binary": "NOT DOWNLOADED; M0-B BLOCKED"
+}

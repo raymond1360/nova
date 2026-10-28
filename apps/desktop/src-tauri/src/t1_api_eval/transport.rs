@@ -1,0 +1,161 @@
+//! Closed mock transport. Numeric IPv4 loopback only; no provider/credential configuration.
+use super::{budget::Budget, Result};
+use std::{
+    io::{Read, Write},
+    net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+pub const PROVIDER_ID: &str = "nova_t1_mock";
+pub const DENIAL_BODY:&[u8]=br#"{"error":{"message":"NOVA_ADMISSION_DENIED","type":"invalid_request_error","code":"nova_admission_denied"}}"#;
+pub const DENIAL_HEADER: &[u8] =
+    b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n";
+pub const MOCK_BODY: &[u8] = br#"{"source":"SYNTHETIC","usage":{"total_tokens":1},"choices":[]}"#;
+
+#[derive(Debug, Clone)]
+pub struct MockEndpoint(SocketAddrV4);
+impl MockEndpoint {
+    pub fn parse(value: &str) -> Result<Self> {
+        // Deliberately no URL normalization, DNS, userinfo, IPv6 aliases or redirect surface.
+        let authority = value
+            .strip_prefix("http://127.0.0.1:")
+            .ok_or("nonfixed loopback URL")?;
+        let port = authority.strip_suffix("/model").ok_or("nonfixed path")?;
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) || port.starts_with('0') {
+            return Err("invalid port".into());
+        }
+        let port: u16 = port.parse().map_err(|_| "invalid port")?;
+        if port == 0 {
+            return Err("zero port".into());
+        }
+        Ok(Self(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)))
+    }
+    pub fn url(&self) -> String {
+        format!("http://127.0.0.1:{}/model", self.0.port())
+    }
+    fn client() -> Result<reqwest::Client> {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(3))
+            .build()
+            .map_err(|e| e.to_string())
+    }
+    pub async fn post(&self, id: &str, worst: u32) -> Result<reqwest::Response> {
+        Self::client()?.post(self.url()).json(&serde_json::json!({"source":"SYNTHETIC","provider":PROVIDER_ID,"id":id,"worst":worst}))
+            .send().await.map_err(|e|e.to_string())
+    }
+}
+pub struct MockBroker {
+    listener: TcpListener,
+    pub endpoint: MockEndpoint,
+    pub ledger: Arc<Mutex<Budget>>,
+}
+impl MockBroker {
+    pub fn bind(ledger: Arc<Mutex<Budget>>) -> Result<Self> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| e.to_string())?;
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        Ok(Self {
+            listener,
+            endpoint: MockEndpoint::parse(&format!("http://127.0.0.1:{port}/model"))?,
+            ledger,
+        })
+    }
+    /// One bounded connection, in-process mock response. No upstream networking exists here.
+    pub fn serve_one(&self) -> Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut s = loop {
+            match self.listener.accept() {
+                Ok((s, addr)) => {
+                    if !addr.ip().is_loopback() {
+                        return Err("nonloopback peer".into());
+                    }
+                    break s;
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        };
+        // Explicitly reset the accepted socket: listener nonblocking inheritance is platform-specific.
+        s.set_nonblocking(false).map_err(|e| e.to_string())?;
+        s.set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(|e| e.to_string())?;
+        s.set_write_timeout(Some(Duration::from_secs(2)))
+            .map_err(|e| e.to_string())?;
+        let input = read_request(&mut s);
+        let mut ledger = self.ledger.lock().map_err(|_| "poisoned ledger")?;
+        // Invalid payloads also consume receive/denial accounting and close admission.
+        let admitted = match input {
+            Ok((id, worst)) => ledger.reserve(&id, worst).map(|_| id),
+            Err(_) => ledger.reserve("", 0).map(|_| String::new()),
+        };
+        let (header, body) = match admitted {
+            Ok(id) => {
+                ledger.settle(&id, Some(1))?;
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n"
+                        .as_slice(),
+                    MOCK_BODY,
+                )
+            }
+            Err(_) => (DENIAL_HEADER, DENIAL_BODY),
+        };
+        drop(ledger);
+        s.write_all(header)
+            .and_then(|_| write!(s, "Content-Length: {}\r\n\r\n", body.len()))
+            .and_then(|_| s.write_all(body))
+            .and_then(|_| s.flush())
+            .map_err(|e| e.to_string())
+    }
+}
+fn read_request(s: &mut TcpStream) -> Result<(String, u32)> {
+    let mut bytes = Vec::new();
+    let mut b = [0; 1];
+    while !bytes.ends_with(b"\r\n\r\n") {
+        if bytes.len() >= 4096 {
+            return Err("header bound".into());
+        }
+        s.read_exact(&mut b).map_err(|e| e.to_string())?;
+        bytes.push(b[0]);
+    }
+    let h = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+    let mut lines = h.split("\r\n");
+    if lines.next() != Some("POST /model HTTP/1.1") {
+        return Err("fixed request only".into());
+    }
+    let mut lengths = Vec::new();
+    for l in lines.filter(|l| !l.is_empty()) {
+        let (k, v) = l.split_once(':').ok_or("malformed header")?;
+        if k.eq_ignore_ascii_case("transfer-encoding") {
+            return Err("transfer encoding rejected".into());
+        }
+        if k.eq_ignore_ascii_case("content-length") {
+            lengths.push(v.trim().parse::<usize>().map_err(|_| "bad length")?);
+        }
+    }
+    if lengths.len() != 1 || lengths[0] > 4096 {
+        return Err("body bound/ambiguous length".into());
+    }
+    let mut body = vec![0; lengths[0]];
+    s.read_exact(&mut body).map_err(|e| e.to_string())?;
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request {
+        source: String,
+        provider: String,
+        id: String,
+        worst: u32,
+    }
+    let r: Request = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+    if r.source != "SYNTHETIC" || r.provider != PROVIDER_ID {
+        return Err("not a synthetic mock provider".into());
+    }
+    Ok((r.id, r.worst))
+}

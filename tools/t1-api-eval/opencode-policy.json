@@ -1,0 +1,14 @@
+{
+  "scope": "SYNTHETIC data contract only; NOT AUTHORIZED to launch OpenCode",
+  "provider_id": "nova_t1_mock",
+  "upstream": "in-process mock only",
+  "edit": "ask; correlate raw running ToolPart; reject without message; require idle before CAS",
+  "input_reloads": 3,
+  "admission_closes_before_reject": true,
+  "deny_without_permission_event": "close admission and request abort on unexpected ToolPart error or subsequent model request",
+  "real_rejected_error_propagation": "M0-B NOT VERIFIED",
+  "real_no_write_after_reject": "M0-B NOT VERIFIED",
+  "budget": {"simulated": true, "requests": 8, "tokens": 12000, "repairs": [0,1]},
+  "M0_B": "BLOCKED",
+  "real_calls": "BLOCKED"
+}

@@ -1,3 +1,8 @@
+#[cfg(all(feature = "t1-api-eval", not(debug_assertions)))]
+compile_error!("t1-api-eval is debug-only and must never ship");
+#[cfg(feature = "t1-api-eval")]
+pub mod t1_api_eval;
+
 #[cfg(all(feature = "wp2a-desktop-validation", not(debug_assertions)))]
 compile_error!("wp2a-desktop-validation is debug-only and must never ship");
 #[cfg(feature = "wp2a-desktop-validation")]

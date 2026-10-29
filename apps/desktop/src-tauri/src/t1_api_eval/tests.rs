@@ -916,3 +916,17 @@ fn connection_deadline_also_bounds_contended_budget_lock() {
     assert!(result.unwrap().is_err());
     assert_eq!(ledger.lock().unwrap().admitted, 0);
 }
+
+#[cfg(windows)]
+#[test]
+fn empty_or_partial_recovery_completion_is_not_success() {
+    for marker in [&b""[..], &b"KNOWN_PREIMAGE"[..]] {
+        let d = Temp::new();
+        let p = d.file();
+        let tx = d.tx(&p);
+        cas::apply(&p, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None).unwrap();
+        assert!(cas::recover_with_fault(&p, &tx, cas::RecoveryFault::Readback).is_err());
+        journal::write_new(&tx.root.join("recovered.json"), marker).unwrap();
+        assert_eq!(tx.status().unwrap(), "UNCERTAIN_RECOVERY");
+    }
+}

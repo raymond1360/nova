@@ -33,10 +33,15 @@ pub struct Transaction {
 impl Transaction {
     /// Historical journal state, not proof that the target has not changed since receipt.
     pub fn status(&self) -> Result<&'static str> {
-        if self.root.join("recovery-intent.json").exists()
-            && !self.root.join("recovered.json").exists()
-        {
+        let recovery_intent = self.root.join("recovery-intent.json").exists();
+        let recovery_complete = fs::read(self.root.join("recovered.json"))
+            .is_ok_and(|b| b == b"KNOWN_PREIMAGE_RESTORED");
+        // A missing, empty or partial completion marker never completes an interrupted recovery.
+        if recovery_intent && !recovery_complete {
             return Ok("UNCERTAIN_RECOVERY");
+        }
+        if self.root.join("recovered.json").exists() && (!recovery_intent || !recovery_complete) {
+            return Err("UNCERTAIN invalid recovery completion marker".into());
         }
         let receipt_path = self.root.join("receipt.json");
         if receipt_path.exists() {

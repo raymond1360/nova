@@ -18,6 +18,13 @@ pub enum Fault {
     CrashAfterIntent,
     Receipt,
 }
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum RecoveryFault {
+    None,
+    AfterIntent,
+    PartialWrite,
+    Readback,
+}
 
 #[cfg(windows)]
 mod native {
@@ -57,6 +64,26 @@ mod native {
         Ok(fs::symlink_metadata(path)
             .map_err(|e| e.to_string())?
             .file_attributes())
+    }
+    pub fn final_path(f: &File) -> Result<PathBuf> {
+        let mut buf = vec![0u16; 32768];
+        let n = unsafe {
+            GetFinalPathNameByHandleW(
+                f.as_raw_handle() as _,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        };
+        if n == 0 || n as usize >= buf.len() {
+            return Err(format!(
+                "final path query failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(PathBuf::from(
+            String::from_utf16(&buf[..n as usize]).map_err(|e| e.to_string())?,
+        ))
     }
     pub fn filesystem(f: &File) -> Result<String> {
         let mut name = [0u16; 64];
@@ -156,6 +183,9 @@ mod native {
     pub fn identity(_: &File) -> Result<String> {
         Err("Windows required".into())
     }
+    pub fn final_path(_: &File) -> Result<PathBuf> {
+        Err("Windows required".into())
+    }
     pub fn attributes(_: &Path) -> Result<u32> {
         Err("NOT ENUMERATED".into())
     }
@@ -169,6 +199,31 @@ mod native {
 pub fn locked_identity(path: &Path) -> Result<String> {
     let f = native::open(path, false, false)?;
     native::identity(&f)
+}
+fn check_final(f: &File, path: &Path, root: &Path) -> Result<()> {
+    if !path.is_absolute() || !root.is_absolute() {
+        return Err("absolute path/root required".into());
+    }
+    no_link_ancestors(root)?;
+    no_link_ancestors(path)?;
+    let root_file = native::open(root, false, true)?;
+    let final_root = native::final_path(&root_file)?;
+    let expected = fs::canonicalize(path).map_err(|e| e.to_string())?;
+    let actual = native::final_path(f)?;
+    if actual != expected
+        || actual.parent() != Some(final_root.as_path())
+        || !actual.starts_with(&final_root)
+    {
+        return Err("handle canonical path/root mismatch".into());
+    }
+    Ok(())
+}
+/// Additional handle-derived evidence, not an atomic namespace lock or a proof of all races eliminated.
+pub fn validate_final_path(path: &Path, root: &Path) -> Result<PathBuf> {
+    let f = native::open(path, false, false)?;
+    native::identity(&f)?;
+    check_final(&f, path, root)?;
+    native::final_path(&f)
 }
 fn no_link_ancestors(path: &Path) -> Result<()> {
     if path
@@ -205,6 +260,15 @@ pub fn apply(
     }
     no_link_ancestors(path)?;
     let mut f = native::open(path, true, false)?;
+    let reserved: serde_json::Value = serde_json::from_slice(
+        &fs::read(tx.root.join("target-identity.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let root = PathBuf::from(reserved["root"].as_str().ok_or("reserved root missing")?);
+    check_final(&f, path, &root)?;
+    if reserved["final_path"] != native::final_path(&f)?.to_string_lossy().as_ref() {
+        return Err("reserved final path changed".into());
+    }
     let id = native::identity(&f)?;
     // Reject replacement since reservation, including same-byte path substitution.
     let reserved_path = tx.root.join("target-identity.json");
@@ -254,19 +318,33 @@ pub fn apply(
 pub fn reserve_identity(path: &Path, tx: &Transaction) -> Result<()> {
     no_link_ancestors(path)?;
     let id = locked_identity(path)?;
+    let root = path.parent().ok_or("no target root")?;
+    let final_path = validate_final_path(path, root)?;
     write_new(
         &tx.root.join("target-identity.json"),
-        &serde_json::to_vec(&serde_json::json!({"identity":id})).unwrap(),
+        &serde_json::to_vec(&serde_json::json!({"identity":id,"root":fs::canonicalize(root).map_err(|e|e.to_string())?,"final_path":final_path})).unwrap(),
     )
 }
 /// Explicit recovery, only known postimage with the original file identity. Unknown partials stay uncertain.
 pub fn recover(path: &Path, tx: &Transaction) -> Result<()> {
+    recover_with_fault(path, tx, RecoveryFault::None)
+}
+pub fn recover_with_fault(path: &Path, tx: &Transaction, fault: RecoveryFault) -> Result<()> {
     no_link_ancestors(path)?;
     let intent: serde_json::Value = serde_json::from_slice(
         &fs::read(tx.root.join("mutation-intent.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     let mut f = native::open(path, true, false)?;
+    let reserved: serde_json::Value = serde_json::from_slice(
+        &fs::read(tx.root.join("target-identity.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let root = PathBuf::from(reserved["root"].as_str().ok_or("reserved root missing")?);
+    check_final(&f, path, &root)?;
+    if reserved["final_path"] != native::final_path(&f)?.to_string_lossy().as_ref() {
+        return Err("recovery final path mismatch".into());
+    }
     if intent["identity"] != native::identity(&f)? || read(&mut f)? != tx.post {
         return Err("UNKNOWN/user edit; recovery refused".into());
     }
@@ -274,11 +352,23 @@ pub fn recover(path: &Path, tx: &Transaction) -> Result<()> {
         &tx.root.join("recovery-intent.json"),
         b"restore known preimage only",
     )?;
+    if fault == RecoveryFault::AfterIntent {
+        return Err("UNCERTAIN_RECOVERY after intent".into());
+    }
+    if fault == RecoveryFault::PartialWrite {
+        f.seek(SeekFrom::Start(0))
+            .and_then(|_| f.write_all(&tx.pre[..tx.pre.len() / 2]))
+            .map_err(|e| e.to_string())?;
+        return Err("UNCERTAIN_RECOVERY partial write".into());
+    }
     f.seek(SeekFrom::Start(0))
         .and_then(|_| f.write_all(&tx.pre))
         .and_then(|_| f.set_len(tx.pre.len() as u64))
         .and_then(|_| f.sync_all())
         .map_err(|e| format!("UNCERTAIN recovery {e}"))?;
+    if fault == RecoveryFault::Readback {
+        return Err("UNCERTAIN_RECOVERY readback interruption".into());
+    }
     if read(&mut f)? != tx.pre {
         return Err("UNCERTAIN recovery readback".into());
     }
@@ -411,7 +501,12 @@ pub fn verify_tree_change(
         if a.path != b.path
             || a.directory != b.directory
             || a.identity != b.identity
-            || a.attributes != b.attributes
+            || (a.attributes != b.attributes
+                && !(a.path == target
+                    && !a.directory
+                    && a.attributes & 0x20 == 0
+                    // NORMAL is exclusive: setting ARCHIVE replaces the no-attributes representation.
+                    && b.attributes == if a.attributes==0x80 {0x20}else{a.attributes|0x20}))
             || a.streams != b.streams
         {
             return Err("tree/ADS/identity changed".into());

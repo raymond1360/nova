@@ -30,6 +30,15 @@ function check(ts, pre, actual) {
 }
 function main(args) {
   if (process.version !== 'v24.14.0' || process.arch !== 'x64') throw Error('fixed Node version/arch required')
+  const policy = JSON.parse(fs.readFileSync(path.join(__dirname, 'opencode-policy.json'), 'utf8'))
+  function policyTest() {
+    const controls = ['429', 'rate_limit', 'provider_returned_error', 'socket hang up', 'read timed out', 'retry your request', 'temporarily at capacity']
+    if (policy.retry_patterns.length !== 7 || policy.provider_id.startsWith('openai')) throw Error('retry contract identity')
+    policy.retry_patterns.forEach((p, i) => { const r = new RegExp(p.source, p.flags); if (r.test(policy.denial_body) || !r.test(controls[i])) throw Error('fixed denial retry-rule regression') })
+    if (/[0-9]/.test(policy.denial_body) || policy.non_api_terms.some(t => policy.denial_body.toLowerCase().includes(t))) throw Error('denial contains retry hint')
+    return {retry_patterns: 7, non_api_terms: 3, source_sha256: policy.retry_source.sha256, scope: 'copied locked rules / SYNTHETIC; not SDK runtime behavior'}
+  }
+  if (args.length === 1 && args[0] === '--policy-self-test') { console.log(JSON.stringify(policyTest())); return }
   if (args.length !== 2 && args.length !== 3) throw Error('usage: check-logo.cjs <verifier-package.json> <--self-test|actual-file> [preimage-file]')
   const pkg = path.resolve(args[0]); if (!path.isAbsolute(args[0]) || path.basename(pkg) !== 'package.json') throw Error('absolute verifier package required')
   const lock = fs.readFileSync(path.join(path.dirname(pkg), 'package-lock.json'))
@@ -46,7 +55,7 @@ function main(args) {
       let rejected = false; try { check(ts, pre, invalid) } catch { rejected = true }
       if (!rejected) throw Error('negative oracle accepted')
     }
-    console.log(JSON.stringify({ ...check(ts, pre, expected), synthetic: true, cases: 6 }))
+    console.log(JSON.stringify({ ...check(ts, pre, expected), typescript_version: ts.version, typescript_resolved: resolved, synthetic: true, cases: 6, policy: policyTest() }))
   } else console.log(JSON.stringify(check(ts, pre, fs.readFileSync(args[1]))))
 }
 try { main(process.argv.slice(2)) } catch (e) { console.error(e.message); process.exitCode = 1 }

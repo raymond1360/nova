@@ -33,6 +33,11 @@ pub struct Transaction {
 impl Transaction {
     /// Historical journal state, not proof that the target has not changed since receipt.
     pub fn status(&self) -> Result<&'static str> {
+        if self.root.join("recovery-intent.json").exists()
+            && !self.root.join("recovered.json").exists()
+        {
+            return Ok("UNCERTAIN_RECOVERY");
+        }
         let receipt_path = self.root.join("receipt.json");
         if receipt_path.exists() {
             let r: Receipt =

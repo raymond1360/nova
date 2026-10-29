@@ -70,7 +70,12 @@ pub fn mock_run() -> Result<serde_json::Value> {
         });
     server.join().map_err(|_| "mock server panic")??;
     journal::write_new(&evidence.join("mock-response.json"), &response?)?;
-    let mut gate = contract::SyntheticGate::new("SYNTHETIC-run", "SYNTHETIC-session");
+    let mut gate = contract::SyntheticGate::new(
+        "SYNTHETIC-run",
+        "SYNTHETIC-session",
+        &project,
+        ledger.clone(),
+    )?;
     let permission = contract::Permission {
         source: "SYNTHETIC".into(),
         id: "edit-attempt".into(),
@@ -85,9 +90,8 @@ pub fn mock_run() -> Result<serde_json::Value> {
     let patch=gate.proposal(&permission,|| {
         reads+=1;
         Ok(vec![contract::ToolPart {source:"SYNTHETIC".into(),session_id:permission.session_id.clone(),message_id:permission.message_id.clone(),call_id:permission.call_id.clone(),tool:"edit".into(),
-            state:if reads==1 {"pending"}else{"running"}.into(),input:if reads==1{serde_json::json!({})}else{serde_json::json!({"filePath":"Logo.tsx","oldString":"alt=\"Payload Logo\"","newString":"alt=\"Northstar Studio logo\""})} }])
+            state:if reads==1 {"pending"}else{"running"}.into(),input:if reads==1{serde_json::json!({})}else{serde_json::json!({"filePath":std::fs::canonicalize(&target).map_err(|e|e.to_string())?,"oldString":"alt=\"Payload Logo\"","newString":"alt=\"Northstar Studio logo\""})} }])
     })?;
-    ledger.lock().map_err(|_| "ledger poison")?.closed = true;
     journal::write_new(
         &evidence.join("synthetic-permission.json"),
         &serde_json::to_vec_pretty(&permission).unwrap(),

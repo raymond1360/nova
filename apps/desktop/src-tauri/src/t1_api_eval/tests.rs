@@ -41,7 +41,14 @@ fn permission() -> contract::Permission {
         call_id: "c".into(),
     }
 }
-fn part() -> contract::ToolPart {
+fn gate() -> (Temp, contract::SyntheticGate) {
+    let d = Temp::new();
+    d.file();
+    let ledger = Arc::new(Mutex::new(budget::Budget::mock(0).unwrap()));
+    let g = contract::SyntheticGate::new("r", "s", &d.0, ledger).unwrap();
+    (d, g)
+}
+fn part(root: &Path) -> contract::ToolPart {
     contract::ToolPart {
         source: "SYNTHETIC".into(),
         session_id: "s".into(),
@@ -49,7 +56,7 @@ fn part() -> contract::ToolPart {
         call_id: "c".into(),
         tool: "edit".into(),
         state: "running".into(),
-        input: serde_json::json!({"filePath":"Logo.tsx","oldString":"alt=\"Payload Logo\"","newString":"alt=\"Northstar Studio logo\""}),
+        input: serde_json::json!({"filePath":fs::canonicalize(root.join("Logo.tsx")).unwrap(),"oldString":"alt=\"Payload Logo\"","newString":"alt=\"Northstar Studio logo\""}),
     }
 }
 #[test]
@@ -63,12 +70,12 @@ fn oracle_is_exact_contract() {
 }
 #[test]
 fn pending_reread_reject_without_message_then_idle() {
-    let mut g = contract::SyntheticGate::new("r", "s");
+    let (_fixture, mut g) = gate();
     let mut reads = 0;
     let p = g
         .proposal(&permission(), || {
             reads += 1;
-            let mut t = part();
+            let mut t = part(&_fixture.0);
             if reads < 3 {
                 t.state = "pending".into();
                 t.input = serde_json::json!({});
@@ -78,7 +85,7 @@ fn pending_reread_reject_without_message_then_idle() {
         .unwrap();
     assert_eq!(reads, 3);
     assert_eq!(p.validate("r", "a", PRE).unwrap(), oracle(PRE).unwrap());
-    assert!(!g.admission_open);
+    assert!(!g.admission_open());
     assert!(!g.cas_allowed());
     assert_eq!(g.reject().unwrap(), br#"{"reply":"reject"}"#);
     g.rejected("a").unwrap();
@@ -90,16 +97,16 @@ fn pending_reread_reject_without_message_then_idle() {
 }
 #[test]
 fn empty_input_exhaustion_aborts() {
-    let mut g = contract::SyntheticGate::new("r", "s");
+    let (_fixture, mut g) = gate();
     assert!(g
         .proposal(&permission(), || {
-            let mut t = part();
+            let mut t = part(&_fixture.0);
             t.input = serde_json::json!({});
             Ok(vec![t])
         })
         .is_err());
     assert_eq!(g.control_http, 3);
-    assert!(g.abort_requested);
+    assert!(g.abort_requested());
     g.abort().unwrap();
     assert!(g.abort().is_err());
     assert!(!g.cas_allowed());
@@ -116,18 +123,18 @@ fn mismatched_permissions_never_read_or_admit() {
             4 => p.id.clear(),
             _ => p.call_id.clear(),
         };
-        let mut g = contract::SyntheticGate::new("r", "s");
+        let (_fixture, mut g) = gate();
         assert!(g
             .proposal(&p, || panic!("GET must be unreachable"))
             .is_err());
-        assert!(g.abort_requested);
+        assert!(g.abort_requested());
     }
 }
 #[test]
 fn tool_input_ambiguity_and_wrong_role_are_rejected() {
     for n in 0..10 {
-        let mut g = contract::SyntheticGate::new("r", "s");
-        let mut t = part();
+        let (_fixture, mut g) = gate();
+        let mut t = part(&_fixture.0);
         match n {
             0 => t.tool = "write".into(),
             1 => t.session_id = "other".into(),
@@ -148,13 +155,15 @@ fn tool_input_ambiguity_and_wrong_role_are_rejected() {
                 vec![t.clone()]
             }))
             .is_err());
-        assert!(!g.admission_open);
+        assert!(!g.admission_open());
     }
 }
 #[test]
 fn patch_binds_run_attempt_hash_role_and_exact_bytes() {
-    let mut g = contract::SyntheticGate::new("r", "s");
-    let p = g.proposal(&permission(), || Ok(vec![part()])).unwrap();
+    let (_fixture, mut g) = gate();
+    let p = g
+        .proposal(&permission(), || Ok(vec![part(&_fixture.0)]))
+        .unwrap();
     for n in 0..8 {
         let mut q = p.clone();
         match n {
@@ -172,10 +181,10 @@ fn patch_binds_run_attempt_hash_role_and_exact_bytes() {
 }
 #[test]
 fn deny_without_permission_event_uses_admission_and_abort() {
-    let mut g = contract::SyntheticGate::new("r", "s");
+    let (_fixture, mut g) = gate();
     g.unexpected_tool_error();
-    assert!(!g.admission_open);
-    assert!(g.abort_requested);
+    assert!(!g.admission_open());
+    assert!(g.abort_requested());
     g.abort().unwrap();
     g.confirm_idle();
     assert!(!g.cas_allowed());
@@ -183,7 +192,7 @@ fn deny_without_permission_event_uses_admission_and_abort() {
 }
 #[test]
 fn cancelled_or_late_permission_cannot_reopen() {
-    let mut g = contract::SyntheticGate::new("r", "s");
+    let (_fixture, mut g) = gate();
     g.stop();
     assert!(g.proposal(&permission(), || panic!()).is_err());
     assert!(g.rejected("unknown").is_err());
@@ -195,7 +204,7 @@ fn simulated_budget_exact_eight_and_ninth_recorded() {
         b.reserve(&i.to_string(), 1500).unwrap();
         b.settle(&i.to_string(), Some(1500)).unwrap();
     }
-    assert_eq!(b.committed_tokens(), 12000);
+    assert_eq!(b.committed_tokens().unwrap(), 12000);
     assert!(b.reserve("nine", 1).is_err());
     assert_eq!((b.received, b.admitted, b.denied), (9, 8, 1));
     assert!(b.abort_requested);
@@ -205,7 +214,7 @@ fn unknown_usage_and_duplicate_settlement_keep_reservation() {
     let mut b = budget::Budget::mock(0).unwrap();
     b.reserve("a", 12000).unwrap();
     assert!(b.settle("a", None).is_err());
-    assert_eq!(b.committed_tokens(), 12000);
+    assert_eq!(b.committed_tokens().unwrap(), 12000);
     assert!(b.settle("a", Some(0)).is_err());
     assert!(b.reserve("b", 1).is_err());
 }
@@ -218,7 +227,7 @@ fn cancellation_late_usage_and_excess_usage_are_uncertain() {
             b.cancel();
         }
         assert!(b.settle("a", Some(5)).is_err());
-        assert_eq!(b.committed_tokens(), if cancel { 4 } else { 5 });
+        assert_eq!(b.committed_tokens().unwrap(), if cancel { 4 } else { 5 });
         assert!(b.closed);
     }
 }
@@ -256,7 +265,7 @@ fn concurrent_reserve_is_serialized() {
     let b = b.lock().unwrap();
     assert_eq!(b.received, 4);
     assert_eq!(b.admitted, 1);
-    assert!(b.committed_tokens() <= 12000);
+    assert!(b.committed_tokens().unwrap() <= 12000);
 }
 #[test]
 fn loopback_parser_rejects_aliases_and_bypass() {
@@ -564,32 +573,6 @@ fn junction_is_rejected_without_following_it() {
     );
     fs::remove_dir(link).unwrap();
 }
-#[test]
-fn admission_closed_on_deny_or_reject_blocks_next_model_attempt() {
-    for error_without_event in [true, false] {
-        let mut g = contract::SyntheticGate::new("r", "s");
-        let mut b = budget::Budget::mock(0).unwrap();
-        b.reserve("initial", 100).unwrap();
-        b.settle("initial", Some(1)).unwrap();
-        if error_without_event {
-            g.unexpected_tool_error();
-        } else {
-            g.proposal(&permission(), || Ok(vec![part()])).unwrap();
-            g.reject().unwrap();
-        }
-        b.closed = !g.admission_open;
-        assert!(b.reserve("subsequent", 100).is_err());
-        assert_eq!((b.received, b.admitted, b.denied), (2, 1, 1));
-        assert!(b.abort_requested);
-        // A denied configuration does not supply a permission event or prove Agent idle.
-        if error_without_event {
-            assert!(g.abort_requested);
-            assert!(!g.reject_sent);
-            g.abort().unwrap();
-            assert!(!g.cas_allowed());
-        }
-    }
-}
 #[cfg(windows)]
 #[test]
 fn receipt_create_new_failure_remains_uncertain() {
@@ -615,4 +598,321 @@ fn fixed_mock_pipeline() {
     assert_eq!(result["post_sha256"], POST_HASH);
     assert_eq!(result["M0_B"], "BLOCKED");
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn agent_edits_are_applied_then_checked_at_different_granularities() {
+    let (_fixture, mut g) = gate();
+    let base = g
+        .proposal(&permission(), || Ok(vec![part(&_fixture.0)]))
+        .unwrap();
+    for (old, new) in [
+        (
+            "Payload Logo".to_string(),
+            "Northstar Studio logo".to_string(),
+        ),
+        (base.old_literal.clone(), base.new_literal.clone()),
+        {
+            let line = std::str::from_utf8(PRE)
+                .unwrap()
+                .lines()
+                .find(|l| l.contains("alt=\"Payload Logo\""))
+                .unwrap();
+            (
+                line.to_string(),
+                line.replace("Payload Logo", "Northstar Studio logo"),
+            )
+        },
+    ] {
+        let mut p = base.clone();
+        p.old_literal = old;
+        p.new_literal = new;
+        assert_eq!(p.validate("r", "a", PRE).unwrap(), oracle(PRE).unwrap());
+    }
+    for (old, new, all) in [
+        ("Logo", "Northstar", false),
+        ("missing", "x", false),
+        ("Payload Logo", "wrong", false),
+        ("Payload Logo", "Northstar Studio logo", true),
+        ("", "x", false),
+    ] {
+        let mut p = base.clone();
+        p.old_literal = old.into();
+        p.new_literal = new.into();
+        p.replace_all = all;
+        assert!(p.validate("r", "a", PRE).is_err());
+    }
+}
+
+#[tokio::test]
+async fn admission_closed_on_deny_or_reject_blocks_next_model_attempt() {
+    for action in 0..4 {
+        let d = Temp::new();
+        d.file();
+        let ledger = Arc::new(Mutex::new(budget::Budget::mock(0).unwrap()));
+        let mut g = contract::SyntheticGate::new("r", "s", &d.0, ledger.clone()).unwrap();
+        let broker = transport::MockBroker::bind(ledger.clone()).unwrap();
+        let endpoint = broker.endpoint.clone();
+        match action {
+            0 => g.stop(),
+            1 => g.unexpected_tool_error(),
+            2 => {
+                g.proposal(&permission(), || Ok(vec![part(&d.0)])).unwrap();
+                g.reject().unwrap();
+            }
+            _ => {
+                let mut p = permission();
+                p.permission = "bash".into();
+                assert!(g.proposal(&p, || panic!()).is_err());
+            }
+        }
+        // No caller writes ledger.closed; only the real gate closes shared state.
+        let server = std::thread::spawn(move || broker.serve_one());
+        let r = endpoint.post("after-gate-close", 100).await.unwrap();
+        assert_eq!(r.status(), 400);
+        assert_eq!(r.bytes().await.unwrap().as_ref(), transport::DENIAL_BODY);
+        server.join().unwrap().unwrap();
+        let b = ledger.lock().unwrap();
+        assert_eq!((b.received, b.admitted, b.denied), (1, 0, 1));
+        assert!(b.closed);
+    }
+}
+
+#[test]
+fn synthetic_absolute_path_has_a_single_relative_mapping() {
+    for variant in 0..5 {
+        let (_fixture, mut g) = gate();
+        let mut t = part(&_fixture.0);
+        let original = t.input["filePath"].as_str().unwrap().to_string();
+        t.input["filePath"] = match variant {
+            0 => "Logo.tsx".into(),
+            1 => original.replace("Logo.tsx", ".\\Logo.tsx").into(),
+            2 => original.replace("Logo.tsx", "logo.tsx").into(),
+            3 => _fixture
+                .0
+                .join("outside.tsx")
+                .to_string_lossy()
+                .into_owned()
+                .into(),
+            _ => format!("{original}:stream").into(),
+        };
+        assert!(g.proposal(&permission(), || Ok(vec![t.clone()])).is_err());
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn interrupted_recovery_is_uncertain_even_with_historical_commit() {
+    for fault in [
+        cas::RecoveryFault::AfterIntent,
+        cas::RecoveryFault::PartialWrite,
+        cas::RecoveryFault::Readback,
+    ] {
+        let d = Temp::new();
+        let p = d.file();
+        let tx = d.tx(&p);
+        cas::apply(&p, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None).unwrap();
+        assert_eq!(tx.status().unwrap(), "COMMITTED_HISTORICAL");
+        assert!(cas::recover_with_fault(&p, &tx, fault).is_err());
+        assert!(!tx.root.join("recovered.json").exists());
+        assert_eq!(tx.status().unwrap(), "UNCERTAIN_RECOVERY");
+        assert_eq!(
+            journal::Transaction::reopen(&tx.root)
+                .unwrap()
+                .status()
+                .unwrap(),
+            "UNCERTAIN_RECOVERY"
+        );
+    }
+}
+
+#[test]
+fn trickle_input_does_not_reset_connection_deadline() {
+    use std::net::TcpStream;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let ledger = Arc::new(Mutex::new(budget::Budget::mock(0).unwrap()));
+    let broker = transport::MockBroker::bind(ledger.clone()).unwrap();
+    let url = broker.endpoint.url();
+    let addr = url
+        .strip_prefix("http://")
+        .unwrap()
+        .strip_suffix("/model")
+        .unwrap()
+        .to_string();
+    let server = std::thread::spawn(move || {
+        let start = Instant::now();
+        let r = broker.serve_with_window(Duration::from_millis(200));
+        (start.elapsed(), r)
+    });
+    let mut stream = TcpStream::connect(addr).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let sender = std::thread::spawn(move || {
+        for _ in 0..100 {
+            if flag.load(Ordering::Relaxed) || stream.write_all(b"P").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    let (elapsed, result) = server.join().unwrap();
+    stop.store(true, Ordering::Relaxed);
+    sender.join().unwrap();
+    assert!(result.is_err());
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    assert_eq!(ledger.lock().unwrap().denied, 1);
+}
+
+#[test]
+fn accounting_overflow_and_anomalous_usage_close_without_poison() {
+    let mut b = budget::Budget::mock(0).unwrap();
+    b.received = u32::MAX;
+    assert!(b.reserve("overflow", 1).is_err());
+    assert!(b.closed && b.arithmetic_error);
+    let mut b = budget::Budget::mock(0).unwrap();
+    b.reserve("a", 1).unwrap();
+    assert!(b.settle("a", Some(u32::MAX)).is_err());
+    assert_eq!(b.committed_tokens().unwrap(), u64::from(u32::MAX));
+    assert!(b.closed);
+    assert!(b.reserve("b", 1).is_err());
+    let ledger = Arc::new(Mutex::new(b));
+    let l = ledger.clone();
+    std::thread::spawn(move || {
+        assert!(l.lock().unwrap().reserve("c", u32::MAX).is_err());
+    })
+    .join()
+    .unwrap();
+    assert!(!ledger.is_poisoned());
+    let mut b = budget::Budget::mock(0).unwrap();
+    for i in 0..9 {
+        b.attempts.insert(
+            i.to_string(),
+            budget::Attempt {
+                reserved: u32::MAX,
+                usage: Some(u32::MAX),
+                settled: true,
+                uncertain: true,
+            },
+        );
+    }
+    assert!(b.committed_tokens().is_err());
+    assert!(b.reserve("invalid", 1).is_err());
+    assert!(b.closed && b.arithmetic_error);
+}
+
+#[cfg(windows)]
+#[test]
+fn canonical_handle_path_must_match_reserved_root() {
+    let d = Temp::new();
+    let p = d.file();
+    assert_eq!(
+        cas::validate_final_path(&p, &d.0).unwrap(),
+        fs::canonicalize(&p).unwrap()
+    );
+    let other = Temp::new();
+    assert!(cas::validate_final_path(&p, &other.0).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn only_target_archive_off_to_on_is_allowed() {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::*;
+    let d = Temp::new();
+    let root = d.0.join("project");
+    fs::create_dir(&root).unwrap();
+    let p = root.join("Logo.tsx");
+    fs::write(&p, PRE).unwrap();
+    let wide: Vec<_> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+    assert_ne!(
+        unsafe { SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_NORMAL) },
+        0
+    );
+    let before = cas::snapshot(&root, &d.0.join("before-archive.json")).unwrap();
+    let tx = d.tx(&p);
+    let post = oracle(PRE).unwrap();
+    cas::apply(&p, PRE, &post, &tx, cas::Fault::None).unwrap();
+    let mut after = cas::snapshot(&root, &d.0.join("after-archive.json")).unwrap();
+    assert!(before.complete && after.complete);
+    cas::verify_tree_change(&before, &after, Path::new("Logo.tsx"), &post).unwrap();
+    // Keep every unrelated bit equal: the sole exception is target ARCHIVE 0->1.
+    let target = after
+        .entries
+        .iter_mut()
+        .find(|e| e.path == Path::new("Logo.tsx"))
+        .unwrap();
+    let original = before
+        .entries
+        .iter()
+        .find(|e| e.path == Path::new("Logo.tsx"))
+        .unwrap()
+        .attributes;
+    target.attributes = if original == FILE_ATTRIBUTE_NORMAL {
+        FILE_ATTRIBUTE_ARCHIVE
+    } else {
+        original | FILE_ATTRIBUTE_ARCHIVE
+    };
+    cas::verify_tree_change(&before, &after, Path::new("Logo.tsx"), &post).unwrap();
+    after
+        .entries
+        .iter_mut()
+        .find(|e| e.path == Path::new("Logo.tsx"))
+        .unwrap()
+        .attributes |= FILE_ATTRIBUTE_HIDDEN;
+    assert!(cas::verify_tree_change(&before, &after, Path::new("Logo.tsx"), &post).is_err());
+    let mut after = cas::snapshot(&root, &d.0.join("after-other-attr.json")).unwrap();
+    after.entries[0].attributes ^= FILE_ATTRIBUTE_ARCHIVE;
+    assert!(cas::verify_tree_change(&before, &after, Path::new("Logo.tsx"), &post).is_err());
+}
+
+#[test]
+fn fixed_denial_matches_locked_policy_bytes() {
+    let policy: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../../tools/t1-api-eval/opencode-policy.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        policy["denial_body"].as_str().unwrap().as_bytes(),
+        transport::DENIAL_BODY
+    );
+    assert_eq!(policy["retry_patterns"].as_array().unwrap().len(), 7);
+    assert_eq!(
+        policy["retry_source"]["sha256"],
+        "7e24b96622f7b46586eabb68d3c2464d1c68f5cc58262f2d305878d5e55b9aed"
+    );
+}
+
+#[test]
+fn connection_deadline_also_bounds_contended_budget_lock() {
+    use std::{net::TcpStream, sync::mpsc, time::Duration};
+    let ledger = Arc::new(Mutex::new(budget::Budget::mock(0).unwrap()));
+    let broker = transport::MockBroker::bind(ledger.clone()).unwrap();
+    let u = broker.endpoint.url();
+    let address = u
+        .strip_prefix("http://")
+        .unwrap()
+        .strip_suffix("/model")
+        .unwrap()
+        .to_string();
+    let held = ledger.lock().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        tx.send(broker.serve_with_window(Duration::from_millis(200)))
+            .unwrap();
+    });
+    let mut client = TcpStream::connect(address).unwrap();
+    let body = br#"{"source":"SYNTHETIC","provider":"nova_t1_mock","id":"a","worst":1}"#;
+    write!(
+        client,
+        "POST /model HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    client.write_all(body).unwrap();
+    let result = rx.recv_timeout(Duration::from_secs(2));
+    drop(held);
+    worker.join().unwrap();
+    assert!(result.unwrap().is_err());
+    assert_eq!(ledger.lock().unwrap().admitted, 0);
 }

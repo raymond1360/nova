@@ -4,7 +4,7 @@ use std::{
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 pub const PROVIDER_ID: &str = "nova_t1_mock";
 pub const DENIAL_BODY:&[u8]=br#"{"error":{"message":"NOVA_ADMISSION_DENIED","type":"invalid_request_error","code":"nova_admission_denied"}}"#;
@@ -65,6 +65,9 @@ impl MockBroker {
     }
     /// One bounded connection, in-process mock response. No upstream networking exists here.
     pub fn serve_one(&self) -> Result<()> {
+        self.serve_with_window(Duration::from_secs(5))
+    }
+    pub(super) fn serve_with_window(&self, window: Duration) -> Result<()> {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let mut s = loop {
             match self.listener.accept() {
@@ -85,12 +88,18 @@ impl MockBroker {
         };
         // Explicitly reset the accepted socket: listener nonblocking inheritance is platform-specific.
         s.set_nonblocking(false).map_err(|e| e.to_string())?;
-        s.set_read_timeout(Some(Duration::from_secs(2)))
-            .map_err(|e| e.to_string())?;
-        s.set_write_timeout(Some(Duration::from_secs(2)))
-            .map_err(|e| e.to_string())?;
-        let input = read_request(&mut s);
-        let mut ledger = self.ledger.lock().map_err(|_| "poisoned ledger")?;
+        let connection_deadline = Instant::now() + window;
+        let input = read_request(&mut s, connection_deadline);
+        let mut ledger = loop {
+            match self.ledger.try_lock() {
+                Ok(lock) => break lock,
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err("poisoned ledger".into()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let left = remaining(connection_deadline)?;
+                    std::thread::sleep(left.min(Duration::from_millis(2)));
+                }
+            }
+        };
         // Invalid payloads also consume receive/denial accounting and close admission.
         let admitted = match input {
             Ok((id, worst)) => ledger.reserve(&id, worst).map(|_| id),
@@ -108,21 +117,53 @@ impl MockBroker {
             Err(_) => (DENIAL_HEADER, DENIAL_BODY),
         };
         drop(ledger);
-        s.write_all(header)
-            .and_then(|_| write!(s, "Content-Length: {}\r\n\r\n", body.len()))
-            .and_then(|_| s.write_all(body))
-            .and_then(|_| s.flush())
-            .map_err(|e| e.to_string())
+        let response = [
+            header,
+            format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes(),
+            body,
+        ]
+        .concat();
+        let mut at = 0;
+        while at < response.len() {
+            s.set_write_timeout(Some(remaining(connection_deadline)?))
+                .map_err(|e| e.to_string())?;
+            let n = s.write(&response[at..]).map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("zero response write".into());
+            }
+            at += n;
+        }
+        Ok(())
     }
 }
-fn read_request(s: &mut TcpStream) -> Result<(String, u32)> {
+fn remaining(deadline: Instant) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+        .map(|d| d.min(Duration::from_secs(2)))
+        .ok_or_else(|| "connection total deadline exceeded".into())
+}
+fn read_exact_deadline(s: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> Result<()> {
+    let mut at = 0;
+    while at < buf.len() {
+        s.set_read_timeout(Some(remaining(deadline)?))
+            .map_err(|e| e.to_string())?;
+        let n = s.read(&mut buf[at..]).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("incomplete request".into());
+        }
+        at += n;
+    }
+    Ok(())
+}
+fn read_request(s: &mut TcpStream, deadline: Instant) -> Result<(String, u32)> {
     let mut bytes = Vec::new();
     let mut b = [0; 1];
     while !bytes.ends_with(b"\r\n\r\n") {
         if bytes.len() >= 4096 {
             return Err("header bound".into());
         }
-        s.read_exact(&mut b).map_err(|e| e.to_string())?;
+        read_exact_deadline(s, &mut b, deadline)?;
         bytes.push(b[0]);
     }
     let h = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
@@ -144,7 +185,7 @@ fn read_request(s: &mut TcpStream) -> Result<(String, u32)> {
         return Err("body bound/ambiguous length".into());
     }
     let mut body = vec![0; lengths[0]];
-    s.read_exact(&mut body).map_err(|e| e.to_string())?;
+    read_exact_deadline(s, &mut body, deadline)?;
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Request {

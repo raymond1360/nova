@@ -8,7 +8,58 @@
   "deny_without_permission_event": "close admission and request abort on unexpected ToolPart error or subsequent model request",
   "real_rejected_error_propagation": "M0-B NOT VERIFIED",
   "real_no_write_after_reject": "M0-B NOT VERIFIED",
-  "budget": {"simulated": true, "requests": 8, "tokens": 12000, "repairs": [0,1]},
+  "budget": {
+    "simulated": true,
+    "requests": 8,
+    "tokens": 12000,
+    "repairs": [
+      0,
+      1
+    ]
+  },
   "M0_B": "BLOCKED",
-  "real_calls": "BLOCKED"
+  "real_calls": "BLOCKED",
+  "denial_body": "{\"error\":{\"message\":\"NOVA_ADMISSION_DENIED\",\"type\":\"invalid_request_error\",\"code\":\"nova_admission_denied\"}}",
+  "retry_source": {
+    "url": "https://raw.githubusercontent.com/anomalyco/opencode/148842ef7cb1bc34192b3fff57d0f9721ab9c801/packages/opencode/src/session/retry.ts",
+    "sha256": "7e24b96622f7b46586eabb68d3c2464d1c68f5cc58262f2d305878d5e55b9aed",
+    "bytes": 8139,
+    "lines": "33-41, 85-99, 157-158",
+    "scope": "copied fixed patterns, not running Agent code"
+  },
+  "retry_patterns": [
+    {
+      "source": "429|500|502|503|504|524",
+      "flags": "i"
+    },
+    {
+      "source": "rate increased too quickly|rate limit|rate-limit|rate_limit|too many requests",
+      "flags": "i"
+    },
+    {
+      "source": "overloaded|service unavailable|service_unavailable|service-unavailable|internal error|internal_error|internal server error|server error|server_error|server-error|provider returned error|provider_returned_error|provider-returned-error",
+      "flags": "i"
+    },
+    {
+      "source": "terminated|fetch failed|failed to fetch|network[-_\\s]error|upstream connect|connection error|connection refused|connection lost|socket connection was closed|socket hang up|reset before headers|getaddrinfo|enotfound|eai_again|econnrefused|econnreset|etimedout",
+      "flags": "i"
+    },
+    {
+      "source": "^timeout$|\\b(?:request|response|connection|network|stream|read) (?:timeout|timed out|time out)\\b",
+      "flags": "i"
+    },
+    {
+      "source": "try your request again|retry your request|resource exhausted|resource_exhausted",
+      "flags": "i"
+    },
+    {
+      "source": "\\btry again (?:later|in\\b)|\\b(?:currently|temporarily) at capacity\\b",
+      "flags": "i"
+    }
+  ],
+  "non_api_terms": [
+    "too_many_requests",
+    "exhausted",
+    "unavailable"
+  ]
 }

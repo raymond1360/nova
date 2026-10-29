@@ -13,11 +13,15 @@ function oracle(pre) {
   if (at < 0 || pre.indexOf(old, at + 1) >= 0) throw Error('ambiguous literal')
   return Buffer.concat([pre.subarray(0, at), Buffer.from(contract.new_literal), pre.subarray(at + old.length)])
 }
+function parseSyntax(ts, actual) {
+  const ast = ts.createSourceFile('Logo.tsx', actual.toString('utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  if (ast.parseDiagnostics.length) throw Error('TSX syntax failure')
+  return ast
+}
 function check(ts, pre, actual) {
   const expected = oracle(pre)
   if (!actual.equals(expected) || actual.length !== 795 || hash(actual) !== contract.post_sha256) throw Error('byte oracle mismatch')
-  const ast = ts.createSourceFile('Logo.tsx', actual.toString('utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
-  if (ast.parseDiagnostics.length) throw Error('TSX syntax failure')
+  const ast = parseSyntax(ts, actual)
   let matching = 0
   function visit(n) {
     if (ts.isJsxAttribute(n) && n.name.getText(ast) === 'alt' && n.initializer && ts.isStringLiteral(n.initializer)
@@ -55,7 +59,10 @@ function main(args) {
       let rejected = false; try { check(ts, pre, invalid) } catch { rejected = true }
       if (!rejected) throw Error('negative oracle accepted')
     }
-    console.log(JSON.stringify({ ...check(ts, pre, expected), typescript_version: ts.version, typescript_resolved: resolved, synthetic: true, cases: 6, policy: policyTest() }))
+    let syntaxRejected = false
+    try { parseSyntax(ts, Buffer.from('export const broken = <img alt="unterminated')) } catch { syntaxRejected = true }
+    if (!syntaxRejected) throw Error('invalid TSX syntax accepted')
+    console.log(JSON.stringify({ ...check(ts, pre, expected), typescript_version: ts.version, typescript_resolved: resolved, synthetic: true, cases: 6, syntax_negative_cases: 1, policy: policyTest() }))
   } else console.log(JSON.stringify(check(ts, pre, fs.readFileSync(args[1]))))
 }
 try { main(process.argv.slice(2)) } catch (e) { console.error(e.message); process.exitCode = 1 }

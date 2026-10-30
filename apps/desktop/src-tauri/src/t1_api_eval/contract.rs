@@ -1,5 +1,5 @@
 //! Inputs simulate locked Permission V1 / running ToolPart fields; not an OpenCode client.
-use super::budget::Budget;
+use super::budget::{AdmissionFault, Budget};
 use super::{hash, oracle, Result, PRE, PRE_HASH};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -89,6 +89,7 @@ pub struct SyntheticGate {
     pub run_id: String,
     pub session_id: String,
     ledger: Arc<Mutex<Budget>>,
+    fault: Arc<AdmissionFault>,
     fixture_root: PathBuf,
     fixture_target: PathBuf,
     pub abort_acknowledged: bool,
@@ -103,6 +104,10 @@ impl SyntheticGate {
         if !root.is_absolute() {
             return Err("fixture root must be absolute".into());
         }
+        let fault = ledger
+            .lock()
+            .map_err(|_| "poisoned ledger at gate construction")?
+            .fault_handle();
         let fixture_root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
         let fixture_target = fixture_root.join("Logo.tsx");
         super::cas::validate_final_path(&fixture_target, &fixture_root)?;
@@ -110,6 +115,7 @@ impl SyntheticGate {
             run_id: run.into(),
             session_id: session.into(),
             ledger,
+            fault,
             fixture_root,
             fixture_target,
             abort_acknowledged: false,
@@ -120,19 +126,31 @@ impl SyntheticGate {
             seen: BTreeSet::new(),
         })
     }
+    pub fn fixture_root(&self) -> &Path {
+        &self.fixture_root
+    }
     pub fn admission_open(&self) -> bool {
+        if self.fault.is_closed() {
+            return false;
+        }
         self.ledger
-            .lock()
+            .try_lock()
             .map(|b| !b.closed && !b.cancelled && !b.abort_requested)
             .unwrap_or(false)
     }
     pub fn abort_requested(&self) -> bool {
+        if self.fault.is_closed() {
+            return true;
+        }
         self.ledger
-            .lock()
+            .try_lock()
             .map(|b| b.abort_requested)
             .unwrap_or(true)
     }
     fn close(&self, abort: bool) -> Result<()> {
+        if self.fault.is_closed() {
+            return Ok(());
+        }
         self.ledger
             .lock()
             .map_err(|_| "poisoned ledger")?

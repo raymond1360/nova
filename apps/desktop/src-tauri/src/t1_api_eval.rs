@@ -116,8 +116,15 @@ pub fn mock_run() -> Result<serde_json::Value> {
     }
     let post = patch.validate("SYNTHETIC-run", "edit-attempt", PRE)?;
     let tx = journal::Transaction::prepare(&evidence.join("transaction"), PRE, &post)?;
-    cas::reserve_identity(&target, &tx)?;
-    let receipt = cas::apply(&target, PRE, &post, &tx, cas::Fault::None)?;
+    cas::reserve_identity(&target, gate.fixture_root(), &tx)?;
+    let receipt = cas::apply(
+        &target,
+        gate.fixture_root(),
+        PRE,
+        &post,
+        &tx,
+        cas::Fault::None,
+    )?;
     let after = cas::snapshot(&project, &evidence.join("after.json"))?;
     cas::verify_tree_change(&before, &after, Path::new("Logo.tsx"), &post)?;
     journal::write_new(

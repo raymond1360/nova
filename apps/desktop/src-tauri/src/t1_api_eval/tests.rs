@@ -17,10 +17,10 @@ impl Temp {
         fs::write(&p, PRE).unwrap();
         p
     }
-    fn tx(&self, p: &Path) -> journal::Transaction {
+    fn tx(&self, p: &Path, fixture_root: &Path) -> journal::Transaction {
         let t =
             journal::Transaction::prepare(&self.0.join("tx"), PRE, &oracle(PRE).unwrap()).unwrap();
-        cas::reserve_identity(p, &t).unwrap();
+        cas::reserve_identity(p, fixture_root, &t).unwrap();
         t
     }
 }
@@ -355,16 +355,16 @@ fn denial_is_constant_not_retry_regex_input() {
 fn same_handle_cas_receipt_and_explicit_recovery() {
     let d = Temp::new();
     let p = d.file();
-    let tx = d.tx(&p);
-    let r = cas::apply(&p, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None).unwrap();
+    let tx = d.tx(&p, &d.0);
+    let r = cas::apply(&p, &d.0, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None).unwrap();
     assert_eq!(r.post_sha256, POST_HASH);
     assert_eq!(tx.status().unwrap(), "COMMITTED_HISTORICAL");
     assert_eq!(fs::read(&p).unwrap(), oracle(PRE).unwrap());
-    assert!(cas::apply(&p, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None).is_err());
+    assert!(cas::apply(&p, &d.0, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None).is_err());
     let reopened = journal::Transaction::reopen(&d.0.join("tx")).unwrap();
-    cas::recover(&p, &reopened).unwrap();
+    cas::recover(&p, &d.0, &reopened).unwrap();
     assert_eq!(fs::read(&p).unwrap(), PRE);
-    assert!(cas::recover(&p, &reopened).is_err());
+    assert!(cas::recover(&p, &d.0, &reopened).is_err());
 }
 #[cfg(windows)]
 #[test]
@@ -397,9 +397,9 @@ fn sharing_allows_read_but_rejects_writers_and_delete() {
 fn concurrent_writer_blocks_cas_before_intent() {
     let d = Temp::new();
     let p = d.file();
-    let tx = d.tx(&p);
+    let tx = d.tx(&p, &d.0);
     let _writer = fs::OpenOptions::new().write(true).open(&p).unwrap();
-    assert!(cas::apply(&p, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None).is_err());
+    assert!(cas::apply(&p, &d.0, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None).is_err());
     assert!(!tx.root.join("mutation-intent.json").exists());
 }
 #[cfg(windows)]
@@ -408,7 +408,7 @@ fn stale_hash_and_same_bytes_replacement_rejected() {
     for replace in [false, true] {
         let d = Temp::new();
         let p = d.file();
-        let tx = d.tx(&p);
+        let tx = d.tx(&p, &d.0);
         if replace {
             let other = d.0.join("new");
             fs::write(&other, PRE).unwrap();
@@ -417,7 +417,7 @@ fn stale_hash_and_same_bytes_replacement_rejected() {
         } else {
             fs::write(&p, b"user edit").unwrap();
         }
-        assert!(cas::apply(&p, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None).is_err());
+        assert!(cas::apply(&p, &d.0, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None).is_err());
         assert!(!tx.root.join("mutation-intent.json").exists());
     }
 }
@@ -432,17 +432,17 @@ fn uncertain_faults_never_create_success_receipt() {
     ] {
         let d = Temp::new();
         let p = d.file();
-        let tx = d.tx(&p);
-        assert!(cas::apply(&p, PRE, &oracle(PRE).unwrap(), &tx, fault)
+        let tx = d.tx(&p, &d.0);
+        assert!(cas::apply(&p, &d.0, PRE, &oracle(PRE).unwrap(), &tx, fault)
             .unwrap_err()
             .contains("UNCERTAIN"));
         assert!(!tx.root.join("receipt.json").exists());
         assert_eq!(tx.status().unwrap(), "UNCERTAIN");
         assert!(tx.root.join("mutation-intent.json").exists());
         if fault == cas::Fault::ShortWrite || fault == cas::Fault::CrashAfterIntent {
-            assert!(cas::recover(&p, &tx).is_err());
+            assert!(cas::recover(&p, &d.0, &tx).is_err());
         } else {
-            cas::recover(&p, &tx).unwrap();
+            cas::recover(&p, &d.0, &tx).unwrap();
         }
     }
 }
@@ -451,10 +451,10 @@ fn uncertain_faults_never_create_success_receipt() {
 fn user_edit_after_commit_cannot_be_restored() {
     let d = Temp::new();
     let p = d.file();
-    let tx = d.tx(&p);
-    cas::apply(&p, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None).unwrap();
+    let tx = d.tx(&p, &d.0);
+    cas::apply(&p, &d.0, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None).unwrap();
     fs::write(&p, b"new user data").unwrap();
-    assert!(cas::recover(&p, &tx).is_err());
+    assert!(cas::recover(&p, &d.0, &tx).is_err());
     assert_eq!(fs::read(&p).unwrap(), b"new user data");
 }
 #[test]
@@ -578,10 +578,10 @@ fn junction_is_rejected_without_following_it() {
 fn receipt_create_new_failure_remains_uncertain() {
     let d = Temp::new();
     let p = d.file();
-    let tx = d.tx(&p);
+    let tx = d.tx(&p, &d.0);
     journal::write_new(&tx.root.join("receipt.json"), b"existing evidence").unwrap();
     assert!(
-        cas::apply(&p, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None)
+        cas::apply(&p, &d.0, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None)
             .unwrap_err()
             .contains("UNCERTAIN")
     );
@@ -710,10 +710,10 @@ fn interrupted_recovery_is_uncertain_even_with_historical_commit() {
     ] {
         let d = Temp::new();
         let p = d.file();
-        let tx = d.tx(&p);
-        cas::apply(&p, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None).unwrap();
+        let tx = d.tx(&p, &d.0);
+        cas::apply(&p, &d.0, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None).unwrap();
         assert_eq!(tx.status().unwrap(), "COMMITTED_HISTORICAL");
-        assert!(cas::recover_with_fault(&p, &tx, fault).is_err());
+        assert!(cas::recover_with_fault(&p, &d.0, &tx, fault).is_err());
         assert!(!tx.root.join("recovered.json").exists());
         assert_eq!(tx.status().unwrap(), "UNCERTAIN_RECOVERY");
         assert_eq!(
@@ -830,9 +830,9 @@ fn only_target_archive_off_to_on_is_allowed() {
         0
     );
     let before = cas::snapshot(&root, &d.0.join("before-archive.json")).unwrap();
-    let tx = d.tx(&p);
+    let tx = d.tx(&p, &root);
     let post = oracle(PRE).unwrap();
-    cas::apply(&p, PRE, &post, &tx, cas::Fault::None).unwrap();
+    cas::apply(&p, &root, PRE, &post, &tx, cas::Fault::None).unwrap();
     let mut after = cas::snapshot(&root, &d.0.join("after-archive.json")).unwrap();
     assert!(before.complete && after.complete);
     cas::verify_tree_change(&before, &after, Path::new("Logo.tsx"), &post).unwrap();
@@ -885,9 +885,17 @@ fn fixed_denial_matches_locked_policy_bytes() {
 
 #[test]
 fn connection_deadline_also_bounds_contended_budget_lock() {
-    use std::{net::TcpStream, sync::mpsc, time::Duration};
+    use std::{
+        net::TcpStream,
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+    let d = Temp::new();
+    d.file();
     let ledger = Arc::new(Mutex::new(budget::Budget::mock(0).unwrap()));
+    let gate = contract::SyntheticGate::new("r", "s", &d.0, ledger.clone()).unwrap();
     let broker = transport::MockBroker::bind(ledger.clone()).unwrap();
+    let endpoint = broker.endpoint.clone();
     let u = broker.endpoint.url();
     let address = u
         .strip_prefix("http://")
@@ -898,10 +906,15 @@ fn connection_deadline_also_bounds_contended_budget_lock() {
     let held = ledger.lock().unwrap();
     let (tx, rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
-        tx.send(broker.serve_with_window(Duration::from_millis(200)))
-            .unwrap();
+        let start = Instant::now();
+        let result = broker.serve_with_window(Duration::from_millis(200));
+        tx.send((result, start.elapsed())).unwrap();
+        broker.serve_one()
     });
     let mut client = TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
     let body = br#"{"source":"SYNTHETIC","provider":"nova_t1_mock","id":"a","worst":1}"#;
     write!(
         client,
@@ -910,11 +923,54 @@ fn connection_deadline_also_bounds_contended_budget_lock() {
     )
     .unwrap();
     client.write_all(body).unwrap();
-    let result = rx.recv_timeout(Duration::from_secs(2));
+    let (result, elapsed) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(result.unwrap_err().contains("HTTP 400 unconfirmed"));
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    // Still holding the lock; only the shared atomic fault can answer these queries.
+    assert!(!gate.admission_open());
+    assert!(gate.abort_requested());
+    assert_eq!((held.received, held.admitted, held.denied), (0, 0, 0));
+    let fault = held.fault_snapshot();
+    assert!(
+        fault.failed_closed
+            && fault.lock_deadline
+            && !fault.ledger_counts_complete
+            && fault.association_unknown
+    );
+    assert_eq!(
+        (
+            fault.unledgered_received,
+            fault.unledgered_denied,
+            fault.response_400_unconfirmed
+        ),
+        (Some(1), Some(1), Some(1))
+    );
+    let encoded = serde_json::to_value(&*held).unwrap();
+    assert_eq!(encoded["received"], 0);
+    assert_eq!(encoded["broker_fault"]["unledgered_received"], 1);
+    println!("G01_LOCK_FAILURE_SNAPSHOT={encoded}");
+    let mut first_response = Vec::new();
+    let _ = client.read_to_end(&mut first_response);
+    assert!(!first_response.starts_with(transport::DENIAL_HEADER));
     drop(held);
-    worker.join().unwrap();
-    assert!(result.unwrap().is_err());
-    assert_eq!(ledger.lock().unwrap().admitted, 0);
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let response = endpoint.post("after-fault-release", 1).await.unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            response.bytes().await.unwrap().as_ref(),
+            transport::DENIAL_BODY
+        );
+    });
+    worker.join().unwrap().unwrap();
+    let ledger = ledger.lock().unwrap();
+    assert_eq!((ledger.received, ledger.admitted, ledger.denied), (1, 0, 1));
+    let fault = ledger.fault_snapshot();
+    assert_eq!(fault.unledgered_received, Some(1));
+    assert_eq!(
+        u64::from(ledger.received) + fault.unledgered_received.unwrap(),
+        2
+    );
+    assert!(!gate.admission_open());
 }
 
 #[cfg(windows)]
@@ -923,10 +979,120 @@ fn empty_or_partial_recovery_completion_is_not_success() {
     for marker in [&b""[..], &b"KNOWN_PREIMAGE"[..]] {
         let d = Temp::new();
         let p = d.file();
-        let tx = d.tx(&p);
-        cas::apply(&p, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None).unwrap();
-        assert!(cas::recover_with_fault(&p, &tx, cas::RecoveryFault::Readback).is_err());
+        let tx = d.tx(&p, &d.0);
+        cas::apply(&p, &d.0, PRE, &oracle(PRE).unwrap(), &tx, cas::Fault::None).unwrap();
+        assert!(cas::recover_with_fault(&p, &d.0, &tx, cas::RecoveryFault::Readback).is_err());
         journal::write_new(&tx.root.join("recovered.json"), marker).unwrap();
         assert_eq!(tx.status().unwrap(), "UNCERTAIN_RECOVERY");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn reservation_same_handle_and_gate_root_contract() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let (d, gate) = gate();
+    let p = d.0.join("Logo.tsx");
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .custom_flags(0x00200000)
+        .open(&p)
+        .unwrap();
+    let (id, final_path) = cas::reservation_on_handle(&f, &p, gate.fixture_root()).unwrap();
+    assert_eq!(final_path, fs::canonicalize(&p).unwrap());
+    // The real controlled handle excludes concurrent data writes/deletion.
+    assert!(fs::rename(&p, d.0.join("replaced.tsx")).is_err());
+    assert!(fs::OpenOptions::new().write(true).open(&p).is_err());
+    let tx = journal::Transaction::prepare(&d.0.join("tx"), PRE, &oracle(PRE).unwrap()).unwrap();
+    let events = cas::trace_reservation(&p, gate.fixture_root(), &tx).unwrap();
+    let target_opens: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            cas::ReservationEvent::Open { handle, path } if path == &p => Some(*handle),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        target_opens.len(),
+        1,
+        "target opened more than once: {events:?}"
+    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, cas::ReservationEvent::Identity(h) if *h == target_opens[0])));
+    assert!(events.iter().any(
+        |event| matches!(event, cas::ReservationEvent::FinalPath(h) if *h == target_opens[0])
+    ));
+    println!("G02_RESERVATION_NATIVE_TRACE={events:?}");
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(tx.root.join("target-identity.json")).unwrap()).unwrap();
+    assert_eq!(record["identity"], id);
+    assert_eq!(record["final_path"], final_path.to_string_lossy().as_ref());
+    assert_eq!(
+        record["root"],
+        gate.fixture_root().to_string_lossy().as_ref()
+    );
+    drop(f);
+    cas::apply(
+        &p,
+        gate.fixture_root(),
+        PRE,
+        &oracle(PRE).unwrap(),
+        &tx,
+        cas::Fault::None,
+    )
+    .unwrap();
+    cas::recover(&p, gate.fixture_root(), &tx).unwrap();
+    assert_eq!(fs::read(&p).unwrap(), PRE);
+}
+
+#[cfg(windows)]
+#[test]
+fn reservation_apply_and_recovery_reject_wrong_root() {
+    let d = Temp::new();
+    let p = d.file();
+    let other = Temp::new();
+    let outside = other.file();
+    let bad =
+        journal::Transaction::prepare(&d.0.join("bad-tx"), PRE, &oracle(PRE).unwrap()).unwrap();
+    assert!(cas::reserve_identity(&p, &other.0, &bad).is_err());
+    assert!(!bad.root.join("target-identity.json").exists());
+    assert!(cas::reserve_identity(&outside, &d.0, &bad).is_err());
+    let tx = d.tx(&p, &d.0);
+    let post = oracle(PRE).unwrap();
+    assert!(cas::apply(&p, &other.0, PRE, &post, &tx, cas::Fault::None).is_err());
+    assert!(!tx.root.join("mutation-intent.json").exists());
+    assert_eq!(fs::read(&p).unwrap(), PRE);
+    cas::apply(&p, &d.0, PRE, &post, &tx, cas::Fault::None).unwrap();
+    assert!(cas::recover(&p, &other.0, &tx).is_err());
+    assert!(!tx.root.join("recovery-intent.json").exists());
+    assert_eq!(fs::read(&p).unwrap(), post);
+    cas::recover(&p, &d.0, &tx).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn replacement_after_reservation_or_commit_is_refused() {
+    for recovering in [false, true] {
+        let d = Temp::new();
+        let p = d.file();
+        let tx = d.tx(&p, &d.0);
+        let post = oracle(PRE).unwrap();
+        if recovering {
+            cas::apply(&p, &d.0, PRE, &post, &tx, cas::Fault::None).unwrap();
+        }
+        // Keep the old file alive to prevent immediate file-ID recycling.
+        fs::rename(&p, d.0.join("original-preserved.tsx")).unwrap();
+        let bytes = if recovering { post.as_slice() } else { PRE };
+        fs::write(&p, bytes).unwrap();
+        if recovering {
+            assert!(cas::recover(&p, &d.0, &tx).is_err());
+            assert!(!tx.root.join("recovery-intent.json").exists());
+        } else {
+            assert!(cas::apply(&p, &d.0, PRE, &post, &tx, cas::Fault::None).is_err());
+            assert!(!tx.root.join("mutation-intent.json").exists());
+        }
+        assert_eq!(fs::read(&p).unwrap(), bytes);
     }
 }

@@ -26,6 +26,38 @@ pub enum RecoveryFault {
     Readback,
 }
 
+// Test-only tracing of actual native queries. Open events distinguish reused OS handles.
+#[cfg(all(test, windows))]
+#[derive(Debug)]
+pub(super) enum ReservationEvent {
+    Open { handle: usize, path: PathBuf },
+    Identity(usize),
+    FinalPath(usize),
+}
+#[cfg(all(test, windows))]
+std::thread_local! {
+    static RESERVATION_TRACE: std::cell::RefCell<Option<Vec<ReservationEvent>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(all(test, windows))]
+fn trace_query(event: ReservationEvent) {
+    RESERVATION_TRACE.with(|trace| {
+        if let Some(events) = trace.borrow_mut().as_mut() {
+            events.push(event);
+        }
+    });
+}
+#[cfg(all(test, windows))]
+pub(super) fn trace_reservation(
+    path: &Path,
+    root: &Path,
+    tx: &Transaction,
+) -> Result<Vec<ReservationEvent>> {
+    RESERVATION_TRACE.with(|trace| *trace.borrow_mut() = Some(Vec::new()));
+    let result = reserve_identity(path, root, tx);
+    let events = RESERVATION_TRACE.with(|trace| trace.borrow_mut().take().unwrap());
+    result.map(|_| events)
+}
+
 #[cfg(windows)]
 mod native {
     use super::*;
@@ -43,9 +75,17 @@ mod native {
             .custom_flags(
                 FILE_FLAG_OPEN_REPARSE_POINT | if dir { FILE_FLAG_BACKUP_SEMANTICS } else { 0 },
             );
-        o.open(path).map_err(|e| e.to_string())
+        let file = o.open(path).map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        super::trace_query(super::ReservationEvent::Open {
+            handle: file.as_raw_handle() as usize,
+            path: path.to_path_buf(),
+        });
+        Ok(file)
     }
     pub fn identity(f: &File) -> Result<String> {
+        #[cfg(test)]
+        super::trace_query(super::ReservationEvent::Identity(f.as_raw_handle() as usize));
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         if unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) } == 0 {
             return Err(std::io::Error::last_os_error().to_string());
@@ -66,6 +106,10 @@ mod native {
             .file_attributes())
     }
     pub fn final_path(f: &File) -> Result<PathBuf> {
+        #[cfg(test)]
+        super::trace_query(super::ReservationEvent::FinalPath(
+            f.as_raw_handle() as usize
+        ));
         let mut buf = vec![0u16; 32768];
         let n = unsafe {
             GetFinalPathNameByHandleW(
@@ -200,7 +244,7 @@ pub fn locked_identity(path: &Path) -> Result<String> {
     let f = native::open(path, false, false)?;
     native::identity(&f)
 }
-fn check_final(f: &File, path: &Path, root: &Path) -> Result<()> {
+fn check_final(f: &File, path: &Path, root: &Path) -> Result<PathBuf> {
     if !path.is_absolute() || !root.is_absolute() {
         return Err("absolute path/root required".into());
     }
@@ -216,14 +260,13 @@ fn check_final(f: &File, path: &Path, root: &Path) -> Result<()> {
     {
         return Err("handle canonical path/root mismatch".into());
     }
-    Ok(())
+    Ok(actual)
 }
 /// Additional handle-derived evidence, not an atomic namespace lock or a proof of all races eliminated.
 pub fn validate_final_path(path: &Path, root: &Path) -> Result<PathBuf> {
     let f = native::open(path, false, false)?;
     native::identity(&f)?;
-    check_final(&f, path, root)?;
-    native::final_path(&f)
+    check_final(&f, path, root)
 }
 fn no_link_ancestors(path: &Path) -> Result<()> {
     if path
@@ -250,6 +293,7 @@ fn read(f: &mut File) -> Result<Vec<u8>> {
 }
 pub fn apply(
     path: &Path,
+    fixture_root: &Path,
     expected: &[u8],
     post: &[u8],
     tx: &Transaction,
@@ -264,23 +308,15 @@ pub fn apply(
         &fs::read(tx.root.join("target-identity.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    let root = PathBuf::from(reserved["root"].as_str().ok_or("reserved root missing")?);
+    let root = confirmed_reserved_root(fixture_root, &reserved)?;
     check_final(&f, path, &root)?;
     if reserved["final_path"] != native::final_path(&f)?.to_string_lossy().as_ref() {
         return Err("reserved final path changed".into());
     }
     let id = native::identity(&f)?;
-    // Reject replacement since reservation, including same-byte path substitution.
-    let reserved_path = tx.root.join("target-identity.json");
-    if reserved_path.exists() {
-        let expected_id: serde_json::Value =
-            serde_json::from_slice(&fs::read(&reserved_path).map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?;
-        if expected_id["identity"] != id {
-            return Err("identity changed".into());
-        }
-    } else {
-        return Err("target identity must be reserved before CAS".into());
+    // All fields are from the same reservation read, checked against this handle.
+    if reserved["identity"] != id {
+        return Err("identity changed".into());
     }
     if read(&mut f)? != expected {
         return Err("CAS preimage conflict".into());
@@ -315,21 +351,45 @@ pub fn apply(
         .map_err(|e| format!("UNCERTAIN receipt: {e}"))?;
     Ok(receipt)
 }
-pub fn reserve_identity(path: &Path, tx: &Transaction) -> Result<()> {
+fn confirmed_reserved_root(fixture_root: &Path, reserved: &serde_json::Value) -> Result<PathBuf> {
+    if !fixture_root.is_absolute() {
+        return Err("confirmed fixture root must be absolute".into());
+    }
+    no_link_ancestors(fixture_root)?;
+    let root = fs::canonicalize(fixture_root).map_err(|e| e.to_string())?;
+    if reserved["root"] != root.to_string_lossy().as_ref() {
+        return Err("confirmed/reserved fixture root mismatch".into());
+    }
+    Ok(root)
+}
+/// The target identity and final path are queried from this one controlled handle.
+pub(super) fn reservation_on_handle(
+    f: &File,
+    path: &Path,
+    fixture_root: &Path,
+) -> Result<(String, PathBuf)> {
+    let id = native::identity(f)?;
+    let final_path = check_final(f, path, fixture_root)?;
+    Ok((id, final_path))
+}
+pub fn reserve_identity(path: &Path, fixture_root: &Path, tx: &Transaction) -> Result<()> {
+    no_link_ancestors(fixture_root)?;
     no_link_ancestors(path)?;
-    let id = locked_identity(path)?;
-    let root = path.parent().ok_or("no target root")?;
-    let final_path = validate_final_path(path, root)?;
-    write_new(
-        &tx.root.join("target-identity.json"),
-        &serde_json::to_vec(&serde_json::json!({"identity":id,"root":fs::canonicalize(root).map_err(|e|e.to_string())?,"final_path":final_path})).unwrap(),
-    )
+    let f = native::open(path, false, false)?;
+    let (id, final_path) = reservation_on_handle(&f, path, fixture_root)?;
+    write_new(&tx.root.join("target-identity.json"),
+        &serde_json::to_vec(&serde_json::json!({"identity":id,"root":fs::canonicalize(fixture_root).map_err(|e|e.to_string())?,"final_path":final_path})).unwrap())
 }
 /// Explicit recovery, only known postimage with the original file identity. Unknown partials stay uncertain.
-pub fn recover(path: &Path, tx: &Transaction) -> Result<()> {
-    recover_with_fault(path, tx, RecoveryFault::None)
+pub fn recover(path: &Path, fixture_root: &Path, tx: &Transaction) -> Result<()> {
+    recover_with_fault(path, fixture_root, tx, RecoveryFault::None)
 }
-pub fn recover_with_fault(path: &Path, tx: &Transaction, fault: RecoveryFault) -> Result<()> {
+pub fn recover_with_fault(
+    path: &Path,
+    fixture_root: &Path,
+    tx: &Transaction,
+    fault: RecoveryFault,
+) -> Result<()> {
     no_link_ancestors(path)?;
     let intent: serde_json::Value = serde_json::from_slice(
         &fs::read(tx.root.join("mutation-intent.json")).map_err(|e| e.to_string())?,
@@ -340,12 +400,13 @@ pub fn recover_with_fault(path: &Path, tx: &Transaction, fault: RecoveryFault) -
         &fs::read(tx.root.join("target-identity.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    let root = PathBuf::from(reserved["root"].as_str().ok_or("reserved root missing")?);
+    let root = confirmed_reserved_root(fixture_root, &reserved)?;
     check_final(&f, path, &root)?;
     if reserved["final_path"] != native::final_path(&f)?.to_string_lossy().as_ref() {
         return Err("recovery final path mismatch".into());
     }
-    if intent["identity"] != native::identity(&f)? || read(&mut f)? != tx.post {
+    let id = native::identity(&f)?;
+    if intent["identity"] != id || reserved["identity"] != id || read(&mut f)? != tx.post {
         return Err("UNKNOWN/user edit; recovery refused".into());
     }
     write_new(

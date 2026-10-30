@@ -1,5 +1,8 @@
 //! Closed mock transport. Numeric IPv4 loopback only; no provider/credential configuration.
-use super::{budget::Budget, Result};
+use super::{
+    budget::{AdmissionFault, Budget, FaultKind},
+    Result,
+};
 use std::{
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream},
@@ -51,9 +54,14 @@ pub struct MockBroker {
     listener: TcpListener,
     pub endpoint: MockEndpoint,
     pub ledger: Arc<Mutex<Budget>>,
+    fault: Arc<AdmissionFault>,
 }
 impl MockBroker {
     pub fn bind(ledger: Arc<Mutex<Budget>>) -> Result<Self> {
+        let fault = ledger
+            .lock()
+            .map_err(|_| "poisoned ledger at bind")?
+            .fault_handle();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| e.to_string())?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
@@ -61,6 +69,7 @@ impl MockBroker {
             listener,
             endpoint: MockEndpoint::parse(&format!("http://127.0.0.1:{port}/model"))?,
             ledger,
+            fault,
         })
     }
     /// One bounded connection, in-process mock response. No upstream networking exists here.
@@ -93,17 +102,41 @@ impl MockBroker {
         let mut ledger = loop {
             match self.ledger.try_lock() {
                 Ok(lock) => break lock,
-                Err(std::sync::TryLockError::Poisoned(_)) => return Err("poisoned ledger".into()),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.fault.record_unledgered(FaultKind::Poisoned);
+                    return Err("poisoned ledger; failed closed; HTTP 400 unconfirmed".into());
+                }
                 Err(std::sync::TryLockError::WouldBlock) => {
-                    let left = remaining(connection_deadline)?;
+                    if self.fault.is_closed() {
+                        self.fault
+                            .record_unledgered(FaultKind::ClosedWhileContended);
+                        return Err(
+                            "admission fault; ledger unavailable; HTTP 400 unconfirmed".into()
+                        );
+                    }
+                    let left = match remaining(connection_deadline) {
+                        Ok(left) => left,
+                        Err(_) => {
+                            self.fault.record_unledgered(FaultKind::LockDeadline);
+                            return Err(
+                                "ledger lock deadline; failed closed; HTTP 400 unconfirmed".into(),
+                            );
+                        }
+                    };
                     std::thread::sleep(left.min(Duration::from_millis(2)));
                 }
             }
         };
+        // The captured shared fault remains authoritative after the lock becomes available.
+        if self.fault.is_closed() {
+            ledger.close(true);
+        }
         // Invalid payloads also consume receive/denial accounting and close admission.
         let admitted = match input {
-            Ok((id, worst)) => ledger.reserve(&id, worst).map(|_| id),
-            Err(_) => ledger.reserve("", 0).map(|_| String::new()),
+            Ok((id, worst)) if Instant::now() < connection_deadline => {
+                ledger.reserve(&id, worst).map(|_| id)
+            }
+            _ => ledger.reserve("", 0).map(|_| String::new()),
         };
         let (header, body) = match admitted {
             Ok(id) => {

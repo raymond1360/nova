@@ -30,7 +30,7 @@ if(([IO.File]::ReadAllText((Join-Path $EvidenceDirectory 'node-version.stdout.tx
 $env:CARGO_TARGET_DIR = Join-Path $EvidenceDirectory 'cargo-target'
 Push-Location (Join-Path $root 'apps/desktop/src-tauri')
 try {
- & cargo test --offline --locked --features t1-api-eval --lib t1_api_eval::tests -- --test-threads=1 2>&1 | Tee-Object (Join-Path $EvidenceDirectory 'mock-tests.log')
+ & cargo test --offline --locked --features t1-api-eval --lib t1_api_eval:: -- --test-threads=1 2>&1 | Tee-Object (Join-Path $EvidenceDirectory 'mock-tests.log')
  if ($LASTEXITCODE -ne 0) { throw 'Mock tests failed' }
  & cargo build --offline --locked --features t1-api-eval --bin nova_t1_api_eval 2>&1 | Tee-Object (Join-Path $EvidenceDirectory 'build.log')
  if ($LASTEXITCODE -ne 0) { throw 'Debug build failed' }

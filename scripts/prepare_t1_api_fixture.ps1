@@ -1,13 +1,104 @@
 #requires -Version 7.0
 param(
  [Parameter(Mandatory=$true,ParameterSetName='Fixture')][string]$RunDirectory,
- [Parameter(Mandatory=$true,ParameterSetName='Dependencies')][string]$VerifierDeps,
+ [Parameter(Mandatory=$true,ParameterSetName='Dependencies')]
+ [Parameter(Mandatory=$true,ParameterSetName='Evidence')][string]$VerifierDeps,
+ [Parameter(Mandatory=$true,ParameterSetName='Evidence')][switch]$ExportDiagnostics,
+ [Parameter(Mandatory=$true,ParameterSetName='Evidence')][string]$DiagnosticDirectory,
  [Parameter(Mandatory=$true,ParameterSetName='Dependencies')][string]$NodePath,
  [Parameter(ParameterSetName='Dependencies')][string]$GitPath='C:\Program Files\Git\cmd\git.exe',
  [Parameter(ParameterSetName='Dependencies')][switch]$PreparationSelfTest
 )
 $ErrorActionPreference='Stop'
 $root=Split-Path -Parent $PSScriptRoot
+# Evidence export never runs a child, prepares dependencies, or copies raw logs.
+# Only these direct children can be read; all other files/directories are excluded.
+if($PSCmdlet.ParameterSetName -eq 'Evidence') {
+ $names=@('preparation-identity.json','historical-inputs.json','node-version.stdout.txt','node-version.stderr.txt','node-version.exit.json','git-version.stdout.txt','git-version.stderr.txt','git-version.exit.json','dependencies.stdout.txt','dependencies.stderr.txt','dependencies.exit.json','preparation-failure.json','preparation-complete.json','npm-ci-result.json','npm-ci.stdout.bin','npm-ci.stderr.bin','source-rules-selftest.json')
+ $maxFile=65536;$maxTotal=1048576;$total=0;$outputTotal=0;$rows=@()
+ $source=[IO.Path]::GetFullPath($VerifierDeps);$dest=[IO.Path]::GetFullPath($DiagnosticDirectory)
+ if($dest -eq $source -or $dest.StartsWith($source.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Diagnostics must be separate from preparation'}
+ function Test-PlainAncestors([string]$Path) {
+  $cursor=$Path
+  while($cursor){
+   if(Test-Path -LiteralPath $cursor){if((Get-Item -LiteralPath $cursor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Diagnostic reparse ancestor rejected'}}
+   $parent=Split-Path -Parent $cursor;if($parent -eq $cursor){break};$cursor=$parent
+  }
+ }
+ Test-PlainAncestors $source;Test-PlainAncestors $dest
+ if(Test-Path -LiteralPath $dest){throw 'Fresh diagnostic directory required'}
+ New-Item -ItemType Directory -Path $dest | Out-Null
+ foreach($name in $names){
+  $path=Join-Path $source $name;$row=[ordered]@{name=$name;state='MISSING';source_bytes=$null;source_sha256=$null;output_bytes=$null;output_sha256=$null;redacted=$false};$rows+=,$row
+  if(-not(Test-Path -LiteralPath $path)){continue}
+  try {
+   $item=Get-Item -LiteralPath $path -Force
+   if($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)){$row.state='REJECTED_TYPE';continue}
+   $stream=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+   try {
+    $row.source_bytes=$stream.Length
+    if($stream.Length -gt $maxFile -or $total+$stream.Length -gt $maxTotal){$row.state='REJECTED_SIZE';continue}
+    $bytes=[byte[]]::new([int]$stream.Length);$offset=0
+    while($offset -lt $bytes.Length){$count=$stream.Read($bytes,$offset,$bytes.Length-$offset);if($count -eq 0){throw 'Diagnostic short read'};$offset+=$count}
+   } finally {$stream.Dispose()}
+   $total+=$bytes.Length;$row.source_sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+   $text=[Text.UTF8Encoding]::new($false,$true).GetString($bytes).TrimStart([char]0xfeff)
+   if($name.EndsWith('.json')){
+    $obj=ConvertFrom-Json -InputObject $text -AsHashtable -Depth 32
+    if($obj -isnot [Collections.IDictionary]){throw 'Diagnostic JSON object required'}
+    # Reconstruct typed, fixed fields. Never serialize arbitrary error strings,
+    # paths, environment, records, URLs, headers, command argv, or extra keys.
+    $safe=[ordered]@{sanitized=$true;source_name=$name}
+    foreach($key in @('elapsed_ms','packages','plans','negative','scoped')){
+     if($obj.Contains($key) -and $obj[$key] -is [long] -and $obj[$key] -ge 0 -and $obj[$key] -le 2147483647){$safe[$key]=$obj[$key]}
+    }
+    if($obj.Contains('exit') -and ($null -eq $obj.exit -or ($obj.exit -is [long] -and $obj.exit -ge -2147483648 -and $obj.exit -le 2147483647))){$safe.exit=$obj.exit}
+    if($obj.Contains('utc')){try{if($obj.utc -is [datetime]){$safe.utc=$obj.utc.ToUniversalTime().ToString('o')}elseif($obj.utc -is [string]){$safe.utc=[DateTimeOffset]::ParseExact($obj.utc,'o',[Globalization.CultureInfo]::InvariantCulture).ToString('o')}}catch{}}
+    foreach($key in @('timed_out','inherited_environment')){if($obj.Contains($key) -and $obj[$key] -is [bool]){$safe[$key]=$obj[$key]}}
+    foreach($key in @('script_sha256','node_sha256','git_sha256','lock_before','lock_after')){
+     if($obj.Contains($key) -and [string]$obj[$key] -cmatch '^[0-9a-f]{64}$'){$safe[$key]=[string]$obj[$key]}
+    }
+    if($name -eq 'historical-inputs.json'){
+     if($obj.commit -cne '7788e9bfd6d7fc6baccce503b0ad5d873790d026'){throw 'Unexpected history evidence'}
+     $safe.commit=$obj.commit;$safe.verified=($obj.verified -is [bool] -and $obj.verified -eq $true)
+     $safe.inputs=[ordered]@{}
+     foreach($f in @('package.json','package-lock.json')){
+      $input=$obj.inputs[$f]
+      $expectedSize=if($f -eq 'package.json'){628}else{104076}
+      $expectedHash=if($f -eq 'package.json'){'f1256aec72b0eae47b8cc3bef4937a1284bb9cf69d94cd1eaaa4df77b460f991'}else{'097850e97d14a6280dbc2ca91b411ecc4aa6bebf327a5a97d8d647a07fe5b68a'}
+      $expectedBlob=if($f -eq 'package.json'){'6d682980eb0910c5e17afd3fb29ea78e81636bc8'}else{'3632f1d248f294f73dae78a56c02c6c9355b7f52'}
+      if($input.size -ne $expectedSize -or $input.sha256 -cne $expectedHash -or $input.blob -cne $expectedBlob){throw 'Unexpected history evidence identity'}
+      $safe.inputs[$f]=@{size=$expectedSize;sha256=$expectedHash;blob=$expectedBlob}
+     }
+    }
+    if($name -eq 'preparation-failure.json'){
+     $safe.error='[REDACTED: arbitrary child error]'
+     if($obj.error -is [string] -and $obj.error -cmatch '^Error: historical input (commit missing or invalid|blob identity mismatch: package(-lock)?\.json)$'){$safe.error=$obj.error}
+     $knownErrors=@('fixed Node version/arch','lock blob mismatch','full package count','single sha512 required','lock key invalid','package identity invalid','unapproved exact source','source/package mapping','redirect status/hop/HTTPS rejected','fixed CDN mapping rejected','noncanonical CDN URL','second response must be 200; no further redirect','locked sha512 mismatch','offline npm ci failed or changed lock','overall preparation deadline','absolute request deadline','package size bound')
+     if($obj.error -is [string] -and $obj.error.StartsWith('Error: ') -and $knownErrors -ccontains $obj.error.Substring(7)){$safe.error=$obj.error}
+     $safe.record_count=if($obj.records -is [array]){$obj.records.Count}else{$null}
+    }
+    $output=ConvertTo-Json -InputObject $safe -Depth 5;$row.redacted=$true
+   } else {
+    $lines=[Collections.Generic.List[string]]::new()
+    if($text.Length -gt 0){foreach($line in ($text -split '\r?\n')){
+     if($line -ceq 'v24.14.0' -or $line -cmatch '^git version 2\.[0-9]{1,3}\.[0-9]{1,3}(\.windows\.[0-9]{1,3})?$'){$lines.Add($line)}
+     elseif($line.Length -gt 0){$lines.Add('[REDACTED: unapproved log line]');$row.redacted=$true}
+    }}
+    $output=$lines -join "`n"
+   }
+   $encoded=[Text.UTF8Encoding]::new($false).GetBytes($output)
+   if($encoded.Length -gt $maxFile -or $outputTotal+$encoded.Length -gt $maxTotal){$row.state='REJECTED_OUTPUT_SIZE';continue}
+   [IO.File]::WriteAllBytes((Join-Path $dest $name),$encoded)
+   $outputTotal+=$encoded.Length;$row.output_bytes=$encoded.Length;$row.output_sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($encoded)).ToLowerInvariant()
+   $row.state=if($bytes.Length -eq 0){'EMPTY'}else{'SANITIZED'}
+  } catch {$row.state='REJECTED_READ_OR_PARSE';$row.redacted=$true}
+ }
+ $manifest=[ordered]@{purpose='CI diagnostics only; not raw preparation evidence';policy='fixed direct-child allowlist; unknown text/URLs removed; no environment or paths';per_file_limit=$maxFile;total_input_limit=$maxTotal;total_read=$total;total_output_limit=$maxTotal;total_output=$outputTotal;files=$rows}
+ [IO.File]::WriteAllText((Join-Path $dest 'diagnostic-manifest.json'),($manifest|ConvertTo-Json -Depth 6),[Text.UTF8Encoding]::new($false))
+ Write-Output 'Exported fixed sanitized CI diagnostics; see manifest for missing/rejected/empty files.'
+ return
+}
 if($PSCmdlet.ParameterSetName -eq 'Dependencies') {
  if(-not [IO.Path]::IsPathRooted($NodePath) -or (Get-FileHash -LiteralPath $NodePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne '63c259c81e5d472b5f11c8d506070130cb04a1ecf84b80377a34ed6ec9048088'){throw 'Pinned Windows x64 Node required'}
  if(-not [IO.Path]::IsPathRooted($GitPath) -or -not(Test-Path -LiteralPath $GitPath -PathType Leaf)){throw 'Verified absolute Git required'}
@@ -81,7 +172,15 @@ function get(url,row,hop){return new Promise((ok,no)=>{
 });}
 (async()=>{try{
  if(process.version!=='v24.14.0'||process.arch!=='x64')throw Error('fixed Node version/arch');
- for(const f of ['package.json','package-lock.json']){const bytes=cp.execFileSync(git,['--no-pager','show','7788e9bfd6d7fc6baccce503b0ad5d873790d026:apps/desktop/'+f],{env:process.env,timeout:10000,maxBuffer:1024*1024});fs.writeFileSync(path.join(d,f),bytes,{flag:'wx'});}
+ const base='7788e9bfd6d7fc6baccce503b0ad5d873790d026',gitOptions={env:process.env,timeout:10000,maxBuffer:1024*1024};
+ try{if(cp.execFileSync(git,['rev-parse','--verify',base+'^{commit}'],gitOptions).toString().trim()!==base||cp.execFileSync(git,['cat-file','-t',base],gitOptions).toString().trim()!=='commit')throw Error('wrong commit');}catch{throw Error('historical input commit missing or invalid');}
+ const expected={'package.json':{size:628,sha256:'f1256aec72b0eae47b8cc3bef4937a1284bb9cf69d94cd1eaaa4df77b460f991',blob:'6d682980eb0910c5e17afd3fb29ea78e81636bc8'},'package-lock.json':{size:104076,sha256:'097850e97d14a6280dbc2ca91b411ecc4aa6bebf327a5a97d8d647a07fe5b68a',blob:'3632f1d248f294f73dae78a56c02c6c9355b7f52'}};
+ for(const [f,e] of Object.entries(expected)){
+  let bytes,blob;try{bytes=cp.execFileSync(git,['--no-pager','show',base+':apps/desktop/'+f],gitOptions);blob=cp.execFileSync(git,['rev-parse',base+':apps/desktop/'+f],gitOptions).toString().trim();}catch{throw Error('historical input blob identity mismatch: '+f);}
+  if(blob!==e.blob||bytes.length!==e.size||crypto.createHash('sha256').update(bytes).digest('hex')!==e.sha256)throw Error('historical input blob identity mismatch: '+f);
+  fs.writeFileSync(path.join(d,f),bytes,{flag:'wx'});
+ }
+ writeNew('historical-inputs.json',{commit:base,verified:true,inputs:expected});
  const lockBytes=fs.readFileSync(path.join(d,'package-lock.json'));if(lockBytes.length!==104076||crypto.createHash('sha256').update(lockBytes).digest('hex')!=='097850e97d14a6280dbc2ca91b411ecc4aa6bebf327a5a97d8d647a07fe5b68a')throw Error('lock blob mismatch');
  const plans=Object.entries(JSON.parse(lockBytes).packages).filter(([,p])=>p.resolved).map(([k,p])=>plan(k,p));if(plans.length!==198)throw Error('full package count');writeNew('source-plan.json',plans);
  if(mode==='selftest'){

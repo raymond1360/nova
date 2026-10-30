@@ -17,6 +17,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+          # Preparation reads fixed 7788 blobs; shallow HEAD alone is insufficient.
+          fetch-depth: 0
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: '24.14.0'
@@ -39,3 +41,17 @@ jobs:
           & ./scripts/prepare_t1_api_fixture.ps1 -VerifierDeps $deps -NodePath $node -GitPath $git
           & ./scripts/test_t1_api_eval_mock.ps1 -VerifierDeps $deps -NodePath $node -EvidenceDirectory (Join-Path $env:RUNNER_TEMP 't1-mock-evidence')
           # Only the locked exact source + single fixed CDN mapping is permitted; scripts stay disabled.
+      - name: Collect fixed sanitized preparation diagnostics
+        id: diagnostics
+        if: ${{ always() }}
+        run: |
+          & ./scripts/prepare_t1_api_fixture.ps1 -ExportDiagnostics -VerifierDeps (Join-Path $env:RUNNER_TEMP 't1-verifier-deps') -DiagnosticDirectory (Join-Path $env:RUNNER_TEMP 't1-preparation-diagnostics')
+      - name: Preserve CI diagnostic evidence (not a release)
+        if: ${{ always() && steps.diagnostics.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: CI-DIAGNOSTIC-M0A-preparation-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/t1-preparation-diagnostics/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6

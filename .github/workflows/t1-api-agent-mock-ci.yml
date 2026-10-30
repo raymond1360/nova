@@ -1,0 +1,41 @@
+name: T1 M0-A Nova-only mock (no Agent or Key)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  mock:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.0-x86_64-pc-windows-msvc
+      CARGO_TERM_COLOR: never
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '24.14.0'
+          architecture: x64
+          package-manager-cache: false
+      - name: Locked dependency preparation and Nova-only tests
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Rust setup failed' }
+          # .gitattributes preserves licensed fixture bytes in a fresh Windows checkout.
+          Push-Location apps/desktop/src-tauri
+          try {
+            cargo fetch --locked
+            if ($LASTEXITCODE -ne 0) { throw 'Locked Rust dependency preparation failed' }
+          } finally { Pop-Location }
+          $deps = Join-Path $env:RUNNER_TEMP 't1-verifier-deps'
+          $node = (Get-Command node).Source
+          $git = (Get-Command git).Source
+          & ./scripts/prepare_t1_api_fixture.ps1 -VerifierDeps $deps -NodePath $node -GitPath $git
+          & ./scripts/test_t1_api_eval_mock.ps1 -VerifierDeps $deps -NodePath $node -EvidenceDirectory (Join-Path $env:RUNNER_TEMP 't1-mock-evidence')
+          # Only the locked exact source + single fixed CDN mapping is permitted; scripts stay disabled.

@@ -1,4 +1,8 @@
 //! Injectable orchestration. Native Job methods are compiled, never used by mock tests.
+use super::opencode_paths::{
+    AgentTreeReceipt, FixtureReservation, GitPreflight, ProcessIdentity, TreeSnapshot,
+};
+pub use super::opencode_paths::{JobStopReceipt, StopError};
 use super::{
     opencode_gate::{RunState, State},
     Result,
@@ -41,31 +45,32 @@ pub struct Preflight {
     pub resources_prepared: bool,
     pub parent_policy_flags: Option<u32>,
     pub standard_probe_account: bool,
-    pub owner_verified: bool,
-    pub git_images_verified: bool,
-    pub git_root_verified: bool,
     pub capture_exclusive: bool,
     pub observation_complete: bool,
     pub loss: Option<u64>,
+    pub fixture: FixtureReservation,
 }
 impl Preflight {
     pub fn validate(&self) -> Result<()> {
         if self.parent_policy_flags != Some(0)
             || !self.standard_probe_account
             || !self.resources_prepared
-            || !self.owner_verified
-            || !self.git_images_verified
-            || !self.git_root_verified
             || !self.capture_exclusive
             || !self.observation_complete
             || self.loss != Some(0)
         {
             return Err("resource/facility/ownership incomplete; execution BLOCKED".into());
         }
-        Ok(())
+        self.fixture.validate()
     }
 }
 /// Injected observation receipt contract; neither Procmon nor WFP supplies a generic owned ID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ObservationClass {
+    ProcessTree,
+    FileWriteAds,
+    NetworkAttempts,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationReview {
@@ -75,9 +80,8 @@ pub struct ObservationReview {
     pub start_receipt: bool,
     pub stop_receipt: bool,
     pub outputs_closed: bool,
-    pub process_tree: bool,
-    pub file_writes_ads: bool,
-    pub network_attempts: bool,
+    pub classes: Vec<ObservationClass>,
+    pub tree: AgentTreeReceipt,
     pub pml_loss: Option<u64>,
     pub etl_loss: Option<u64>,
     pub pml_bytes: u64,
@@ -85,15 +89,20 @@ pub struct ObservationReview {
 }
 impl ObservationReview {
     pub fn validate(&self) -> Result<()> {
-        if !self.exclusive_vm
+        if self.classes.len() != 3
+            || ![
+                ObservationClass::ProcessTree,
+                ObservationClass::FileWriteAds,
+                ObservationClass::NetworkAttempts,
+            ]
+            .iter()
+            .all(|c| self.classes.contains(c))
+            || !self.exclusive_vm
             || !self.same_generation
             || !self.no_prior_capture
             || !self.start_receipt
             || !self.stop_receipt
             || !self.outputs_closed
-            || !self.process_tree
-            || !self.file_writes_ads
-            || !self.network_attempts
             || self.pml_loss != Some(0)
             || self.etl_loss != Some(0)
             || self.pml_bytes == 0
@@ -212,12 +221,14 @@ pub trait Ops {
     fn evidence(&mut self, label: &str) -> Result<()>;
     fn preflight(&mut self) -> Result<Preflight>;
     fn capture_start(&mut self) -> Result<()>;
-    fn start_and_verify(&mut self) -> Result<()>;
+    fn git_preflight(&mut self) -> Result<GitPreflight>;
+    fn before_tree(&mut self) -> Result<TreeSnapshot>;
+    fn start_and_verify(&mut self) -> Result<ProcessIdentity>;
     fn task(&mut self, state: &Arc<RunState>) -> Result<super::contract::Patch>;
     fn reject(&mut self, body: &[u8]) -> Result<()>;
     fn idle(&mut self) -> Result<bool>;
     fn abort(&mut self) -> Result<()>;
-    fn stop_job(&mut self) -> Result<Option<u32>>;
+    fn stop_job(&mut self) -> Result<JobStopReceipt>;
     fn capture_stop(&mut self) -> Result<()>;
     fn export_and_review(&mut self) -> Result<ObservationReview>;
     fn cas_and_verify(&mut self, patch: &super::contract::Patch) -> Result<CasReview>;
@@ -230,6 +241,8 @@ pub struct Outcome {
     pub cas_started: bool,
     pub journal: Option<CasReview>,
     pub job_active: Option<u32>,
+    pub job_stop: Option<JobStopReceipt>,
+    pub target: Option<ProcessIdentity>,
     pub error: Option<String>,
     pub cleanup_errors: Vec<String>,
     pub phases: Vec<String>,
@@ -249,6 +262,8 @@ pub fn run<O: Ops>(ops: &mut O, state: Arc<RunState>, source: &str) -> Outcome {
         cas_started: false,
         journal: None,
         job_active: None,
+        job_stop: None,
+        target: None,
         error: None,
         cleanup_errors: vec![],
         phases: vec![],
@@ -265,15 +280,29 @@ pub fn run<O: Ops>(ops: &mut O, state: Arc<RunState>, source: &str) -> Outcome {
     }
     let result = (|| -> Result<()> {
         clock.enter(Phase::Preflight, ops.now_ms())?;
-        ops.preflight()?.validate()?;
+        let preflight = ops.preflight()?;
+        preflight.validate()?;
         clock.enter(Phase::Capture, ops.now_ms())?;
         ops.capture_start()?;
         capture = true;
         ops.evidence("capture-started")?;
         clock.enter(Phase::Target, ops.now_ms())?;
         job_touched = true;
+        let git = ops.git_preflight()?;
+        super::opencode_paths::git_preflight(
+            &git,
+            &preflight.fixture.sid,
+            &preflight.fixture.git_images,
+            &preflight.fixture.root,
+        )?;
+        let before = ops.before_tree()?;
+        super::opencode_paths::validate_snapshot(&before, &preflight.fixture)?;
+        // Target reserves 90s for OpenCode/start/task/idle/Job; Git+snapshot may use at most 30s.
+        within(clock.entered, ops.now_ms(), 30000)?;
         let startup_start = ops.now_ms();
-        ops.start_and_verify()?;
+        let target = ops.start_and_verify()?;
+        target.validate()?;
+        out.target = Some(target.clone());
         within(startup_start, ops.now_ms(), 20000)?;
         state.open_once(true)?;
         state.prompt_once(Instant::now() + Duration::from_secs(1))?;
@@ -293,16 +322,23 @@ pub fn run<O: Ops>(ops: &mut O, state: Arc<RunState>, source: &str) -> Outcome {
         }
         within(idle_start, ops.now_ms(), 5000)?;
         let job_start = ops.now_ms();
-        out.job_active = ops.stop_job()?;
+        let receipt = ops.stop_job()?;
+        out.job_stop = Some(receipt.clone());
         within(job_start, ops.now_ms(), 5000)?;
-        if out.job_active != Some(0) {
-            return Err("Job UNKNOWN/nonzero; no CAS".into());
-        }
+        receipt.validate()?;
+        out.job_active = receipt.active;
         clock.enter(Phase::CaptureStop, ops.now_ms())?;
         capture = false;
         ops.capture_stop()?;
         clock.enter(Phase::Export, ops.now_ms())?;
-        ops.export_and_review()?.validate()?;
+        let observation = ops.export_and_review()?;
+        observation.validate()?;
+        super::opencode_paths::review_agent_tree(
+            &before,
+            &observation.tree,
+            &preflight.fixture,
+            &target,
+        )?;
         ops.evidence("observation-reviewed")?;
         clock.enter(Phase::Cas, ops.now_ms())?;
         if state.state() != State::Stopped {
@@ -355,7 +391,16 @@ pub fn run<O: Ops>(ops: &mut O, state: Arc<RunState>, source: &str) -> Outcome {
                 within(t, ops.now_ms(), 5000)?;
                 Ok(n)
             }) {
-                Ok(n) => out.job_active = n,
+                Ok(receipt) => {
+                    out.job_stop = Some(receipt.clone());
+                    match receipt.validate() {
+                        Ok(()) => out.job_active = receipt.active,
+                        Err(e) => {
+                            out.job_active = None;
+                            out.cleanup_errors.push(e);
+                        }
+                    }
+                }
                 Err(e) => {
                     out.job_active = None;
                     out.cleanup_errors.push(e);
@@ -378,6 +423,125 @@ pub fn run<O: Ops>(ops: &mut O, state: Arc<RunState>, source: &str) -> Outcome {
     out
 }
 
+// These fixtures are explicitly INJECTED, never prepared resource identities.
+pub(super) fn injected_target() -> ProcessIdentity {
+    ProcessIdentity {
+        pid: 17,
+        created: 1,
+    }
+}
+pub(super) fn injected_job() -> JobStopReceipt {
+    JobStopReceipt {
+        flags: Some(0x2000),
+        active: Some(0),
+        direct_exited: Some(true),
+        error: None,
+    }
+}
+pub(super) fn injected_preflight() -> Preflight {
+    Preflight {
+        resources_prepared: true,
+        parent_policy_flags: Some(0),
+        standard_probe_account: true,
+        capture_exclusive: true,
+        observation_complete: true,
+        loss: Some(0),
+        fixture: FixtureReservation {
+            root: super::opencode_paths::RootReservation {
+                path: super::opencode_paths::ROOT.into(),
+                identity: "INJECTED:root".into(),
+            },
+            logo_identity: "INJECTED:Logo.tsx".into(),
+            commit: "a".repeat(40),
+            sid: "probe-sid".into(),
+            git_images: vec![("git.exe".into(), super::hash(b"INJECTED Git image"))],
+            git_config_sha256: super::hash(super::opencode_paths::FROZEN_GIT_CONFIG),
+        },
+    }
+}
+pub(super) fn injected_tree() -> TreeSnapshot {
+    use super::opencode_paths::{FileFact, FROZEN_GIT_CONFIG};
+    let files = [
+        (".", vec![], 0x10),
+        (".git", vec![], 0x10),
+        ("Logo.tsx", super::PRE.to_vec(), 0x20),
+        (".git/config", FROZEN_GIT_CONFIG.to_vec(), 0x20),
+        (".git/opencode", vec![b'a'; 40], 0x20),
+    ]
+    .into_iter()
+    .map(|(path, bytes, attributes)| FileFact {
+        path: path.into(),
+        bytes,
+        identity: if path == "." {
+            "INJECTED:root".into()
+        } else {
+            format!("INJECTED:{path}")
+        },
+        owner: "probe-sid".into(),
+        dacl: "INJECTED_DACL".into(),
+        attributes,
+        ads: vec![],
+        links: 1,
+        creation: 1,
+        write: 1,
+        access: 1,
+        change: 1,
+    })
+    .collect();
+    TreeSnapshot {
+        complete: Some(true),
+        files,
+    }
+}
+pub(super) fn injected_git() -> GitPreflight {
+    let p = injected_preflight();
+    GitPreflight {
+        attempts: 1,
+        exit: Some(0),
+        timed_out: false,
+        job: injected_job(),
+        stdout: format!("{}\r\n", p.fixture.root.path).into_bytes(),
+        owner_sid: p.fixture.sid,
+        manifest_complete: true,
+        images: p.fixture.git_images,
+        root_identity: Some(p.fixture.root.identity),
+    }
+}
+pub(super) fn injected_observation() -> ObservationReview {
+    let mut after = injected_tree();
+    after
+        .files
+        .iter_mut()
+        .find(|f| f.path == ".git/opencode")
+        .unwrap()
+        .write = 2;
+    ObservationReview {
+        exclusive_vm: true,
+        same_generation: true,
+        no_prior_capture: true,
+        start_receipt: true,
+        stop_receipt: true,
+        outputs_closed: true,
+        classes: vec![
+            ObservationClass::ProcessTree,
+            ObservationClass::FileWriteAds,
+            ObservationClass::NetworkAttempts,
+        ],
+        tree: AgentTreeReceipt {
+            after,
+            descendants: vec![],
+            writes: vec![super::opencode_paths::FileWriteFact {
+                path: ".git/opencode".into(),
+                process: injected_target(),
+                kind: super::opencode_paths::WriteKind::Overwrite,
+            }],
+        },
+        pml_loss: Some(0),
+        etl_loss: Some(0),
+        pml_bytes: 1,
+        etl_bytes: 1,
+    }
+}
 /// A complete in-memory run through the production orchestration, explicitly INJECTED.
 /// It neither imports SYNTHETIC upstream facts nor touches processes/files/network.
 pub fn mock_self_test() -> Result<serde_json::Value> {
@@ -404,26 +568,24 @@ pub fn mock_self_test() -> Result<serde_json::Value> {
             Ok(())
         }
         fn preflight(&mut self) -> Result<Preflight> {
-            Ok(Preflight {
-                resources_prepared: true,
-                parent_policy_flags: Some(0),
-                standard_probe_account: true,
-                owner_verified: true,
-                git_images_verified: true,
-                git_root_verified: true,
-                capture_exclusive: true,
-                observation_complete: true,
-                loss: Some(0),
-            })
+            Ok(injected_preflight())
+        }
+        fn git_preflight(&mut self) -> Result<GitPreflight> {
+            self.records.push("INJECTED Git receipt".into());
+            Ok(injected_git())
+        }
+        fn before_tree(&mut self) -> Result<TreeSnapshot> {
+            self.records.push("INJECTED tree before".into());
+            Ok(injected_tree())
         }
         fn capture_start(&mut self) -> Result<()> {
             self.records.push("INJECTED capture start".into());
             Ok(())
         }
-        fn start_and_verify(&mut self) -> Result<()> {
+        fn start_and_verify(&mut self) -> Result<ProcessIdentity> {
             self.records
                 .push("INJECTED assign-query-resume-health-path-permission".into());
-            Ok(())
+            Ok(injected_target())
         }
         fn task(&mut self, state: &Arc<RunState>) -> Result<super::contract::Patch> {
             use super::{
@@ -432,10 +594,11 @@ pub fn mock_self_test() -> Result<serde_json::Value> {
                 opencode_protocol::*,
             };
             let deadline = || Instant::now() + Duration::from_secs(1);
-            let b = Broker {
-                state: state.clone(),
-            };
-            b.request(&fixed_request(false), deadline())?;
+            let b = Broker::new(state.clone(), super::opencode_broker::INJECTED_NONCE).unwrap();
+            b.request(
+                &fixed_request(false, super::opencode_broker::INJECTED_NONCE)?,
+                deadline(),
+            )?;
             let read = Permission {
                 id: "per_read".into(),
                 session_id: "s".into(),
@@ -459,7 +622,10 @@ pub fn mock_self_test() -> Result<serde_json::Value> {
                 .push("INJECTED permission read reply once".into());
             part.status = "completed".into();
             flow.completed_read(state, &part)?;
-            b.request(&fixed_request(true), deadline())?;
+            b.request(
+                &fixed_request(true, super::opencode_broker::INJECTED_NONCE)?,
+                deadline(),
+            )?;
             let p = Permission {
                 id: "per_edit".into(),
                 session_id: "s".into(),
@@ -494,31 +660,17 @@ pub fn mock_self_test() -> Result<serde_json::Value> {
             self.records.push("INJECTED abort".into());
             Ok(())
         }
-        fn stop_job(&mut self) -> Result<Option<u32>> {
-            self.records.push("INJECTED Job zero".into());
-            Ok(Some(0))
+        fn stop_job(&mut self) -> Result<JobStopReceipt> {
+            self.records.push("INJECTED Job stop receipt".into());
+            Ok(injected_job())
         }
         fn capture_stop(&mut self) -> Result<()> {
             self.records.push("INJECTED capture stopped".into());
             Ok(())
         }
         fn export_and_review(&mut self) -> Result<ObservationReview> {
-            self.records.push("INJECTED complete review".into());
-            Ok(ObservationReview {
-                exclusive_vm: true,
-                same_generation: true,
-                no_prior_capture: true,
-                start_receipt: true,
-                stop_receipt: true,
-                outputs_closed: true,
-                process_tree: true,
-                file_writes_ads: true,
-                network_attempts: true,
-                pml_loss: Some(0),
-                etl_loss: Some(0),
-                pml_bytes: 1,
-                etl_bytes: 1,
-            })
+            self.records.push("INJECTED observation facts".into());
+            Ok(injected_observation())
         }
         fn cas_and_verify(&mut self, p: &super::contract::Patch) -> Result<CasReview> {
             self.post = Some(p.validate("M0B", &p.attempt_id, super::PRE)?);
@@ -570,9 +722,6 @@ pub fn minimal_environment() -> std::collections::BTreeMap<String, String> {
         ("GIT_CONFIG_NOSYSTEM", "1"),
         ("GIT_CONFIG_GLOBAL", r"C:\NovaM0B\run\agent\empty.gitconfig"),
         ("GIT_TERMINAL_PROMPT", "0"),
-        ("GIT_CONFIG_COUNT", "1"),
-        ("GIT_CONFIG_KEY_0", "protocol.allow"),
-        ("GIT_CONFIG_VALUE_0", "never"),
         ("OPENCODE_DB", r"C:\NovaM0B\run\agent\state\opencode.db"),
         ("OPENCODE_MODELS_PATH", r"C:\NovaM0B\run\agent\models.json"),
         ("OPENCODE_CONFIG", r"C:\NovaM0B\run\agent\config.json"),
@@ -607,28 +756,116 @@ pub trait ProcessOps {
     fn terminate_job(&mut self) -> Result<()>;
     fn exited(&mut self) -> Result<bool>;
 }
-/// Errors never resume a partially verified child. Cleanup uncertainty is not zero.
-pub fn launch_verified<P: ProcessOps>(p: &mut P) -> Result<()> {
-    p.create_suspended()?;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SuspendedCleanupReceipt {
+    pub requested: bool,
+    pub direct_exited: Option<bool>,
+    pub error: Option<StopError>,
+}
+impl SuspendedCleanupReceipt {
+    pub fn confirmed(&self) -> bool {
+        self.requested && self.direct_exited == Some(true) && self.error.is_none()
+    }
+}
+#[derive(Debug)]
+pub struct LaunchFailure {
+    pub reason: String,
+    pub resume_attempted: bool,
+    pub cleanup: Option<SuspendedCleanupReceipt>,
+    pub job_termination_error: Option<String>,
+}
+impl LaunchFailure {
+    /// Direct-child cleanup only; never evidence that the Job has reached zero.
+    pub fn direct_cleanup_confirmed(&self) -> bool {
+        self.job_termination_error.is_none() && self.cleanup.as_ref().is_some_and(|r| r.confirmed())
+    }
+}
+fn exit_after_request<P: ProcessOps>(
+    p: &mut P,
+    requested: bool,
+    deadline: Instant,
+) -> SuspendedCleanupReceipt {
+    let mut receipt = SuspendedCleanupReceipt {
+        requested,
+        direct_exited: None,
+        error: None,
+    };
+    if !requested {
+        receipt.error = Some(StopError::TerminationFailed);
+        return receipt;
+    }
+    loop {
+        if Instant::now() >= deadline {
+            receipt.error = Some(StopError::Deadline);
+            return receipt;
+        }
+        match p.exited() {
+            Err(_) => {
+                receipt.error = Some(StopError::QueryFailed);
+                return receipt;
+            }
+            Ok(value) => {
+                receipt.direct_exited = Some(value);
+                if Instant::now() >= deadline {
+                    receipt.error = Some(StopError::Deadline);
+                    return receipt;
+                }
+                if value {
+                    return receipt;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+/// Shared launch skeleton: no resume after failed assignment/query, with bounded direct-exit evidence.
+pub fn launch_verified<P: ProcessOps>(p: &mut P) -> std::result::Result<(), LaunchFailure> {
+    launch_verified_until(p, Instant::now() + Duration::from_secs(5))
+}
+pub(super) fn launch_verified_until<P: ProcessOps>(
+    p: &mut P,
+    deadline: Instant,
+) -> std::result::Result<(), LaunchFailure> {
+    if let Err(reason) = p.create_suspended() {
+        return Err(LaunchFailure {
+            reason,
+            resume_attempted: false,
+            cleanup: None,
+            job_termination_error: None,
+        });
+    }
     let verified = p.assign().and_then(|_| p.flags_and_active()).and_then(|v| {
-        if v != (0x2000, 1) {
-            Err("Job flags/member UNKNOWN".into())
-        } else {
+        if v == (0x2000, 1) {
             Ok(())
+        } else {
+            Err("Job flags/member UNKNOWN".into())
         }
     });
-    if let Err(e) = verified {
-        let _ = p.terminate_suspended();
-        let _ = p.terminate_job();
-        return Err(e);
+    if let Err(reason) = verified {
+        let requested = p.terminate_suspended().is_ok();
+        let job_termination_error = p.terminate_job().err();
+        let cleanup = Some(exit_after_request(p, requested, deadline));
+        return Err(LaunchFailure {
+            reason,
+            resume_attempted: false,
+            cleanup,
+            job_termination_error,
+        });
     }
-    if let Err(e) = p.resume() {
-        let _ = p.terminate_job();
-        return Err(e);
+    if let Err(reason) = p.resume() {
+        let error = p.terminate_job().err();
+        let cleanup = Some(exit_after_request(p, error.is_none(), deadline));
+        return Err(LaunchFailure {
+            reason,
+            resume_attempted: true,
+            cleanup,
+            job_termination_error: error,
+        });
     }
     Ok(())
 }
-pub fn confirm_stopped<P: ProcessOps>(p: &mut P, deadline: Instant) -> Result<()> {
+pub fn confirm_stopped<P: ProcessOps>(p: &mut P, deadline: Instant) -> Result<JobStopReceipt> {
     p.terminate_job()?;
     loop {
         if Instant::now() >= deadline {
@@ -638,8 +875,20 @@ pub fn confirm_stopped<P: ProcessOps>(p: &mut P, deadline: Instant) -> Result<()
         if flags != 0x2000 {
             return Err("cleanup flags UNKNOWN".into());
         }
-        if active == 0 && p.exited()? {
-            return Ok(());
+        if active == 0 {
+            let direct = p.exited()?;
+            if Instant::now() >= deadline {
+                return Err("cleanup query late/UNKNOWN".into());
+            }
+            let receipt = JobStopReceipt {
+                flags: Some(flags),
+                active: Some(active),
+                direct_exited: Some(direct),
+                error: None,
+            };
+            if receipt.validate().is_ok() {
+                return Ok(receipt);
+            }
         }
         std::thread::sleep(Duration::from_millis(1));
     }

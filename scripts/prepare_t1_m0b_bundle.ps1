@@ -35,6 +35,17 @@ foreach ($f in $records) {
         throw 'BLOCKED: fixture identity mismatch'
     }
 }
+# The protocol policy is frozen in .git/config, never injected through GIT_CONFIG_*.
+$configRecords = @($records | Where-Object { $_.path -ceq '.git/config' })
+$approvedConfigBytes = [Text.Encoding]::UTF8.GetBytes("[core]`n`trepositoryformatversion = 0`n`tfilemode = false`n`tbare = false`n`tlogallrefupdates = true`n[protocol]`n`tallow = never`n")
+$sha = [Security.Cryptography.SHA256]::Create()
+try { $configHash = [BitConverter]::ToString($sha.ComputeHash($approvedConfigBytes)).Replace('-','').ToLowerInvariant() }
+finally { $sha.Dispose() }
+if ($configRecords.Count -ne 1 -or $policy.git_config.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+    $policy.git_config.sha256 -cne $configHash -or $configRecords[0].sha256 -cne $configHash -or
+    $configRecords[0].size -ne $approvedConfigBytes.Length) {
+    throw 'BLOCKED: frozen Git config/manifest input mismatch'
+}
 # Preparation does not invoke Git, OpenCode, rg, observers or networking.
 New-Item -ItemType Directory -Path "$runRoot\project" -ErrorAction Stop | Out-Null
 foreach ($f in $records) {

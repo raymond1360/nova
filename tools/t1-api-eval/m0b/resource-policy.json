@@ -33,5 +33,10 @@
   "export_ms": 15000,
   "cas_ms": 30000,
   "cleanup_ms": 10000,
-  "outer_ms": 240000
+  "outer_ms": 240000,
+  "git_config": {
+    "path": ".git/config",
+    "sha256": null,
+    "protocol_allow": "never"
+  }
 }

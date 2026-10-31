@@ -250,13 +250,13 @@ fn sse_fixed_tool_and_framing() {
     assert!(sse("bash", "r", &serde_json::json!({})).is_err())
 }
 fn request(edit: bool) -> Vec<u8> {
-    super::opencode_broker::fixed_request(edit)
+    super::opencode_broker::fixed_request(edit, super::opencode_broker::INJECTED_NONCE).unwrap()
 }
 
 #[test]
 fn broker_read_edit_and_fixed_denial() {
     let s = open();
-    let b = Broker { state: s.clone() };
+    let b = Broker::new(s.clone(), super::opencode_broker::INJECTED_NONCE).unwrap();
     assert!(
         String::from_utf8(b.request(&request(false), deadline()).unwrap())
             .unwrap()
@@ -275,7 +275,7 @@ fn broker_route_size_deadline() {
         vec![b'x'; 1048600],
         request(false),
     ] {
-        let b = Broker { state: open() };
+        let b = Broker::new(open(), super::opencode_broker::INJECTED_NONCE).unwrap();
         assert!(b.request(&raw, Instant::now()).is_err());
     }
 }
@@ -290,17 +290,7 @@ fn timeline_order_and_late_api() {
 }
 #[test]
 fn resource_unknown_loss_blocks() {
-    let p = Preflight {
-        resources_prepared: true,
-        parent_policy_flags: Some(0),
-        standard_probe_account: true,
-        owner_verified: true,
-        git_images_verified: true,
-        git_root_verified: true,
-        capture_exclusive: true,
-        observation_complete: true,
-        loss: Some(0),
-    };
+    let p = injected_preflight();
     assert!(p.validate().is_ok());
     let mut q = p;
     q.loss = None;
@@ -311,7 +301,11 @@ struct Injected {
     now: u64,
     fail: &'static str,
     calls: Vec<String>,
-    active: Option<u32>,
+    job: JobStopReceipt,
+    git: GitPreflight,
+    before: TreeSnapshot,
+    observation: ObservationReview,
+    pre: Preflight,
     idle: bool,
     review: bool,
     cas: bool,
@@ -325,7 +319,11 @@ impl Injected {
             now: 0,
             fail: "",
             calls: vec![],
-            active: Some(0),
+            job: injected_job(),
+            git: injected_git(),
+            before: injected_tree(),
+            observation: injected_observation(),
+            pre: injected_preflight(),
             idle: true,
             review: true,
             cas: false,
@@ -353,27 +351,26 @@ impl Ops for Injected {
     }
     fn preflight(&mut self) -> super::Result<Preflight> {
         self.call("preflight")?;
-        Ok(Preflight {
-            resources_prepared: true,
-            parent_policy_flags: Some(0),
-            standard_probe_account: true,
-            owner_verified: true,
-            git_images_verified: true,
-            git_root_verified: true,
-            capture_exclusive: true,
-            observation_complete: true,
-            loss: Some(0),
-        })
+        Ok(self.pre.clone())
+    }
+    fn git_preflight(&mut self) -> super::Result<GitPreflight> {
+        self.call("git-preflight")?;
+        Ok(self.git.clone())
+    }
+    fn before_tree(&mut self) -> super::Result<TreeSnapshot> {
+        self.call("tree-before")?;
+        Ok(self.before.clone())
     }
     fn capture_start(&mut self) -> super::Result<()> {
         self.call("capture")
     }
-    fn start_and_verify(&mut self) -> super::Result<()> {
-        self.call("assign-query-resume")
+    fn start_and_verify(&mut self) -> super::Result<ProcessIdentity> {
+        self.call("assign-query-resume")?;
+        Ok(injected_target())
     }
     fn task(&mut self, s: &Arc<RunState>) -> super::Result<super::contract::Patch> {
         self.call("task")?;
-        let b = Broker { state: s.clone() };
+        let b = Broker::new(s.clone(), super::opencode_broker::INJECTED_NONCE).unwrap();
         b.request(&request(false), deadline())?;
         let mut flow = PermissionFlow::new("s");
         let mut read_permission = permission();
@@ -400,30 +397,18 @@ impl Ops for Injected {
     fn abort(&mut self) -> super::Result<()> {
         self.call("abort")
     }
-    fn stop_job(&mut self) -> super::Result<Option<u32>> {
+    fn stop_job(&mut self) -> super::Result<JobStopReceipt> {
         self.call("job-zero")?;
-        Ok(self.active)
+        Ok(self.job.clone())
     }
     fn capture_stop(&mut self) -> super::Result<()> {
         self.call("capture-stop")
     }
     fn export_and_review(&mut self) -> super::Result<ObservationReview> {
         self.call("capture-review")?;
-        Ok(ObservationReview {
-            exclusive_vm: self.review,
-            same_generation: true,
-            no_prior_capture: true,
-            start_receipt: true,
-            stop_receipt: true,
-            outputs_closed: true,
-            process_tree: true,
-            file_writes_ads: true,
-            network_attempts: true,
-            pml_loss: Some(0),
-            etl_loss: Some(0),
-            pml_bytes: 1,
-            etl_bytes: 1,
-        })
+        let mut r = self.observation.clone();
+        r.exclusive_vm &= self.review;
+        Ok(r)
     }
     fn cas_and_verify(&mut self, patch: &super::contract::Patch) -> super::Result<CasReview> {
         self.cas = true;
@@ -458,6 +443,8 @@ fn every_injected_failure_before_cas_blocks_write() {
         "preflight",
         "capture",
         "capture-started",
+        "git-preflight",
+        "tree-before",
         "assign-query-resume",
         "task",
         "proposal-stopped",
@@ -482,8 +469,8 @@ fn unknown_job_idle_and_loss_do_not_cas() {
     for i in 0..4 {
         let mut o = Injected::new();
         match i {
-            0 => o.active = None,
-            1 => o.active = Some(1),
+            0 => o.job.active = None,
+            1 => o.job.active = Some(1),
             2 => o.idle = false,
             _ => o.review = false,
         }
@@ -507,9 +494,7 @@ fn failed_cas_never_auto_recovers() {
 #[test]
 fn malformed_request_is_retained_and_stops() {
     let state = open();
-    let b = Broker {
-        state: state.clone(),
-    };
+    let b = Broker::new(state.clone(), super::opencode_broker::INJECTED_NONCE).unwrap();
     assert!(b.request(b"invalid", deadline()).is_err());
     let g = state.ledger.lock().unwrap();
     assert_eq!((g.budget.received, g.budget.denied), (1, 1));
@@ -594,6 +579,7 @@ fn assign_query_flags_failures_never_resume() {
             fail: f,
             flags: 0,
             active: 1,
+            exit: true,
             ..Default::default()
         };
         assert!(launch_verified(&mut c).is_err());
@@ -779,7 +765,7 @@ fn connection_bytes_match_fixed_request() {
         || 0,
     )
     .unwrap();
-    assert_eq!(out, bytes);
+    assert!(out == bytes, "bounded bytes differ; raw auth omitted");
 }
 #[test]
 fn actual_permission_wire_is_normalized_explicitly() {
@@ -834,21 +820,7 @@ fn control_health_event_and_request_limits() {
 
 #[test]
 fn mandatory_observer_fields_and_unknown_loss_block() {
-    let good = ObservationReview {
-        exclusive_vm: true,
-        same_generation: true,
-        no_prior_capture: true,
-        start_receipt: true,
-        stop_receipt: true,
-        outputs_closed: true,
-        process_tree: true,
-        file_writes_ads: true,
-        network_attempts: true,
-        pml_loss: Some(0),
-        etl_loss: Some(0),
-        pml_bytes: 1,
-        etl_bytes: 1,
-    };
+    let good = injected_observation();
     good.validate().unwrap();
     for i in 0..9 {
         let mut v = good.clone();
@@ -857,9 +829,11 @@ fn mandatory_observer_fields_and_unknown_loss_block() {
             1 => v.etl_loss = None,
             2 => v.pml_loss = Some(1),
             3 => v.outputs_closed = false,
-            4 => v.network_attempts = false,
-            5 => v.process_tree = false,
-            6 => v.file_writes_ads = false,
+            4 => v
+                .classes
+                .retain(|c| *c != ObservationClass::NetworkAttempts),
+            5 => v.classes.retain(|c| *c != ObservationClass::ProcessTree),
+            6 => v.classes.retain(|c| *c != ObservationClass::FileWriteAds),
             7 => v.same_generation = false,
             _ => v.no_prior_capture = false,
         };
@@ -943,35 +917,59 @@ fn minimal_environment_has_no_inherited_injections() {
         assert!(!env.contains_key(k));
     }
     assert_eq!(env["GIT_CONFIG_NOSYSTEM"], "1");
-    assert_eq!(env["GIT_CONFIG_VALUE_0"], "never");
+    assert!(!env.keys().any(|k| k == "GIT_CONFIG_COUNT"
+        || k.starts_with("GIT_CONFIG_KEY_")
+        || k.starts_with("GIT_CONFIG_VALUE_")));
     assert!(env["HOME"].starts_with(r"C:\NovaM0B\run\agent"));
 }
 
 #[test]
 fn git_owner_root_image_preflight_is_fixed_and_fail_closed() {
     let manifest = vec![("git.exe".into(), "frozen-test-hash".into())];
-    let mut r = GitPreflight {
-        attempts: 1,
-        exit: Some(0),
-        timed_out: false,
-        job_active: Some(0),
-        stdout: format!("{ROOT}\r\n").into_bytes(),
-        owner_sid: "probe-sid".into(),
-        manifest_complete: true,
-        images: manifest.clone(),
-    };
-    git_preflight(&r, "probe-sid", &manifest).unwrap();
+    let mut r = injected_git();
+    r.images = manifest.clone();
+    git_preflight(
+        &r,
+        "probe-sid",
+        &manifest,
+        &injected_preflight().fixture.root,
+    )
+    .unwrap();
     r.stdout = b"C:\\other\r\n".to_vec();
-    assert!(git_preflight(&r, "probe-sid", &manifest).is_err());
+    assert!(git_preflight(
+        &r,
+        "probe-sid",
+        &manifest,
+        &injected_preflight().fixture.root
+    )
+    .is_err());
     r.stdout = format!("{ROOT}\r\n").into_bytes();
     r.owner_sid = "admin".into();
-    assert!(git_preflight(&r, "probe-sid", &manifest).is_err());
+    assert!(git_preflight(
+        &r,
+        "probe-sid",
+        &manifest,
+        &injected_preflight().fixture.root
+    )
+    .is_err());
     r.owner_sid = "probe-sid".into();
-    r.job_active = None;
-    assert!(git_preflight(&r, "probe-sid", &manifest).is_err());
-    r.job_active = Some(0);
+    r.job.active = None;
+    assert!(git_preflight(
+        &r,
+        "probe-sid",
+        &manifest,
+        &injected_preflight().fixture.root
+    )
+    .is_err());
+    r.job.active = Some(0);
     r.manifest_complete = false;
-    assert!(git_preflight(&r, "probe-sid", &manifest).is_err());
+    assert!(git_preflight(
+        &r,
+        "probe-sid",
+        &manifest,
+        &injected_preflight().fixture.root
+    )
+    .is_err());
 }
 #[test]
 fn normal_stop_before_or_after_prompt_decision_cannot_reopen() {
@@ -1022,17 +1020,7 @@ fn failure_in_one_run_does_not_pollute_fresh_scope() {
 
 #[test]
 fn parent_policy_unknown_or_any_nonzero_bit_blocks_preflight() {
-    let good = Preflight {
-        parent_policy_flags: Some(0),
-        standard_probe_account: true,
-        resources_prepared: true,
-        owner_verified: true,
-        git_images_verified: true,
-        git_root_verified: true,
-        capture_exclusive: true,
-        observation_complete: true,
-        loss: Some(0),
-    };
+    let good = injected_preflight();
     good.validate().unwrap();
     for flags in [None, Some(1), Some(2), Some(0x80000000)] {
         let mut p = good.clone();
@@ -1075,4 +1063,463 @@ fn poisoned_ledger_never_reopens_and_records_unledgered_request() {
     assert_eq!(s.state(), State::Stopped);
     assert!(s.open_once(true).is_err());
     assert!(s.snapshot(deadline()).is_err());
+}
+
+#[test]
+fn run_forces_git_receipt_inside_capture_before_opencode() {
+    let mut o = Injected::new();
+    let r = run(&mut o, RunState::new().unwrap(), "INJECTED");
+    assert!(r.success);
+    let i = |s: &str| o.calls.iter().position(|x| x == s).unwrap();
+    assert!(
+        i("capture") < i("git-preflight")
+            && i("git-preflight") < i("tree-before")
+            && i("tree-before") < i("assign-query-resume")
+    );
+    assert!(i("capture-review") < i("CAS"));
+}
+#[test]
+fn run_rejects_git_exit_root_identity_images_and_job_unknown() {
+    for case in 0..10 {
+        let mut o = Injected::new();
+        match case {
+            0 => o.git.exit = Some(1),
+            1 => o.git.stdout = b"C:\\outside\r\n".to_vec(),
+            2 => o.git.root_identity = Some("same-path-different-file-id".into()),
+            3 => o.git.root_identity = None,
+            4 => o.git.job.active = None,
+            5 => o.git.job.active = Some(1),
+            6 => o.git.job.direct_exited = None,
+            7 => o.git.images = vec![],
+            8 => o.git.owner_sid = "different-sid".into(),
+            _ => o.git.attempts = 2,
+        }
+        let state = RunState::new().unwrap();
+        let result = run(&mut o, state.clone(), "INJECTED");
+        assert!(
+            !result.success && !result.cas_started && !o.cas,
+            "case {case}"
+        );
+        assert_eq!(state.state(), State::Stopped);
+        assert!(!o.calls.iter().any(|s| s == "assign-query-resume"));
+    }
+}
+#[test]
+fn run_rejects_agent_logo_git_owner_ads_and_identity_changes() {
+    for case in 0..10 {
+        let mut o = Injected::new();
+        let after = &mut o.observation.tree.after.files;
+        match case {
+            0 => {
+                after
+                    .iter_mut()
+                    .find(|f| f.path == "Logo.tsx")
+                    .unwrap()
+                    .bytes[0] ^= 1
+            }
+            1 => {
+                after
+                    .iter_mut()
+                    .find(|f| f.path == ".git/config")
+                    .unwrap()
+                    .write += 1
+            }
+            2 => {
+                after
+                    .iter_mut()
+                    .find(|f| f.path == "Logo.tsx")
+                    .unwrap()
+                    .owner = "other".into()
+            }
+            3 => after
+                .iter_mut()
+                .find(|f| f.path == ".git/opencode")
+                .unwrap()
+                .ads
+                .push(("hidden".into(), vec![1])),
+            4 => {
+                after
+                    .iter_mut()
+                    .find(|f| f.path == "Logo.tsx")
+                    .unwrap()
+                    .identity = "replacement".into()
+            }
+            5 => o.observation.tree.writes.push(FileWriteFact {
+                path: "Logo.tsx".into(),
+                process: injected_target(),
+                kind: WriteKind::Overwrite,
+            }),
+            6 => {
+                o.observation.tree.writes[0].process = ProcessIdentity {
+                    pid: 17,
+                    created: 999,
+                }
+            }
+            7 => o.observation.tree.writes.clear(),
+            8 => o.observation.tree.after.complete = None,
+            _ => o.observation.tree.writes[0].kind = WriteKind::Replace,
+        }
+        let state = RunState::new().unwrap();
+        let result = run(&mut o, state.clone(), "INJECTED");
+        assert!(
+            !result.success && !result.cas_started && !o.cas,
+            "case {case}"
+        );
+        assert_eq!(state.state(), State::Stopped);
+    }
+}
+#[test]
+fn run_baseline_owner_preimage_config_and_identity_are_not_verdicts() {
+    for case in 0..5 {
+        let mut o = Injected::new();
+        match case {
+            0 => o.before.files[0].owner = "admin".into(),
+            1 => o.before.complete = None,
+            2 => {
+                o.before
+                    .files
+                    .iter_mut()
+                    .find(|f| f.path == "Logo.tsx")
+                    .unwrap()
+                    .bytes[0] ^= 1
+            }
+            3 => {
+                o.before
+                    .files
+                    .iter_mut()
+                    .find(|f| f.path == ".git/config")
+                    .unwrap()
+                    .bytes = b"[protocol]\nallow = always\n".to_vec()
+            }
+            _ => o.before.files[0].identity = "replacement root".into(),
+        }
+        let state = RunState::new().unwrap();
+        let result = run(&mut o, state.clone(), "INJECTED");
+        assert!(!result.success && !o.cas);
+        assert_eq!(state.state(), State::Stopped);
+        assert!(!o.calls.iter().any(|s| s == "assign-query-resume"));
+    }
+}
+#[test]
+fn run_accepts_attributed_descendant_overwrite_only() {
+    let mut o = Injected::new();
+    let child = ProcessIdentity {
+        pid: 18,
+        created: 2,
+    };
+    o.observation.tree.descendants.push(ProcessEdge {
+        process: child.clone(),
+        parent: injected_target(),
+    });
+    o.observation.tree.writes[0].process = child;
+    assert!(run(&mut o, RunState::new().unwrap(), "INJECTED").success);
+}
+#[test]
+fn run_requires_complete_job_stop_receipt() {
+    for case in 0..6 {
+        let mut o = Injected::new();
+        match case {
+            0 => o.job.flags = Some(0x2008),
+            1 => o.job.flags = None,
+            2 => o.job.direct_exited = Some(false),
+            3 => o.job.direct_exited = None,
+            4 => o.job.error = Some(StopError::QueryFailed),
+            _ => o.fail = "job-zero",
+        }
+        let state = RunState::new().unwrap();
+        let r = run(&mut o, state.clone(), "INJECTED");
+        assert!(!r.success && !r.cas_started && !o.cas);
+        assert_eq!(state.state(), State::Stopped);
+        assert_eq!(r.job_active, None);
+    }
+}
+#[test]
+fn expired_uncontended_request_is_denied_in_ledger_not_lock_fault() {
+    let s = open();
+    assert!(s.admit("expired", false, Instant::now()).is_err());
+    let l = s.ledger.lock().unwrap();
+    assert_eq!(
+        (l.budget.received, l.budget.denied, l.budget.admitted),
+        (1, 1, 0)
+    );
+    assert_eq!(l.budget.fault_snapshot().unledgered_received, Some(0));
+    assert_eq!(s.state(), State::Stopped);
+}
+#[test]
+fn expired_contended_request_is_unledgered_fault() {
+    let s = open();
+    let held = s.ledger.lock().unwrap();
+    let c = s.clone();
+    assert!(
+        std::thread::spawn(move || c.admit("blocked", false, Instant::now()))
+            .join()
+            .unwrap()
+            .is_err()
+    );
+    drop(held);
+    let l = s.ledger.lock().unwrap();
+    assert_eq!(l.budget.received, 0);
+    assert_eq!(l.budget.fault_snapshot().unledgered_received, Some(1));
+    assert_eq!(s.state(), State::Stopped);
+}
+#[test]
+fn authentication_failures_close_without_tickets_or_nonce_logs() {
+    let original = request(false);
+    let text = String::from_utf8(original).unwrap();
+    for case in 0..4 {
+        let s = open();
+        let broker = Broker::new(s.clone(), super::opencode_broker::INJECTED_NONCE).unwrap();
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("Authorization:"))
+            .unwrap();
+        let raw = match case {
+            0 => text.replace(&format!("{line}\r\n"), ""),
+            1 => text.replace(
+                line,
+                "Authorization: Bearer different-invalid-authentication-value",
+            ),
+            2 => text.replace(line, &format!("{line}\r\n{line}")),
+            _ => {
+                let mut altered = line.as_bytes().to_vec();
+                let last = altered.len() - 1;
+                altered[last] = if altered[last] == b'x' { b'y' } else { b'x' };
+                text.replace(line, std::str::from_utf8(&altered).unwrap())
+            }
+        };
+        let err = broker.request(raw.as_bytes(), deadline()).unwrap_err();
+        assert_eq!(err, "authentication rejected");
+        let snapshot = s.snapshot(deadline()).unwrap();
+        assert_eq!(snapshot["read_ticket"], false);
+        assert_eq!(snapshot["edit_ticket"], false);
+        let l = s.ledger.lock().unwrap();
+        assert_eq!(
+            (l.budget.received, l.budget.denied, l.budget.admitted),
+            (1, 1, 0)
+        );
+        assert!(l.budget.attempts.is_empty());
+        assert_eq!(s.state(), State::Stopped);
+    }
+    assert!(Broker::new(RunState::new().unwrap(), b"UNPREPARED_RUN_NONCE").is_err());
+}
+#[test]
+fn git_root_identity_unknown_or_replaced_is_not_same_root() {
+    let p = injected_preflight();
+    let mut r = injected_git();
+    git_preflight(&r, &p.fixture.sid, &p.fixture.git_images, &p.fixture.root).unwrap();
+    for id in [None, Some("other-file-id".into())] {
+        r.root_identity = id;
+        assert!(git_preflight(&r, &p.fixture.sid, &p.fixture.git_images, &p.fixture.root).is_err());
+    }
+}
+#[test]
+fn suspended_failure_cleanup_has_bounded_exit_receipt() {
+    for fail in ["assign", "query"] {
+        let mut c = Child {
+            fail,
+            flags: 0x2000,
+            active: 1,
+            exit: true,
+            ..Default::default()
+        };
+        let e = launch_verified_until(&mut c, deadline()).unwrap_err();
+        assert!(e.direct_cleanup_confirmed());
+        assert!(!e.resume_attempted);
+        assert!(!c.calls.contains(&"resume"));
+    }
+    for fail in ["terminate-direct", "exit", ""] {
+        let mut c = Child {
+            fail,
+            flags: 0,
+            active: 1,
+            exit: false,
+            ..Default::default()
+        };
+        let e =
+            launch_verified_until(&mut c, Instant::now() + Duration::from_millis(3)).unwrap_err();
+        assert!(!e.direct_cleanup_confirmed());
+        assert!(!e.resume_attempted);
+        assert!(!c.calls.contains(&"resume"));
+        assert!(e.cleanup.unwrap().error.is_some());
+    }
+}
+
+/// mode 0/1 deterministically establish both legal orders; mode 2 releases a real race.
+fn barrier_stop_decision(
+    s: Arc<RunState>,
+    mode: u8,
+    decision: impl FnOnce(Arc<RunState>) -> bool + Send + 'static,
+) -> bool {
+    use std::sync::Barrier;
+    let start = Arc::new(Barrier::new(3));
+    let order = Arc::new(Barrier::new(2));
+    let a = s.clone();
+    let first = start.clone();
+    let handoff = order.clone();
+    let d = std::thread::spawn(move || {
+        first.wait();
+        if mode == 1 {
+            handoff.wait();
+        }
+        let result = decision(a);
+        if mode == 0 {
+            handoff.wait();
+        }
+        result
+    });
+    let first = start.clone();
+    let handoff = order.clone();
+    let stop = std::thread::spawn(move || {
+        first.wait();
+        if mode == 0 {
+            handoff.wait();
+        }
+        s.stop();
+        if mode == 1 {
+            handoff.wait();
+        }
+    });
+    start.wait();
+    let result = d.join().unwrap();
+    stop.join().unwrap();
+    result
+}
+#[test]
+fn barrier_open_stop_validates_both_linearizations_and_no_second_open() {
+    for mode in 0..3 {
+        let s = RunState::new().unwrap();
+        let won = barrier_stop_decision(s.clone(), mode, |s| s.open_once(true).is_ok());
+        if mode != 2 {
+            assert_eq!(won, mode == 0);
+        }
+        let l = s.ledger.lock().unwrap();
+        assert_eq!((l.budget.received, l.budget.admitted), (0, 0));
+        drop(l);
+        assert_eq!(s.state(), State::Stopped);
+        assert!(s.open_once(true).is_err());
+        assert!(s.prompt_once(deadline()).is_err());
+    }
+}
+#[test]
+fn barrier_prompt_stop_matches_persisted_decision_receipt() {
+    for mode in 0..3 {
+        let s = RunState::new().unwrap();
+        s.open_once(true).unwrap();
+        let won = barrier_stop_decision(s.clone(), mode, |s| {
+            s.prompt_once(Instant::now() + Duration::from_secs(1))
+                .is_ok()
+        });
+        if mode != 2 {
+            assert_eq!(won, mode == 0);
+        }
+        let snapshot = s.snapshot(deadline()).unwrap();
+        assert_eq!(snapshot["prompt_attempted"], won);
+        assert_eq!(snapshot["ledger"]["received"], 0);
+        assert_eq!(s.state(), State::Stopped);
+        assert!(s.prompt_once(deadline()).is_err());
+        assert!(s.open_once(true).is_err());
+        assert_eq!(s.snapshot(deadline()).unwrap()["prompt_attempted"], won);
+    }
+}
+#[test]
+fn barrier_admit_stop_retains_exact_decision_and_denial_counts() {
+    for mode in 0..3 {
+        let s = open();
+        let admitted = barrier_stop_decision(s.clone(), mode, |s| {
+            s.admit("race", false, Instant::now() + Duration::from_secs(1))
+                .is_ok()
+        });
+        if mode != 2 {
+            assert_eq!(admitted, mode == 0);
+        }
+        {
+            let l = s.ledger.lock().unwrap();
+            assert_eq!(l.budget.received, 1);
+            assert_eq!(l.budget.admitted, u32::from(admitted));
+            assert_eq!(l.budget.denied, u32::from(!admitted));
+            assert_eq!(l.budget.attempts.contains_key("race"), admitted);
+            assert_eq!(l.budget.fault_snapshot().unledgered_received, Some(0));
+        }
+        if admitted {
+            s.settle_injected("race", Some(1), deadline()).unwrap();
+        }
+        assert!(s.admit("late", false, deadline()).is_err());
+        assert!(s.open_once(true).is_err());
+        let l = s.ledger.lock().unwrap();
+        assert_eq!(l.budget.received, 2);
+        assert_eq!(l.budget.admitted, u32::from(admitted));
+        assert_eq!(l.budget.denied, 2 - u32::from(admitted));
+        if admitted {
+            assert!(l.budget.attempts["race"].settled);
+        }
+        assert_eq!(s.state(), State::Stopped);
+    }
+}
+#[test]
+fn authenticated_expired_http_is_normal_denial_not_lock_fault() {
+    let s = open();
+    let b = Broker::new(s.clone(), super::opencode_broker::INJECTED_NONCE).unwrap();
+    assert!(b.request(&request(false), Instant::now()).is_err());
+    let l = s.ledger.lock().unwrap();
+    assert_eq!(
+        (l.budget.received, l.budget.denied, l.budget.admitted),
+        (1, 1, 0)
+    );
+    assert_eq!(l.budget.fault_snapshot().unledgered_received, Some(0));
+}
+
+#[test]
+fn late_git_or_snapshot_receipt_never_starts_opencode() {
+    for stage in ["git-preflight", "tree-before"] {
+        let mut o = Injected::new();
+        o.late = stage;
+        let state = RunState::new().unwrap();
+        let r = run(&mut o, state.clone(), "INJECTED");
+        assert!(!r.success && !o.cas);
+        assert_eq!(state.state(), State::Stopped);
+        assert!(!o.calls.iter().any(|s| s == "assign-query-resume"));
+    }
+}
+#[test]
+fn run_rejects_frozen_git_config_manifest_mismatch() {
+    let mut o = Injected::new();
+    o.pre.fixture.git_config_sha256 = super::hash(b"unapproved configuration");
+    let state = RunState::new().unwrap();
+    assert!(!run(&mut o, state.clone(), "INJECTED").success);
+    assert!(!o.cas);
+    assert_eq!(state.state(), State::Stopped);
+    assert!(!o.calls.iter().any(|s| s == "capture"));
+}
+#[test]
+fn run_rejects_unknown_or_impossible_write_ancestry() {
+    for case in 0..3 {
+        let mut o = Injected::new();
+        let child = ProcessIdentity {
+            pid: 18,
+            created: 2,
+        };
+        let parent = match case {
+            0 => ProcessIdentity {
+                pid: 99,
+                created: 1,
+            },
+            1 => ProcessIdentity {
+                pid: 18,
+                created: 1,
+            },
+            _ => ProcessIdentity {
+                pid: 17,
+                created: 3,
+            },
+        };
+        o.observation.tree.descendants.push(ProcessEdge {
+            process: child.clone(),
+            parent,
+        });
+        o.observation.tree.writes[0].process = child;
+        let state = RunState::new().unwrap();
+        assert!(!run(&mut o, state.clone(), "INJECTED").success);
+        assert!(!o.cas);
+        assert_eq!(state.state(), State::Stopped);
+    }
 }

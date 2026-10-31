@@ -2,8 +2,32 @@ use super::{opencode_gate::RunState, Result};
 use std::{sync::Arc, time::Instant};
 pub struct Broker {
     pub state: Arc<RunState>,
+    nonce_len: usize,
+    auth_key: ring::hmac::Key,
+    nonce_tag: ring::hmac::Tag,
+}
+// Public test stimulus only, never a production default or prepared run credential.
+pub(super) const INJECTED_NONCE: &[u8] = b"injected-not-a-real-run-credential-0001";
+fn valid_nonce(n: &[u8]) -> bool {
+    (32..=128).contains(&n.len())
+        && n.iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
 }
 impl Broker {
+    pub fn new(state: Arc<RunState>, nonce: &[u8]) -> Result<Self> {
+        if !valid_nonce(nonce) {
+            return Err("run authentication not prepared".into());
+        }
+        // ring::hmac::verify compares fixed-size tags in constant time. Raw nonce is not retained.
+        let auth_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"Nova-M0B-auth-compare-v1");
+        let nonce_tag = ring::hmac::sign(&auth_key, nonce);
+        Ok(Self {
+            state,
+            nonce_len: nonce.len(),
+            auth_key,
+            nonce_tag,
+        })
+    }
     pub fn request(&self, raw: &[u8], deadline: Instant) -> Result<Vec<u8>> {
         let parsed = (|| -> Result<serde_json::Value> {
             let split = raw
@@ -21,15 +45,32 @@ impl Broker {
                 return Err("fixed route".into());
             }
             let mut lengths = Vec::new();
+            let mut authorization = Vec::new();
             for line in lines {
                 let (k, v) = line.split_once(':').ok_or("header syntax")?;
                 if k.eq_ignore_ascii_case("transfer-encoding") {
                     self.state.stop();
                     return Err("transfer encoding".into());
                 }
+                if k.eq_ignore_ascii_case("authorization") {
+                    authorization.push(v.trim());
+                }
                 if k.eq_ignore_ascii_case("content-length") {
                     lengths.push(v.trim().parse::<usize>().map_err(|_| "content length")?)
                 }
+            }
+            if authorization.len() != 1 {
+                return Err("authentication rejected".into());
+            }
+            let supplied = authorization[0]
+                .strip_prefix("Bearer ")
+                .ok_or("authentication rejected")?
+                .as_bytes();
+            if supplied.len() != self.nonce_len
+                || !valid_nonce(supplied)
+                || ring::hmac::verify(&self.auth_key, supplied, self.nonce_tag.as_ref()).is_err()
+            {
+                return Err("authentication rejected".into());
             }
             if lengths != [raw.len() - split - 4] {
                 self.state.stop();
@@ -167,7 +208,10 @@ pub fn read_bounded(
 }
 
 /// Fixed pure mock stimulus, not a configurable target or provider interface.
-pub fn fixed_request(edit: bool) -> Vec<u8> {
+pub fn fixed_request(edit: bool, nonce: &[u8]) -> Result<Vec<u8>> {
+    if !valid_nonce(nonce) {
+        return Err("mock authentication input invalid".into());
+    }
     let tools = serde_json::json!([
         {"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"filePath":{"type":"string"}}}}},
         {"type":"function","function":{"name":"edit","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"oldString":{"type":"string"},"newString":{"type":"string"},"replaceAll":{"type":"boolean"}}}}}
@@ -178,12 +222,10 @@ pub fn fixed_request(edit: bool) -> Vec<u8> {
         serde_json::json!([{"role":"user","content":"fixed task"}])
     };
     let b=serde_json::json!({"model":"nova_t1_fixture","stream":true,"tools":tools,"messages":messages}).to_string();
-    format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
-        b.len(),
-        b
-    )
-    .into_bytes()
+    Ok(format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n{}",
+        std::str::from_utf8(nonce).map_err(|_|"mock nonce encoding")?, b.len(), b
+    ).into_bytes())
 }
 
 /// Native socket boundary, compiled only in this pack; tests never call bind/serve.

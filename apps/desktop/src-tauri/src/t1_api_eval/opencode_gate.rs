@@ -98,14 +98,24 @@ impl RunState {
         }
     }
     fn request_lock(&self, deadline: Instant) -> Result<MutexGuard<'_, Ledger>> {
-        self.lock(deadline).map_err(|error| {
-            self.fault.record_unledgered(if error.contains("poisoned") {
-                FaultKind::Poisoned
-            } else {
-                FaultKind::LockDeadline
-            });
-            error
-        })
+        loop {
+            match self.ledger.try_lock() {
+                Ok(g) => return Ok(g),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.stop();
+                    self.fault.record_unledgered(FaultKind::Poisoned);
+                    return Err("ledger poisoned; request unledgered".into());
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        self.stop();
+                        self.fault.record_unledgered(FaultKind::LockDeadline);
+                        return Err("contended ledger deadline; request unledgered".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
     }
     pub fn prompt_once(&self, deadline: Instant) -> Result<()> {
         let mut g = self.lock(deadline)?;
@@ -139,7 +149,8 @@ impl RunState {
     pub fn admit(&self, id: &str, edit: bool, deadline: Instant) -> Result<()> {
         loop {
             let mut g = self.request_lock(deadline)?;
-            if self.state() != State::Open
+            if Instant::now() >= deadline
+                || self.state() != State::Open
                 || self.fault.is_closed()
                 || !g.prompt
                 || (!edit && g.read)
@@ -184,7 +195,7 @@ impl RunState {
     pub fn snapshot(&self, deadline: Instant) -> Result<serde_json::Value> {
         let g = self.lock(deadline)?;
         Ok(
-            serde_json::json!({"state":format!("{:?}",self.state()),"ledger":g.budget,"usage_source":"INJECTED","native_facts_verified":false}),
+            serde_json::json!({"state":format!("{:?}",self.state()),"ledger":g.budget,"usage_source":"INJECTED","native_facts_verified":false,"prompt_attempted":g.prompt,"read_ticket":g.read,"edit_ticket":g.edit}),
         )
     }
     pub fn proposal_ready(&self, deadline: Instant) -> Result<()> {

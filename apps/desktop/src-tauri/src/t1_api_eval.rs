@@ -4,6 +4,13 @@ pub mod cas;
 pub mod contract;
 pub mod journal;
 pub mod transport;
+pub mod opencode_gate;
+pub mod opencode_paths;
+pub mod opencode_protocol;
+pub mod opencode_broker;
+pub mod opencode_probe;
+#[cfg(test)]
+mod opencode_probe_tests;
 
 use ring::digest::{digest, SHA256};
 use std::path::Path;

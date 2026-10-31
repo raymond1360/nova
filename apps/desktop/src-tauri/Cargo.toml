@@ -30,6 +30,11 @@ path = "tests/fixtures/t1_api_agent_main.rs"
 required-features = ["t1-api-eval"]
 
 [[bin]]
+name = "nova_t1_m0b_offline"
+path = "tests/fixtures/t1_m0b_offline_main.rs"
+required-features = ["t1-api-eval"]
+
+[[bin]]
 name = "nova_test_helper"
 path = "tests/fixtures/nova_test_helper.rs"
 required-features = ["nova-test-helper"]

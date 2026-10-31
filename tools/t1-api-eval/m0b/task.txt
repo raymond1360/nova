@@ -1,0 +1,1 @@
+In the existing Logo.tsx file, change only the logo alternative text to Northstar Studio logo. Preserve all other bytes and behavior. Read the file first. Request exactly one bounded edit proposal; do not run commands, access other files or use the network. Nova will reject the Agent write and independently validate and apply the proposal.

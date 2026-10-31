@@ -1,0 +1,37 @@
+{
+  "schema": "nova-m0b-resource-policy-v1",
+  "prepared": false,
+  "execution_authorized": false,
+  "root": "C:\\NovaM0B\\run\\project",
+  "input": "D:\\NovaM0BInput",
+  "probe_sid": null,
+  "root_commit": null,
+  "controller_sha256": null,
+  "resources": {
+    "opencode": null,
+    "rg": null,
+    "git": null,
+    "git_children": null,
+    "plugin_closure": null,
+    "fixture": null,
+    "node": null
+  },
+  "facility_receipt": null,
+  "required_observation": [
+    "process-tree",
+    "file-writes-including-ADS",
+    "network-attempts",
+    "loss-known-zero"
+  ],
+  "git_opencode": {
+    "attributes": 32,
+    "content": "root_commit_ascii_no_newline",
+    "only_same_bytes_timestamps": true
+  },
+  "target_ms": 120000,
+  "capture_ms": 180000,
+  "export_ms": 15000,
+  "cas_ms": 30000,
+  "cleanup_ms": 10000,
+  "outer_ms": 240000
+}

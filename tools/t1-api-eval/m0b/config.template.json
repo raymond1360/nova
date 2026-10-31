@@ -1,0 +1,58 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "nova/nova_t1_fixture",
+  "small_model": "nova/nova_t1_fixture",
+  "autoupdate": false,
+  "share": "disabled",
+  "plugin": [],
+  "mcp": {},
+  "lsp": false,
+  "formatter": false,
+  "snapshot": false,
+  "permission": {
+    "*": "deny",
+    "read": "ask",
+    "edit": "ask",
+    "external_directory": "deny"
+  },
+  "experimental": {
+    "continue_loop_on_deny": false
+  },
+  "provider": {
+    "nova": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Nova loopback mock",
+      "options": {
+        "baseURL": "http://127.0.0.1:UNPREPARED/v1",
+        "apiKey": "UNPREPARED_RUN_NONCE"
+      },
+      "models": {
+        "nova_t1_fixture": {
+          "name": "fixed offline mock"
+        }
+      }
+    }
+  },
+  "instructions": [],
+  "skills": {
+    "paths": [],
+    "urls": []
+  },
+  "agent": {
+    "nova_probe": {
+      "mode": "primary",
+      "permission": {
+        "*": "deny",
+        "read": {
+          "*": "deny",
+          "Logo.tsx": "ask"
+        },
+        "edit": {
+          "*": "deny",
+          "Logo.tsx": "ask"
+        }
+      }
+    }
+  },
+  "default_agent": "nova_probe"
+}

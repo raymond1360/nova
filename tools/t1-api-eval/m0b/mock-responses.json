@@ -1,0 +1,18 @@
+{
+  "schema": "nova-m0b-injected-responses-v1",
+  "source": "INJECTED",
+  "model": "nova_t1_fixture",
+  "read": {
+    "filePath": "C:\\NovaM0B\\run\\project\\Logo.tsx"
+  },
+  "edit": {
+    "filePath": "C:\\NovaM0B\\run\\project\\Logo.tsx",
+    "oldString": "alt=\"Payload Logo\"",
+    "newString": "alt=\"Northstar Studio logo\"",
+    "replaceAll": false
+  },
+  "usage": {
+    "source": "INJECTED_NOT_TOKEN_MEASUREMENT",
+    "total_tokens": 1
+  }
+}

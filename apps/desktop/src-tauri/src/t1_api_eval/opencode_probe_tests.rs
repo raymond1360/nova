@@ -292,6 +292,8 @@ fn timeline_order_and_late_api() {
 fn resource_unknown_loss_blocks() {
     let p = Preflight {
         resources_prepared: true,
+        parent_policy_flags: Some(0),
+        standard_probe_account: true,
         owner_verified: true,
         git_images_verified: true,
         git_root_verified: true,
@@ -353,6 +355,8 @@ impl Ops for Injected {
         self.call("preflight")?;
         Ok(Preflight {
             resources_prepared: true,
+            parent_policy_flags: Some(0),
+            standard_probe_account: true,
             owner_verified: true,
             git_images_verified: true,
             git_root_verified: true,
@@ -1014,4 +1018,61 @@ fn failure_in_one_run_does_not_pollute_fresh_scope() {
     let fresh = open();
     assert!(fresh.admit("r", false, deadline()).is_ok());
     assert_eq!(old.state(), State::Stopped);
+}
+
+#[test]
+fn parent_policy_unknown_or_any_nonzero_bit_blocks_preflight() {
+    let good = Preflight {
+        parent_policy_flags: Some(0),
+        standard_probe_account: true,
+        resources_prepared: true,
+        owner_verified: true,
+        git_images_verified: true,
+        git_root_verified: true,
+        capture_exclusive: true,
+        observation_complete: true,
+        loss: Some(0),
+    };
+    good.validate().unwrap();
+    for flags in [None, Some(1), Some(2), Some(0x80000000)] {
+        let mut p = good.clone();
+        p.parent_policy_flags = flags;
+        assert!(p.validate().is_err());
+    }
+    let mut p = good;
+    p.standard_probe_account = false;
+    assert!(p.validate().is_err());
+}
+
+#[test]
+fn owned_job_handle_closes_once_on_move_and_unwind_without_zero_claim() {
+    use std::sync::Mutex;
+    let closed = Arc::new(Mutex::new(Vec::new()));
+    let c = closed.clone();
+    let h = JobHandle::new(17u32, move |v| c.lock().unwrap().push(v));
+    let moved = h;
+    assert!(closed.lock().unwrap().is_empty());
+    drop(moved);
+    assert_eq!(*closed.lock().unwrap(), vec![17]);
+    let c = closed.clone();
+    let _ = std::panic::catch_unwind(move || {
+        let _h = JobHandle::new(18u32, move |v| c.lock().unwrap().push(v));
+        panic!("INJECTED unwind");
+    });
+    assert_eq!(*closed.lock().unwrap(), vec![17, 18]);
+    // Close is resource ownership only; it never supplies ActiveProcesses==0.
+}
+#[test]
+fn poisoned_ledger_never_reopens_and_records_unledgered_request() {
+    let s = open();
+    let c = s.clone();
+    let _ = std::thread::spawn(move || {
+        let _held = c.ledger.lock().unwrap();
+        panic!("INJECTED poison");
+    })
+    .join();
+    assert!(s.admit("x", false, deadline()).is_err());
+    assert_eq!(s.state(), State::Stopped);
+    assert!(s.open_once(true).is_err());
+    assert!(s.snapshot(deadline()).is_err());
 }

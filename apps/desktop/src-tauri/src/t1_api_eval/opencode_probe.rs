@@ -39,6 +39,8 @@ pub fn resource_admission(text: &str) -> Result<()> {
 #[serde(deny_unknown_fields)]
 pub struct Preflight {
     pub resources_prepared: bool,
+    pub parent_policy_flags: Option<u32>,
+    pub standard_probe_account: bool,
     pub owner_verified: bool,
     pub git_images_verified: bool,
     pub git_root_verified: bool,
@@ -48,7 +50,9 @@ pub struct Preflight {
 }
 impl Preflight {
     pub fn validate(&self) -> Result<()> {
-        if !self.resources_prepared
+        if self.parent_policy_flags != Some(0)
+            || !self.standard_probe_account
+            || !self.resources_prepared
             || !self.owner_verified
             || !self.git_images_verified
             || !self.git_root_verified
@@ -402,6 +406,8 @@ pub fn mock_self_test() -> Result<serde_json::Value> {
         fn preflight(&mut self) -> Result<Preflight> {
             Ok(Preflight {
                 resources_prepared: true,
+                parent_policy_flags: Some(0),
+                standard_probe_account: true,
                 owner_verified: true,
                 git_images_verified: true,
                 git_root_verified: true,
@@ -661,6 +667,29 @@ pub fn record<S: EvidenceSink>(s: &mut S, label: &str, bytes: &[u8], nonce: &[u8
     }
     s.flush()
 }
+/// Single ownership mechanism shared by the compiled native Job and pure close tests.
+pub(super) struct JobHandle<H, C: FnMut(H)> {
+    value: Option<H>,
+    close: C,
+}
+impl<H, C: FnMut(H)> JobHandle<H, C> {
+    pub(super) fn new(value: H, close: C) -> Self {
+        Self {
+            value: Some(value),
+            close,
+        }
+    }
+    fn get(&self) -> &H {
+        self.value.as_ref().expect("owned Job handle")
+    }
+}
+impl<H, C: FnMut(H)> Drop for JobHandle<H, C> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            (self.close)(value);
+        }
+    }
+}
 #[cfg(windows)]
 pub mod native {
     use super::Result;
@@ -668,7 +697,12 @@ pub mod native {
         Foundation::{CloseHandle, HANDLE},
         System::JobObjects::*,
     };
-    pub struct ProbeJob(HANDLE);
+    pub struct ProbeJob(super::JobHandle<HANDLE, fn(HANDLE)>);
+    fn close_native(h: HANDLE) {
+        unsafe {
+            CloseHandle(h);
+        }
+    }
     impl ProbeJob {
         pub fn new() -> Result<Self> {
             unsafe {
@@ -676,7 +710,7 @@ pub mod native {
                 if h.is_null() {
                     return Err(std::io::Error::last_os_error().to_string());
                 }
-                let own = Self(h);
+                let own = Self(super::JobHandle::new(h, close_native as fn(HANDLE)));
                 let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
                 info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
                 if SetInformationJobObject(
@@ -699,7 +733,7 @@ pub mod native {
                 let mut e: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
                 let mut n = 0;
                 if QueryInformationJobObject(
-                    self.0,
+                    *self.0.get(),
                     JobObjectExtendedLimitInformation,
                     &mut e as *mut _ as _,
                     std::mem::size_of_val(&e) as u32,
@@ -719,7 +753,7 @@ pub mod native {
                 }
                 let mut a: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
                 if QueryInformationJobObject(
-                    self.0,
+                    *self.0.get(),
                     JobObjectBasicAccountingInformation,
                     &mut a as *mut _ as _,
                     std::mem::size_of_val(&a) as u32,
@@ -740,11 +774,11 @@ pub mod native {
         /// Borrowed process handle: caller retains ownership; assignment never resumes it.
         pub fn assign(&self, process: HANDLE) -> Result<()> {
             unsafe {
-                if AssignProcessToJobObject(self.0, process) == 0 {
+                if AssignProcessToJobObject(*self.0.get(), process) == 0 {
                     return Err(std::io::Error::last_os_error().to_string());
                 }
                 let mut member = 0;
-                if IsProcessInJob(process, self.0, &mut member) == 0
+                if IsProcessInJob(process, *self.0.get(), &mut member) == 0
                     || member == 0
                     || self.query()? != 1
                 {
@@ -755,18 +789,11 @@ pub mod native {
         }
         pub fn terminate(&self) -> Result<()> {
             unsafe {
-                if TerminateJobObject(self.0, 1) == 0 {
+                if TerminateJobObject(*self.0.get(), 1) == 0 {
                     Err(std::io::Error::last_os_error().to_string())
                 } else {
                     Ok(())
                 }
-            }
-        }
-    }
-    impl Drop for ProbeJob {
-        fn drop(&mut self) {
-            unsafe {
-                CloseHandle(self.0);
             }
         }
     }

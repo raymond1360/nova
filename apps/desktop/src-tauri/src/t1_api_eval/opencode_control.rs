@@ -363,23 +363,62 @@ pub(super) fn event(v: Value, session: Option<&Id>) -> Result<Event> {
             id: Id::parse(p["requestID"].as_str().ok_or("reply id")?)?.0,
             reply: p["reply"].as_str().ok_or("reply kind")?.into(),
         },
+        // Locked 148842ef, schema/src/v1/session.ts blob
+        // 75e9282f117cb25078b087661434fcf5e6660620:81-85,233-256,613-649.
+        // processor.ts 9f8530929c154a3718b135bd481d7e2e492cb7ff:424-470
+        // publishes step parts; 498-521 publishes text then delta. Outer PartUpdated
+        // has sessionID/part/time, NOT an outer messageID (schema:613-623).
         "message.part.updated" => {
+            s()?;
             let part = &p["part"];
-            if part["type"] != "tool" {
-                if !["text", "reasoning"].contains(&part["type"].as_str().unwrap_or(""))
-                    || part["sessionID"].as_str() != session.map(|s| s.0.as_str())
-                    || Id::parse(part["messageID"].as_str().ok_or("part message")?).is_err()
-                    || !part["text"].is_string()
+            if part["sessionID"].as_str() != session.map(|s| s.0.as_str())
+                || !wire_id(&part["messageID"], "msg")
+                || !wire_id(&part["id"], "prt")
+                || !finite(&p["time"])
+            {
+                return Err("part envelope schema".into());
+            }
+            match part["type"].as_str() {
+                Some("tool") => Event::Part(wire::tool_wire(part)?),
+                Some("text" | "reasoning") if part["text"].is_string() => Event::Ignored,
+                Some("step-start") if optional_string(part, "snapshot") => Event::Ignored,
+                Some("step-finish")
+                    if part["reason"].is_string()
+                        && optional_string(part, "snapshot")
+                        && finite(&part["cost"])
+                        && valid_step_tokens(&part["tokens"]) =>
                 {
-                    return Err("unexpected non-tool part".into());
+                    Event::Ignored
                 }
-                return Ok(Event::Ignored);
+                // patch/snapshot/file/agent/subtask/compaction/retry are NOT approved.
+                _ => return Err("unapproved or invalid part schema".into()),
             }
-            let t = wire::tool_wire(part)?;
-            if session.is_none_or(|s| s.0 != t.session_id) {
-                return Err("foreign part".into());
+        }
+        // session.ts a2a91cd47b5e854606444d1fc09fb18515fbe3b7:877-884;
+        // processor.ts:287-305,498-521; schema/v1/session.ts:632-641.
+        // Delta is display-only: do not require a previously observed PartID.
+        // The locked publisher orders start before delta, but subscription begins
+        // at an arbitrary point; prior-part inventory is not an upstream guarantee.
+        "message.part.delta" => {
+            s()?;
+            if !wire_id(&p["messageID"], "msg")
+                || !wire_id(&p["partID"], "prt")
+                || p["field"] != "text"
+                || !p["delta"].is_string()
+            {
+                return Err("part delta schema".into());
             }
-            Event::Part(t)
+            Event::Ignored
+        }
+        // summary.ts 6484730d0bd526289febe26014229c83f20f93b9:114:
+        // diff=[] is published even before snapshot:false early return.
+        "session.diff" => {
+            s()?;
+            if p["diff"].as_array().is_none_or(|diff| !diff.is_empty()) {
+                // A refusal signal, NOT a final proof of any on-disk mutation.
+                return Err("nonempty or invalid session diff".into());
+            }
+            Event::Ignored
         }
         "session.idle" => Event::Idle(s()?),
         "session.status" => {
@@ -417,6 +456,56 @@ pub(super) fn event(v: Value, session: Option<&Id>) -> Result<Event> {
         _ => return Err("unknown event type".into()),
     })
 }
+fn finite(value: &Value) -> bool {
+    value.as_f64().is_some_and(f64::is_finite)
+}
+fn wire_id(value: &Value, prefix: &str) -> bool {
+    value
+        .as_str()
+        .is_some_and(|id| id.starts_with(prefix) && Id::parse(id).is_ok())
+}
+fn optional_string(object: &Value, field: &str) -> bool {
+    object.get(field).is_none_or(Value::is_string)
+}
+fn valid_step_tokens(t: &Value) -> bool {
+    t.is_object()
+        && ["input", "output", "reasoning"]
+            .iter()
+            .all(|key| finite(&t[key]))
+        && t.get("total").is_none_or(finite)
+        && t["cache"].is_object()
+        && finite(&t["cache"]["read"])
+        && finite(&t["cache"]["write"])
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum PumpFault {
+    UnknownEvent,
+    Schema,
+    InstanceDisposed,
+    QueueFull,
+    ReceiverClosed,
+    Framing,
+    Transport,
+    Disconnected,
+    Timeout,
+    ReceiptPoisoned,
+}
+impl PumpFault {
+    fn label(self) -> &'static str {
+        match self {
+            Self::UnknownEvent => "event unknown type",
+            Self::Schema => "event schema rejected",
+            Self::InstanceDisposed => "instance disposed",
+            Self::QueueFull => "event queue bound",
+            Self::ReceiverClosed => "event receiver closed",
+            Self::Framing => "event framing/bound rejected",
+            Self::Transport => "event transport failure",
+            Self::Disconnected => "event disconnected",
+            Self::Timeout => "event deadline",
+            Self::ReceiptPoisoned => "event fault receipt poisoned",
+        }
+    }
+}
 pub struct ControlDriver<T: ControlTransport> {
     transport: Arc<T>,
     endpoint: Endpoint,
@@ -435,7 +524,7 @@ pub struct ControlDriver<T: ControlTransport> {
     previews: std::collections::BTreeSet<(String, String, String)>,
     deadline: Instant,
     phase_deadline: Instant,
-    pump_fault: Arc<Mutex<Option<String>>>,
+    pump_fault: Arc<Mutex<Option<PumpFault>>>,
 }
 impl<T: ControlTransport> Drop for ControlDriver<T> {
     fn drop(&mut self) {
@@ -478,6 +567,13 @@ impl<T: ControlTransport> ControlDriver<T> {
     pub(super) fn shorten_deadline(&mut self, duration: Duration) {
         self.deadline = self.deadline.min(Instant::now() + duration);
         self.phase_deadline = self.phase_deadline.min(self.deadline);
+    }
+    /// Fixed, sanitized terminal reason; does not expose raw event/transport text.
+    pub fn pump_failure(&self) -> Option<PumpFault> {
+        match self.pump_fault.lock() {
+            Ok(f) => *f,
+            Err(_) => Some(PumpFault::ReceiptPoisoned),
+        }
     }
     pub fn control_count(&self) -> u32 {
         self.budget.received
@@ -696,51 +792,51 @@ impl<T: ControlTransport> ControlDriver<T> {
         self.events = Some(rx);
         self.pump = Some(tokio::spawn(async move {
             let mut framing = EventStream::new();
-            let failure = loop {
+            let failure = 'pump: loop {
                 match until(d, async { Ok(stream.next().await) }).await {
                     Ok(Some(Ok(chunk))) => match framing.push(&chunk) {
                         Ok(values) => {
-                            let mut bad = false;
                             for v in values {
                                 match event(v.clone(), Some(&sid)) {
                                     Err(e) => {
-                                        state.stop();
-                                        let _ = tx.try_send(Err(e));
-                                        bad = true;
-                                        break;
+                                        break 'pump if e == "unknown event type" {
+                                            PumpFault::UnknownEvent
+                                        } else {
+                                            PumpFault::Schema
+                                        }
                                     }
-                                    Ok(Event::Disposed) => {
-                                        state.stop();
-                                        let _ = tx.try_send(Err("instance disposed".into()));
-                                        bad = true;
-                                        break;
-                                    }
+                                    Ok(Event::Disposed) => break 'pump PumpFault::InstanceDisposed,
                                     _ => {}
                                 }
-                                if tx.try_send(Ok(v)).is_err() {
-                                    bad = true;
-                                    break;
+                                match tx.try_send(Ok(v)) {
+                                    Ok(()) => {}
+                                    Err(mpsc::TrySendError::Full(_)) => {
+                                        break 'pump PumpFault::QueueFull
+                                    }
+                                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                                        break 'pump PumpFault::ReceiverClosed
+                                    }
                                 }
                             }
-                            if bad {
-                                break "event queue bound".to_string();
-                            }
                         }
-                        Err(e) => break e,
+                        Err(_) => break PumpFault::Framing,
                     },
-                    Ok(Some(Err(_))) => break "event transport failure".to_string(),
+                    Ok(Some(Err(_))) => break PumpFault::Transport,
                     Ok(None) => {
-                        let e = framing.end().err().unwrap_or("event disconnected".into());
-                        break e;
+                        break if framing.end().is_err() {
+                            PumpFault::Framing
+                        } else {
+                            PumpFault::Disconnected
+                        }
                     }
-                    Err(e) => break e,
+                    Err(_) => break PumpFault::Timeout,
                 }
             };
             state.stop();
             if let Ok(mut f) = fault.lock() {
-                *f = Some(failure.clone());
+                *f = Some(failure);
             }
-            let _ = tx.try_send(Err(failure));
+            let _ = tx.try_send(Err(failure.label().into()));
         }));
         match self.next(self.deadline).await? {
             Event::Connected => {}

@@ -43,14 +43,23 @@ fn secrets() -> RunSecrets {
 fn id(s: &str) -> Id {
     Id::parse(s).unwrap()
 }
-fn env(t: &str, p: Value) -> Vec<u8> {
+fn env(t: &str, mut p: Value) -> Vec<u8> {
+    // Every PartUpdated fixture uses the real outer sessionID/part/time envelope.
+    if t == "message.part.updated" && p.get("part").is_some() {
+        let session = p["part"]["sessionID"].clone();
+        p.as_object_mut()
+            .unwrap()
+            .entry("sessionID")
+            .or_insert(session);
+        p.as_object_mut().unwrap().entry("time").or_insert(json!(0));
+    }
     format!("data: {}\n\n", json!({"type":t,"properties":p})).into_bytes()
 }
 fn permission(edit: bool) -> Value {
     json!({"id":if edit{"per_edit"}else{"per_read"},"sessionID":"ses_fixed","permission":if edit{"edit"}else{"read"},"patterns":["Logo.tsx"],"metadata":if edit{json!({"filepath":TARGET})}else{json!({})},"always":[],"tool":{"messageID":if edit{"msg_edit"}else{"msg_read"},"callID":if edit{"call_edit"}else{"call_read"}}})
 }
 fn part(edit: bool, status: &str) -> Value {
-    json!({"type":"tool","id":"part_fixed","sessionID":"ses_fixed","messageID":if edit{"msg_edit"}else{"msg_read"},"callID":if edit{"call_edit"}else{"call_read"},"tool":if edit{"edit"}else{"read"},"state":{"status":status,"input":if edit{json!({"filePath":TARGET,"oldString":"alt=\"Payload Logo\"","newString":"alt=\"Northstar Studio logo\"","replaceAll":false})}else{json!({"filePath":TARGET})},"error":"The user rejected permission to use this specific tool call."}})
+    json!({"type":"tool","id":"prt_fixed","sessionID":"ses_fixed","messageID":if edit{"msg_edit"}else{"msg_read"},"callID":if edit{"call_edit"}else{"call_read"},"tool":if edit{"edit"}else{"read"},"state":{"status":status,"input":if edit{json!({"filePath":TARGET,"oldString":"alt=\"Payload Logo\"","newString":"alt=\"Northstar Studio logo\"","replaceAll":false})}else{json!({"filePath":TARGET})},"error":"The user rejected permission to use this specific tool call."}})
 }
 struct Scripted {
     tx: mpsc::Sender<Result<Vec<u8>>>,
@@ -75,6 +84,11 @@ struct Scripted {
     raw_error: bool,
     message_event: Option<Vec<u8>>,
     message_delay: Duration,
+    upstream_sequence: bool,
+    pause_http_until_stopped: bool,
+    injection: Option<Value>,
+    reader_released: Arc<AtomicUsize>,
+    sent: Arc<Mutex<Vec<String>>>,
 }
 impl Scripted {
     fn new(s: Arc<RunState>) -> Self {
@@ -104,9 +118,15 @@ impl Scripted {
             raw_error: false,
             message_event: None,
             message_delay: Duration::ZERO,
+            upstream_sequence: false,
+            pause_http_until_stopped: false,
+            injection: None,
+            reader_released: Arc::new(AtomicUsize::new(0)),
+            sent: Arc::new(Mutex::new(vec![])),
         }
     }
     fn send(&self, t: &str, p: Value) {
+        self.sent.lock().unwrap().push(event_label(t, &p));
         let _ = self.tx.send(Ok(env(t, p)));
     }
     fn model_request(&self, edit: bool) -> Vec<u8> {
@@ -173,6 +193,18 @@ impl ControlTransport for Scripted {
                         .broker
                         .request(&self.model_request(false), d)?
                         .starts_with(b"HTTP/1.1 200"));
+                    if self.upstream_sequence {
+                        for (t, p) in upstream_start(false) {
+                            self.send(&t, p);
+                        }
+                    }
+                    if let Some(v) = &self.injection {
+                        self.sent
+                            .lock()
+                            .unwrap()
+                            .push(event_label(v["type"].as_str().unwrap(), &v["properties"]));
+                        let _ = self.tx.send(Ok(format!("data: {v}\n\n").into_bytes()));
+                    }
                     self.send("permission.asked", permission(false));
                     Value::Null
                 }
@@ -188,7 +220,16 @@ impl ControlTransport for Scripted {
                     } else {
                         self.send("server.heartbeat", json!({}));
                     }
-                    tokio::time::sleep(Duration::from_millis(2) + self.message_delay).await;
+                    if self.pause_http_until_stopped {
+                        while self.broker.state.state() != State::Stopped {
+                            if Instant::now() >= d {
+                                return Err("injected synchronization deadline".into());
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(2) + self.message_delay).await;
+                    }
                     // The reader, not this awaiting HTTP dispatcher, consumed the frame.
                     assert!(self.emitted.load(Ordering::SeqCst) > before);
                     json!({"parts":[part(false,if pending{"pending"}else{"running"})]})
@@ -207,6 +248,8 @@ impl ControlTransport for Scripted {
                     let tx = self.tx.clone();
                     let results = self.model_results.clone();
                     let early = self.early_edit;
+                    let upstream = self.upstream_sequence;
+                    let sent = self.sent.clone();
                     // Independent broker thread starts BEFORE completed-read is emitted.
                     let (ready_tx, ready_rx) = mpsc::channel();
                     let h = std::thread::spawn(move || {
@@ -215,6 +258,18 @@ impl ControlTransport for Scripted {
                         let ok = result.is_ok_and(|v| v.starts_with(b"HTTP/1.1 200"));
                         results.lock().unwrap().push(ok);
                         if ok && !early {
+                            if upstream {
+                                for (t, p) in upstream_finish(false)
+                                    .into_iter()
+                                    .chain(upstream_start(true))
+                                {
+                                    sent.lock().unwrap().push(event_label(&t, &p));
+                                    let _ = tx.send(Ok(env(&t, p)));
+                                }
+                            }
+                            sent.lock()
+                                .unwrap()
+                                .push(event_label("permission.asked", &permission(true)));
                             let _ = tx.send(Ok(env("permission.asked", permission(true))));
                         }
                     });
@@ -231,8 +286,12 @@ impl ControlTransport for Scripted {
                     }
                     let tx = self.tx.clone();
                     let delay = self.delay;
+                    let sent = self.sent.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
+                        sent.lock()
+                            .unwrap()
+                            .push("message.part.updated/tool/read/completed".into());
                         let _ = tx.send(Ok(env(
                             "message.part.updated",
                             json!({"part":part(false,"completed")}),
@@ -249,6 +308,11 @@ impl ControlTransport for Scripted {
                     );
                     if !self.omit_error {
                         self.send("message.part.updated", json!({"part":part(true,"error")}));
+                    }
+                    if self.upstream_sequence {
+                        for (t, p) in upstream_finish(true) {
+                            self.send(&t, p);
+                        }
                     }
                     self.send(
                         "session.status",
@@ -282,18 +346,19 @@ impl ControlTransport for Scripted {
             let rx = self.rx.lock().unwrap().take().ok_or("event reopened")?;
             self.send("server.connected", json!({}));
             let count = self.emitted.clone();
+            let lease = ReaderLease(self.reader_released.clone());
             Ok(EventResponse {
                 status: self.event_status,
                 authenticate: self.event_challenge,
                 sse_content_type: self.event_sse,
                 stream: Box::pin(futures_util::stream::unfold(
-                    (rx, count),
-                    |(rx, c)| async move {
+                    (rx, count, lease),
+                    |(rx, c, lease)| async move {
                         loop {
                             match rx.try_recv() {
                                 Ok(v) => {
                                     c.fetch_add(1, Ordering::SeqCst);
-                                    return Some((v, (rx, c)));
+                                    return Some((v, (rx, c, lease)));
                                 }
                                 Err(mpsc::TryRecvError::Empty) => {
                                     tokio::time::sleep(Duration::from_millis(1)).await
@@ -328,8 +393,13 @@ struct Harness {
 }
 impl Harness {
     fn new() -> Self {
+        Self::configured(|_| {})
+    }
+    fn configured(configure: impl FnOnce(&mut Scripted)) -> Self {
         let s = RunState::new().unwrap();
-        let t = Arc::new(Scripted::new(s.clone()));
+        let mut scripted = Scripted::new(s.clone());
+        configure(&mut scripted);
+        let t = Arc::new(scripted);
         Self {
             runtime: rt(),
             driver: driver(t.clone(), s.clone(), limit()),
@@ -690,19 +760,6 @@ fn exhausted_reread_stops_and_aborts_once() {
     );
 }
 #[test]
-fn early_edit_model_wait_does_not_block_completed_read_events() {
-    let mut h = Harness::new();
-    assert!(h.run().success);
-    h.transport.join();
-    assert_eq!(*h.transport.model_results.lock().unwrap(), [true]);
-    assert!(h.driver.facts.read_reply.event_confirmed);
-    let l = h.state.ledger.lock().unwrap();
-    assert_eq!(
-        (l.budget.received, l.budget.admitted, l.budget.denied),
-        (2, 2, 0)
-    );
-}
-#[test]
 fn late_read_completion_refuses_and_accounts_no_deadlock() {
     let s = RunState::new().unwrap();
     let mut t = Scripted::new(s.clone());
@@ -800,6 +857,20 @@ fn unknown_and_disposed_events_stop_while_http_is_pending() {
         t.join();
         assert_eq!(s.state(), State::Stopped);
         assert!(d.confirm_idle().is_err());
+        assert!(!t
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(p, _)| p == "/permission/per_read/reply"));
+        assert_eq!(
+            d.pump_failure(),
+            Some(if kind == "unknown.type" {
+                PumpFault::UnknownEvent
+            } else {
+                PumpFault::InstanceDisposed
+            })
+        );
     }
 }
 #[test]
@@ -916,10 +987,20 @@ fn repeated_task_does_not_dispatch_second_prompt() {
 fn driver_drop_stops_state_and_cancels_single_reader() {
     let s = RunState::new().unwrap();
     let t = Arc::new(Scripted::new(s.clone()));
-    let mut d = driver(t, s.clone(), limit());
+    let released = t.reader_released.clone();
+    let mut d = driver(t, s.clone(), Instant::now() + Duration::from_secs(3600));
     let runtime = rt();
     runtime.block_on(d.prepare()).unwrap();
+    assert_eq!(released.load(Ordering::SeqCst), 0);
     drop(d);
+    runtime.block_on(async {
+        let end = limit();
+        while released.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < end);
+            tokio::task::yield_now().await;
+        }
+    });
+    assert_eq!(released.load(Ordering::SeqCst), 1);
     assert_eq!(s.state(), State::Stopped);
     assert!(s.open_once(true).is_err());
 }
@@ -1079,13 +1160,325 @@ fn consumed_tool_lifecycle_does_not_grant_extra_permission() {
     let sid = id("ses_fixed");
     assert!(matches!(
         event(
-            json!({"type":"message.part.updated","properties":{"part":part(false,"pending")}}),
+            json!({"type":"message.part.updated","properties":{"sessionID":"ses_fixed","time":0,"part":part(false,"pending")}}),
             Some(&sid)
         )
         .unwrap(),
         Event::Part(_)
     ));
-    assert!(matches!(event(json!({"type":"message.part.updated","properties":{"part":{"type":"text","sessionID":"ses_fixed","messageID":"msg_fixed","text":"bounded display only"}}}),Some(&sid)).unwrap(),Event::Ignored));
+    assert!(matches!(event(json!({"type":"message.part.updated","properties":{"sessionID":"ses_fixed","time":0,"part":{"id":"prt_text","type":"text","sessionID":"ses_fixed","messageID":"msg_fixed","text":"bounded display only"}}}),Some(&sid)).unwrap(),Event::Ignored));
     assert!(event(json!({"type":"message.part.updated","properties":{"part":{"type":"text","sessionID":"other","messageID":"msg_fixed","text":"x"}}}),Some(&sid)).is_err());
     assert!(event(json!({"type":"session.status","properties":{"sessionID":"ses_fixed","status":{"type":"retry"}}}),Some(&sid)).is_err());
+}
+
+struct ReaderLease(Arc<AtomicUsize>);
+impl Drop for ReaderLease {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+fn tokens() -> Value {
+    json!({"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0}})
+}
+fn non_tool(kind: &str, edit: bool) -> Value {
+    let mut p = json!({"id":format!("prt_{kind}"),"sessionID":"ses_fixed","messageID":if edit{"msg_edit"}else{"msg_read"},"type":kind});
+    match kind {
+        "step-finish" => {
+            p["reason"] = json!("tool-calls");
+            p["cost"] = json!(0);
+            p["tokens"] = tokens();
+        }
+        "text" | "reasoning" => p["text"] = json!(""),
+        _ => {}
+    }
+    json!({"sessionID":"ses_fixed","part":p,"time":0})
+}
+fn message(edit: bool, user: bool) -> Value {
+    let info = if user {
+        json!({"id":"msg_user","sessionID":"ses_fixed","role":"user","time":{"created":0},"agent":"nova_probe","model":{"providerID":"nova","modelID":"nova_t1_fixture"}})
+    } else {
+        json!({"id":if edit{"msg_edit"}else{"msg_read"},"sessionID":"ses_fixed","role":"assistant","parentID":"msg_user","time":{"created":0},"agent":"nova_probe","mode":"nova_probe","modelID":"nova_t1_fixture","providerID":"nova","path":{"cwd":ROOT,"root":ROOT},"cost":0,"tokens":tokens()})
+    };
+    json!({"sessionID":"ses_fixed","info":info})
+}
+fn upstream_start(edit: bool) -> Vec<(String, Value)> {
+    let mut events = vec![(
+        "session.status".into(),
+        json!({"sessionID":"ses_fixed","status":{"type":"busy"}}),
+    )];
+    if !edit {
+        events.push(("message.updated".into(), message(false, true)));
+        let mut text = non_tool("text", false);
+        text["part"]["messageID"] = json!("msg_user");
+        text["part"]["text"] = json!("fixed task");
+        events.push(("message.part.updated".into(), text));
+    }
+    events.push(("message.updated".into(), message(edit, false)));
+    events.push(("message.part.updated".into(), non_tool("step-start", edit)));
+    events.push(("message.part.updated".into(), non_tool("text", edit)));
+    events.push(("message.part.delta".into(),json!({"sessionID":"ses_fixed","messageID":if edit{"msg_edit"}else{"msg_read"},"partID":"prt_text","field":"text","delta":"bounded injected text"})));
+    for status in ["pending", "running"] {
+        events.push((
+            "message.part.updated".into(),
+            json!({"sessionID":"ses_fixed","part":part(edit,status),"time":0}),
+        ));
+    }
+    events
+}
+fn upstream_finish(edit: bool) -> Vec<(String, Value)> {
+    vec![
+        ("message.part.updated".into(), non_tool("step-finish", edit)),
+        ("message.updated".into(), message(edit, false)),
+        (
+            "session.diff".into(),
+            json!({"sessionID":"ses_fixed","diff":[]}),
+        ),
+    ]
+}
+fn event_label(t: &str, p: &Value) -> String {
+    match t {
+        "message.part.updated" => {
+            let part = &p["part"];
+            if part["type"] == "tool" {
+                format!(
+                    "{t}/tool/{}/{}",
+                    part["tool"].as_str().unwrap(),
+                    part["state"]["status"].as_str().unwrap()
+                )
+            } else {
+                format!("{t}/{}", part["type"].as_str().unwrap())
+            }
+        }
+        "message.updated" => format!("{t}/{}", p["info"]["role"].as_str().unwrap()),
+        "permission.asked" => format!("{t}/{}", p["permission"].as_str().unwrap()),
+        _ => t.into(),
+    }
+}
+#[test]
+fn upstream_ordered_full_run_steps_delta_diff_and_reject_idle() {
+    let mut h = Harness::configured(|t| t.upstream_sequence = true);
+    let outcome = h.run();
+    h.transport.join();
+    assert!(outcome.success, "{:?}", outcome.error);
+    assert!(h.cas);
+    let sent = h.transport.sent.lock().unwrap().clone();
+    let expected = [
+        "session.status",
+        "message.updated/user",
+        "message.part.updated/text",
+        "message.updated/assistant",
+        "message.part.updated/step-start",
+        "message.part.updated/text",
+        "message.part.delta",
+        "message.part.updated/tool/read/pending",
+        "message.part.updated/tool/read/running",
+        "permission.asked/read",
+        "permission.replied",
+        "message.part.updated/tool/read/completed",
+        "message.part.updated/step-finish",
+        "message.updated/assistant",
+        "session.diff",
+        "session.status",
+        "message.updated/assistant",
+        "message.part.updated/step-start",
+        "message.part.updated/text",
+        "message.part.delta",
+        "message.part.updated/tool/edit/pending",
+        "message.part.updated/tool/edit/running",
+        "permission.asked/edit",
+        "permission.replied",
+        "message.part.updated/tool/edit/error",
+        "message.part.updated/step-finish",
+        "message.updated/assistant",
+        "session.diff",
+        "session.status",
+        "session.idle",
+    ];
+    // The connected/heartbeat infrastructure events do not assert task ordering.
+    let task = sent
+        .iter()
+        .filter(|s| !s.starts_with("server."))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(task, expected);
+    assert_eq!(h.driver.pump_failure(), None);
+    assert!(h.driver.facts.idle.event_confirmed);
+    assert_eq!(*h.transport.model_results.lock().unwrap(), [true]);
+    let l = h.state.ledger.lock().unwrap();
+    assert_eq!(
+        (l.budget.received, l.budget.admitted, l.budget.denied),
+        (2, 2, 0)
+    );
+    println!(
+        "INJECTED_UPSTREAM_ORDER={}",
+        serde_json::to_string(&task).unwrap()
+    );
+}
+fn negative_event(v: Value) {
+    let mut h = Harness::configured(|t| t.injection = Some(v));
+    let outcome = h.run();
+    h.transport.join();
+    assert!(!outcome.success);
+    assert!(!h.cas);
+    assert!(!outcome.cas_started);
+    assert_eq!(h.state.state(), State::Stopped);
+    assert!(!h
+        .transport
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(p, _)| p == "/permission/per_read/reply"));
+}
+fn updated(p: Value) -> Value {
+    serde_json::json!({"type":"message.part.updated","properties":p})
+}
+#[test]
+fn step_start_run_rejects_foreign_ids_snapshot_type_and_missing_time() {
+    for mode in 0..7 {
+        let mut p = non_tool("step-start", false);
+        match mode {
+            0 => p["sessionID"] = json!("ses_other"),
+            1 => p["part"]["sessionID"] = json!("ses_other"),
+            2 => p["part"]["messageID"] = json!("wrong_prefix"),
+            3 => p["part"]["id"] = json!(""),
+            4 => p["part"]["snapshot"] = json!(false),
+            5 => {
+                p.as_object_mut().unwrap().remove("time");
+            }
+            _ => p["part"]["messageID"] = json!(3),
+        };
+        negative_event(updated(p));
+    }
+}
+#[test]
+fn step_finish_run_rejects_reason_cost_tokens_and_foreign_identity() {
+    for mode in 0..10 {
+        let mut p = non_tool("step-finish", false);
+        match mode {
+            0 => p["sessionID"] = json!("ses_other"),
+            1 => p["part"]["messageID"] = json!(""),
+            2 => p["part"]["id"] = json!("bad"),
+            3 => p["part"]["reason"] = json!(12),
+            4 => p["part"]["cost"] = json!("0"),
+            5 => p["part"]["tokens"]["input"] = Value::Null,
+            6 => p["part"]["tokens"]["cache"]["read"] = json!(true),
+            7 => p["part"]["tokens"]["total"] = json!("1"),
+            8 => p["part"]["tokens"]["reasoning"] = json!({}),
+            _ => p["part"]["snapshot"] = json!(0),
+        };
+        negative_event(updated(p));
+    }
+}
+#[test]
+fn delta_run_rejects_session_ids_field_and_type() {
+    for mode in 0..6 {
+        let mut p = json!({"sessionID":"ses_fixed","messageID":"msg_read","partID":"prt_text","field":"text","delta":"fragment"});
+        match mode {
+            0 => p["sessionID"] = json!("ses_other"),
+            1 => p["messageID"] = json!("wrong"),
+            2 => p["partID"] = json!("wrong"),
+            3 => p["messageID"] = json!("msg_\n"),
+            4 => p["field"] = json!("input"),
+            _ => p["delta"] = json!(1),
+        };
+        negative_event(json!({"type":"message.part.delta","properties":p}));
+    }
+}
+#[test]
+fn empty_diff_only_and_nonempty_is_refusal_not_disk_proof() {
+    for p in [
+        json!({"sessionID":"ses_other","diff":[]}),
+        json!({"sessionID":"ses_fixed","diff":[{"file":"Logo.tsx"}]}),
+        json!({"sessionID":"ses_fixed","diff":"[]"}),
+        json!({"sessionID":"ses_fixed","diff":null}),
+    ] {
+        negative_event(json!({"type":"session.diff","properties":p}));
+    }
+}
+#[test]
+fn nonapproved_parts_removals_and_future_inventories_still_stop_run() {
+    for kind in [
+        "patch",
+        "snapshot",
+        "file",
+        "agent",
+        "subtask",
+        "compaction",
+        "retry",
+    ] {
+        negative_event(updated(non_tool(kind, false)));
+    }
+    for kind in [
+        "message.part.removed",
+        "message.removed",
+        "file.watcher.updated",
+        "vcs.branch.updated",
+        "lsp.updated",
+        "project.updated",
+        "todo.updated",
+        "session.next.started",
+    ] {
+        negative_event(
+            json!({"type":kind,"properties":{"sessionID":"ses_fixed","messageID":"msg_read","partID":"prt_text"}}),
+        );
+    }
+}
+#[test]
+fn delta_is_display_only_and_does_not_require_prior_part_inventory() {
+    let sid = id("ses_fixed");
+    assert!(matches!(event(json!({"type":"message.part.delta","properties":{"sessionID":"ses_fixed","messageID":"msg_read","partID":"prt_unseen","field":"text","delta":"fragment"}}),Some(&sid)).unwrap(),Event::Ignored));
+    let p = non_tool("step-start", false);
+    assert!(p.get("messageID").is_none());
+    assert!(matches!(
+        event(updated(p), Some(&sid)).unwrap(),
+        Event::Ignored
+    ));
+    let mut p = non_tool("step-finish", false);
+    p["part"]["tokens"]["total"] = json!(2.5);
+    p["part"]["cost"] = json!(-0.1);
+    // Locked Schema.Finite, not an invented integer/nonnegative constraint.
+    assert!(matches!(
+        event(updated(p), Some(&sid)).unwrap(),
+        Event::Ignored
+    ));
+}
+#[test]
+fn queue_capacity_64_overflow_is_deterministic_while_dispatcher_is_blocked() {
+    let mut h = Harness::configured(|t| {
+        t.message_event = Some(
+            (0..65)
+                .flat_map(|_| env("server.heartbeat", json!({})))
+                .collect(),
+        );
+        t.pause_http_until_stopped = true;
+    });
+    let outcome = h.run();
+    h.transport.join();
+    assert!(!outcome.success);
+    assert!(!h.cas);
+    assert_eq!(h.driver.pump_failure(), Some(PumpFault::QueueFull));
+    assert_eq!(h.state.state(), State::Stopped);
+    assert!(!h
+        .transport
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(p, _)| p == "/permission/per_read/reply"));
+}
+#[test]
+fn schema_fault_preserved_instead_of_misreported_queue_overflow() {
+    let mut h = Harness::configured(|t| {
+        t.message_event = Some(env(
+            "message.part.delta",
+            json!({"sessionID":"ses_fixed","messageID":"msg_read","partID":"prt_text","field":"text","delta":42}),
+        ));
+        t.pause_http_until_stopped = true;
+    });
+    assert!(!h.run().success);
+    h.transport.join();
+    assert_eq!(h.driver.pump_failure(), Some(PumpFault::Schema));
+    assert_eq!(h.state.state(), State::Stopped);
+    assert!(!h.cas);
 }

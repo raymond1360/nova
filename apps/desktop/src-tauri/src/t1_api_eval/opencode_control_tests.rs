@@ -987,6 +987,9 @@ fn repeated_task_does_not_dispatch_second_prompt() {
 fn driver_drop_stops_state_and_cancels_single_reader() {
     let s = RunState::new().unwrap();
     let t = Arc::new(Scripted::new(s.clone()));
+    // Keep the transport AND its Sender alive beyond the release assertions.
+    // Otherwise driver Drop can close the source channel and fake cancellation.
+    let keep_transport = t.clone();
     let released = t.reader_released.clone();
     let mut d = driver(t, s.clone(), Instant::now() + Duration::from_secs(3600));
     let runtime = rt();
@@ -996,13 +999,18 @@ fn driver_drop_stops_state_and_cancels_single_reader() {
     runtime.block_on(async {
         let end = limit();
         while released.load(Ordering::SeqCst) == 0 {
-            assert!(Instant::now() < end);
+            assert!(
+                Instant::now() < end,
+                "reader future was not cancelled/released while transport Sender remained alive"
+            );
             tokio::task::yield_now().await;
         }
     });
     assert_eq!(released.load(Ordering::SeqCst), 1);
     assert_eq!(s.state(), State::Stopped);
     assert!(s.open_once(true).is_err());
+    // Explicit last use prevents accidental future shortening of the keepalive scope.
+    drop(keep_transport);
 }
 #[test]
 fn prompt_dispatch_stop_barrier_linearizations() {
@@ -1229,6 +1237,7 @@ fn upstream_finish(edit: bool) -> Vec<(String, Value)> {
     vec![
         ("message.part.updated".into(), non_tool("step-finish", edit)),
         ("message.updated".into(), message(edit, false)),
+        ("session.updated".into(), session_updated("ses_fixed")),
         (
             "session.diff".into(),
             json!({"sessionID":"ses_fixed","diff":[]}),
@@ -1277,6 +1286,7 @@ fn upstream_ordered_full_run_steps_delta_diff_and_reject_idle() {
         "message.part.updated/tool/read/completed",
         "message.part.updated/step-finish",
         "message.updated/assistant",
+        "session.updated",
         "session.diff",
         "session.status",
         "message.updated/assistant",
@@ -1290,6 +1300,7 @@ fn upstream_ordered_full_run_steps_delta_diff_and_reject_idle() {
         "message.part.updated/tool/edit/error",
         "message.part.updated/step-finish",
         "message.updated/assistant",
+        "session.updated",
         "session.diff",
         "session.status",
         "session.idle",
@@ -1481,4 +1492,22 @@ fn schema_fault_preserved_instead_of_misreported_queue_overflow() {
     assert_eq!(h.driver.pump_failure(), Some(PumpFault::Schema));
     assert_eq!(h.state.state(), State::Stopped);
     assert!(!h.cas);
+}
+
+// Fixed schema/v1/session.ts@148842ef (75e9282f117cb25078b087661434fcf5e6660620):
+// SessionInfo:543-569; Updated:581-588. summary.ts:110 -> session.ts:803-807
+// -> patch:746 publishes full {sessionID, info}, not an invented {id}-only DTO.
+fn session_updated(sid: &str) -> Value {
+    json!({"sessionID":sid,"info":{
+        "id":sid,"slug":"nova-fixed-probe","projectID":"a".repeat(40),
+        "directory":ROOT,"summary":{"additions":0,"deletions":0,"files":0},
+        "title":"Nova fixed offline probe","version":"1.19.4",
+        "time":{"created":0,"updated":1}
+    }})
+}
+#[test]
+fn foreign_session_updated_refuses_real_driver_run_without_cas() {
+    // A valid event for another session: outer and info identity both differ,
+    // matching the locked publisher's consistency. No production parser changes.
+    negative_event(json!({"type":"session.updated","properties":session_updated("ses_other")}));
 }

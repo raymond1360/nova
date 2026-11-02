@@ -148,6 +148,7 @@ pub struct RootReservation {
 pub struct FixtureReservation {
     pub root: RootReservation,
     pub logo_identity: String,
+    pub git_marker_identity: String,
     pub commit: String,
     pub sid: String,
     pub git_images: Vec<(String, String)>,
@@ -158,6 +159,7 @@ impl FixtureReservation {
         if self.root.path != ROOT
             || self.root.identity.is_empty()
             || self.logo_identity.is_empty()
+            || self.git_marker_identity.is_empty()
             || self.sid.is_empty()
             || self.commit.len() != 40
             || !self
@@ -191,6 +193,11 @@ pub fn validate_snapshot(s: &TreeSnapshot, r: &FixtureReservation) -> Result<()>
             .find(|f| f.path == path)
             .ok_or("required fixture entry missing")
     };
+    let marker = get(".git/opencode")?;
+    declared_git_write(marker, marker, &r.commit, &r.sid, true)?;
+    if marker.identity != r.git_marker_identity {
+        return Err("Git marker identity changed".into());
+    }
     if get(".")?.identity != r.root.identity
         || get(".")?.attributes & 0x10 == 0
         || get(".git")?.attributes & 0x10 == 0

@@ -452,6 +452,7 @@ pub(super) fn injected_preflight() -> Preflight {
                 identity: "INJECTED:root".into(),
             },
             logo_identity: "INJECTED:Logo.tsx".into(),
+            git_marker_identity: "INJECTED:.git/opencode".into(),
             commit: "a".repeat(40),
             sid: "probe-sid".into(),
             git_images: vec![("git.exe".into(), super::hash(b"INJECTED Git image"))],

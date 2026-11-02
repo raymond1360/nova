@@ -14,6 +14,12 @@ fn valid_nonce(n: &[u8]) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
 }
 impl Broker {
+    pub fn from_run(state: Arc<RunState>, nonce: &super::opencode_nonce::RunNonce<super::opencode_nonce::Model>) -> Result<Self> {
+        nonce.with_bytes(|n| {
+            super::opencode_nonce::RunNonce::<super::opencode_nonce::Model>::validate_external(n)?;
+            Self::new(state, n)
+        })
+    }
     pub fn new(state: Arc<RunState>, nonce: &[u8]) -> Result<Self> {
         if !valid_nonce(nonce) {
             return Err("run authentication not prepared".into());

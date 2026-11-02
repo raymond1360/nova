@@ -23,8 +23,11 @@ pub struct Ledger {
     edit: bool,
     read_complete: bool,
     prompt: bool,
+    prompt_dispatched: bool,
 }
 pub struct RunState {
+    #[cfg(test)]
+    waiting_read: std::sync::atomic::AtomicBool,
     state: AtomicU8,
     pub ledger: Mutex<Ledger>,
     fault: Arc<AdmissionFault>,
@@ -34,6 +37,8 @@ impl RunState {
         let budget = Budget::mock(0)?;
         let fault = budget.fault_handle();
         Ok(Arc::new(Self {
+            #[cfg(test)]
+            waiting_read: std::sync::atomic::AtomicBool::new(false),
             state: AtomicU8::new(0),
             ledger: Mutex::new(Ledger {
                 budget,
@@ -41,9 +46,14 @@ impl RunState {
                 edit: false,
                 read_complete: false,
                 prompt: false,
+                prompt_dispatched: false,
             }),
             fault,
         }))
+    }
+    #[cfg(test)]
+    pub(super) fn waiting_for_read(&self) -> bool {
+        self.waiting_read.load(Ordering::SeqCst)
     }
     pub fn state(&self) -> State {
         match self.state.load(Ordering::SeqCst) & 3 {
@@ -145,6 +155,18 @@ impl RunState {
         g.read_complete = true;
         Ok(())
     }
+    /// Consume, never recreate, run's already linearized prompt decision.
+    pub(super) fn consume_prompt(&self, deadline: Instant) -> Result<()> {
+        let mut g = self.lock(deadline)?;
+        if !g.prompt || g.prompt_dispatched || self.fault.is_closed()
+            || self.state.compare_exchange(5, 9, Ordering::SeqCst, Ordering::SeqCst).is_err()
+        {
+            self.stop();
+            return Err("prompt dispatch rejected".into());
+        }
+        g.prompt_dispatched = true;
+        Ok(())
+    }
     /// Waiting never holds the ledger lock. Deadline is shared with the connection.
     pub fn admit(&self, id: &str, edit: bool, deadline: Instant) -> Result<()> {
         loop {
@@ -161,6 +183,8 @@ impl RunState {
                 return r;
             }
             if edit && !g.read_complete {
+                #[cfg(test)]
+                self.waiting_read.store(true, Ordering::SeqCst);
                 drop(g);
                 if Instant::now() >= deadline {
                     let mut g = self.request_lock(deadline)?;

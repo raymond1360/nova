@@ -9,6 +9,10 @@ pub mod opencode_paths;
 pub mod opencode_protocol;
 pub mod opencode_broker;
 pub mod opencode_probe;
+pub mod opencode_control;
+pub mod opencode_nonce;
+#[cfg(test)]
+mod opencode_control_tests;
 #[cfg(test)]
 mod opencode_probe_tests;
 

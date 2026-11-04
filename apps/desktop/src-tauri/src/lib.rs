@@ -1,3 +1,8 @@
+#[cfg(all(feature = "scheduler-validation", not(debug_assertions)))]
+compile_error!("scheduler-validation is debug-only and must never ship");
+#[cfg(any(test, feature = "scheduler-validation"))]
+pub mod scheduler;
+
 #[cfg(all(feature = "wp2a-desktop-validation", not(debug_assertions)))]
 compile_error!("wp2a-desktop-validation is debug-only and must never ship");
 #[cfg(feature = "wp2a-desktop-validation")]

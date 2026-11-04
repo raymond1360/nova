@@ -175,6 +175,6 @@ try {
  $verdict='PASS'
 } finally {
  $inventory=@(Get-ChildItem -LiteralPath $EvidenceDirectory -File | Where-Object {$_.Extension -eq '.log'} | ForEach-Object {@{name=$_.Name;bytes=$_.Length;sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}})
- Write-Json (Join-Path $EvidenceDirectory 'result.json') @{schema='nova.scheduler.local-validation/1';verdict=$verdict;stage=$stage;default_regression_executed=(-not $SkipDefaultRegression);git_process_identity_boundary='Guarded launcher only; delegated images not frozen';commands=$rows;logs=$inventory;external_actions_executed='FIXED_LOCAL_FIXTURE_AND_CARGO_ONLY';github_verified=$false}
+ Write-Json (Join-Path $EvidenceDirectory 'result.json') @{schema='nova.scheduler.local-validation/1';verdict=$verdict;stage=$stage;default_regression_executed=(@($rows | Where-Object {$_.name -ceq 'default-tests' -and $_.state -cne 'START_FAILED'}).Count -gt 0);git_process_identity_boundary='Guarded launcher only; delegated images not frozen';commands=$rows;logs=$inventory;external_actions_executed='FIXED_LOCAL_FIXTURE_AND_CARGO_ONLY';github_verified=$false}
 }
 if($verdict -ne 'PASS'){exit 1}

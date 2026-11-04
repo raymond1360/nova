@@ -152,7 +152,7 @@ impl Git {
             {
                 failure = Some("GIT_DEADLINE_OR_BOUND");
                 let _ = p.kill();
-                break p.wait().ok();
+                break stopped_child(&mut p);
             }
             match p.try_wait() {
                 Ok(Some(s)) => break Some(s),
@@ -160,23 +160,16 @@ impl Git {
                 Err(_) => {
                     failure = Some("GIT_WAIT_UNKNOWN");
                     let _ = p.kill();
-                    break p.wait().ok();
+                    break stopped_child(&mut p);
                 }
             }
         };
-        let o = out
-            .join()
-            .map_err(|_| "GIT_READ")?
-            .map_err(|_| "GIT_READ")?;
-        let e = err
-            .join()
-            .map_err(|_| "GIT_READ")?
-            .map_err(|_| "GIT_READ")?;
+        let (o, e) = collect_readers(out, err, Duration::from_secs(1))?;
         if failure.is_some()
             || overflow.load(Ordering::Acquire)
             || self.start.elapsed() >= Duration::from_secs(30)
         {
-            return Err("GIT_DEADLINE_OR_BOUND");
+            return Err(failure.unwrap_or("GIT_DEADLINE_OR_BOUND"));
         }
         self.total = self
             .total
@@ -573,6 +566,37 @@ impl Git {
         Ok(e)
     }
 }
+// Cleanup has its own bounded grace after query admission has failed. No
+// unconditional wait/join: unconfirmed termination or pipes remain UNKNOWN.
+fn stopped_child(p: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(1) {
+        match p.try_wait() {
+            Ok(Some(s)) => return Some(s),
+            Err(_) => return None,
+            Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+        }
+    }
+    None
+}
+type Reader = std::thread::JoinHandle<std::io::Result<Vec<u8>>>;
+fn collect_readers(out: Reader, err: Reader, grace: Duration) -> Result<(Vec<u8>, Vec<u8>)> {
+    let start = Instant::now();
+    while !out.is_finished() || !err.is_finished() {
+        if start.elapsed() >= grace {
+            return Err("GIT_STREAM_UNKNOWN");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok((
+        out.join()
+            .map_err(|_| "GIT_READ")?
+            .map_err(|_| "GIT_READ")?,
+        err.join()
+            .map_err(|_| "GIT_READ")?
+            .map_err(|_| "GIT_READ")?,
+    ))
+}
 fn nul(b: &[u8]) -> Result<Vec<String>> {
     if b.is_empty() {
         return Ok(vec![]);
@@ -866,6 +890,26 @@ mod tests {
         assert_eq!(
             range(raw.as_bytes(), &["Logo.tsx".into()]),
             Err("SCOPE_EXCEEDED")
+        );
+    }
+    #[test]
+    fn blocked_reader_returns_unknown_without_unbounded_join() {
+        let (send, receive) = std::sync::mpsc::channel::<()>();
+        let blocked = std::thread::spawn(move || {
+            let _ = receive.recv();
+            Ok(vec![])
+        });
+        let finished = std::thread::spawn(|| Ok(vec![]));
+        assert_eq!(
+            collect_readers(blocked, finished, Duration::from_millis(5)),
+            Err("GIT_STREAM_UNKNOWN")
+        );
+        drop(send); // releases only this injected reader, no native subprocess.
+        let out = std::thread::spawn(|| Ok(vec![1]));
+        let err = std::thread::spawn(|| Ok(vec![]));
+        assert_eq!(
+            collect_readers(out, err, Duration::from_secs(1)),
+            Ok((vec![1], vec![]))
         );
     }
 }

@@ -446,6 +446,12 @@ impl Store {
         text.pipe_json()
     }
     pub fn unverified_status(&self, code: &'static str) -> Result<Value> {
+        self.unverified_view(code, false)
+    }
+    pub fn unverified_handoff(&self, code: &'static str) -> Result<Value> {
+        self.unverified_view(code, true)
+    }
+    fn unverified_view(&self, code: &'static str, compact: bool) -> Result<Value> {
         let c = self.read_connection()?;
         let snap = snapshot(&c)?;
         let saved: String = sql(c.query_row(
@@ -454,7 +460,7 @@ impl Store {
             |r| r.get(0),
         ))?;
         let old: Envelope = saved.pipe_json()?;
-        let mut v = self.status(&old)?;
+        let mut v = self.view(&old, compact, Some(code))?;
         let obj = v.as_object_mut().ok_or("ENCODING")?;
         if let Some(head) = obj.remove("head") {
             obj.insert("last_observed_head".into(), head);
@@ -645,7 +651,17 @@ impl Store {
                                 &rid,
                             )?;
                         }
-                        step(&db, &now.task_id, TaskState::Verifying, Actor::User, &rid)?;
+                        step(
+                            &db,
+                            &now.task_id,
+                            if projection.has_development {
+                                TaskState::Verifying
+                            } else {
+                                TaskState::Queued
+                            },
+                            Actor::User,
+                            &rid,
+                        )?;
                     }
                     Some("PAUSE") => {
                         step(&db, &now.task_id, TaskState::Interrupted, Actor::User, &rid)?
@@ -722,6 +738,12 @@ impl Store {
         }
     }
     pub fn status(&self, e: &Envelope) -> Result<Value> {
+        self.view(e, false, None)
+    }
+    pub fn handoff(&self, e: &Envelope) -> Result<Value> {
+        self.view(e, true, None)
+    }
+    fn view(&self, e: &Envelope, compact: bool, forced_hold: Option<&str>) -> Result<Value> {
         let c = self.read_connection()?;
         let s = snapshot(&c)?;
         let cs = load_candidates(&c, &s.delivery, false)?;
@@ -752,7 +774,7 @@ impl Store {
             if file_state != "PRESENT" {
                 missing = true;
             }
-            receipts.push(json!({"receipt_id":rid,"mode":mode,"file_path":attributed(path,Source::ToolFileHash),"file_state":file_state,"bytes":attributed(bytes,Source::ToolFileHash),"sha256":attributed(digest,Source::ToolFileHash),"claims":metadata.and_then(|v|serde_json::from_str::<Value>(&v).ok()).map(|v|attributed(v,Source::HumanAttested)),"delivery_identity":d,"source_receipt_id":source}));
+            receipts.push(if compact{json!({"receipt_id":rid,"mode":mode,"file_path":attributed(path,Source::ToolFileHash),"file_state":file_state,"sha256":attributed(digest,Source::ToolFileHash),"delivery_identity":d,"source_receipt_id":source})}else{json!({"receipt_id":rid,"mode":mode,"file_path":attributed(path,Source::ToolFileHash),"file_state":file_state,"bytes":attributed(bytes,Source::ToolFileHash),"sha256":attributed(digest,Source::ToolFileHash),"claims":metadata.and_then(|v|serde_json::from_str::<Value>(&v).ok()).map(|v|attributed(v,Source::HumanAttested)),"delivery_identity":d,"source_receipt_id":source})});
         }
         let stale = e.delivery_identity != s.delivery;
         let task: (String, i64) = sql(c.query_row(
@@ -760,9 +782,26 @@ impl Store {
             [&s.task_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         ))?;
-        let root_files = inventory(&self.root)?;
+        let root_files = if compact {
+            vec![]
+        } else {
+            inventory(&self.root)?
+        };
+        let hold = forced_hold.or(if stale {
+            Some("DELIVERY_IDENTITY_CHANGED")
+        } else if missing {
+            Some("REPORT_IDENTITY_UNKNOWN")
+        } else {
+            None
+        });
+        let handoff = policy::handoff_plan(&s.phase, &p, &cs, s.invalidated, s.closed, hold);
+        if compact {
+            return Ok(
+                json!({"schema":"nova.scheduler.handoff/1","context":attributed(json!({"package_id":s.manifest.package_id,"title":s.manifest.title,"goal":s.manifest.goal,"allowed_paths":s.manifest.allowed_paths,"acceptance_items":s.manifest.acceptance_items,"pm_decision_ref":s.manifest.pm_decision_ref}),Source::HumanAttested),"head":attributed(&e.head,Source::ToolGitRead),"base":attributed(&e.base,Source::base(&s.base_source)?),"delivery_identity":s.delivery,"sampled_delivery_identity":e.delivery_identity,"eol_policy":attributed(&s.manifest.eol_policy,Source::HumanAttested),"scope_claim":"FINAL_CUMULATIVE_DIFF_ONLY","phase":s.phase,"projection":p,"version_stale":stale,"report_identity_problem":missing,"handoff":handoff,"receipts":receipts,"external_actions_executed":"NONE","execution_permission":"NOT_GRANTED_BY_SH1"}),
+            );
+        }
         Ok(
-            json!({"schema":"nova.scheduler.status/1","manifest":attributed(&s.manifest,Source::HumanAttested),"package_id":attributed(&s.manifest.package_id,Source::HumanAttested),"phase":s.phase,"task_state":task.0,"result_generation":task.1,"projection":p,"head":attributed(&e.head,Source::ToolGitRead),"base":attributed(&e.base,Source::base(&s.base_source)?),"scope_claim":"FINAL_CUMULATIVE_DIFF_ONLY; DOES_NOT_PROVE_INTERMEDIATE_COMMITS_STAYED_IN_SCOPE","envelope_id":e.envelope_id,"scope_files":attributed(&e.files,Source::ToolFileHash),"head_tree":attributed(&e.tree,Source::ToolGitRead),"delivery_identity":s.delivery,"sampled_delivery_identity":e.delivery_identity,"version_stale":stale,"report_identity_problem":missing,"eol_policy":attributed(&s.manifest.eol_policy,Source::HumanAttested),"outside_scope_notice":e.outside_scope_notice,"auto_repair_count":0,"manual_rounds_recorded":s.manual_rounds,"historical_rounds":"UNKNOWN","readiness_invalidated":s.invalidated,"registration_closed":s.closed,"closure_semantics":if s.closed{"CLOSED_BY_PM_REFERENCE [HUMAN_ATTESTED]"}else{"NOT_CLOSED"},"receipts":receipts,"owned_root_entries":root_files,"external_actions_executed":"NONE","execution_permission":"NOT_GRANTED_BY_SH1","next":"PM_DECISION_REQUIRED; manually deliver this material to the appropriate session"}),
+            json!({"schema":"nova.scheduler.status/1","manifest":attributed(&s.manifest,Source::HumanAttested),"package_id":attributed(&s.manifest.package_id,Source::HumanAttested),"phase":s.phase,"task_state":task.0,"result_generation":task.1,"projection":p,"head":attributed(&e.head,Source::ToolGitRead),"base":attributed(&e.base,Source::base(&s.base_source)?),"scope_claim":"FINAL_CUMULATIVE_DIFF_ONLY; DOES_NOT_PROVE_INTERMEDIATE_COMMITS_STAYED_IN_SCOPE","envelope_id":e.envelope_id,"scope_files":attributed(&e.files,Source::ToolFileHash),"head_tree":attributed(&e.tree,Source::ToolGitRead),"delivery_identity":s.delivery,"sampled_delivery_identity":e.delivery_identity,"version_stale":stale,"report_identity_problem":missing,"eol_policy":attributed(&s.manifest.eol_policy,Source::HumanAttested),"outside_scope_notice":e.outside_scope_notice,"auto_repair_count":0,"manual_rounds_recorded":s.manual_rounds,"historical_rounds":"UNKNOWN","readiness_invalidated":s.invalidated,"registration_closed":s.closed,"closure_semantics":if s.closed{"CLOSED_BY_PM_REFERENCE [HUMAN_ATTESTED]"}else{"NOT_CLOSED"},"receipts":receipts,"owned_root_entries":root_files,"external_actions_executed":"NONE","execution_permission":"NOT_GRANTED_BY_SH1","handoff":handoff}),
         )
     }
 }

@@ -1,5 +1,5 @@
 #requires -Version 7.0
-param([Parameter(Mandatory)][string]$EvidenceDirectory,[string]$TargetDirectory)
+param([Parameter(Mandatory)][string]$EvidenceDirectory,[string]$TargetDirectory,[switch]$SkipDefaultRegression)
 $ErrorActionPreference='Stop'
 $repo=Split-Path -Parent $PSScriptRoot
 if(-not [IO.Path]::IsPathRooted($EvidenceDirectory) -or (Test-Path -LiteralPath $EvidenceDirectory)){throw 'New absolute evidence directory required'}
@@ -10,6 +10,7 @@ $cargo=(Get-Command cargo -CommandType Application | Select-Object -First 1).Sou
 $git=(Get-Command git -CommandType Application | Select-Object -First 1).Source
 if(-not $cargo -or -not $git){throw 'Tool missing'}
 $crate=Join-Path $repo 'apps/desktop/src-tauri'
+$commandTemp=Join-Path $EvidenceDirectory 'command-temp';New-Item -ItemType Directory -Path $commandTemp | Out-Null
 $clock=[Diagnostics.Stopwatch]::StartNew();$deadline=2700000
 $rows=[Collections.Generic.List[object]]::new();$verdict='FAIL';$stage='BUILD'
 $gitElapsedMs=0L
@@ -18,6 +19,7 @@ function Invoke-Fixed([string]$Name,[string]$Exe,[string[]]$Vector,[string]$Cwd=
  $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$Exe;$info.WorkingDirectory=$Cwd
  $info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
  $info.Environment['CARGO_TARGET_DIR']=$TargetDirectory;$info.Environment['CARGO_NET_OFFLINE']='true'
+ $info.Environment['TEMP']=$commandTemp;$info.Environment['TMP']=$commandTemp
  $info.Environment['RUSTUP_AUTO_INSTALL']='0';$info.Environment['NOVA_SH1_TEST_ROOT']=$EvidenceDirectory
  if($FixtureGit){
   $info.Environment.Clear();$info.Environment['SystemRoot']=$env:SystemRoot
@@ -30,6 +32,7 @@ function Invoke-Fixed([string]$Name,[string]$Exe,[string[]]$Vector,[string]$Cwd=
   foreach($key in @('GIT_AUTHOR_DATE','GIT_COMMITTER_DATE')){$info.Environment[$key]='2026-01-01T00:00:00+00:00'}
  }
  foreach($a in $Vector){$info.ArgumentList.Add($a)}
+ $beforeTemps=@(Get-ChildItem -LiteralPath $commandTemp -Directory -Filter 'nova-sh1-*' | ForEach-Object Name)
  $local=[Diagnostics.Stopwatch]::StartNew()
  $row=[ordered]@{name=$Name;state='START_FAILED';exit_code=$null;started_utc=[DateTime]::UtcNow.ToString('o');ended_utc=$null}
  $rows.Add($row);$p=[Diagnostics.Process]::new();$p.StartInfo=$info
@@ -51,6 +54,7 @@ function Invoke-Fixed([string]$Name,[string]$Exe,[string[]]$Vector,[string]$Cwd=
    [Threading.Thread]::Sleep(10)
   }
   $row.state='COMPLETE';$row.exit_code=$p.ExitCode
+  if($Exe -ceq $bin -and @(Get-ChildItem -LiteralPath $commandTemp -Directory -Filter 'nova-sh1-*' | Where-Object {$_.Name -cnotin $beforeTemps}).Count -ne 0){throw 'BIN_TEMP_NOT_CLEANED'}
  } finally {
   if($row.state -eq 'PARTIAL' -and -not $p.HasExited){$p.Kill($true);[void]$p.WaitForExit(5000);if($p.HasExited){$row.exit_code=$p.ExitCode}}
   if($FixtureGit){$script:gitElapsedMs+=$local.ElapsedMilliseconds}
@@ -88,6 +92,10 @@ try {
  Require-Zero 'fixture-commit-base' $git ($prefix+@('-C',$fixture,'commit','--no-gpg-sign','--no-verify','-m','fixture-base')) $EvidenceDirectory -FixtureGit
  Require-Zero 'fixture-base-sha' $git ($prefix+@('-C',$fixture,'rev-parse','--verify','HEAD^{commit}')) $EvidenceDirectory -FixtureGit
  $base=([string](Get-Content (Join-Path $EvidenceDirectory 'fixture-base-sha.stdout.log') -Raw)).Trim()
+
+ $rootManifest=Join-Path $EvidenceDirectory 'root-commit-manifest.json'
+ Write-Json $rootManifest @{schema='nova.sh1.package/1';package_id='root-fixture';repo_path=$fixture;title='Root unsupported';goal='Report fixed limitation';allowed_paths=@('Logo.tsx');acceptance_items=@('explicit error');pm_decision_ref='fixture-only';report_roots=@($reports);required_reports=@('DEVELOPMENT','REVIEW','CI');baseline=@{mode='PRE_WORK';base_sha=$null};eol_policy='false'}
+ if((Invoke-Fixed 'root-commit-rejected' $bin @('init','--workspace',(Join-Path $EvidenceDirectory 'owned-root-rejected'),'--manifest',$rootManifest)) -ne 2 -or (Output-Json 'root-commit-rejected').error_code -cne 'ROOT_COMMIT_UNSUPPORTED'){throw 'Root limitation not explicit'}
  [IO.File]::WriteAllText((Join-Path $fixture 'Logo.tsx'),"export const Logo = 'after';`n",[Text.UTF8Encoding]::new($false))
  Require-Zero 'fixture-add-change' $git ($prefix+@('-C',$fixture,'add','--','Logo.tsx')) $EvidenceDirectory -FixtureGit
  Require-Zero 'fixture-commit-change' $git ($prefix+@('-C',$fixture,'commit','--no-gpg-sign','--no-verify','-m','fixture-change-1')) $EvidenceDirectory -FixtureGit
@@ -95,6 +103,12 @@ try {
  Write-Json $manifest @{schema='nova.sh1.package/1';package_id='sh1-fixed-fixture';repo_path=$fixture;title='Handoff fixture';goal='Record one bounded edit';allowed_paths=@('Logo.tsx');acceptance_items=@('fixed fixture');pm_decision_ref='fixture-only';report_roots=@($reports);required_reports=@('DEVELOPMENT','REVIEW','CI');baseline=@{mode='DECLARED';base_sha=$base};eol_policy='false'}
  Require-Zero 'bin-init' $bin @('init','--workspace',$owned,'--manifest',$manifest)
  $initial=Output-Json 'bin-init';$head=$initial.head.value
+ $nestedManifest=Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json -AsHashtable
+ $nestedManifest.allowed_paths=@('brand/new/Logo.tsx');$nestedManifest.baseline=@{mode='PRE_WORK';base_sha=$null}
+ $nestedPath=Join-Path $EvidenceDirectory 'manifest-absent-nested.json';Write-Json $nestedPath $nestedManifest
+ Require-Zero 'absent-nested-init' $bin @('init','--workspace',(Join-Path $EvidenceDirectory 'owned-absent-nested'),'--manifest',$nestedPath)
+ if(Test-Path -LiteralPath (Join-Path $fixture 'brand')){throw 'ABSENT_CREATED_USER_DIRECTORY'}
+
  if((Invoke-Fixed 'handoff-missing-slots' $bin @('handoff','--workspace',$owned)) -ne 2){throw 'Incomplete handoff was not held'}
  $legacy=Join-Path $reports 'legacy.md';[IO.File]::WriteAllText($legacy,'historical human report, no fixed schema')
  Require-Zero 'legacy-index-only' $bin @('import','--workspace',$owned,'--report',$legacy,'--index-only')
@@ -152,13 +166,15 @@ try {
  Require-Zero 'fixture-add-extra' $git ($prefix+@('-C',$fixture,'add','--','scope-extra.txt')) $EvidenceDirectory -FixtureGit
  Require-Zero 'fixture-commit-extra' $git ($prefix+@('-C',$fixture,'commit','--no-gpg-sign','--no-verify','-m','fixture-change-2')) $EvidenceDirectory -FixtureGit
  if((Invoke-Fixed 'cumulative-scope-rejected' $bin @('status','--workspace',$owned)) -ne 2 -or (Output-Json 'cumulative-scope-rejected').error_code -cne 'SCOPE_EXCEEDED'){throw 'Cumulative outside change missed'}
+ if(-not $SkipDefaultRegression){
  $stage='DEFAULT_REGRESSION'
  Require-Zero 'default-list' $cargo @('test','--offline','--locked','--lib','--','--list')
  Require-Zero 'default-tests' $cargo @('test','--offline','--locked','--lib','--','--test-threads=1')
  Require-Zero 'default-build' $cargo @('build','--offline','--locked')
+ }
  $verdict='PASS'
 } finally {
  $inventory=@(Get-ChildItem -LiteralPath $EvidenceDirectory -File | Where-Object {$_.Extension -eq '.log'} | ForEach-Object {@{name=$_.Name;bytes=$_.Length;sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}})
- Write-Json (Join-Path $EvidenceDirectory 'result.json') @{schema='nova.scheduler.local-validation/1';verdict=$verdict;stage=$stage;commands=$rows;logs=$inventory;external_actions_executed='FIXED_LOCAL_FIXTURE_AND_CARGO_ONLY';github_verified=$false}
+ Write-Json (Join-Path $EvidenceDirectory 'result.json') @{schema='nova.scheduler.local-validation/1';verdict=$verdict;stage=$stage;default_regression_executed=(-not $SkipDefaultRegression);git_process_identity_boundary='Guarded launcher only; delegated images not frozen';commands=$rows;logs=$inventory;external_actions_executed='FIXED_LOCAL_FIXTURE_AND_CARGO_ONLY';github_verified=$false}
 }
 if($verdict -ne 'PASS'){exit 1}

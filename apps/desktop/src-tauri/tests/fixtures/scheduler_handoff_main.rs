@@ -24,6 +24,9 @@ struct Git {
     temp: PathBuf,
     start: Instant,
     total: usize,
+    failed: bool,
+    cleanup_allowed: bool,
+    temp_owner: Option<OwnedTemp>,
 }
 impl Git {
     fn new() -> Result<Self> {
@@ -35,25 +38,29 @@ impl Git {
             .ok_or("GIT_MISSING")?;
         let exe_guard = Guard::tool(&exe)?;
         let exe = exe_guard.path.clone();
-        let temp = std::env::temp_dir().join(format!("nova-sh1-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&temp).map_err(|_| "TEMP_CREATE")?;
-        fs::create_dir(temp.join("hooks")).map_err(|_| "TEMP_CREATE")?;
-        OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(temp.join("empty-config"))
-            .map_err(|_| "TEMP_CREATE")?;
+        let temp_owner = OwnedTemp::create()?;
+        let temp = temp_owner.path.clone();
         Ok(Self {
             exe,
             _exe_guard: exe_guard,
             temp,
             start: Instant::now(),
             total: 0,
+            failed: false,
+            cleanup_allowed: true,
+            temp_owner: Some(temp_owner),
         })
     }
     fn call(&mut self, m: &Manifest, args: &[String]) -> Result<Vec<u8>> {
-        self._exe_guard.verify()?;
+        if self.failed {
+            return Err("GIT_ADMISSION_STOPPED");
+        }
+        if let Err(e) = self._exe_guard.verify() {
+            self.failed = true;
+            return Err(e);
+        }
         if self.start.elapsed() >= Duration::from_secs(30) {
+            self.failed = true;
             return Err("GIT_TOTAL_DEADLINE");
         }
         let mut c = Command::new(&self.exe);
@@ -113,73 +120,22 @@ impl Git {
             use std::os::windows::process::CommandExt;
             c.creation_flags(0x08000000);
         }
-        let mut p = c.spawn().map_err(|_| "GIT_START_FAILED")?;
-        let overflow = Arc::new(AtomicBool::new(false));
-        fn reader<T: Read + Send + 'static>(
-            mut r: T,
-            cap: usize,
-            overflow: Arc<AtomicBool>,
-        ) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
-            std::thread::spawn(move || {
-                let mut out = vec![];
-                let mut buf = [0u8; 4096];
-                loop {
-                    let n = r.read(&mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    if out.len() + n > cap {
-                        overflow.store(true, Ordering::Release);
-                        break;
-                    }
-                    out.extend_from_slice(&buf[..n]);
-                }
-                Ok(out)
-            })
-        }
-        let out = reader(
-            p.stdout.take().ok_or("GIT_PIPE")?,
-            1048576,
-            overflow.clone(),
-        );
-        let err = reader(p.stderr.take().ok_or("GIT_PIPE")?, 32768, overflow.clone());
-        let local = Instant::now();
-        let mut failure = None;
-        let code = loop {
-            if overflow.load(Ordering::Acquire)
-                || local.elapsed() >= Duration::from_secs(5)
-                || self.start.elapsed() >= Duration::from_secs(30)
-            {
-                failure = Some("GIT_DEADLINE_OR_BOUND");
-                let _ = p.kill();
-                break stopped_child(&mut p);
-            }
-            match p.try_wait() {
-                Ok(Some(s)) => break Some(s),
-                Ok(None) => std::thread::sleep(Duration::from_millis(2)),
-                Err(_) => {
-                    failure = Some("GIT_WAIT_UNKNOWN");
-                    let _ = p.kill();
-                    break stopped_child(&mut p);
-                }
+        let native = run_git(&c, self.start + Duration::from_secs(30));
+        let (o, e) = match native {
+            Ok(value) => value,
+            Err(failure) => {
+                self.failed = true;
+                self.cleanup_allowed &= failure.lifecycle_known;
+                return Err(failure.code);
             }
         };
-        let (o, e) = collect_readers(out, err, Duration::from_secs(1))?;
-        if failure.is_some()
-            || overflow.load(Ordering::Acquire)
-            || self.start.elapsed() >= Duration::from_secs(30)
-        {
-            return Err(failure.unwrap_or("GIT_DEADLINE_OR_BOUND"));
-        }
         self.total = self
             .total
             .checked_add(o.len() + e.len())
             .ok_or("GIT_BOUND")?;
         if self.total > 8 * 1024 * 1024 {
+            self.failed = true;
             return Err("GIT_BOUND");
-        }
-        if !code.is_some_and(|s| s.success()) {
-            return Err("GIT_QUERY_FAILED");
         }
         Ok(o)
     }
@@ -377,6 +333,10 @@ impl Git {
         // index forms rather than trusting a status that may intentionally skip content.
         index_flags(&store::read_file(&gd.path.join("index"), 1048576)?.0)?;
         let head = self.text(m, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+        let tip = self.text(m, &["rev-list", "--parents", "--max-count=1", &head])?;
+        if tip.split_whitespace().collect::<Vec<_>>() == vec![head.as_str()] {
+            return Err("ROOT_COMMIT_UNSUPPORTED");
+        }
         let parent = self.text(m, &["rev-parse", "--verify", "HEAD^1^{commit}"])?;
         if !hex(&head, 40) || !hex(&parent, 40) {
             return Err("VERSION_UNKNOWN");
@@ -489,6 +449,7 @@ impl Git {
                 }
                 scope_guards.push(guard);
             } else {
+                scope_guards.push(absent_ancestor(&abs, &rg.path)?);
                 match fs::symlink_metadata(&abs) {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
                     _ => return Err("DIRTY_SCOPE"),
@@ -524,7 +485,7 @@ impl Git {
                 if fs::symlink_metadata(&abs).is_ok() {
                     return Err("DIRTY_SCOPE");
                 }
-                let _ = Guard::open(abs.parent().ok_or("PATH_REJECTED")?, true)?;
+                let _ = absent_ancestor(&abs, &rg.path)?;
                 entries.push(TreeEntry {
                     path: path.clone(),
                     mode: "ABSENT".into(),
@@ -568,18 +529,121 @@ impl Git {
 }
 // Cleanup has its own bounded grace after query admission has failed. No
 // unconditional wait/join: unconfirmed termination or pipes remain UNKNOWN.
-fn stopped_child(p: &mut std::process::Child) -> Option<std::process::ExitStatus> {
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(1) {
-        match p.try_wait() {
-            Ok(Some(s)) => return Some(s),
-            Err(_) => return None,
-            Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+type Reader = std::thread::JoinHandle<std::io::Result<Vec<u8>>>;
+struct RunFailure {
+    code: &'static str,
+    lifecycle_known: bool,
+}
+fn reader(mut file: std::fs::File, cap: usize, overflow: Arc<AtomicBool>) -> Reader {
+    std::thread::spawn(move || {
+        let mut data = vec![];
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            if data.len() + n > cap {
+                overflow.store(true, Ordering::Release);
+                break;
+            }
+            data.extend_from_slice(&buf[..n]);
+        }
+        Ok(data)
+    })
+}
+#[cfg(windows)]
+fn run_git(c: &Command, total: Instant) -> std::result::Result<(Vec<u8>, Vec<u8>), RunFailure> {
+    let deadline = std::cmp::min(total, Instant::now() + Duration::from_secs(5));
+    let mut tree = process_job::Tree::spawn(c, false).map_err(|code| RunFailure {
+        code,
+        lifecycle_known: false,
+    })?;
+    let overflow = Arc::new(AtomicBool::new(false));
+    let out = reader(
+        tree.out.take().ok_or(RunFailure {
+            code: "GIT_PIPE",
+            lifecycle_known: false,
+        })?,
+        1048576,
+        overflow.clone(),
+    );
+    let err = reader(
+        tree.err.take().ok_or(RunFailure {
+            code: "GIT_PIPE",
+            lifecycle_known: false,
+        })?,
+        32768,
+        overflow.clone(),
+    );
+    let (reason, code, stop) = process_job::supervise(&mut tree, deadline, &overflow);
+    let streams = collect_readers(out, err, Duration::from_secs(1));
+    let known = stop.confirmed() && streams.is_ok();
+    if let Some(code) = reason {
+        return Err(RunFailure {
+            code,
+            lifecycle_known: known,
+        });
+    }
+    if !known {
+        return Err(RunFailure {
+            code: "GIT_LIFECYCLE_UNKNOWN",
+            lifecycle_known: false,
+        });
+    }
+    let data = streams.map_err(|code| RunFailure {
+        code,
+        lifecycle_known: known,
+    })?;
+    if code != Some(0) {
+        return Err(RunFailure {
+            code: "GIT_QUERY_FAILED",
+            lifecycle_known: known,
+        });
+    }
+    Ok(data)
+}
+#[cfg(not(windows))]
+fn run_git(_: &Command, _: Instant) -> std::result::Result<(Vec<u8>, Vec<u8>), RunFailure> {
+    Err(RunFailure {
+        code: "WINDOWS_REQUIRED",
+        lifecycle_known: true,
+    })
+}
+
+fn absent_ancestor(abs: &Path, root: &Path) -> Result<Guard> {
+    if !store::inside(abs, root) {
+        return Err("PATH_REJECTED");
+    }
+    let remaining = abs
+        .strip_prefix(root)
+        .map_err(|_| "PATH_REJECTED")?
+        .to_str()
+        .ok_or("PATH_REJECTED")?
+        .replace('\\', "/");
+    if !relative(&remaining) {
+        return Err("PATH_REJECTED");
+    }
+    let mut p = abs.parent().ok_or("PATH_REJECTED")?;
+    loop {
+        match fs::symlink_metadata(p) {
+            Ok(_) => {
+                let g = Guard::open(p, true)?;
+                if !g.path.is_dir() || !store::inside(&g.path, root) {
+                    return Err("ABSENT_ANCESTOR_REJECTED");
+                }
+                return Ok(g);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                p = p.parent().ok_or("PATH_REJECTED")?;
+                if !store::inside(p, root) {
+                    return Err("PATH_REJECTED");
+                }
+            }
+            Err(_) => return Err("ABSENT_LOOKUP_REJECTED"),
         }
     }
-    None
 }
-type Reader = std::thread::JoinHandle<std::io::Result<Vec<u8>>>;
 fn collect_readers(out: Reader, err: Reader, grace: Duration) -> Result<(Vec<u8>, Vec<u8>)> {
     let start = Instant::now();
     while !out.is_finished() || !err.is_finished() {
@@ -749,10 +813,11 @@ fn command(args: &[String]) -> Result<Value> {
             store::safe_location(mp)?;
             let m: Manifest = json(&store::read_file(mp, REPORT_LIMIT)?.0)?;
             m.validate()?;
-            let mut g = Git::new()?;
-            let e = sample_twice(&mut g, &m, None)?;
-            let s = Store::init(root, &m, &e)?;
-            s.status(&e)
+            git_session(|g| {
+                let e = sample_twice(g, &m, None)?;
+                let s = Store::init(root, &m, &e)?;
+                s.status(&e)
+            })
         }
         "import" => {
             if opts.len() != 2 + usize::from(opts.contains_key("--index-only")) {
@@ -792,25 +857,22 @@ fn command(args: &[String]) -> Result<Value> {
                     json!({"import":result,"projection":"NOT_RECOMPUTED_INDEX_ONLY","execution_permission":"NOT_GRANTED_BY_SH1"}),
                 );
             }
-            let mut g = Git::new()?;
-            let e = sample_twice(
-                &mut g,
-                &snap.manifest,
-                Some((&snap.base, &snap.base_source)),
-            )?;
-            if store::read_file(path, REPORT_LIMIT)?.0 != bytes {
-                return Err("FILE_CHANGED");
-            }
-            let result = s.import(
-                &snap,
-                &e,
-                &Import {
-                    path: guard.path.to_string_lossy().into(),
-                    bytes,
-                    report,
-                },
-            )?;
-            Ok(json!({"import":result,"status":s.status(&e)?}))
+            git_session(|g| {
+                let e = sample_twice(g, &snap.manifest, Some((&snap.base, &snap.base_source)))?;
+                if store::read_file(path, REPORT_LIMIT)?.0 != bytes {
+                    return Err("FILE_CHANGED");
+                }
+                let result = s.import(
+                    &snap,
+                    &e,
+                    &Import {
+                        path: guard.path.to_string_lossy().into(),
+                        bytes,
+                        report,
+                    },
+                )?;
+                Ok(json!({"import":result,"status":s.status(&e)?}))
+            })
         }
         "status" | "handoff" => {
             if opts.len() != 1 {
@@ -818,15 +880,24 @@ fn command(args: &[String]) -> Result<Value> {
             }
             let s = Store::open(root)?;
             let snap = s.snapshot()?;
-            let mut g = Git::new()?;
-            match sample_twice(
-                &mut g,
-                &snap.manifest,
-                Some((&snap.base, &snap.base_source)),
-            ) {
-                Ok(e) => s.status(&e),
-                Err(code) => s.unverified_status(code),
-            }
+            git_session(|g| {
+                match sample_twice(g, &snap.manifest, Some((&snap.base, &snap.base_source))) {
+                    Ok(e) => {
+                        if verb == "handoff" {
+                            s.handoff(&e)
+                        } else {
+                            s.status(&e)
+                        }
+                    }
+                    Err(code) => {
+                        if verb == "handoff" {
+                            s.unverified_handoff(code)
+                        } else {
+                            s.unverified_status(code)
+                        }
+                    }
+                }
+            })
         }
         _ => Err("ARGUMENT_REJECTED"),
     }
@@ -836,7 +907,8 @@ fn main() {
     let (value, code) = match command(&args) {
         Ok(v) => {
             let status = v.get("status").unwrap_or(&v);
-            let unknown = status.get("error_code").is_some()
+            let unknown = v.get("cleanup_warning").is_some()
+                || status.get("error_code").is_some()
                 || status.get("version_stale").and_then(Value::as_bool) == Some(true)
                 || status
                     .get("report_identity_problem")
@@ -911,5 +983,661 @@ mod tests {
             collect_readers(out, err, Duration::from_secs(1)),
             Ok((vec![1], vec![]))
         );
+    }
+}
+
+#[cfg(windows)]
+mod process_job {
+    use super::*;
+    use std::{
+        ffi::OsStr,
+        os::windows::{ffi::OsStrExt, io::FromRawHandle},
+        ptr::{null, null_mut},
+    };
+    use windows_sys::Win32::{
+        Foundation::*,
+        Security::SECURITY_ATTRIBUTES,
+        Storage::FileSystem::*,
+        System::{JobObjects::*, Pipes::CreatePipe, Threading::*},
+    };
+    pub struct Handle(pub HANDLE);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+    fn wide(s: &OsStr) -> Vec<u16> {
+        s.encode_wide().chain(Some(0)).collect()
+    }
+    fn quote(s: &OsStr) -> Vec<u16> {
+        let mut out = vec![34];
+        let mut slash = 0;
+        for x in s.encode_wide() {
+            if x == 92 {
+                slash += 1;
+                continue;
+            }
+            if x == 34 {
+                out.extend(std::iter::repeat_n(92, slash * 2 + 1));
+                out.push(34)
+            } else {
+                out.extend(std::iter::repeat_n(92, slash));
+                out.push(x)
+            }
+            slash = 0;
+        }
+        out.extend(std::iter::repeat_n(92, slash * 2));
+        out.push(34);
+        out
+    }
+    fn pipe() -> Result<(Handle, Handle)> {
+        unsafe {
+            let mut a = null_mut();
+            let mut b = null_mut();
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: null_mut(),
+                bInheritHandle: 1,
+            };
+            if CreatePipe(&mut a, &mut b, &sa, 0) == 0 {
+                return Err("GIT_PIPE");
+            };
+            Ok((Handle(a), Handle(b)))
+        }
+    }
+    #[derive(Debug)]
+    pub struct StopReceipt {
+        pub flags: Option<u32>,
+        pub active: Option<u32>,
+        pub direct_exited: bool,
+    }
+    impl StopReceipt {
+        pub fn confirmed(&self) -> bool {
+            self.flags == Some(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+                && self.active == Some(0)
+                && self.direct_exited
+        }
+    }
+    pub struct Tree {
+        pub out: Option<fs::File>,
+        pub err: Option<fs::File>,
+        job: Handle,
+        process: Handle,
+        _stdin: Option<Handle>,
+        assigned: bool,
+    }
+    impl Tree {
+        pub fn spawn(c: &Command, hold_stdin: bool) -> Result<Self> {
+            unsafe {
+                let job = Handle(CreateJobObjectW(null(), null()));
+                if job.0.is_null() {
+                    return Err("GIT_JOB_CREATE");
+                }
+                let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    &limits as *const _ as _,
+                    std::mem::size_of_val(&limits) as u32,
+                ) == 0
+                {
+                    return Err("GIT_JOB_LIMIT");
+                }
+                let (stdout, childout) = pipe()?;
+                let (stderr, childerr) = pipe()?;
+                let (childin, stdin) = pipe()?;
+                for h in [&stdout, &stderr, &stdin] {
+                    if SetHandleInformation(h.0, HANDLE_FLAG_INHERIT, 0) == 0 {
+                        return Err("GIT_PIPE_FLAGS");
+                    }
+                }
+                let mut size = 0;
+                InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size);
+                let mut attr = vec![
+                    0usize;
+                    (size + std::mem::size_of::<usize>() - 1)
+                        / std::mem::size_of::<usize>()
+                ];
+                let list = attr.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+                if InitializeProcThreadAttributeList(list, 1, 0, &mut size) == 0 {
+                    return Err("GIT_ATTRIBUTE");
+                }
+                struct Attr(LPPROC_THREAD_ATTRIBUTE_LIST);
+                impl Drop for Attr {
+                    fn drop(&mut self) {
+                        unsafe { DeleteProcThreadAttributeList(self.0) }
+                    }
+                }
+                let _attr = Attr(list);
+                let handles = [childin.0, childout.0, childerr.0];
+                if UpdateProcThreadAttribute(
+                    list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    handles.as_ptr() as _,
+                    std::mem::size_of_val(&handles),
+                    null_mut(),
+                    null(),
+                ) == 0
+                {
+                    return Err("GIT_ATTRIBUTE");
+                }
+                let mut startup: STARTUPINFOEXW = std::mem::zeroed();
+                startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+                startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+                startup.StartupInfo.hStdInput = childin.0;
+                startup.StartupInfo.hStdOutput = childout.0;
+                startup.StartupInfo.hStdError = childerr.0;
+                startup.lpAttributeList = list;
+                let app = wide(c.get_program());
+                let mut command = quote(c.get_program());
+                for a in c.get_args() {
+                    command.push(32);
+                    command.extend(quote(a))
+                }
+                command.push(0);
+                let mut vars = c
+                    .get_envs()
+                    .filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string())))
+                    .collect::<Vec<_>>();
+                vars.sort_by_key(|(k, _)| k.to_string_lossy().to_uppercase());
+                let mut env = vec![];
+                for (k, v) in vars {
+                    env.extend(k.encode_wide());
+                    env.push(61);
+                    env.extend(v.encode_wide());
+                    env.push(0)
+                }
+                env.push(0);
+                if env.len() == 1 {
+                    env.push(0)
+                }
+                let cwd = c.get_current_dir().map(|p| wide(p.as_os_str()));
+                let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+                if CreateProcessW(
+                    app.as_ptr(),
+                    command.as_mut_ptr(),
+                    null(),
+                    null(),
+                    1,
+                    CREATE_SUSPENDED
+                        | CREATE_NO_WINDOW
+                        | EXTENDED_STARTUPINFO_PRESENT
+                        | CREATE_UNICODE_ENVIRONMENT,
+                    env.as_ptr() as _,
+                    cwd.as_ref().map_or(null(), |v| v.as_ptr()),
+                    &startup.StartupInfo,
+                    &mut pi,
+                ) == 0
+                {
+                    return Err("GIT_START_FAILED");
+                }
+                let thread = Handle(pi.hThread);
+                let mut tree = Self {
+                    out: Some(fs::File::from_raw_handle(stdout.0 as _)),
+                    err: Some(fs::File::from_raw_handle(stderr.0 as _)),
+                    job,
+                    process: Handle(pi.hProcess),
+                    _stdin: if hold_stdin {
+                        Some(stdin)
+                    } else {
+                        drop(stdin);
+                        None
+                    },
+                    assigned: false,
+                };
+                std::mem::forget(stdout);
+                std::mem::forget(stderr);
+                drop(childin);
+                drop(childout);
+                drop(childerr);
+                // Child cannot execute until membership is established. Failed assignment
+                // terminates only this suspended process; never resume it.
+                if AssignProcessToJobObject(tree.job.0, tree.process.0) == 0 {
+                    let _ = tree.stop();
+                    return Err("GIT_JOB_ASSIGN_UNKNOWN");
+                }
+                tree.assigned = true;
+                if tree.receipt().flags != Some(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) {
+                    let _ = tree.stop();
+                    return Err("GIT_JOB_QUERY_UNKNOWN");
+                }
+                if ResumeThread(thread.0) == u32::MAX {
+                    let _ = tree.stop();
+                    return Err("GIT_RESUME_UNKNOWN");
+                }
+                Ok(tree)
+            }
+        }
+        pub fn receipt(&self) -> StopReceipt {
+            unsafe {
+                let mut l: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                let mut a: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
+                let flags = (QueryInformationJobObject(
+                    self.job.0,
+                    JobObjectExtendedLimitInformation,
+                    &mut l as *mut _ as _,
+                    std::mem::size_of_val(&l) as u32,
+                    null_mut(),
+                ) != 0)
+                    .then_some(l.BasicLimitInformation.LimitFlags);
+                let active = (QueryInformationJobObject(
+                    self.job.0,
+                    JobObjectBasicAccountingInformation,
+                    &mut a as *mut _ as _,
+                    std::mem::size_of_val(&a) as u32,
+                    null_mut(),
+                ) != 0)
+                    .then_some(a.ActiveProcesses);
+                StopReceipt {
+                    flags,
+                    active,
+                    direct_exited: WaitForSingleObject(self.process.0, 0) == WAIT_OBJECT_0,
+                }
+            }
+        }
+        pub fn stop(&mut self) -> StopReceipt {
+            unsafe {
+                if self.assigned {
+                    TerminateJobObject(self.job.0, 1);
+                } else {
+                    TerminateProcess(self.process.0, 1);
+                }
+            }
+            let end = Instant::now() + Duration::from_secs(1);
+            loop {
+                let r = self.receipt();
+                if r.confirmed() || Instant::now() >= end {
+                    return r;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        fn code(&self) -> Option<u32> {
+            if !self.receipt().direct_exited {
+                return None;
+            }
+            let mut code = 0;
+            (unsafe { GetExitCodeProcess(self.process.0, &mut code) } != 0).then_some(code)
+        }
+        #[cfg(test)]
+        pub fn members(&self) -> Result<Vec<Handle>> {
+            unsafe {
+                // Bounded test-only inventory of this unnamed Job, never global names.
+                let mut data = [0usize; 66];
+                if QueryInformationJobObject(
+                    self.job.0,
+                    JobObjectBasicProcessIdList,
+                    data.as_mut_ptr() as _,
+                    std::mem::size_of_val(&data) as u32,
+                    null_mut(),
+                ) == 0
+                {
+                    return Err("TEST_JOB_INVENTORY");
+                }
+                let list = &*(data.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST);
+                if list.NumberOfProcessIdsInList > 64 {
+                    return Err("TEST_JOB_BOUND");
+                }
+                let ids = std::slice::from_raw_parts(
+                    list.ProcessIdList.as_ptr(),
+                    list.NumberOfProcessIdsInList as usize,
+                );
+                let mut out = vec![];
+                for id in ids {
+                    let h = Handle(OpenProcess(
+                        PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                        0,
+                        *id as u32,
+                    ));
+                    if h.0.is_null() {
+                        return Err("TEST_PROCESS_HANDLE");
+                    }
+                    let mut member = 0;
+                    if IsProcessInJob(h.0, self.job.0, &mut member) == 0 || member == 0 {
+                        return Err("TEST_MEMBERSHIP");
+                    }
+                    out.push(h)
+                }
+                Ok(out)
+            }
+        }
+    }
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            if !self.receipt().confirmed() {
+                let _ = self.stop();
+            }
+        }
+    }
+    pub fn supervise(
+        t: &mut Tree,
+        deadline: Instant,
+        overflow: &AtomicBool,
+    ) -> (Option<&'static str>, Option<u32>, StopReceipt) {
+        loop {
+            let r = t.receipt();
+            if r.flags != Some(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) || r.active.is_none() {
+                return (Some("GIT_WAIT_UNKNOWN"), None, t.stop());
+            }
+            if r.confirmed() {
+                return (None, t.code(), r);
+            }
+            if Instant::now() >= deadline || overflow.load(Ordering::Acquire) {
+                return (Some("GIT_DEADLINE_OR_BOUND"), t.code(), t.stop());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    // Handle-based disposition: never recursively delete a substituted pathname.
+    pub fn delete_owned(path: &Path, identity: &str, dir: bool) -> Result<()> {
+        unsafe {
+            let w = wide(path.as_os_str());
+            let h = Handle(CreateFileW(
+                w.as_ptr(),
+                GENERIC_READ | DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                null_mut(),
+            ));
+            if h.0 == INVALID_HANDLE_VALUE {
+                return Err("TEMP_CLEANUP_OPEN");
+            }
+            let mut i: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+            let mut b = vec![0u16; 32768];
+            let n = GetFinalPathNameByHandleW(h.0, b.as_mut_ptr(), b.len() as u32, 0) as usize;
+            if GetFileInformationByHandle(h.0, &mut i) == 0
+                || i.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                || n == 0
+                || n >= b.len()
+            {
+                return Err("TEMP_CLEANUP_IDENTITY");
+            }
+            let actual = format!(
+                "{:08x}:{:08x}{:08x}",
+                i.dwVolumeSerialNumber, i.nFileIndexHigh, i.nFileIndexLow
+            );
+            let final_path = String::from_utf16(&b[..n]).map_err(|_| "TEMP_CLEANUP_IDENTITY")?;
+            if actual != identity
+                || !final_path
+                    .trim_start_matches("\\\\?\\")
+                    .eq_ignore_ascii_case(&path.to_string_lossy())
+                || (!dir && i.nNumberOfLinks != 1)
+            {
+                return Err("TEMP_CLEANUP_IDENTITY");
+            }
+            if dir
+                && fs::read_dir(path)
+                    .map_err(|_| "TEMP_CLEANUP_READ")?
+                    .next()
+                    .is_some()
+            {
+                return Err("TEMP_CLEANUP_NOT_EMPTY");
+            }
+            let info = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+            if SetFileInformationByHandle(
+                h.0,
+                FileDispositionInfo,
+                &info as *const _ as _,
+                std::mem::size_of_val(&info) as u32,
+            ) == 0
+            {
+                return Err("TEMP_CLEANUP_DELETE");
+            }
+            Ok(())
+        }
+    }
+}
+
+struct OwnedTemp {
+    path: PathBuf,
+    root: Option<Guard>,
+    hooks: Option<Guard>,
+    config: Option<Guard>,
+}
+impl OwnedTemp {
+    fn create() -> Result<Self> {
+        let path = std::env::temp_dir().join(format!("nova-sh1-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&path).map_err(|_| "TEMP_CREATE")?;
+        let mut owner = Self {
+            root: Some(Guard::open(&path, true)?),
+            path,
+            hooks: None,
+            config: None,
+        };
+        let setup = (|| {
+            fs::create_dir(owner.path.join("hooks")).map_err(|_| "TEMP_CREATE")?;
+            owner.hooks = Some(Guard::open(&owner.path.join("hooks"), false)?);
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(owner.path.join("empty-config"))
+                .map_err(|_| "TEMP_CREATE")?;
+            owner.config = Some(Guard::open(&owner.path.join("empty-config"), false)?);
+            Ok(())
+        })();
+        if let Err(e) = setup {
+            eprintln!("TEMP_SETUP_PARTIAL_RETAINED");
+            return Err(e);
+        }
+        Ok(owner)
+    }
+    #[cfg(windows)]
+    fn cleanup(&mut self) -> Result<()> {
+        // Root's existing guard prevents parent substitution while children are
+        // checked/deleted. Each child is reopened with DELETE and its original ID.
+        self.root.as_ref().ok_or("TEMP_CLEANUP_UNKNOWN")?.verify()?;
+        for child in [&mut self.config, &mut self.hooks] {
+            if let Some(g) = child.take() {
+                g.verify()?;
+                let p = g.path.clone();
+                let id = g.identity.clone();
+                let dir = p.file_name() == Some(std::ffi::OsStr::new("hooks"));
+                drop(g);
+                process_job::delete_owned(&p, &id, dir)?;
+            }
+        }
+        let g = self.root.take().ok_or("TEMP_CLEANUP_UNKNOWN")?;
+        let p = g.path.clone();
+        let id = g.identity.clone();
+        drop(g);
+        process_job::delete_owned(&p, &id, true)
+    }
+    #[cfg(not(windows))]
+    fn cleanup(&mut self) -> Result<()> {
+        Err("WINDOWS_REQUIRED")
+    }
+}
+impl Git {
+    fn finish(&mut self) -> Result<()> {
+        if !self.cleanup_allowed {
+            return Err("TEMP_RETAINED_LIFECYCLE_UNKNOWN");
+        }
+        if let Some(mut owner) = self.temp_owner.take() {
+            owner.cleanup()?
+        }
+        Ok(())
+    }
+}
+impl Drop for Git {
+    fn drop(&mut self) {
+        if self.temp_owner.is_some() {
+            if let Err(code) = self.finish() {
+                eprintln!("{code}");
+            }
+        }
+    }
+}
+fn git_session(f: impl FnOnce(&mut Git) -> Result<Value>) -> Result<Value> {
+    let mut g = Git::new()?;
+    let result = f(&mut g);
+    let cleanup = g.finish();
+    match (result, cleanup) {
+        (Ok(mut v), Err(e)) => {
+            v["cleanup_warning"] = json!(e);
+            Ok(v)
+        }
+        (result, Err(e)) => {
+            eprintln!("{e}");
+            result
+        }
+        (result, Ok(())) => result,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod remediation_tests {
+    use super::*;
+    fn scratch() -> PathBuf {
+        let root = std::env::var_os("NOVA_SH1_TEST_ROOT")
+            .map(PathBuf::from)
+            .expect("self-owned test root required")
+            .join(format!("adapter-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        root
+    }
+    #[test]
+    fn absent_nested_path_guards_existing_ancestor_without_creating_directories() {
+        let root = scratch();
+        let target = root.join("new-dir/deeper/file.txt");
+        let g = absent_ancestor(&target, &root).unwrap();
+        assert_eq!(g.path, root);
+        assert!(!root.join("new-dir").exists());
+        assert!(absent_ancestor(&root.parent().unwrap().join("outside"), &root).is_err());
+    }
+    #[test]
+    fn owned_temp_normal_cleanup_and_unknown_children_are_not_recursive() {
+        let mut t = OwnedTemp::create().unwrap();
+        let p = t.path.clone();
+        t.cleanup().unwrap();
+        assert!(!p.exists());
+        let mut t = OwnedTemp::create().unwrap();
+        let p = t.path.clone();
+        fs::write(p.join("unknown"), b"retain").unwrap();
+        assert_eq!(t.cleanup(), Err("TEMP_CLEANUP_NOT_EMPTY"));
+        assert_eq!(fs::read(p.join("unknown")).unwrap(), b"retain");
+    }
+    #[test]
+    fn substituted_temp_entry_is_never_deleted() {
+        let mut t = OwnedTemp::create().unwrap();
+        let p = t.path.join("empty-config");
+        t.config.take();
+        fs::rename(&p, t.path.join("original")).unwrap();
+        fs::write(&p, b"other-owner").unwrap();
+        assert!(t.cleanup().is_err());
+        assert_eq!(fs::read(p).unwrap(), b"other-owner");
+    }
+    #[test]
+    fn lifecycle_unknown_retains_owned_temp_and_latches_admission() {
+        let mut g = Git::new().unwrap();
+        let p = g.temp.clone();
+        g.failed = true;
+        g.cleanup_allowed = false;
+        assert_eq!(g.finish(), Err("TEMP_RETAINED_LIFECYCLE_UNKNOWN"));
+        assert!(p.exists());
+        assert!(g.failed);
+    }
+    #[test]
+    fn actual_git_launcher_tree_timeout_reclaims_job_children_and_pipe_readers() {
+        use windows_sys::Win32::{
+            Foundation::WAIT_OBJECT_0, System::Threading::WaitForSingleObject,
+        };
+        let root = scratch();
+        let mut g = Git::new().unwrap();
+        let mut c = Command::new(&g.exe);
+        // Test-only non-repository command. Intentionally retain pipe stdin so the
+        // installed launcher and its actual Git child cannot finish naturally.
+        c.args(["--no-pager", "hash-object", "--stdin"])
+            .current_dir(&root)
+            .env_clear()
+            .env("SystemRoot", std::env::var_os("SystemRoot").unwrap())
+            .env(
+                "PATH",
+                format!(
+                    "{};{}\\System32",
+                    g.exe.parent().unwrap().display(),
+                    std::env::var("SystemRoot").unwrap()
+                ),
+            )
+            .env("HOME", &g.temp)
+            .env("USERPROFILE", &g.temp)
+            .env("TEMP", &g.temp)
+            .env("TMP", &g.temp)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", g.temp.join("empty-config"))
+            .env("GIT_TERMINAL_PROMPT", "0");
+        let mut tree = process_job::Tree::spawn(&c, true).unwrap();
+        let overflow = Arc::new(AtomicBool::new(false));
+        let out = reader(tree.out.take().unwrap(), 1048576, overflow.clone());
+        let err = reader(tree.err.take().unwrap(), 32768, overflow.clone());
+        let end = Instant::now() + Duration::from_secs(3);
+        let (members, observed_images) = loop {
+            let members = tree.members().unwrap();
+            let mut images = vec![];
+            let mut delegated_git = false;
+            for h in &members {
+                let mut name = vec![0u16; 32768];
+                let mut n = name.len() as u32;
+                assert_ne!(
+                    unsafe {
+                        windows_sys::Win32::System::Threading::QueryFullProcessImageNameW(
+                            h.0,
+                            0,
+                            name.as_mut_ptr(),
+                            &mut n,
+                        )
+                    },
+                    0
+                );
+                let image = String::from_utf16(&name[..n as usize]).unwrap();
+                delegated_git |= Path::new(&image)
+                    .file_name()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("git.exe"))
+                    && !image.eq_ignore_ascii_case(&g.exe.to_string_lossy());
+                images.push(json!({"pid":unsafe{windows_sys::Win32::System::Threading::GetProcessId(h.0)},"image_observed":image}));
+            }
+            // A second Job member may only be conhost. Require the actual
+            // delegated git.exe image before exercising the timeout.
+            if delegated_git {
+                break (members, images);
+            }
+            assert!(
+                Instant::now() < end,
+                "installed launcher did not produce delegated git.exe"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let before = tree.receipt();
+        assert!(before.active.unwrap() >= 2);
+        let clock = Instant::now();
+        let (reason, _, receipt) =
+            process_job::supervise(&mut tree, clock + Duration::from_millis(75), &overflow);
+        assert_eq!(reason, Some("GIT_DEADLINE_OR_BOUND"));
+        assert!(receipt.confirmed(), "{receipt:?}");
+        let signal_deadline = Instant::now() + Duration::from_secs(1);
+        for h in &members {
+            assert_eq!(
+                unsafe {
+                    WaitForSingleObject(
+                        h.0,
+                        signal_deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_millis()
+                            .min(1000) as u32,
+                    )
+                },
+                WAIT_OBJECT_0
+            );
+        }
+        let streams = collect_readers(out, err, Duration::from_secs(1)).unwrap();
+        assert!(clock.elapsed() < Duration::from_secs(3));
+        fs::write(root.join("job-timeout-receipt.json"),serde_json::to_vec_pretty(&json!({"source":"WINDOWS_NATIVE_FIXED_GIT_FIXTURE","job_flags":receipt.flags,"active_before":before.active,"active_after":receipt.active,"direct_exited":receipt.direct_exited,"observed_job_process_handles":members.len(),"observed_images":observed_images,"delegated_git_observed":true,"all_observed_processes_signaled":true,"stdout_eof_joined":true,"stderr_eof_joined":true,"stdout_bytes":streams.0.len(),"stderr_bytes":streams.1.len(),"elapsed_ms":clock.elapsed().as_millis(),"identity_boundary":"guarded launcher only; downstream image identity not frozen"})).unwrap()).unwrap();
+        drop(tree);
+        g.finish().unwrap();
     }
 }

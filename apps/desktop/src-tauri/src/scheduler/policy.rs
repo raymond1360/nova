@@ -142,3 +142,123 @@ pub fn validate_history(old: &Report, new: &Report) -> Result<()> {
     }
     Ok(())
 }
+
+/// Deterministic, non-executing handoff. Conclusions and issue details remain
+/// human claims; state/projection only choose the material recipient.
+pub fn handoff_plan(
+    phase: &str,
+    p: &Projection,
+    candidates: &[Candidate],
+    invalidated: bool,
+    closed: bool,
+    hold: Option<&str>,
+) -> serde_json::Value {
+    use serde_json::json;
+    let mut conflicts = vec![];
+    let mut blockers = vec![];
+    let mut open = vec![];
+    for kind in &p.conflicts {
+        let mut ids = candidates
+            .iter()
+            .filter(|c| c.report.report_type == *kind)
+            .map(|c| c.receipt_id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        conflicts.push(json!({"slot":kind,"candidate_receipt_ids":ids,"required_reference":"SLOT_RESOLUTION with exact complete candidate set, then CONTINUE_MATERIALS","claim_source":"HUMAN_ATTESTED"}));
+    }
+    for c in candidates
+        .iter()
+        .filter(|c| p.selected.get(&c.report.report_type) == Some(&c.receipt_id))
+    {
+        for i in &c.report.issues {
+            if i.status == IssueStatus::Open {
+                let row = json!({"issue_id":i.id,"blocking":i.blocking,"severity":i.severity,"slot":c.report.report_type,"receipt_id":c.receipt_id,"source":"HUMAN_ATTESTED"});
+                if i.blocking {
+                    blockers.push(row)
+                } else {
+                    open.push(row)
+                }
+            }
+        }
+        if matches!(
+            c.report.claimed_conclusion,
+            Conclusion::Fail | Conclusion::Blocked
+        ) {
+            blockers.push(json!({"issue_id":null,"blocking":true,"reason":"CLAIMED_FAIL_OR_BLOCKED","claimed_conclusion":c.report.claimed_conclusion,"slot":c.report.report_type,"receipt_id":c.receipt_id,"source":"HUMAN_ATTESTED"}));
+        }
+        if !c
+            .report
+            .claims
+            .author
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            blockers.push(json!({"issue_id":null,"blocking":true,"reason":"AUTHOR_CLAIM_MISSING","slot":c.report.report_type,"receipt_id":c.receipt_id,"source":"HUMAN_ATTESTED"}));
+        }
+    }
+    let (action, recipient, reason) = if let Some(reason) = hold {
+        ("STOP_RECONCILE_IDENTITY", "PM", reason)
+    } else if closed {
+        (
+            "REGISTRATION_CLOSED",
+            "PM",
+            "CLOSURE_REFERENCE_RECORDED_NOT_USER_ACCEPTANCE",
+        )
+    } else if phase == "PAUSED" {
+        ("PAUSED", "PM", "EXPLICIT_CONTINUE_REFERENCE_REQUIRED")
+    } else if phase == "CANCELLED" {
+        ("CANCELLED", "PM", "REGISTRATION_CANCELLED")
+    } else if invalidated {
+        (
+            "NO_NEW_DELIVERY",
+            "PM",
+            "NEW_LEGALLY_REFERENCED_DELIVERY_REQUIRED",
+        )
+    } else if !conflicts.is_empty() {
+        ("REQUEST_SLOT_RESOLUTION", "PM", "SLOT_CONFLICT")
+    } else if !p.blocking.is_empty() {
+        ("HANDOFF_BLOCKED", "PM", "BLOCKING_CLAIMS_REQUIRE_DECISION")
+    } else if phase == "PM_DECISION_REQUIRED" {
+        ("REQUEST_CONTINUE_REFERENCE", "PM", "NO_AUTOMATIC_RESUME")
+    } else if phase == "AWAITING_PM" && p.complete {
+        (
+            "DELIVER_TO_PM_FOR_CLOSURE",
+            "PM",
+            "MATERIALS_REGISTERED_NOT_MACHINE_VERIFIED",
+        )
+    } else if !p.has_development && phase == "HANDOFF_READY" {
+        (
+            "DELIVER_TO_DEVELOPER",
+            "DEVELOPER",
+            "DEVELOPMENT_RECEIPT_REQUIRED",
+        )
+    } else if p.has_development
+        && p.missing.contains(&ReportType::Review)
+        && p.missing.contains(&ReportType::Ci)
+    {
+        (
+            "COLLECT_REVIEW_AND_VALIDATION",
+            "REVIEWER_AND_PM",
+            "MISSING_REVIEW_AND_CI",
+        )
+    } else if p.has_development && p.missing.contains(&ReportType::Review) {
+        (
+            "DELIVER_TO_REVIEWER",
+            "READ_ONLY_REVIEWER",
+            "MISSING_REVIEW",
+        )
+    } else if p.has_development && p.missing.contains(&ReportType::Ci) {
+        (
+            "REQUEST_PM_VALIDATION",
+            "PM",
+            "MISSING_CI_PM_MUST_ARRANGE_AUTHORIZED_VALIDATION",
+        )
+    } else {
+        (
+            "STOP_RECONCILE_STATE",
+            "PM",
+            "STATE_OR_MATERIALS_REQUIRE_RECONCILIATION",
+        )
+    };
+    json!({"rule_id":"SH1_HANDOFF_V2","action":action,"recipient":recipient,"reason":reason,"missing_slots":p.missing,"conflicts":conflicts,"blocking_claims":blockers,"nonblocking_open_claims":open,"suggestion_only":true,"execution_authorized":false,"claims_are_not_machine_verification":true})
+}

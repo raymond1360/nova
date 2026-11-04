@@ -742,3 +742,147 @@ fn actual_pause_then_continue_requires_reference_and_keeps_materials() {
     assert_eq!(s.snapshot().unwrap().phase, "MATERIAL_COLLECTION");
     assert_eq!(s.snapshot().unwrap().manual_rounds, 0);
 }
+
+#[test]
+fn handoff_recipients_missing_slots_and_terminal_holds() {
+    let empty = project_all(&[], &[], false);
+    assert_eq!(
+        handoff_plan("HANDOFF_READY", &empty, &[], false, false, None)["action"],
+        "DELIVER_TO_DEVELOPER"
+    );
+    let dev = vec![candidate(ReportType::Development)];
+    let p = project_all(&dev, &[], false);
+    assert_eq!(
+        handoff_plan("MATERIAL_COLLECTION", &p, &dev, false, false, None)["recipient"],
+        "REVIEWER_AND_PM"
+    );
+    let mut c = dev.clone();
+    c.push(candidate(ReportType::Review));
+    let p = project_all(&c, &[], false);
+    assert_eq!(
+        handoff_plan("MATERIAL_COLLECTION", &p, &c, false, false, None)["action"],
+        "REQUEST_PM_VALIDATION"
+    );
+    let c = all();
+    let p = project_all(&c, &[], false);
+    assert_eq!(
+        handoff_plan("AWAITING_PM", &p, &c, false, false, None)["action"],
+        "DELIVER_TO_PM_FOR_CLOSURE"
+    );
+    for (phase, invalid, closed, hold, action) in [
+        ("PAUSED", false, false, None, "PAUSED"),
+        ("CANCELLED", false, false, None, "CANCELLED"),
+        ("AWAITING_PM", true, false, None, "NO_NEW_DELIVERY"),
+        ("AWAITING_PM", false, true, None, "REGISTRATION_CLOSED"),
+        (
+            "AWAITING_PM",
+            false,
+            false,
+            Some("DIRTY_SCOPE"),
+            "STOP_RECONCILE_IDENTITY",
+        ),
+    ] {
+        let h = handoff_plan(phase, &p, &c, invalid, closed, hold);
+        assert_eq!(h["action"], action);
+        assert_eq!(h["execution_authorized"], false);
+    }
+}
+#[test]
+fn handoff_conflicts_and_blockers_carry_exact_receipt_sources() {
+    let mut c = all();
+    let mut other = c[1].clone();
+    other.receipt_id = "review-other".into();
+    other.report.claims.author = Some("other".into());
+    c.push(other);
+    let p = project_all(&c, &[], false);
+    let h = handoff_plan("MATERIAL_COLLECTION", &p, &c, false, false, None);
+    let ids = h["conflicts"][0]["candidate_receipt_ids"]
+        .as_array()
+        .unwrap();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&json!("review-other")));
+    assert!(ids.contains(&json!("r-review")));
+    c.pop();
+    c[1].report.issues.push(issue(true));
+    let p = project_all(&c, &[], false);
+    let h = handoff_plan("MATERIAL_COLLECTION", &p, &c, false, false, None);
+    assert_eq!(h["action"], "HANDOFF_BLOCKED");
+    assert_eq!(h["blocking_claims"][0]["issue_id"], "N-1");
+    assert_eq!(h["blocking_claims"][0]["receipt_id"], "r-review");
+    assert_eq!(h["blocking_claims"][0]["source"], "HUMAN_ATTESTED");
+}
+#[test]
+fn every_pm_decision_requires_author_role_and_references() {
+    for decision in [
+        "CONTINUE_MATERIALS",
+        "CLOSURE_REFERENCE",
+        "SLOT_RESOLUTION",
+        "PAUSE",
+        "CANCEL",
+        "REPAIR_REFERENCE",
+    ] {
+        let mut r = report(ReportType::PmDecision);
+        r.context.decision_kind = Some(decision.into());
+        r.context.pm_decision_ref = Some("fixture-decision".into());
+        if decision == "SLOT_RESOLUTION" {
+            r.context.slot_resolution = Some(Resolution {
+                delivery_identity: "a".repeat(64),
+                report_type: ReportType::Review,
+                candidate_receipt_ids: vec!["one".into(), "two".into()],
+                selected_receipt_id: "one".into(),
+                supersedes_resolution_receipt_id: None,
+                reason: "fixture".into(),
+            });
+        }
+        r.validate().unwrap();
+        for author in [None, Some("".into()), Some("  \t".into())] {
+            let mut x = r.clone();
+            x.claims.author = author;
+            assert_eq!(x.validate(), Err("PM_AUTHOR_CLAIM_REQUIRED"));
+        }
+        let mut x = r.clone();
+        x.claims.role = "user".into();
+        assert!(x.validate().is_err());
+        let mut x = r;
+        x.context.pm_decision_ref = None;
+        assert!(x.validate().is_err());
+    }
+}
+#[cfg(windows)]
+#[test]
+fn paused_without_development_resumes_queued_then_accepts_development() {
+    let f = Fixture::new();
+    let s = f.store();
+    let mut pm = report(ReportType::PmDecision);
+    pm.context.pm_decision_ref = Some("pause-fixture".into());
+    pm.context.decision_kind = Some("PAUSE".into());
+    f.import(&s, &pm).unwrap();
+    assert_eq!(s.status(&f.e).unwrap()["handoff"]["action"], "PAUSED");
+    pm.context.pm_decision_ref = Some("resume-fixture".into());
+    pm.context.decision_kind = Some("CONTINUE_MATERIALS".into());
+    f.import(&s, &pm).unwrap();
+    assert_eq!(s.status(&f.e).unwrap()["task_state"], "queued");
+    f.import(&s, &report(ReportType::Development)).unwrap();
+    assert_eq!(s.status(&f.e).unwrap()["task_state"], "verifying");
+}
+#[cfg(windows)]
+#[test]
+fn compact_handoff_keeps_context_and_index_ids_without_echoing_claims() {
+    let f = Fixture::new();
+    let s = f.store();
+    let mut r = report(ReportType::Development);
+    r.claims.model = Some("m".repeat(2000));
+    f.import(&s, &r).unwrap();
+    let h = s.handoff(&f.e).unwrap();
+    assert_eq!(h["context"]["source"], "HUMAN_ATTESTED");
+    assert_eq!(h["context"]["value"]["goal"], f.m.goal);
+    assert!(h["receipts"][0].get("claims").is_none());
+    assert!(!h["receipts"][0]["receipt_id"].as_str().unwrap().is_empty());
+    assert!(serde_json::to_vec(&h).unwrap().len() < 8192);
+    let mut stale = f.e.clone();
+    stale.delivery_identity = "different".into();
+    assert_eq!(
+        s.handoff(&stale).unwrap()["handoff"]["action"],
+        "STOP_RECONCILE_IDENTITY"
+    );
+}

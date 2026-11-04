@@ -407,6 +407,14 @@ impl Report {
         }
         if self.report_type == ReportType::PmDecision {
             if !self
+                .claims
+                .author
+                .as_ref()
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                return Err("PM_AUTHOR_CLAIM_REQUIRED");
+            }
+            if !self
                 .context
                 .pm_decision_ref
                 .as_ref()

@@ -68,6 +68,58 @@ jobs:
             lockfile_sha256 = $hashes
           } | ConvertTo-Json | Set-Content (Join-Path $logs 'build-info.json') -Encoding utf8
 
+      - name: Prepare SH1 run-scoped long paths
+        id: sh1_paths
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Resolve-Sh1LongDirectory([string]$Path) {
+            if (-not ('Sh1LongPath' -as [type])) {
+              Add-Type -TypeDefinition @"
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+          public static class Sh1LongPath {
+            [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+            public static extern uint GetLongPathName(string input, StringBuilder output, uint size);
+          }
+          "@
+            }
+            if (-not [IO.Path]::IsPathFullyQualified($Path)) { throw 'SH1_PATH_REJECTED' }
+            $full = [IO.Path]::GetFullPath($Path)
+            if ($full -notmatch '^[A-Za-z]:\\' -or $full -match '[\r\n]') { throw 'SH1_PATH_REJECTED' }
+            $buffer = [Text.StringBuilder]::new(32768)
+            $n = [Sh1LongPath]::GetLongPathName($full, $buffer, 32768)
+            if ($n -eq 0 -or $n -ge 32768) { throw 'SH1_PATH_REJECTED' }
+            $long = $buffer.ToString()
+            $item = Get-Item -LiteralPath $long -Force -ErrorAction Stop
+            if (-not $item.PSIsContainer) { throw 'SH1_PATH_REJECTED' }
+            for ($p = $item; $null -ne $p; $p = $p.Parent) {
+              if (($p.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'SH1_PATH_REJECTED' }
+            }
+            if ($long.Length -eq 3) { return $long }
+            return $long.TrimEnd('\')
+          }
+          if ($env:GITHUB_RUN_ID -notmatch '^[1-9][0-9]{0,19}$' -or $env:GITHUB_RUN_ATTEMPT -notmatch '^[1-9][0-9]{0,9}$') { throw 'SH1_CONTEXT_REJECTED' }
+          $base = Resolve-Sh1LongDirectory $env:RUNNER_TEMP
+          $root = Join-Path $base "nova-sh1-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)"
+          if (Test-Path -LiteralPath $root) { throw 'SH1_PATH_ALREADY_EXISTS' }
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+          $root = Resolve-Sh1LongDirectory $root
+          foreach ($name in @('process-temp','ci-public')) {
+            $p = Join-Path $root $name
+            New-Item -ItemType Directory -Path $p -ErrorAction Stop | Out-Null
+            if ((Resolve-Sh1LongDirectory $p) -cne $p) { throw 'SH1_PATH_REJECTED' }
+          }
+          # Script creates these itself. Do not pre-create or reuse its evidence directory.
+          foreach ($name in @('evidence','target')) {
+            if (Test-Path -LiteralPath (Join-Path $root $name)) { throw 'SH1_PATH_ALREADY_EXISTS' }
+          }
+          [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "root=$root`n", [Text.UTF8Encoding]::new($false))
+          # Applies before future pwsh processes start, including the original default
+          # backend tests. Do not set CARGO_TARGET_DIR globally: helper lookup is unchanged.
+          $processTemp = Join-Path $root 'process-temp'
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "TEMP=$processTemp`nTMP=$processTemp`n", [Text.UTF8Encoding]::new($false))
+
       - name: Install locked frontend and run frontend tests
         working-directory: apps/desktop
         run: |
@@ -145,6 +197,284 @@ jobs:
           # GitHub's pwsh wrapper propagates LASTEXITCODE at script end.
           # The deliberate failure is now validated, so this step succeeds.
           $global:LASTEXITCODE = 0
+
+      - name: Run complete SH1 handoff validation
+        env:
+          SH1_ROOT: ${{ steps.sh1_paths.outputs.root }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:SH1_ROOT
+          $processTemp = Join-Path $root 'process-temp'
+          $env:TEMP = $processTemp
+          $env:TMP = $processTemp
+          $pwsh = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
+          if (-not $pwsh) { throw 'SH1_WRAPPER_TOOL_MISSING' }
+          $info = [Diagnostics.ProcessStartInfo]::new()
+          $info.FileName = $pwsh
+          $info.WorkingDirectory = $env:GITHUB_WORKSPACE
+          $info.UseShellExecute = $false
+          $info.CreateNoWindow = $true
+          $info.RedirectStandardOutput = $true
+          $info.RedirectStandardError = $true
+          $info.Environment['TEMP'] = $processTemp
+          $info.Environment['TMP'] = $processTemp
+          foreach ($arg in @('-NoProfile','-NonInteractive','-File',(Join-Path $env:GITHUB_WORKSPACE 'scripts/test_scheduler_handoff.ps1'),'-EvidenceDirectory',(Join-Path $root 'evidence'),'-TargetDirectory',(Join-Path $root 'target'))) { $info.ArgumentList.Add($arg) }
+          # No SkipDefaultRegression. A fresh pwsh receives long TEMP before startup.
+          $p = [Diagnostics.Process]::new(); $p.StartInfo = $info
+          $state = 'START_FAILED'; $exitCode = $null; $started = $false
+          $clock = [Diagnostics.Stopwatch]::StartNew()
+          try {
+            if (-not $p.Start()) { throw 'SH1_WRAPPER_START_FAILED' }
+            $started = $true; $state = 'PARTIAL'
+            $streams = @($p.StandardOutput, $p.StandardError)
+            $buffers = @(([char[]]::new(4096)), ([char[]]::new(4096)))
+            $tasks = @($streams[0].ReadAsync($buffers[0],0,4096), $streams[1].ReadAsync($buffers[1],0,4096))
+            $done = @($false,$false); $counts = @(0L,0L)
+            while (-not ($done[0] -and $done[1] -and $p.HasExited)) {
+              # Inner script has a 45 minute total deadline; 30 seconds for wrapper grace.
+              if ($clock.ElapsedMilliseconds -ge 2730000) { throw 'SH1_WRAPPER_DEADLINE' }
+              for ($i=0; $i -lt 2; $i++) {
+                if (-not $done[$i] -and $tasks[$i].IsCompleted) {
+                  $n = $tasks[$i].GetAwaiter().GetResult()
+                  if ($n -eq 0) { $done[$i] = $true; continue }
+                  $counts[$i] += $n
+                  if ($counts[$i] -gt 65536) { throw 'SH1_WRAPPER_OUTPUT_BOUND' }
+                  # Never echo or publish arbitrary child exception text.
+                  $tasks[$i] = $streams[$i].ReadAsync($buffers[$i],0,4096)
+                }
+              }
+              [Threading.Thread]::Sleep(10)
+            }
+            $exitCode = $p.ExitCode; $state = 'COMPLETE'
+          } catch {
+            throw 'SH1_WRAPPER_FAILED'
+          } finally {
+            if ($started -and $state -eq 'PARTIAL') {
+              try { if (-not $p.HasExited) { $p.Kill($true) }; if ($p.WaitForExit(5000)) { $exitCode = $p.ExitCode } } catch { $exitCode = $null }
+            }
+            $record = @{schema='nova.sh1.ci-execution/1';sha=$env:GITHUB_SHA;run_id=$env:GITHUB_RUN_ID;attempt=$env:GITHUB_RUN_ATTEMPT;state=$state;exit_code=$exitCode}
+            $b = [Text.Encoding]::UTF8.GetBytes(($record | ConvertTo-Json -Compress))
+            $f = [IO.File]::Open((Join-Path $root 'execution.json'),[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read)
+            try { $f.Write($b,0,$b.Length); $f.Flush($true) } finally { $f.Dispose(); $p.Dispose() }
+          }
+          if ($state -cne 'COMPLETE' -or $exitCode -ne 0) { throw 'SH1_SCRIPT_FAILED' }
+
+      - name: Verify and export closed SH1 CI evidence
+        if: ${{ always() && steps.sh1_paths.outputs.root != '' }}
+        env:
+          SH1_ROOT: ${{ steps.sh1_paths.outputs.root }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Test-Sh1Integer($Value) { return (($Value -is [int] -or $Value -is [long]) -and $Value -ge 0 -and $Value -le 2147483647) }
+          function Test-Sh1ExitCode($Value) { return (($Value -is [int] -or $Value -is [long]) -and $Value -ge -2147483648 -and $Value -le 2147483647) }
+          function Assert-Sh1($Condition, [string]$Code) { if (-not $Condition) { throw $Code } }
+          function Get-Sh1ExpectedCommands {
+            # Closed ledger contract of the reviewed runner, not arbitrary command input.
+            return [ordered]@{
+              'debug-build'=0;'scheduler-list'=0;'scheduler-tests'=0;'adapter-tests'=0
+              'default-required-features'=101;'release-guard'=101
+              'fixture-init'=0;'fixture-add-base'=0;'fixture-commit-base'=0;'fixture-base-sha'=0;'root-commit-rejected'=2
+              'fixture-add-change'=0;'fixture-commit-change'=0;'bin-init'=0;'absent-nested-init'=0;'handoff-missing-slots'=2
+              'legacy-index-only'=0;'bin-import-REVIEW'=0;'bin-import-CI'=0;'bin-import-DEVELOPMENT'=0
+              'bin-status'=0;'bin-handoff'=0;'bin-repeat'=0;'outside-untracked'=0;'outside-filter'=0
+              'scope-filter'=2;'scope-filter-set'=2;'scope-dirty-repeat'=2;'crlf-false-dirty'=2
+              'crlf-init-true'=0;'crlf-status-true'=0;'crlf-init-input'=0;'crlf-status-input'=0
+              'explicit-eol-crlf'=0;'contradictory-attributes'=2;'junction-rejected'=2;'unknown-command'=2
+              'fixture-add-staged'=0;'staged-scope'=2;'fixture-add-extra'=0;'fixture-commit-extra'=0;'cumulative-scope-rejected'=2
+              'default-list'=0;'default-tests'=0;'default-build'=0
+            }
+          }
+          function Get-Sh1TestNames([string]$List, [string]$Run, [string[]]$Required, [switch]$Adapter) {
+            $namePattern = '[A-Za-z_][A-Za-z0-9_:]{0,255}'
+            $ok = [Collections.Generic.List[string]]::new()
+            $blocks = [regex]::Matches($Run, "(?ms)^test ($namePattern) \.\.\. (.*?)(?=^test $namePattern \.\.\. |^test result:|\z)")
+            foreach ($block in $blocks) {
+              Assert-Sh1 ($block.Groups[2].Value -match '(?m)(?:^|\n)ok\s*\z') 'SH1_TEST_REJECTED'
+              $ok.Add($block.Groups[1].Value)
+            }
+            Assert-Sh1 ($ok.Count -gt 0 -and $ok.Count -le 2048 -and @($ok | Sort-Object -Unique).Count -eq $ok.Count) 'SH1_TEST_REJECTED'
+            $summary = [regex]::Matches($Run,'(?m)^test result: ok\. ([0-9]+) passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s\s*$')
+            Assert-Sh1 ($summary.Count -eq 1 -and [long]$summary[0].Groups[1].Value -eq $ok.Count) 'SH1_TEST_REJECTED'
+            if ($Adapter) { $expected = @($Required | Sort-Object) } else {
+              $expected = @([regex]::Matches($List,"(?m)^($namePattern): test\s*$") | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
+            }
+            Assert-Sh1 ($expected.Count -eq $ok.Count -and @($expected | Sort-Object -Unique).Count -eq $expected.Count) 'SH1_TEST_REJECTED'
+            $actual = @($ok | Sort-Object)
+            for ($i=0; $i -lt $actual.Count; $i++) { Assert-Sh1 ($actual[$i] -ceq $expected[$i]) 'SH1_TEST_REJECTED' }
+            foreach ($requiredName in $Required) { Assert-Sh1 ($actual -ccontains $requiredName) 'SH1_TEST_REJECTED' }
+            return ,$actual
+          }
+          function Test-Sh1Handoff($Value, [string]$Action, [string]$Schema, [string]$ContextKey, [bool]$Complete) {
+            Assert-Sh1 ($Value -is [Collections.IDictionary] -and $Value.schema -is [string] -and $Value.handoff -is [Collections.IDictionary] -and $Value.handoff.action -is [string]) 'SH1_HANDOFF_REJECTED'
+            foreach ($obj in @($Value[$ContextKey],$Value.head,$Value.base)) { Assert-Sh1 ($obj -is [Collections.IDictionary] -and $obj.source -is [string]) 'SH1_HANDOFF_REJECTED' }
+            Assert-Sh1 (-not $Value.Contains('error_code') -and -not $Value.Contains('cleanup_warning')) 'SH1_HANDOFF_REJECTED'
+            Assert-Sh1 ($Value.schema -ceq $Schema -and $Value.execution_permission -ceq 'NOT_GRANTED_BY_SH1' -and $Value.external_actions_executed -ceq 'NONE') 'SH1_HANDOFF_REJECTED'
+            Assert-Sh1 ($Value.handoff.action -ceq $Action -and $Value.handoff.suggestion_only -is [bool] -and $Value.handoff.suggestion_only -eq $true -and $Value.handoff.execution_authorized -is [bool] -and $Value.handoff.execution_authorized -eq $false -and $Value.handoff.claims_are_not_machine_verification -is [bool] -and $Value.handoff.claims_are_not_machine_verification -eq $true) 'SH1_HANDOFF_REJECTED'
+            Assert-Sh1 ($Value[$ContextKey].source -ceq 'HUMAN_ATTESTED' -and $Value.head.source -ceq 'TOOL_GIT_READ' -and $Value.base.source -ceq 'HUMAN_ATTESTED') 'SH1_HANDOFF_REJECTED'
+            Assert-Sh1 ($Value.projection.complete -is [bool] -and $Value.projection.complete -eq $Complete -and $Value.version_stale -is [bool] -and $Value.version_stale -eq $false -and $Value.report_identity_problem -is [bool] -and $Value.report_identity_problem -eq $false -and $Value.projection_is_historical_only -ne $true -and $Value.current_identity_verified -ne $false) 'SH1_HANDOFF_REJECTED'
+          }
+          function Get-Sh1Verification($Result, $Execution, $Texts, $Native, [string]$Sha, [string]$RunId, [string]$Attempt) {
+            Assert-Sh1 ($Result -is [Collections.IDictionary] -and $Execution -is [Collections.IDictionary] -and $Native -is [Collections.IDictionary]) 'SH1_RESULT_REJECTED'
+            foreach ($key in @('schema','verdict','stage')) { Assert-Sh1 ($Result[$key] -is [string]) 'SH1_RESULT_REJECTED' }
+            foreach ($key in @('schema','sha','run_id','attempt','state')) { Assert-Sh1 ($Execution[$key] -is [string]) 'SH1_EXECUTION_REJECTED' }
+            Assert-Sh1 ($Native.source -is [string]) 'SH1_JOB_REJECTED'
+            Assert-Sh1 ($Sha -cmatch '^[0-9a-f]{40}$' -and $RunId -cmatch '^[1-9][0-9]{0,19}$' -and $Attempt -cmatch '^[1-9][0-9]{0,9}$') 'SH1_CONTEXT_REJECTED'
+            Assert-Sh1 ($Execution.schema -ceq 'nova.sh1.ci-execution/1' -and $Execution.sha -ceq $Sha -and $Execution.run_id -ceq $RunId -and $Execution.attempt -ceq $Attempt -and $Execution.state -ceq 'COMPLETE' -and (Test-Sh1Integer $Execution.exit_code) -and $Execution.exit_code -eq 0) 'SH1_EXECUTION_REJECTED'
+            Assert-Sh1 ($Result.schema -ceq 'nova.scheduler.local-validation/1' -and $Result.verdict -ceq 'PASS' -and $Result.stage -ceq 'DEFAULT_REGRESSION') 'SH1_RESULT_REJECTED'
+            Assert-Sh1 ($Result.default_regression_executed -is [bool] -and $Result.default_regression_executed -eq $true) 'SH1_DEFAULT_REQUIRED'
+            Assert-Sh1 ($Result.commands -is [array] -and $Result.commands.Count -le 64) 'SH1_LEDGER_REJECTED'
+            $expected = Get-Sh1ExpectedCommands
+            Assert-Sh1 ($Result.commands.Count -eq $expected.Count) 'SH1_LEDGER_REJECTED'
+            $seen = @{}; $commands = @()
+            foreach ($row in $Result.commands) {
+              Assert-Sh1 ($row -is [Collections.IDictionary] -and $row.name -is [string] -and @($expected.Keys) -ccontains $row.name -and -not $seen.ContainsKey($row.name)) 'SH1_LEDGER_REJECTED'
+              Assert-Sh1 ($row.state -is [string] -and $row.state -ceq 'COMPLETE' -and (Test-Sh1Integer $row.exit_code) -and $row.exit_code -eq $expected[$row.name]) 'SH1_COMMAND_REJECTED'
+              $seen[$row.name] = $true
+              $commands += @{name=$row.name;state='COMPLETE';exit_code=$row.exit_code}
+            }
+            # Exit 101 is accepted only with the exact deliberate diagnostics, never
+            # ordinary compilation failure. Exit 2 remains tied to runner assertions.
+            $err = $Texts['default-required-features.stderr.log']
+            Assert-Sh1 ($err -is [string] -and $err -cmatch '(?m)^error: target `nova_scheduler_handoff` in package `nova` requires the features: `scheduler-validation`\r?$' -and $err -notmatch 'could not compile') 'SH1_GUARD_REJECTED'
+            $errors = @($Texts['release-guard.stdout.log'] -split '\r?\n' | ForEach-Object {
+              if ($_.StartsWith('{')) { $item = ConvertFrom-Json -InputObject $_ -AsHashtable -ErrorAction Stop; if ($item.reason -ceq 'compiler-message' -and $item.message.level -ceq 'error') { $item } }
+            })
+            Assert-Sh1 ($errors.Count -eq 1 -and $errors[0].target.name -ceq 'nova_lib' -and $errors[0].message.message -ceq 'scheduler-validation is debug-only and must never ship' -and $null -eq $errors[0].message.code) 'SH1_GUARD_REJECTED'
+            $adapterNames = @(
+              'remediation_tests::absent_nested_path_guards_existing_ancestor_without_creating_directories',
+              'remediation_tests::actual_git_launcher_tree_timeout_reclaims_job_children_and_pipe_readers',
+              'remediation_tests::lifecycle_unknown_retains_owned_temp_and_latches_admission',
+              'remediation_tests::owned_temp_normal_cleanup_and_unknown_children_are_not_recursive',
+              'remediation_tests::substituted_temp_entry_is_never_deleted',
+              'tests::blocked_reader_returns_unknown_without_unbounded_join',
+              'tests::raw_diff_checks_all_paths_without_pathspec',
+              'tests::typed_graph_bounds_and_merge_rejection'
+            )
+            $scheduler = Get-Sh1TestNames $Texts['scheduler-list.stdout.log'] $Texts['scheduler-tests.stdout.log'] @('scheduler::tests::handoff_recipients_missing_slots_and_terminal_holds')
+            $adapter = Get-Sh1TestNames '' $Texts['adapter-tests.stdout.log'] $adapterNames -Adapter
+            $default = Get-Sh1TestNames $Texts['default-list.stdout.log'] $Texts['default-tests.stdout.log'] @('scheduler::tests::every_pm_decision_requires_author_role_and_references')
+            $init = ConvertFrom-Json -InputObject $Texts['bin-init.stdout.log'] -AsHashtable -ErrorAction Stop
+            $missing = ConvertFrom-Json -InputObject $Texts['handoff-missing-slots.stdout.log'] -AsHashtable -ErrorAction Stop
+            $complete = ConvertFrom-Json -InputObject $Texts['bin-handoff.stdout.log'] -AsHashtable -ErrorAction Stop
+            Test-Sh1Handoff $init 'DELIVER_TO_DEVELOPER' 'nova.scheduler.status/1' 'manifest' $false
+            Test-Sh1Handoff $missing 'DELIVER_TO_DEVELOPER' 'nova.scheduler.handoff/1' 'context' $false
+            Test-Sh1Handoff $complete 'DELIVER_TO_PM_FOR_CLOSURE' 'nova.scheduler.handoff/1' 'context' $true
+            $stale = ConvertFrom-Json -InputObject $Texts['cumulative-scope-rejected.stdout.log'] -AsHashtable -ErrorAction Stop
+            Assert-Sh1 ($stale.error_code -ceq 'SCOPE_EXCEEDED' -and $stale.current_identity_verified -is [bool] -and $stale.current_identity_verified -eq $false -and $stale.projection_is_historical_only -is [bool] -and $stale.projection_is_historical_only -eq $true -and $stale.handoff.action -ceq 'STOP_RECONCILE_IDENTITY' -and $stale.handoff.execution_authorized -is [bool] -and $stale.handoff.execution_authorized -eq $false) 'SH1_HANDOFF_REJECTED'
+            Assert-Sh1 ($Native.source -ceq 'WINDOWS_NATIVE_FIXED_GIT_FIXTURE' -and (Test-Sh1Integer $Native.job_flags) -and $Native.job_flags -eq 8192 -and (Test-Sh1Integer $Native.active_before) -and $Native.active_before -ge 2 -and $Native.active_before -le 64 -and (Test-Sh1Integer $Native.active_after) -and $Native.active_after -eq 0) 'SH1_JOB_REJECTED'
+            foreach ($key in @('direct_exited','delegated_git_observed','all_observed_processes_signaled','stdout_eof_joined','stderr_eof_joined')) { Assert-Sh1 ($Native[$key] -is [bool] -and $Native[$key] -eq $true) 'SH1_JOB_REJECTED' }
+            Assert-Sh1 ($Native.observed_images -is [array] -and (Test-Sh1Integer $Native.observed_job_process_handles) -and $Native.observed_images.Count -eq $Native.observed_job_process_handles -and $Native.observed_images.Count -ge 2 -and $Native.observed_images.Count -le 64 -and (Test-Sh1Integer $Native.elapsed_ms) -and $Native.elapsed_ms -lt 3000) 'SH1_JOB_REJECTED'
+            $gitImages = @($Native.observed_images | Where-Object { $_.image_observed -is [string] -and $_.image_observed -match '^[A-Za-z]:\\.+\\git\.exe$' } | ForEach-Object { $_.image_observed.ToLowerInvariant() } | Sort-Object -Unique)
+            Assert-Sh1 ($gitImages.Count -ge 2) 'SH1_JOB_REJECTED'
+            return @{commands=$commands;scheduler=$scheduler;adapter=$adapter;default=$default;handoff=@(
+              @{scenario='INIT_STATUS';action='DELIVER_TO_DEVELOPER';exit_code=0},
+              @{scenario='MISSING_DEVELOPMENT';action='DELIVER_TO_DEVELOPER';exit_code=2},
+              @{scenario='MATERIALS_REGISTERED';action='DELIVER_TO_PM_FOR_CLOSURE';exit_code=0},
+              @{scenario='CURRENT_SCOPE_UNKNOWN';action='STOP_RECONCILE_IDENTITY';exit_code=2}
+            );job=@{source='WINDOWS_NATIVE_FIXED_GIT_FIXTURE';flags=8192;active_before=$Native.active_before;active_after=0;direct_exited=$true;delegated_git_observed=$true;observed_handles=$Native.observed_job_process_handles;all_observed_signaled=$true;stdout_eof_joined=$true;stderr_eof_joined=$true;elapsed_ms=$Native.elapsed_ms;identity_boundary='LAUNCHER_GUARDED_DELEGATED_IMAGES_OBSERVED_ONLY'}}
+          }
+          function Read-Sh1Bounded([string]$Path, [long]$Limit) {
+            $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+            if ($null -eq $item) { throw 'SH1_INPUT_MISSING' }
+            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'SH1_INPUT_REJECTED' }
+            if ($item.Length -gt $Limit) { throw 'SH1_INPUT_OVERSIZE' }
+            $f = [IO.File]::Open($item.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+          $memory = [IO.MemoryStream]::new(); $buffer = [byte[]]::new(4096)
+          try {
+            while ($true) {
+              $n = $f.Read($buffer,0,[int][Math]::Min(4096,$Limit + 1 - $memory.Length))
+              if ($n -eq 0) { break }
+              if ($memory.Length + $n -gt $Limit) { throw 'SH1_INPUT_OVERSIZE' }
+              $memory.Write($buffer,0,$n)
+            }
+            $bytes = $memory.ToArray()
+            $offset = if ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191) { 3 } else { 0 }
+            return [Text.UTF8Encoding]::new($false,$true).GetString($bytes,$offset,$bytes.Length-$offset)
+          } finally { $f.Dispose(); $memory.Dispose() }
+          }
+          function Write-Sh1Public([string]$Path, $Value, [long]$Limit) {
+            $b = [Text.Encoding]::UTF8.GetBytes(($Value | ConvertTo-Json -Depth 20))
+            if ($b.Length -gt $Limit) { throw 'SH1_EXPORT_BOUND' }
+            $f = [IO.File]::Open($Path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read)
+            try { $f.Write($b,0,$b.Length); $f.Flush($true) } finally { $f.Dispose() }
+          }
+          # Only these closed projections are public. Raw result, logs, paths, SQLite and
+          # fixture trees stay private. Unknown input fields are never copied.
+          $root = $env:SH1_ROOT; $ev = Join-Path $root 'evidence'; $public = Join-Path $root 'ci-public'
+          $identity = @{sha=if($env:GITHUB_SHA -cmatch '^[0-9a-f]{40}$'){$env:GITHUB_SHA}else{$null};run_id=if($env:GITHUB_RUN_ID -cmatch '^[1-9][0-9]{0,19}$'){$env:GITHUB_RUN_ID}else{$null};attempt=if($env:GITHUB_RUN_ATTEMPT -cmatch '^[1-9][0-9]{0,9}$'){$env:GITHUB_RUN_ATTEMPT}else{$null}}
+          $state = 'FAIL'; $code = 'SH1_INPUT_MISSING'; $verified = $null; $inputs = @(); $execution = $null; $result = $null
+          try {
+            $execution = ConvertFrom-Json (Read-Sh1Bounded (Join-Path $root 'execution.json') 8192) -AsHashtable
+            $result = ConvertFrom-Json (Read-Sh1Bounded (Join-Path $ev 'result.json') 131072) -AsHashtable
+            foreach ($fixed in @('execution.json','result.json')) {
+              $p = if ($fixed -ceq 'execution.json') { Join-Path $root $fixed } else { Join-Path $ev $fixed }
+              $inputs += @{name=$fixed;state='READ_LOCAL_ONLY';bytes=(Get-Item -LiteralPath $p).Length;sha256=(Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()}
+            }
+            $texts = @{}
+            foreach ($name in @('default-required-features.stderr.log','release-guard.stdout.log','scheduler-list.stdout.log','scheduler-tests.stdout.log','adapter-tests.stdout.log','default-list.stdout.log','default-tests.stdout.log','bin-init.stdout.log','handoff-missing-slots.stdout.log','bin-handoff.stdout.log','cumulative-scope-rejected.stdout.log')) {
+              $limit = if ($name -match '\.stdout\.log$' -and $name -match '^(bin-|handoff-|cumulative-)') { 65536 } else { 16777216 }
+              $path = Join-Path $ev $name
+              $texts[$name] = Read-Sh1Bounded $path $limit
+              $inputs += @{name=$name;state='READ_LOCAL_ONLY';bytes=(Get-Item -LiteralPath $path).Length;sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()}
+            }
+            # One native test, one receipt, only at its fixed immediate adapter child.
+            $receipts = @()
+            foreach ($dir in @(Get-ChildItem -LiteralPath $ev -Directory -Force)) {
+              if ($dir.Name -cmatch '^adapter-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
+                Assert-Sh1 (($dir.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'SH1_INPUT_REJECTED'
+                $candidate = Join-Path $dir.FullName 'job-timeout-receipt.json'
+                if (Test-Path -LiteralPath $candidate) { $receipts += $candidate }
+              }
+            }
+            Assert-Sh1 ($receipts.Count -eq 1) 'SH1_JOB_REJECTED'
+            $native = ConvertFrom-Json (Read-Sh1Bounded $receipts[0] 32768) -AsHashtable
+            $inputs += @{name='job-timeout-receipt.json';state='READ_LOCAL_ONLY';bytes=(Get-Item -LiteralPath $receipts[0]).Length;sha256=(Get-FileHash -LiteralPath $receipts[0] -Algorithm SHA256).Hash.ToLowerInvariant()}
+            $verified = Get-Sh1Verification $result $execution $texts $native $identity.sha $identity.run_id $identity.attempt
+            $state = 'PASS'; $code = 'NONE'
+          } catch {
+            $allowed = @('SH1_INPUT_MISSING','SH1_INPUT_REJECTED','SH1_INPUT_OVERSIZE','SH1_CONTEXT_REJECTED','SH1_EXECUTION_REJECTED','SH1_RESULT_REJECTED','SH1_DEFAULT_REQUIRED','SH1_LEDGER_REJECTED','SH1_COMMAND_REJECTED','SH1_GUARD_REJECTED','SH1_TEST_REJECTED','SH1_HANDOFF_REJECTED','SH1_JOB_REJECTED')
+            $code = if ($_.Exception.Message -cin $allowed) { $_.Exception.Message } else { 'SH1_UNCLASSIFIED_REJECTED' }
+          }
+          # Failed verification never emits apparently successful sub-checks or guessed
+          # counts. A fixed code identifies the failed boundary, not an exception message.
+          $publicExit = $null; $publicExecution = 'MISSING_OR_INVALID'
+          if ($execution -is [Collections.IDictionary] -and $execution.state -is [string] -and $execution.state -cin @('START_FAILED','PARTIAL','COMPLETE')) {
+            $publicExecution = $execution.state
+            if (Test-Sh1ExitCode $execution.exit_code) { $publicExit = $execution.exit_code }
+          }
+          $publicCommands = @()
+          foreach ($name in (Get-Sh1ExpectedCommands).Keys) {
+            $rowState='MISSING'; $rowExit=$null
+            if ($result -is [Collections.IDictionary] -and $result.commands -is [array]) {
+              $matches = @($result.commands | Where-Object { $_ -is [Collections.IDictionary] -and $_.name -is [string] -and $_.name -ceq $name })
+              if ($matches.Count -gt 1) { $rowState='DUPLICATE' }
+              elseif ($matches.Count -eq 1) {
+                $rowState=if($matches[0].state -is [string] -and $matches[0].state -cin @('START_FAILED','PARTIAL','COMPLETE')){$matches[0].state}else{'INVALID'}
+                if (Test-Sh1ExitCode $matches[0].exit_code) { $rowExit=$matches[0].exit_code }
+              }
+            }
+            $publicCommands += @{name=$name;state=$rowState;exit_code=$rowExit}
+          }
+          Write-Sh1Public (Join-Path $public 'summary.json') @{schema='nova.sh1.ci-summary/1';identity=$identity;verdict=$state;failure_code=$code;script_state=$publicExecution;script_exit=$publicExit;verification='CI_LOCAL_CHECKS_NOT_USER_ACCEPTANCE';upstream_claims='HUMAN_ATTESTED_NOT_MACHINE_VERDICTS'} 16384
+          Write-Sh1Public (Join-Path $public 'checks.json') @{schema='nova.sh1.ci-checks/1';identity=$identity;state=$state;commands=$publicCommands;test_names=if($verified){@{scheduler=$verified.scheduler;adapter=$verified.adapter;default=$verified.default}}else{@{}};handoff=if($verified){$verified.handoff}else{@()};sources='CANDIDATE_LOCAL_OUTPUTS_VALIDATED'} 262144
+          Write-Sh1Public (Join-Path $public 'process-tree.json') @{schema='nova.sh1.ci-process-tree/1';identity=$identity;state=if($verified){'VERIFIED_LOCAL'}else{'UNCONFIRMED'};receipt=if($verified){$verified.job}else{$null}} 8192
+          $files = @('summary.json','checks.json','process-tree.json') | ForEach-Object { $p=Join-Path $public $_; @{name=$_;bytes=(Get-Item -LiteralPath $p).Length;sha256=(Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()} }
+          Write-Sh1Public (Join-Path $public 'files.json') @{schema='nova.sh1.ci-files/1';identity=$identity;files=@($files);local_inputs=$inputs;not_exported='RAW_LOGS_ENV_PATHS_SQLITE_GIT_FIXTURE_TARGET'} 16384
+          if ($state -cne 'PASS') { throw $code }
+
+      - name: Upload only reconstructed SH1 CI evidence
+        if: ${{ always() && steps.sh1_paths.outputs.root != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: SH1-handoff-ci-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: error
+          include-hidden-files: false
+          path: |
+            ${{ steps.sh1_paths.outputs.root }}/ci-public/summary.json
+            ${{ steps.sh1_paths.outputs.root }}/ci-public/checks.json
+            ${{ steps.sh1_paths.outputs.root }}/ci-public/process-tree.json
+            ${{ steps.sh1_paths.outputs.root }}/ci-public/files.json
 
       - name: Verify locks and stage only approved validation artifacts
         run: |

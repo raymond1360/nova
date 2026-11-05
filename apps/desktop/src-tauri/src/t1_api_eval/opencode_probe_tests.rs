@@ -1,3 +1,4 @@
+use super::opencode_native_files::FactSource;
 use super::{
     opencode_broker::Broker, opencode_gate::*, opencode_paths::*, opencode_probe::*,
     opencode_protocol::*,
@@ -291,10 +292,10 @@ fn timeline_order_and_late_api() {
 #[test]
 fn resource_unknown_loss_blocks() {
     let p = injected_preflight();
-    assert!(p.validate().is_ok());
+    assert!(p.validate(FactSource::Injected).is_ok());
     let mut q = p;
     q.loss = None;
-    assert!(q.validate().is_err())
+    assert!(q.validate(FactSource::Injected).is_err())
 }
 
 struct Injected {
@@ -1027,15 +1028,15 @@ fn failure_in_one_run_does_not_pollute_fresh_scope() {
 #[test]
 fn parent_policy_unknown_or_any_nonzero_bit_blocks_preflight() {
     let good = injected_preflight();
-    good.validate().unwrap();
+    good.validate(FactSource::Injected).unwrap();
     for flags in [None, Some(1), Some(2), Some(0x80000000)] {
         let mut p = good.clone();
         p.parent_policy_flags = flags;
-        assert!(p.validate().is_err());
+        assert!(p.validate(FactSource::Injected).is_err());
     }
     let mut p = good;
     p.standard_probe_account = false;
-    assert!(p.validate().is_err());
+    assert!(p.validate(FactSource::Injected).is_err());
 }
 
 #[test]
@@ -1588,4 +1589,120 @@ fn nb2_run_post_tree_must_match_independent_policy_and_enumeration() {
         assert!(!o.cas);
         assert_eq!(state.state(), State::Stopped);
     }
+}
+
+#[test]
+fn n1_native_run_rejects_all_injected_before_capture() {
+    let mut ops = Injected::new();
+    let state = RunState::new().unwrap();
+    let out = run_native(&mut ops, state.clone());
+    assert!(!out.success);
+    assert!(!ops.cas);
+    assert!(!out.cas_started);
+    assert_eq!(state.state(), State::Stopped);
+    assert!(!ops
+        .calls
+        .iter()
+        .any(|c| ["capture", "git-preflight", "assign-query-resume"].contains(&c.as_str())));
+    assert!(ops.calls.iter().any(|c| c == "preflight"));
+}
+#[test]
+fn n1_each_native_material_source_refuses_at_earliest_available_stage() {
+    for wrong in 0..3 {
+        let (reservation, tree) = super::opencode_native_tests::n1_native_fixture();
+        let mut ops = Injected::new();
+        ops.pre.fixture = reservation;
+        ops.git.owner_sid = ops.pre.fixture.sid.clone();
+        ops.git.root_identity = Some(ops.pre.fixture.root.identity.clone());
+        ops.before = tree;
+        match wrong {
+            0 => ops.pre.fixture.policy.as_mut().unwrap().source = FactSource::Injected,
+            1 => ops.pre.fixture.prepared.as_mut().unwrap().source = FactSource::Injected,
+            _ => ops.before.enumeration.as_mut().unwrap().source = FactSource::Injected,
+        }
+        let state = RunState::new().unwrap();
+        let out = run_native(&mut ops, state.clone());
+        assert!(!out.success, "wrong {wrong}");
+        assert!(!ops.cas);
+        assert_eq!(state.state(), State::Stopped);
+        assert!(!ops.calls.iter().any(|c| c == "assign-query-resume"));
+        let captured = ops.calls.iter().any(|c| c == "capture");
+        assert_eq!(captured, wrong == 2);
+        assert_eq!(ops.calls.iter().any(|c| c == "tree-before"), wrong == 2);
+    }
+}
+#[test]
+fn n1_mock_label_rejection_performs_no_ops_not_even_clock_or_attempt() {
+    struct NoOps;
+    // Existing Injected::now_ms has no call log, so a panic sentinel proves even it is not called.
+    impl Ops for NoOps {
+        fn now_ms(&self) -> u64 {
+            panic!("unexpected ops clock")
+        }
+        fn evidence(&mut self, _: &str) -> super::Result<()> {
+            panic!("unexpected attempt")
+        }
+        fn preflight(&mut self) -> super::Result<Preflight> {
+            panic!("unexpected preflight")
+        }
+        fn git_preflight(&mut self) -> super::Result<GitPreflight> {
+            panic!("unexpected Git")
+        }
+        fn before_tree(&mut self) -> super::Result<TreeSnapshot> {
+            panic!("unexpected tree")
+        }
+        fn capture_start(&mut self) -> super::Result<()> {
+            panic!("unexpected capture")
+        }
+        fn start_and_verify(&mut self) -> super::Result<ProcessIdentity> {
+            panic!("unexpected create")
+        }
+        fn task(&mut self, _: &Arc<RunState>) -> super::Result<super::contract::Patch> {
+            panic!("unexpected task")
+        }
+        fn reject(&mut self, _: &[u8]) -> super::Result<()> {
+            panic!("unexpected reject")
+        }
+        fn idle(&mut self) -> super::Result<bool> {
+            panic!("unexpected idle")
+        }
+        fn abort(&mut self) -> super::Result<()> {
+            panic!("unexpected abort")
+        }
+        fn stop_job(&mut self) -> super::Result<JobStopReceipt> {
+            panic!("unexpected job")
+        }
+        fn capture_stop(&mut self) -> super::Result<()> {
+            panic!("unexpected capture stop")
+        }
+        fn export_and_review(&mut self) -> super::Result<ObservationReview> {
+            panic!("unexpected review")
+        }
+        fn cas_and_verify(&mut self, _: &super::contract::Patch) -> super::Result<CasReview> {
+            panic!("unexpected CAS")
+        }
+        fn cleanup(&mut self) -> super::Result<()> {
+            panic!("unexpected cleanup")
+        }
+    }
+    for label in ["NATIVE", "", "native", "XINJECTED", "Injected"] {
+        let state = RunState::new().unwrap();
+        let out = run(&mut NoOps, state.clone(), label);
+        assert!(!out.success);
+        assert!(!out.cas_started);
+        assert!(out.phases.is_empty());
+        assert_eq!(
+            out.error.as_deref(),
+            Some("mock label must start with INJECTED")
+        );
+        assert_eq!(state.state(), State::Stopped);
+    }
+}
+#[test]
+fn n1_valid_injected_prefix_runs_complete_chain() {
+    let mut ops = Injected::new();
+    let out = run(&mut ops, RunState::new().unwrap(), "INJECTED_N1");
+    assert!(out.success, "{out:?}");
+    assert!(ops.cas);
+    assert!(!out.execution_authorized);
 }

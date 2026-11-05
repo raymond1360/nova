@@ -212,6 +212,7 @@ pub fn validate_collected_snapshot(
     s: &TreeSnapshot,
     r: &FixtureReservation,
     content_baseline: bool,
+    expected: FactSource,
 ) -> Result<()> {
     let p = r.policy.as_ref().ok_or("frozen policy missing")?;
     let prepared = r.prepared.as_ref().ok_or("prepared receipt missing")?;
@@ -220,6 +221,9 @@ pub fn validate_collected_snapshot(
         .enumeration
         .as_ref()
         .ok_or("enumeration receipt missing")?;
+    if p.source != expected || prepared.source != expected || proof.source != expected {
+        return Err("snapshot source differs from expected run mode".into());
+    }
     let dir_count = s.files.iter().filter(|f| f.attributes & 0x10 != 0).count();
     if s.complete != Some(true)
         || proof.error.is_some()

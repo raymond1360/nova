@@ -330,7 +330,14 @@ fn access_time_is_fact_but_not_equality_requirement() {
         descendants: vec![],
         writes: vec![],
     };
-    assert!(review_agent_tree(&a, &r, &injected_preflight().fixture, &injected_target()).is_ok());
+    assert!(review_agent_tree(
+        &a,
+        &r,
+        &injected_preflight().fixture,
+        &injected_target(),
+        FactSource::Injected
+    )
+    .is_ok());
 }
 #[test]
 fn nonmarker_creation_write_and_change_still_reject() {
@@ -371,17 +378,17 @@ fn frozen_policy_and_preparation_must_bind_not_follow_current_fact() {
     let r = injected_preflight().fixture;
     let mut s = injected_tree();
     s.files[0].dacl = "other".into();
-    assert!(validate_snapshot(&s, &r).is_err());
+    assert!(validate_snapshot(&s, &r, FactSource::Injected).is_err());
     let mut bad = r.clone();
     bad.prepared.as_mut().unwrap().policy_sha256 = "0".repeat(64);
-    assert!(validate_snapshot(&injected_tree(), &bad).is_err());
+    assert!(validate_snapshot(&injected_tree(), &bad, FactSource::Injected).is_err());
 }
 #[test]
 fn missing_policy_receipt_and_unknown_enumeration_reject() {
     let s = injected_tree();
     let mut r = injected_preflight().fixture;
     r.policy = None;
-    assert!(validate_snapshot(&s, &r).is_err());
+    assert!(validate_snapshot(&s, &r, FactSource::Injected).is_err());
     let r = injected_preflight().fixture;
     for f in [0, 1, 2, 3, 4] {
         let mut s = s.clone();
@@ -392,7 +399,7 @@ fn missing_policy_receipt_and_unknown_enumeration_reject() {
             3 => s.enumeration.as_mut().unwrap().finished = 10001,
             _ => s.enumeration.as_mut().unwrap().directories_ended = 0,
         };
-        assert!(validate_snapshot(&s, &r).is_err());
+        assert!(validate_snapshot(&s, &r, FactSource::Injected).is_err());
     }
 }
 #[test]
@@ -410,17 +417,17 @@ fn actual_owner_ads_identity_and_new_entries_do_not_redefine_expectation() {
                 s.files.push(e)
             }
         };
-        assert!(validate_snapshot(&s, &r).is_err());
+        assert!(validate_snapshot(&s, &r, FactSource::Injected).is_err());
     }
 }
 #[test]
 fn wrong_root_filesystem_and_source_refuse() {
     let mut r = injected_preflight().fixture;
     r.prepared.as_mut().unwrap().filesystem = "FAT32".into();
-    assert!(validate_snapshot(&injected_tree(), &r).is_err());
+    assert!(validate_snapshot(&injected_tree(), &r, FactSource::Injected).is_err());
     let mut r = injected_preflight().fixture;
     r.prepared.as_mut().unwrap().source = FactSource::NativePrepared;
-    assert!(validate_snapshot(&injected_tree(), &r).is_err());
+    assert!(validate_snapshot(&injected_tree(), &r, FactSource::Injected).is_err());
 }
 #[test]
 fn acl_free_capacity_is_not_evidence_but_ace_bytes_are() {
@@ -476,7 +483,7 @@ fn collection_counter_short_read_or_late_receipt_refuse() {
             1 => s.files[2].bytes.pop().map(|_| ()).unwrap(),
             _ => s.enumeration.as_mut().unwrap().root_identity = "changed".into(),
         };
-        assert!(validate_snapshot(&s, &r).is_err());
+        assert!(validate_snapshot(&s, &r, FactSource::Injected).is_err());
     }
 }
 #[test]
@@ -667,4 +674,96 @@ fn termination_api_time_consumes_the_same_one_second_cleanup_window() {
     assert_eq!(e.cleanup.unwrap().error, Some(StopError::Deadline));
     assert!(!p.calls.contains(&"resume"));
     assert!(!p.calls.contains(&"exit"));
+}
+
+/// Synthetic NativePrepared-shaped material for source-check tests, NOT native IO evidence.
+pub(super) fn n1_native_fixture() -> (FixtureReservation, TreeSnapshot) {
+    let mut r = injected_preflight().fixture;
+    let mut tree = injected_tree();
+    let sid = "S-1-5-21-1001";
+    let acl = "0004:0200080000000000";
+    r.sid = sid.into();
+    for f in &mut tree.files {
+        f.owner = sid.into();
+        f.dacl = acl.into();
+        f.identity = format!("test-native:{}", f.path);
+    }
+    r.root.identity = "test-native:.".into();
+    r.logo_identity = "test-native:Logo.tsx".into();
+    r.git_marker_identity = "test-native:.git/opencode".into();
+    let p = r.policy.as_mut().unwrap();
+    p.source = FactSource::NativePrepared;
+    p.sid = sid.into();
+    for e in &mut p.entries {
+        e.owner = sid.into();
+        e.dacl = acl.into();
+    }
+    let digest = p.digest().unwrap();
+    let prepared = r.prepared.as_mut().unwrap();
+    prepared.source = FactSource::NativePrepared;
+    prepared.policy_sha256 = digest;
+    for (path, id) in &mut prepared.identities {
+        *id = format!("test-native:{path}");
+    }
+    let proof = tree.enumeration.as_mut().unwrap();
+    proof.source = FactSource::NativePrepared;
+    proof.root_identity = r.root.identity.clone();
+    (r, tree)
+}
+#[test]
+fn n1_checker_binds_expected_source_in_both_directions_and_retains_valid_paths() {
+    let i = injected_preflight().fixture;
+    let it = injected_tree();
+    let (n, nt) = n1_native_fixture();
+    assert!(validate_collected_snapshot(&it, &i, true, FactSource::Injected).is_ok());
+    assert!(validate_collected_snapshot(&nt, &n, true, FactSource::NativePrepared).is_ok());
+    assert!(validate_collected_snapshot(&it, &i, true, FactSource::NativePrepared).is_err());
+    assert!(validate_collected_snapshot(&nt, &n, true, FactSource::Injected).is_err());
+    assert!(validate_snapshot(&nt, &n, FactSource::NativePrepared).is_ok());
+    assert!(n.validate(FactSource::Injected).is_err());
+    assert!(i.validate(FactSource::NativePrepared).is_err());
+}
+#[test]
+fn n1_checker_rejects_each_mismatching_source_without_changing_other_contracts() {
+    for wrong in 0..3 {
+        let (mut r, mut tree) = n1_native_fixture();
+        match wrong {
+            0 => r.policy.as_mut().unwrap().source = FactSource::Injected,
+            1 => r.prepared.as_mut().unwrap().source = FactSource::Injected,
+            _ => tree.enumeration.as_mut().unwrap().source = FactSource::Injected,
+        }
+        assert!(validate_collected_snapshot(&tree, &r, true, FactSource::NativePrepared).is_err());
+    }
+}
+#[test]
+fn n1_review_rejects_wrong_after_source_even_with_valid_native_before() {
+    let (r, before) = n1_native_fixture();
+    let mut receipt = injected_observation().tree;
+    receipt.after = before.clone();
+    assert!(review_agent_tree(
+        &before,
+        &receipt,
+        &r,
+        &injected_target(),
+        FactSource::NativePrepared
+    )
+    .is_ok());
+    receipt.after.enumeration.as_mut().unwrap().source = FactSource::Injected;
+    assert!(review_agent_tree(
+        &before,
+        &receipt,
+        &r,
+        &injected_target(),
+        FactSource::NativePrepared
+    )
+    .is_err());
+    receipt.after = injected_tree();
+    assert!(review_agent_tree(
+        &before,
+        &receipt,
+        &r,
+        &injected_target(),
+        FactSource::NativePrepared
+    )
+    .is_err());
 }

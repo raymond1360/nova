@@ -1,3 +1,4 @@
+use super::opencode_native_files::FactSource;
 use super::Result;
 use serde::{Deserialize, Serialize};
 pub const ROOT: &str = r"C:\NovaM0B\run\project";
@@ -164,7 +165,7 @@ pub struct FixtureReservation {
     pub prepared: Option<super::opencode_native_files::PreparedFixtureReceipt>,
 }
 impl FixtureReservation {
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self, expected: FactSource) -> Result<()> {
         if self.root.path != ROOT
             || self.root.identity.is_empty()
             || self.logo_identity.is_empty()
@@ -184,6 +185,16 @@ impl FixtureReservation {
             .policy
             .as_ref()
             .ok_or("fixture expected policy missing")?;
+        if policy.source != expected
+            || self
+                .prepared
+                .as_ref()
+                .ok_or("fixture prepared receipt missing")?
+                .source
+                != expected
+        {
+            return Err("fixture source differs from expected run mode".into());
+        }
         self.prepared
             .as_ref()
             .ok_or("fixture prepared receipt missing")?
@@ -204,9 +215,13 @@ pub struct TreeSnapshot {
     pub files: Vec<FileFact>,
     pub enumeration: Option<super::opencode_native_files::EnumerationReceipt>,
 }
-pub fn validate_snapshot(s: &TreeSnapshot, r: &FixtureReservation) -> Result<()> {
-    r.validate()?;
-    super::opencode_native_files::validate_collected_snapshot(s, r, true)?;
+pub fn validate_snapshot(
+    s: &TreeSnapshot,
+    r: &FixtureReservation,
+    expected: FactSource,
+) -> Result<()> {
+    r.validate(expected)?;
+    super::opencode_native_files::validate_collected_snapshot(s, r, true, expected)?;
     if s.complete != Some(true) {
         return Err("tree enumeration UNKNOWN/incomplete".into());
     }
@@ -330,11 +345,12 @@ pub fn review_agent_tree(
     receipt: &AgentTreeReceipt,
     r: &FixtureReservation,
     target: &ProcessIdentity,
+    expected: FactSource,
 ) -> Result<()> {
     use std::collections::BTreeSet;
-    validate_snapshot(before, r)?;
+    validate_snapshot(before, r, expected)?;
     target.validate()?;
-    super::opencode_native_files::validate_collected_snapshot(&receipt.after, r, false)?;
+    super::opencode_native_files::validate_collected_snapshot(&receipt.after, r, false, expected)?;
     if receipt.after.complete != Some(true) {
         return Err("after tree incomplete/UNKNOWN".into());
     }

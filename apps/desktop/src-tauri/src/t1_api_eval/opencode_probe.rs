@@ -1,4 +1,5 @@
 //! Injectable orchestration. Native Job methods are compiled, never used by mock tests.
+use super::opencode_native_files::FactSource;
 use super::opencode_paths::{
     AgentTreeReceipt, FixtureReservation, GitPreflight, ProcessIdentity, TreeSnapshot,
 };
@@ -51,7 +52,7 @@ pub struct Preflight {
     pub fixture: FixtureReservation,
 }
 impl Preflight {
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self, expected: FactSource) -> Result<()> {
         if self.parent_policy_flags != Some(0)
             || !self.standard_probe_account
             || !self.resources_prepared
@@ -61,7 +62,7 @@ impl Preflight {
         {
             return Err("resource/facility/ownership incomplete; execution BLOCKED".into());
         }
-        self.fixture.validate()
+        self.fixture.validate(expected)
     }
 }
 /// Injected observation receipt contract; neither Procmon nor WFP supplies a generic owned ID.
@@ -255,8 +256,22 @@ fn within(start: u64, end: u64, limit: u64) -> Result<()> {
         Err("substage deadline/late API/clock reversal".into())
     }
 }
+/// Public mock-only compatibility entry. A label is never native authorization.
 pub fn run<O: Ops>(ops: &mut O, state: Arc<RunState>, source: &str) -> Outcome {
-    let mut out = Outcome {
+    if !source.starts_with("INJECTED") {
+        state.stop();
+        let mut out = empty_outcome(source);
+        out.error = Some("mock label must start with INJECTED".into());
+        return out;
+    }
+    run_mode(ops, state, source, FactSource::Injected)
+}
+/// Native provenance contract only. Not wired to main/CLI and grants no execution permission.
+pub fn run_native<O: Ops>(ops: &mut O, state: Arc<RunState>) -> Outcome {
+    run_mode(ops, state, "NATIVE", FactSource::NativePrepared)
+}
+fn empty_outcome(source: &str) -> Outcome {
+    Outcome {
         source: source.into(),
         success: false,
         cas_started: false,
@@ -268,7 +283,15 @@ pub fn run<O: Ops>(ops: &mut O, state: Arc<RunState>, source: &str) -> Outcome {
         cleanup_errors: vec![],
         phases: vec![],
         execution_authorized: false,
-    };
+    }
+}
+fn run_mode<O: Ops>(
+    ops: &mut O,
+    state: Arc<RunState>,
+    source: &str,
+    expected: FactSource,
+) -> Outcome {
+    let mut out = empty_outcome(source);
     let mut clock = Timeline::new(ops.now_ms());
     let mut capture = false;
     let mut job_touched = false;
@@ -281,7 +304,7 @@ pub fn run<O: Ops>(ops: &mut O, state: Arc<RunState>, source: &str) -> Outcome {
     let result = (|| -> Result<()> {
         clock.enter(Phase::Preflight, ops.now_ms())?;
         let preflight = ops.preflight()?;
-        preflight.validate()?;
+        preflight.validate(expected)?;
         clock.enter(Phase::Capture, ops.now_ms())?;
         ops.capture_start()?;
         capture = true;
@@ -296,7 +319,7 @@ pub fn run<O: Ops>(ops: &mut O, state: Arc<RunState>, source: &str) -> Outcome {
             &preflight.fixture.root,
         )?;
         let before = ops.before_tree()?;
-        super::opencode_paths::validate_snapshot(&before, &preflight.fixture)?;
+        super::opencode_paths::validate_snapshot(&before, &preflight.fixture, expected)?;
         // Target reserves 90s for OpenCode/start/task/idle/Job; Git+snapshot may use at most 30s.
         within(clock.entered, ops.now_ms(), 30000)?;
         let startup_start = ops.now_ms();
@@ -338,6 +361,7 @@ pub fn run<O: Ops>(ops: &mut O, state: Arc<RunState>, source: &str) -> Outcome {
             &observation.tree,
             &preflight.fixture,
             &target,
+            expected,
         )?;
         ops.evidence("observation-reviewed")?;
         clock.enter(Phase::Cas, ops.now_ms())?;

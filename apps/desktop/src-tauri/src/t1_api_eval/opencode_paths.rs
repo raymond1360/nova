@@ -99,8 +99,15 @@ pub fn review_tree(
     for (path, old) in a {
         let new = &b[&path];
         if path == ".git/opencode" {
-            declared_git_write(&old, new, commit, sid, declared_write_in_target_tree)?;
-        } else if &old != new {
+            declared_git_write(
+                &old,
+                new,
+                commit,
+                sid,
+                declared_write_in_target_tree
+                    || super::opencode_native_files::same_except_access(&old, new),
+            )?;
+        } else if !super::opencode_native_files::same_except_access(&old, new) {
             return Err(format!("undeclared Agent change: {path}"));
         }
     }
@@ -153,6 +160,8 @@ pub struct FixtureReservation {
     pub sid: String,
     pub git_images: Vec<(String, String)>,
     pub git_config_sha256: String,
+    pub policy: Option<super::opencode_native_files::FrozenFixturePolicy>,
+    pub prepared: Option<super::opencode_native_files::PreparedFixtureReceipt>,
 }
 impl FixtureReservation {
     pub fn validate(&self) -> Result<()> {
@@ -171,6 +180,20 @@ impl FixtureReservation {
         {
             return Err("fixture reservation/manifest not frozen".into());
         }
+        let policy = self
+            .policy
+            .as_ref()
+            .ok_or("fixture expected policy missing")?;
+        self.prepared
+            .as_ref()
+            .ok_or("fixture prepared receipt missing")?
+            .validate(policy)?;
+        if policy.sid != self.sid
+            || policy.root != self.root.path
+            || self.prepared.as_ref().unwrap().identities.get(".") != Some(&self.root.identity)
+        {
+            return Err("fixture policy/root binding".into());
+        }
         Ok(())
     }
 }
@@ -179,9 +202,11 @@ impl FixtureReservation {
 pub struct TreeSnapshot {
     pub complete: Option<bool>,
     pub files: Vec<FileFact>,
+    pub enumeration: Option<super::opencode_native_files::EnumerationReceipt>,
 }
 pub fn validate_snapshot(s: &TreeSnapshot, r: &FixtureReservation) -> Result<()> {
     r.validate()?;
+    super::opencode_native_files::validate_collected_snapshot(s, r, true)?;
     if s.complete != Some(true) {
         return Err("tree enumeration UNKNOWN/incomplete".into());
     }
@@ -309,6 +334,7 @@ pub fn review_agent_tree(
     use std::collections::BTreeSet;
     validate_snapshot(before, r)?;
     target.validate()?;
+    super::opencode_native_files::validate_collected_snapshot(&receipt.after, r, false)?;
     if receipt.after.complete != Some(true) {
         return Err("after tree incomplete/UNKNOWN".into());
     }
@@ -349,7 +375,11 @@ pub fn review_agent_tree(
         }
     }
     let marker = |files: &[FileFact]| files.iter().find(|f| f.path == ".git/opencode").cloned();
-    if marker(&before.files) != marker(&receipt.after.files) && receipt.writes.is_empty() {
+    let marker_changed = match (marker(&before.files), marker(&receipt.after.files)) {
+        (Some(a), Some(b)) => !super::opencode_native_files::same_except_access(&a, &b),
+        _ => true,
+    };
+    if marker_changed && receipt.writes.is_empty() {
         return Err("changed Git marker lacks attributed write evidence".into());
     }
     // Attribution is computed above from facts, not supplied as a backend verdict.

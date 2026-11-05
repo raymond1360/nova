@@ -457,12 +457,14 @@ pub(super) fn injected_preflight() -> Preflight {
             sid: "probe-sid".into(),
             git_images: vec![("git.exe".into(), super::hash(b"INJECTED Git image"))],
             git_config_sha256: super::hash(super::opencode_paths::FROZEN_GIT_CONFIG),
+            policy: Some(injected_policy()),
+            prepared: Some(injected_prepared()),
         },
     }
 }
 pub(super) fn injected_tree() -> TreeSnapshot {
     use super::opencode_paths::{FileFact, FROZEN_GIT_CONFIG};
-    let files = [
+    let files: Vec<FileFact> = [
         (".", vec![], 0x10),
         (".git", vec![], 0x10),
         ("Logo.tsx", super::PRE.to_vec(), 0x20),
@@ -491,7 +493,75 @@ pub(super) fn injected_tree() -> TreeSnapshot {
     .collect();
     TreeSnapshot {
         complete: Some(true),
+        enumeration: Some(super::opencode_native_files::EnumerationReceipt {
+            source: super::opencode_native_files::FactSource::Injected,
+            root_identity: "INJECTED:root".into(),
+            started: 0,
+            finished: 1,
+            entries: 5,
+            default_bytes: files.iter().map(|f: &FileFact| f.bytes.len() as u64).sum(),
+            ads_bytes: 0,
+            directories_ended: 2,
+            streams_ended: 5,
+            error: None,
+        }),
         files,
+    }
+}
+// Explicit fixture policy, not native observations promoted to expectations.
+pub(super) fn injected_policy() -> super::opencode_native_files::FrozenFixturePolicy {
+    use super::opencode_native_files::*;
+    let entries = [
+        (".", vec![], 0x10),
+        (".git", vec![], 0x10),
+        ("Logo.tsx", super::PRE.to_vec(), 0x20),
+        (
+            ".git/config",
+            super::opencode_paths::FROZEN_GIT_CONFIG.to_vec(),
+            0x20,
+        ),
+        (".git/opencode", vec![b'a'; 40], 0x20),
+    ]
+    .into_iter()
+    .map(|(path, bytes, attributes)| ExpectedEntry {
+        path: path.into(),
+        owner: "probe-sid".into(),
+        dacl: "INJECTED_DACL".into(),
+        attributes,
+        default_sha256: super::hash(&bytes),
+        ads: vec![],
+    })
+    .collect();
+    FrozenFixturePolicy {
+        schema: "NB2_FIXTURE_V1".into(),
+        source: FactSource::Injected,
+        root: super::opencode_paths::ROOT.into(),
+        sid: "probe-sid".into(),
+        entries,
+    }
+}
+pub(super) fn injected_prepared() -> super::opencode_native_files::PreparedFixtureReceipt {
+    use super::opencode_native_files::*;
+    let policy = injected_policy();
+    PreparedFixtureReceipt {
+        source: FactSource::Injected,
+        policy_sha256: policy.digest().unwrap(),
+        generation: "INJECTED".into(),
+        filesystem: "NTFS".into(),
+        identities: policy
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.path.clone(),
+                    if e.path == "." {
+                        "INJECTED:root".into()
+                    } else {
+                        format!("INJECTED:{}", e.path)
+                    },
+                )
+            })
+            .collect(),
     }
 }
 pub(super) fn injected_git() -> GitPreflight {
@@ -750,6 +820,15 @@ pub fn minimal_environment() -> std::collections::BTreeMap<String, String> {
 /// All native calls sit behind this boundary. Tests supply no OS implementation.
 pub trait ProcessOps {
     fn create_suspended(&mut self) -> Result<()>;
+    fn validate_identity(&mut self) -> Result<()> {
+        Err("identity verifier unavailable".into())
+    }
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn pause(&mut self) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
     fn assign(&mut self) -> Result<()>;
     fn flags_and_active(&mut self) -> Result<(u32, u32)>;
     fn resume(&mut self) -> Result<()>;
@@ -797,7 +876,7 @@ fn exit_after_request<P: ProcessOps>(
         return receipt;
     }
     loop {
-        if Instant::now() >= deadline {
+        if p.now() >= deadline {
             receipt.error = Some(StopError::Deadline);
             return receipt;
         }
@@ -808,7 +887,7 @@ fn exit_after_request<P: ProcessOps>(
             }
             Ok(value) => {
                 receipt.direct_exited = Some(value);
-                if Instant::now() >= deadline {
+                if p.now() >= deadline {
                     receipt.error = Some(StopError::Deadline);
                     return receipt;
                 }
@@ -817,17 +896,33 @@ fn exit_after_request<P: ProcessOps>(
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(1));
+        p.pause();
     }
 }
 /// Shared launch skeleton: no resume after failed assignment/query, with bounded direct-exit evidence.
 pub fn launch_verified<P: ProcessOps>(p: &mut P) -> std::result::Result<(), LaunchFailure> {
-    launch_verified_until(p, Instant::now() + Duration::from_secs(5))
+    {
+        let now = p.now();
+        launch_verified_until(
+            p,
+            now + Duration::from_secs(3),
+            now + Duration::from_secs(4),
+        )
+    }
 }
 pub(super) fn launch_verified_until<P: ProcessOps>(
     p: &mut P,
     deadline: Instant,
+    cleanup_end: Instant,
 ) -> std::result::Result<(), LaunchFailure> {
+    if p.now() >= deadline || cleanup_end < deadline {
+        return Err(LaunchFailure {
+            reason: "launch budget exhausted".into(),
+            resume_attempted: false,
+            cleanup: None,
+            job_termination_error: None,
+        });
+    }
     if let Err(reason) = p.create_suspended() {
         return Err(LaunchFailure {
             reason,
@@ -836,17 +931,38 @@ pub(super) fn launch_verified_until<P: ProcessOps>(
             job_termination_error: None,
         });
     }
-    let verified = p.assign().and_then(|_| p.flags_and_active()).and_then(|v| {
+    let verified = (|| -> Result<()> {
+        if p.now() >= deadline {
+            return Err("creation late return".into());
+        }
+        p.validate_identity()?;
+        if p.now() >= deadline {
+            return Err("identity late return".into());
+        }
+        p.assign()?;
+        if p.now() >= deadline {
+            return Err("assign late return".into());
+        }
+        let v = p.flags_and_active()?;
+        if p.now() >= deadline {
+            return Err("query late return".into());
+        }
+        p.validate_identity()?;
+        if p.now() >= deadline {
+            return Err("identity late return".into());
+        }
+
         if v == (0x2000, 1) {
             Ok(())
         } else {
             Err("Job flags/member UNKNOWN".into())
         }
-    });
+    })();
     if let Err(reason) = verified {
+        let cleanup_deadline = (p.now() + Duration::from_secs(1)).min(cleanup_end);
         let requested = p.terminate_suspended().is_ok();
         let job_termination_error = p.terminate_job().err();
-        let cleanup = Some(exit_after_request(p, requested, deadline));
+        let cleanup = Some(exit_after_request(p, requested, cleanup_deadline));
         return Err(LaunchFailure {
             reason,
             resume_attempted: false,
@@ -854,9 +970,17 @@ pub(super) fn launch_verified_until<P: ProcessOps>(
             job_termination_error,
         });
     }
-    if let Err(reason) = p.resume() {
+    let resumed = p.resume();
+    if let Err(reason) = resumed.and_then(|_| {
+        if p.now() >= deadline {
+            Err("resume late return".into())
+        } else {
+            Ok(())
+        }
+    }) {
+        let cleanup_deadline = (p.now() + Duration::from_secs(1)).min(cleanup_end);
         let error = p.terminate_job().err();
-        let cleanup = Some(exit_after_request(p, error.is_none(), deadline));
+        let cleanup = Some(exit_after_request(p, error.is_none(), cleanup_deadline));
         return Err(LaunchFailure {
             reason,
             resume_attempted: true,
@@ -869,7 +993,7 @@ pub(super) fn launch_verified_until<P: ProcessOps>(
 pub fn confirm_stopped<P: ProcessOps>(p: &mut P, deadline: Instant) -> Result<JobStopReceipt> {
     p.terminate_job()?;
     loop {
-        if Instant::now() >= deadline {
+        if p.now() >= deadline {
             return Err("cleanup deadline UNKNOWN".into());
         }
         let (flags, active) = p.flags_and_active()?;
@@ -878,7 +1002,7 @@ pub fn confirm_stopped<P: ProcessOps>(p: &mut P, deadline: Instant) -> Result<Jo
         }
         if active == 0 {
             let direct = p.exited()?;
-            if Instant::now() >= deadline {
+            if p.now() >= deadline {
                 return Err("cleanup query late/UNKNOWN".into());
             }
             let receipt = JobStopReceipt {
@@ -891,7 +1015,7 @@ pub fn confirm_stopped<P: ProcessOps>(p: &mut P, deadline: Instant) -> Result<Jo
                 return Ok(receipt);
             }
         }
-        std::thread::sleep(Duration::from_millis(1));
+        p.pause();
     }
 }
 /// Evidence writes must check short writes and durable flush; no success repair.

@@ -534,6 +534,9 @@ impl Child {
     }
 }
 impl ProcessOps for Child {
+    fn validate_identity(&mut self) -> super::Result<()> {
+        self.hit("identity")
+    }
     fn create_suspended(&mut self) -> super::Result<()> {
         self.hit("create")
     }
@@ -566,11 +569,14 @@ fn assigned_query_before_resume_and_cleanup_is_observed() {
         ..Default::default()
     };
     launch_verified(&mut c).unwrap();
-    assert_eq!(c.calls, ["create", "assign", "query", "resume"]);
+    assert_eq!(
+        c.calls,
+        ["create", "identity", "assign", "query", "identity", "resume"]
+    );
     c.active = 0;
     c.exit = true;
     confirm_stopped(&mut c, deadline()).unwrap();
-    assert_eq!(&c.calls[4..], ["terminate-job", "query", "exit"]);
+    assert_eq!(&c.calls[6..], ["terminate-job", "query", "exit"]);
 }
 #[test]
 fn assign_query_flags_failures_never_resume() {
@@ -1322,7 +1328,7 @@ fn suspended_failure_cleanup_has_bounded_exit_receipt() {
             exit: true,
             ..Default::default()
         };
-        let e = launch_verified_until(&mut c, deadline()).unwrap_err();
+        let e = launch_verified_until(&mut c, deadline(), deadline()).unwrap_err();
         assert!(e.direct_cleanup_confirmed());
         assert!(!e.resume_attempted);
         assert!(!c.calls.contains(&"resume"));
@@ -1335,8 +1341,12 @@ fn suspended_failure_cleanup_has_bounded_exit_receipt() {
             exit: false,
             ..Default::default()
         };
-        let e =
-            launch_verified_until(&mut c, Instant::now() + Duration::from_millis(3)).unwrap_err();
+        let e = launch_verified_until(
+            &mut c,
+            Instant::now() + Duration::from_millis(3),
+            deadline(),
+        )
+        .unwrap_err();
         assert!(!e.direct_cleanup_confirmed());
         assert!(!e.resume_attempted);
         assert!(!c.calls.contains(&"resume"));
@@ -1519,6 +1529,62 @@ fn run_rejects_unknown_or_impossible_write_ancestry() {
         o.observation.tree.writes[0].process = child;
         let state = RunState::new().unwrap();
         assert!(!run(&mut o, state.clone(), "INJECTED").success);
+        assert!(!o.cas);
+        assert_eq!(state.state(), State::Stopped);
+    }
+}
+
+#[test]
+fn nb2_run_requires_bound_frozen_policy_and_preparation_before_create() {
+    for fault in 0..5 {
+        let mut o = Injected::new();
+        match fault {
+            0 => o.pre.fixture.policy = None,
+            1 => o.pre.fixture.prepared = None,
+            2 => o.pre.fixture.prepared.as_mut().unwrap().policy_sha256 = "wrong".into(),
+            3 => o.before.enumeration = None,
+            _ => o.before.enumeration.as_mut().unwrap().directories_ended = 0,
+        }
+        let state = RunState::new().unwrap();
+        let r = run(&mut o, state.clone(), "INJECTED");
+        assert!(!r.success, "fault {fault}");
+        assert!(!o.calls.iter().any(|s| s == "assign-query-resume"));
+        assert!(!o.cas);
+        assert_eq!(state.state(), State::Stopped);
+    }
+}
+#[test]
+fn nb2_run_post_tree_must_match_independent_policy_and_enumeration() {
+    for fault in 0..5 {
+        let mut o = Injected::new();
+        match fault {
+            0 => o.observation.tree.after.files[0].dacl = "unapproved".into(),
+            1 => o.observation.tree.after.files[0].owner = "other".into(),
+            2 => o.observation.tree.after.files[0]
+                .ads
+                .push(("hidden".into(), vec![1])),
+            3 => {
+                o.observation
+                    .tree
+                    .after
+                    .enumeration
+                    .as_mut()
+                    .unwrap()
+                    .streams_ended = 0
+            }
+            _ => {
+                o.observation
+                    .tree
+                    .after
+                    .enumeration
+                    .as_mut()
+                    .unwrap()
+                    .source = super::opencode_native_files::FactSource::NativePrepared
+            }
+        }
+        let state = RunState::new().unwrap();
+        let r = run(&mut o, state.clone(), "INJECTED");
+        assert!(!r.success, "fault {fault}");
         assert!(!o.cas);
         assert_eq!(state.state(), State::Stopped);
     }

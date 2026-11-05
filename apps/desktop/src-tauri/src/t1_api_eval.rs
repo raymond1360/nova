@@ -11,6 +11,10 @@ pub mod opencode_broker;
 pub mod opencode_probe;
 pub mod opencode_control;
 pub mod opencode_nonce;
+pub mod opencode_native_process;
+pub mod opencode_native_files;
+#[cfg(test)]
+mod opencode_native_tests;
 #[cfg(test)]
 mod opencode_control_tests;
 #[cfg(test)]

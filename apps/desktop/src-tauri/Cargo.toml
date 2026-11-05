@@ -76,6 +76,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Security_Credentials",
+    "Win32_Security_Authorization",
     "Win32_Foundation",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
@@ -83,3 +84,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
 ] }
+
+[[bin]]
+name = "nova_t1_m0b_native_helper"
+path = "tests/fixtures/t1_m0b_native_helper.rs"
+required-features = ["t1-api-eval"]

@@ -556,3 +556,211 @@ pub fn attributed<T: Serialize>(value: T, source: Source) -> Value {
 pub fn issue_map(r: &Report) -> BTreeMap<&str, &Issue> {
     r.issues.iter().map(|i| (i.id.as_str(), i)).collect()
 }
+
+// Separate AR0 bounds; V1 parser and DTOs remain unchanged.
+pub fn relay_json<T: serde::de::DeserializeOwned>(b: &[u8], limit: usize) -> Result<T> {
+    if b.is_empty() || b.len() > limit {
+        return Err("BOUND");
+    }
+    let u: Unique = serde_json::from_slice(b).map_err(|_| "SCHEMA_REJECTED")?;
+    fn valid(v: &Value, d: usize) -> bool {
+        if d > 32 {
+            return false;
+        }
+        match v {
+            Value::String(s) => s.len() <= 65536,
+            Value::Array(a) => a.len() <= 256 && a.iter().all(|v| valid(v, d + 1)),
+            Value::Object(m) => {
+                m.len() <= 128 && m.iter().all(|(k, v)| k.len() <= 256 && valid(v, d + 1))
+            }
+            _ => true,
+        }
+    }
+    if !valid(&u.0, 0) {
+        return Err("BOUND");
+    }
+    serde_json::from_value(u.0).map_err(|_| "SCHEMA_REJECTED")
+}
+pub const RELAY_SIGNATURE: &str = "pub fn normalize_label(s: &str) -> String {";
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayLimits {
+    pub stage_ms: u64,
+    pub total_ms: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayPlan {
+    pub schema: String,
+    pub package_id: String,
+    pub registration_revision: i64,
+    pub input_base_sha: String,
+    pub input_delivery_identity: String,
+    pub target_path: String,
+    pub base_sha256: String,
+    pub goal: String,
+    pub constraints: Vec<String>,
+    pub examples: Vec<String>,
+    pub develop_profile: String,
+    pub review_profile: String,
+    pub model_develop: String,
+    pub model_review: String,
+    pub pm_decision_ref: String,
+    pub limits: RelayLimits,
+    pub mock: bool,
+}
+impl RelayPlan {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != "nova.relay.plan/1"
+            || !id(&self.package_id)
+            || self.registration_revision < 0
+            || !hex(&self.input_base_sha, 40)
+            || !hex(&self.input_delivery_identity, 64)
+            || self.target_path != "pilot/src/normalize_label.rs"
+            || !hex(&self.base_sha256, 64)
+            || self.goal.is_empty()
+            || self.goal.len() > 4096
+            || self.constraints.len() > 16
+            || self.examples.len() > 16
+            || self
+                .constraints
+                .iter()
+                .chain(&self.examples)
+                .any(|x| x.len() > 1024)
+            || self.develop_profile != "codex-exec-0.162.1"
+            || self.review_profile != "claude-print-2.1.197"
+            || [&self.model_develop, &self.model_review]
+                .iter()
+                .any(|x| x.is_empty() || x.len() > 128 || x.contains(['\0', '\r', '\n']))
+            || self.pm_decision_ref.trim().is_empty()
+            || self.pm_decision_ref.len() > 2048
+            || self.limits.stage_ms == 0
+            || self.limits.stage_ms > 300000
+            || self.limits.total_ms > 600000
+            || self.limits.total_ms < 60000
+        {
+            return Err("SCHEMA_REJECTED");
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Proposal {
+    pub schema: String,
+    pub target_path: String,
+    pub old_text: String,
+    pub new_text: String,
+    pub rationale: String,
+}
+impl Proposal {
+    pub fn validate(&self, p: &RelayPlan) -> Result<()> {
+        if self.schema != "nova.relay.proposal/1"
+            || self.target_path != p.target_path
+            || self.old_text.is_empty()
+            || self.old_text.len() > 8192
+            || self.new_text.len() > 16384
+            || self.rationale.len() > 2048
+            || self.old_text.contains(['\0', '\r'])
+            || self.new_text.contains(['\0', '\r'])
+        {
+            return Err("SCHEMA_REJECTED");
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewIssue {
+    pub id: String,
+    pub severity: Severity,
+    pub blocking: bool,
+    pub location: String,
+    pub summary: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewClaim {
+    pub schema: String,
+    pub base_sha256: String,
+    pub candidate_sha256: String,
+    pub verdict: String,
+    pub issues: Vec<ReviewIssue>,
+    pub unknowns: Vec<String>,
+}
+impl ReviewClaim {
+    pub fn validate(&self, b: &str, c: &str) -> Result<()> {
+        if self.schema != "nova.relay.review/1"
+            || self.base_sha256 != b
+            || self.candidate_sha256 != c
+        {
+            return Err("BINDING_MISMATCH");
+        }
+        if !["PASS", "CHANGES_REQUIRED", "BLOCKED"].contains(&self.verdict.as_str())
+            || self.issues.len() > 32
+            || self.unknowns.len() > 16
+            || self.unknowns.iter().any(|s| s.len() > 512)
+        {
+            return Err("SCHEMA_REJECTED");
+        }
+        let mut seen = BTreeSet::new();
+        for i in &self.issues {
+            let n = i.id.strip_prefix("R-").ok_or("SCHEMA_REJECTED")?;
+            if n.is_empty()
+                || n.len() > 3
+                || !n.bytes().all(|b| b.is_ascii_digit())
+                || !seen.insert(&i.id)
+                || i.location.len() > 256
+                || i.summary.len() > 1024
+            {
+                return Err("SCHEMA_REJECTED");
+            }
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RelayRole {
+    Develop,
+    Review,
+}
+impl RelayRole {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Develop => "DEVELOP",
+            Self::Review => "REVIEW",
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Attempt {
+    pub attempt_id: String,
+    pub role: RelayRole,
+    pub state: String,
+    pub state_version: i64,
+    pub input_identity: String,
+    pub parent_attempt_id: Option<String>,
+    pub profile_id: String,
+    pub exe_sha256: String,
+    pub argv_sha256: String,
+    pub env_names_sha256: String,
+    pub started_utc: Option<String>,
+    pub ended_utc: Option<String>,
+    pub pid: Option<u32>,
+    pub process_creation_utc: Option<String>,
+    pub exit_code: Option<i64>,
+    pub terminal: Option<String>,
+    pub reclaim: Option<String>,
+    pub session_id: Option<String>,
+    pub stdout_bytes: Option<u64>,
+    pub stdout_sha256: Option<String>,
+    pub stderr_bytes: Option<u64>,
+    pub stderr_sha256: Option<String>,
+    pub result_sha256: Option<String>,
+    // SQLite carrier only: model claims are projected separately from tool facts.
+    #[serde(skip_serializing, default)]
+    pub model_claim_json: Option<String>,
+    pub usage_json: Option<String>,
+}

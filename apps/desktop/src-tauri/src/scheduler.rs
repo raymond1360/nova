@@ -6,3 +6,6 @@ pub mod store;
 mod tests;
 
 pub type Result<T> = std::result::Result<T, &'static str>;
+
+pub mod relay;
+pub mod cli_adapter;

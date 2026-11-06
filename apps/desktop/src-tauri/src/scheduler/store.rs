@@ -260,6 +260,15 @@ impl Store {
     }
     // Fixed fault points only accessible to this crate's tests; never an input/CLI flag.
     fn init_stage(root: &Path, m: &Manifest, e: &Envelope, fault: u8) -> Result<Self> {
+        Self::init_version(root, m, e, fault, 1)
+    }
+    fn init_version(
+        root: &Path,
+        m: &Manifest,
+        e: &Envelope,
+        fault: u8,
+        version: i64,
+    ) -> Result<Self> {
         m.validate()?;
         safe_location(root)?;
         absolute(root)?;
@@ -319,7 +328,16 @@ impl Store {
         }
         sql(db.conn().execute_batch("BEGIN IMMEDIATE;"))?;
         let result = (|| {
-            sql(db.conn().execute_batch(SCHEMA))?;
+            let ddl = if version == 2 {
+                SCHEMA.replace("CHECK(schema_version=1)", "CHECK(schema_version=2)")
+                    + RELAY_PLANS_DDL
+                    + ";"
+                    + RELAY_ATTEMPTS_DDL
+                    + ";"
+            } else {
+                SCHEMA.into()
+            };
+            sql(db.conn().execute_batch(&ddl))?;
             let task = product(db.create_task_in_transaction(
                 &CreateTaskRequest {
                     project_id: project.id.clone(),
@@ -343,7 +361,7 @@ impl Store {
             if v != 12 {
                 return Err("PRODUCT_SCHEMA_UNSUPPORTED");
             }
-            sql(db.conn().execute("INSERT INTO scheduler_meta VALUES(1,'NOVA_SH1_OWNED_V1','INTERNAL_HANDOFF_ONLY',1,?1,?2,?3,1)",params![owner.db_id,owner.root,v]))?;
+            sql(db.conn().execute("INSERT INTO scheduler_meta VALUES(1,'NOVA_SH1_OWNED_V1','INTERNAL_HANDOFF_ONLY',?4,?1,?2,?3,1)",params![owner.db_id,owner.root,v,version]))?;
             sql(db.conn().execute("INSERT INTO scheduler_packages(package_id,project_id,task_id,manifest_json,manifest_sha256,policy_id,phase,revision,current_envelope_id,base_sha,base_source,current_delivery_identity) VALUES(?1,?2,?3,?4,?5,'INTERNAL_MANUAL_V1','HANDOFF_READY',0,?6,?7,?8,?9)",params![m.package_id,project.id,task.id,encoded(m)?,hash(encoded(m)?.as_bytes()),e.envelope_id,e.base,e.base_source,e.delivery_identity]))?;
             save_envelope(db.conn(), m, e)?;
             sql(db.conn().execute("INSERT INTO scheduler_events(package_id,revision,idempotency_key,kind,actor,payload_json) VALUES(?1,0,'INIT','INIT','user',?2)",params![m.package_id,encoded(&json!({"base_source":e.base_source,"execution_permission":"NOT_GRANTED_BY_SH1"}))?]))?;
@@ -394,7 +412,7 @@ impl Store {
             != (
                 "NOVA_SH1_OWNED_V1".into(),
                 "INTERNAL_HANDOFF_ONLY".into(),
-                1,
+                mark.2,
                 s.owner.db_id.clone(),
                 s.owner.root.clone(),
                 12,
@@ -408,6 +426,24 @@ impl Store {
             )? != 1
         {
             return Err("STORE_VERSION_REJECTED");
+        }
+        if ![1, 2].contains(&mark.2) {
+            return Err("STORE_VERSION_REJECTED");
+        }
+        if mark.2 == 2 {
+            for (name, expected) in [
+                ("relay_plans", RELAY_PLANS_DDL),
+                ("relay_attempts", RELAY_ATTEMPTS_DDL),
+            ] {
+                let actual: String = sql(c.query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    [name],
+                    |r| r.get(0),
+                ))?;
+                if actual != expected {
+                    return Err("STORE_VERSION_REJECTED");
+                }
+            }
         }
         let _ = s.snapshot()?;
         Ok(s)
@@ -1044,4 +1080,416 @@ pub(super) fn test_constraints(s: &Store) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub const RELAY_PLANS_DDL: &str = r#"CREATE TABLE relay_plans(plan_id TEXT PRIMARY KEY,package_id TEXT NOT NULL UNIQUE REFERENCES scheduler_packages(package_id),plan_json TEXT NOT NULL,plan_sha256 TEXT NOT NULL CHECK(length(plan_sha256)=64),registration_revision INTEGER NOT NULL,run_root TEXT NOT NULL,run_root_identity TEXT NOT NULL,mock INTEGER NOT NULL CHECK(mock IN (0,1)),created_utc TEXT NOT NULL)"#;
+pub const RELAY_ATTEMPTS_DDL: &str = r#"CREATE TABLE relay_attempts(attempt_id TEXT PRIMARY KEY,plan_id TEXT NOT NULL REFERENCES relay_plans(plan_id),role TEXT NOT NULL CHECK(role IN ('DEVELOP','REVIEW')),round INTEGER NOT NULL CHECK(round=1),input_identity TEXT NOT NULL CHECK(length(input_identity)=64),parent_attempt_id TEXT REFERENCES relay_attempts(attempt_id),profile_id TEXT NOT NULL,exe_sha256 TEXT NOT NULL CHECK(length(exe_sha256)=64),argv_sha256 TEXT NOT NULL CHECK(length(argv_sha256)=64),env_names_sha256 TEXT NOT NULL CHECK(length(env_names_sha256)=64),state TEXT NOT NULL CHECK(state IN ('RESERVED','LAUNCHING','RUNNING','EXITED','STOPPED','LAUNCH_FAILED','UNKNOWN')),state_version INTEGER NOT NULL CHECK(state_version>=0),pid INTEGER,process_creation_utc TEXT,started_utc TEXT,ended_utc TEXT,exit_code INTEGER,terminal TEXT CHECK(terminal IS NULL OR terminal IN ('SUCCESS','TURN_FAILED','RESULT_ERROR','TERMINAL_MISSING','PROTOCOL_ERROR','TOOL_USE_OBSERVED','BOUND','DEADLINE','CANCELLED','LIFECYCLE_UNKNOWN','LAUNCH_FAILED','BINDING_MISMATCH','SCHEMA_REJECTED')),reclaim TEXT CHECK(reclaim IS NULL OR reclaim IN ('CONFIRMED','UNKNOWN')),session_id TEXT,stdout_bytes INTEGER,stdout_sha256 TEXT,stderr_bytes INTEGER,stderr_sha256 TEXT,result_sha256 TEXT,model_claim_json TEXT CHECK(model_claim_json IS NULL OR length(model_claim_json)<=65536),usage_json TEXT,UNIQUE(plan_id,role,round),CHECK((role='DEVELOP' AND parent_attempt_id IS NULL) OR (role='REVIEW' AND parent_attempt_id IS NOT NULL)))"#;
+
+/// Not serializable/cloneable: only a newly reserved flow can acquire a launch permit.
+pub struct Reservation {
+    attempt: Attempt,
+}
+pub struct LaunchPermit {
+    attempt: Attempt,
+    claimed: std::sync::atomic::AtomicBool,
+}
+impl LaunchPermit {
+    pub fn claim_once(&self) -> bool {
+        self.claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+    pub fn attempt(&self) -> &Attempt {
+        &self.attempt
+    }
+}
+#[derive(Clone)]
+pub struct StoredPlan {
+    pub id: String,
+    pub plan: RelayPlan,
+    pub run_root: PathBuf,
+    pub run_identity: String,
+}
+impl Store {
+    pub fn relay_init(root: &Path, m: &Manifest, e: &Envelope) -> Result<Self> {
+        Self::init_version(root, m, e, 0, 2)
+    }
+    pub fn relay_require_v2(&self) -> Result<()> {
+        let c = self.read_connection()?;
+        let v: i64 = sql(
+            c.query_row("SELECT schema_version FROM scheduler_meta", [], |r| {
+                r.get(0)
+            }),
+        )?;
+        if v != 2 {
+            return Err("RELAY_SCHEMA_UNSUPPORTED");
+        }
+        Ok(())
+    }
+    pub fn relay_bind(&self, p: &RelayPlan, run_root: &Path) -> Result<StoredPlan> {
+        self.relay_require_v2()?;
+        if !p.mock {
+            return Err("REAL_PILOT_NOT_AUTHORIZED");
+        }
+        p.validate()?;
+        let snap = self.snapshot()?;
+        if !snap.manifest.allowed_paths.contains(&p.target_path) {
+            return Err("BINDING_MISMATCH");
+        }
+        if p.package_id != snap.manifest.package_id
+            || p.registration_revision != snap.revision
+            || p.input_base_sha != self.audit_envelope()?.head
+            || p.input_delivery_identity != snap.delivery
+        {
+            return Err("BINDING_MISMATCH");
+        }
+        absolute(run_root)?;
+        safe_location(run_root)?;
+        if inside(run_root, &self.root)
+            || inside(&self.root, run_root)
+            || inside(run_root, Path::new(&snap.manifest.repo_path))
+            || inside(Path::new(&snap.manifest.repo_path), run_root)
+        {
+            return Err("RUN_ROOT_REJECTED");
+        }
+        let _parent = Guard::open(run_root.parent().ok_or("PATH_REJECTED")?, true)?;
+        let c = self.read_connection()?;
+        if sql(c.query_row("SELECT COUNT(*) FROM relay_plans", [], |r| {
+            r.get::<_, i64>(0)
+        }))? != 0
+        {
+            return Err("PLAN_EXISTS");
+        }
+        fs::create_dir(run_root).map_err(|_| "CREATE_NEW_REJECTED")?;
+        let guard = Guard::open(run_root, true)?;
+        let encoded = encoded(p)?;
+        let digest = hash(encoded.as_bytes());
+        let id = digest.clone();
+        let db = self.write_connection()?;
+        sql(db.conn().execute_batch("BEGIN IMMEDIATE"))?;
+        let result = (|| {
+            let current = snapshot(db.conn())?;
+            if current.revision != p.registration_revision || current.invalidated || current.closed
+            {
+                return Err("REGISTRATION_CHANGED");
+            }
+            sql(db.conn().execute(
+                "INSERT INTO relay_plans VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8)",
+                params![
+                    id,
+                    p.package_id,
+                    encoded,
+                    digest,
+                    p.registration_revision,
+                    guard.path.to_string_lossy(),
+                    guard.identity,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            ))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => sql(db.conn().execute_batch("COMMIT"))?,
+            Err(e) => {
+                let _ = db.conn().execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
+        self.relay_plan()
+    }
+    pub fn relay_plan(&self) -> Result<StoredPlan> {
+        self.relay_require_v2()?;
+        let c = self.read_connection()?;
+        let (id,pkg,text,digest,revision,path,identity,mock):(String,String,String,String,i64,String,String,i64)=sql(c.query_row("SELECT plan_id,package_id,plan_json,plan_sha256,registration_revision,run_root,run_root_identity,mock FROM relay_plans",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))))?;
+        let p: RelayPlan = relay_json(text.as_bytes(), 65536)?;
+        if !p.mock {
+            return Err("REAL_PILOT_NOT_AUTHORIZED");
+        }
+        p.validate()?;
+        let snap = self.snapshot()?;
+        if hash(text.as_bytes()) != digest
+            || id != digest
+            || pkg != p.package_id
+            || pkg != snap.manifest.package_id
+            || revision != p.registration_revision
+            || mock != i64::from(p.mock)
+            || !p.mock
+            || p.input_base_sha != self.audit_envelope()?.head
+            || p.input_delivery_identity != snap.delivery
+        {
+            return Err("BINDING_MISMATCH");
+        }
+        let guard = Guard::open(Path::new(&path), true)?;
+        if guard.identity != identity {
+            return Err("RUN_ROOT_IDENTITY");
+        }
+        Ok(StoredPlan {
+            id,
+            plan: p,
+            run_root: guard.path,
+            run_identity: identity,
+        })
+    }
+    pub fn relay_attempts(&self) -> Result<Vec<Attempt>> {
+        let p = self.relay_plan()?;
+        let c = self.read_connection()?;
+        let mut q=sql(c.prepare("SELECT attempt_id,role,state,state_version,input_identity,parent_attempt_id,profile_id,pid,process_creation_utc,exit_code,terminal,reclaim,session_id,stdout_bytes,stdout_sha256,stderr_bytes,stderr_sha256,result_sha256,model_claim_json,usage_json,exe_sha256,argv_sha256,env_names_sha256,started_utc,ended_utc FROM relay_attempts WHERE plan_id=?1 ORDER BY role"))?;
+        let rows = sql(q.query_map([&p.id], |r| {
+            Ok(Attempt {
+                attempt_id: r.get(0)?,
+                role: if r.get::<_, String>(1)? == "DEVELOP" {
+                    RelayRole::Develop
+                } else {
+                    RelayRole::Review
+                },
+                state: r.get(2)?,
+                state_version: r.get(3)?,
+                input_identity: r.get(4)?,
+                parent_attempt_id: r.get(5)?,
+                profile_id: r.get(6)?,
+                pid: r.get(7)?,
+                process_creation_utc: r.get(8)?,
+                exit_code: r.get(9)?,
+                terminal: r.get(10)?,
+                reclaim: r.get(11)?,
+                session_id: r.get(12)?,
+                stdout_bytes: r.get(13)?,
+                stdout_sha256: r.get(14)?,
+                stderr_bytes: r.get(15)?,
+                stderr_sha256: r.get(16)?,
+                result_sha256: r.get(17)?,
+                model_claim_json: r.get(18)?,
+                usage_json: r.get(19)?,
+                exe_sha256: r.get(20)?,
+                argv_sha256: r.get(21)?,
+                env_names_sha256: r.get(22)?,
+                started_utc: r.get(23)?,
+                ended_utc: r.get(24)?,
+            })
+        }))?;
+        let mut out = vec![];
+        for a in rows {
+            let a = sql(a)?;
+            let profile = match a.role {
+                RelayRole::Develop => &p.plan.develop_profile,
+                RelayRole::Review => &p.plan.review_profile,
+            };
+            if &a.profile_id != profile
+                || [
+                    &a.input_identity,
+                    &a.exe_sha256,
+                    &a.argv_sha256,
+                    &a.env_names_sha256,
+                ]
+                .iter()
+                .any(|s| !hex(s, 64))
+            {
+                return Err("BINDING_MISMATCH");
+            }
+            out.push(a)
+        }
+        for a in &out {
+            match a.role {
+                RelayRole::Develop => {
+                    if a.parent_attempt_id.is_some() {
+                        return Err("BINDING_MISMATCH");
+                    }
+                }
+                RelayRole::Review => {
+                    let d = out
+                        .iter()
+                        .find(|x| x.role == RelayRole::Develop)
+                        .ok_or("BINDING_MISMATCH")?;
+                    if a.parent_attempt_id.as_ref() != Some(&d.attempt_id)
+                        || d.state != "EXITED"
+                        || d.terminal.as_deref() != Some("SUCCESS")
+                    {
+                        return Err("BINDING_MISMATCH");
+                    }
+                }
+            }
+        }
+        let base = super::relay::read_base(self, &p.plan)?;
+        for a in &out {
+            let expected = if a.role == RelayRole::Develop {
+                super::relay::develop_input(&p.plan, &base)?
+            } else {
+                let d = out
+                    .iter()
+                    .find(|x| x.role == RelayRole::Develop)
+                    .ok_or("BINDING_MISMATCH")?;
+                super::relay::prepare_review(
+                    &p.plan,
+                    &base,
+                    d.model_claim_json
+                        .as_ref()
+                        .ok_or("BINDING_MISMATCH")?
+                        .as_bytes(),
+                )?
+                .1
+            };
+            if hash(&expected) != a.input_identity {
+                return Err("BINDING_MISMATCH");
+            }
+            if let Some(claim) = &a.model_claim_json {
+                if a.result_sha256.as_deref() != Some(hash(claim.as_bytes()).as_str()) {
+                    return Err("BINDING_MISMATCH");
+                }
+            }
+        }
+        Ok(out)
+    }
+    pub fn relay_reserve(
+        &self,
+        role: RelayRole,
+        input: &[u8],
+        parent: Option<&Attempt>,
+        exe_hash: &str,
+        argv_hash: &str,
+        env_hash: &str,
+    ) -> Result<Reservation> {
+        let p = self.relay_plan()?;
+        let existing = self.relay_attempts()?;
+        if existing.iter().any(|a| a.role == role) {
+            return Err("LEASE_EXISTS");
+        }
+        if role == RelayRole::Review {
+            let d = parent.ok_or("BINDING_MISMATCH")?;
+            let actual = existing
+                .iter()
+                .find(|a| {
+                    a.attempt_id == d.attempt_id
+                        && a.role == RelayRole::Develop
+                        && a.state == "EXITED"
+                        && a.terminal.as_deref() == Some("SUCCESS")
+                })
+                .ok_or("BINDING_MISMATCH")?;
+            let base = super::relay::read_base(self, &p.plan)?;
+            let proposal = actual.model_claim_json.as_ref().ok_or("SCHEMA_REJECTED")?;
+            let (_, review) = super::relay::prepare_review(&p.plan, &base, proposal.as_bytes())?;
+            if review != input {
+                return Err("BINDING_MISMATCH");
+            }
+        } else if parent.is_some() {
+            return Err("BINDING_MISMATCH");
+        } else if super::relay::develop_input(&p.plan, &super::relay::read_base(self, &p.plan)?)?
+            != input
+        {
+            return Err("BINDING_MISMATCH");
+        }
+        if [exe_hash, argv_hash, env_hash].iter().any(|s| !hex(s, 64)) {
+            return Err("BINDING_MISMATCH");
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let profile = if role == RelayRole::Develop {
+            p.plan.develop_profile.clone()
+        } else {
+            p.plan.review_profile.clone()
+        };
+        let a = Attempt {
+            attempt_id: id.clone(),
+            role,
+            state: "RESERVED".into(),
+            state_version: 0,
+            input_identity: hash(input),
+            parent_attempt_id: parent.map(|a| a.attempt_id.clone()),
+            profile_id: profile.clone(),
+            exe_sha256: exe_hash.into(),
+            argv_sha256: argv_hash.into(),
+            env_names_sha256: env_hash.into(),
+            started_utc: None,
+            ended_utc: None,
+            pid: None,
+            process_creation_utc: None,
+            exit_code: None,
+            terminal: None,
+            reclaim: None,
+            session_id: None,
+            stdout_bytes: None,
+            stdout_sha256: None,
+            stderr_bytes: None,
+            stderr_sha256: None,
+            result_sha256: None,
+            model_claim_json: None,
+            usage_json: None,
+        };
+        let db = self.write_connection()?;
+        sql(db.conn().execute_batch("BEGIN IMMEDIATE"))?;
+        let result = (|| {
+            let s = snapshot(db.conn())?;
+            if s.revision != p.plan.registration_revision || s.invalidated || s.closed {
+                return Err("REGISTRATION_CHANGED");
+            }
+            db.conn().execute("INSERT INTO relay_attempts(attempt_id,plan_id,role,round,input_identity,parent_attempt_id,profile_id,exe_sha256,argv_sha256,env_names_sha256,state,state_version) VALUES(?1,?2,?3,1,?4,?5,?6,?7,?8,?9,'RESERVED',0)",params![id,p.id,role.name(),a.input_identity,a.parent_attempt_id,profile,exe_hash,argv_hash,env_hash]).map_err(|_|"LEASE_EXISTS")?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => sql(db.conn().execute_batch("COMMIT"))?,
+            Err(e) => {
+                let _ = db.conn().execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
+        Ok(Reservation { attempt: a })
+    }
+    pub fn relay_launching(&self, r: Reservation) -> Result<LaunchPermit> {
+        let mut a = r.attempt;
+        self.relay_cas(&mut a, "LAUNCHING")?;
+        Ok(LaunchPermit {
+            attempt: a,
+            claimed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+    pub fn relay_cas(&self, a: &mut Attempt, to: &str) -> Result<()> {
+        self.relay_require_v2()?;
+        let edge = matches!(
+            (a.state.as_str(), to),
+            ("RESERVED", "LAUNCHING")
+                | ("LAUNCHING", "RUNNING")
+                | ("LAUNCHING", "LAUNCH_FAILED")
+                | ("LAUNCHING", "STOPPED")
+                | ("RUNNING", "EXITED")
+                | ("RUNNING", "STOPPED")
+        ) || (["RESERVED", "LAUNCHING", "RUNNING"].contains(&a.state.as_str())
+            && to == "UNKNOWN");
+        if !edge {
+            return Err("ATTEMPT_EDGE_REJECTED");
+        }
+        let p = self.relay_plan()?;
+        let persisted = self.relay_attempts()?;
+        let actual = persisted
+            .iter()
+            .find(|v| v.attempt_id == a.attempt_id)
+            .ok_or("BINDING_MISMATCH")?;
+        if actual.role != a.role
+            || actual.profile_id != a.profile_id
+            || actual.input_identity != a.input_identity
+            || actual.parent_attempt_id != a.parent_attempt_id
+            || actual.exe_sha256 != a.exe_sha256
+            || actual.argv_sha256 != a.argv_sha256
+            || actual.env_names_sha256 != a.env_names_sha256
+        {
+            return Err("BINDING_MISMATCH");
+        }
+        let db = self.write_connection()?;
+        let utc = chrono::Utc::now().to_rfc3339();
+        let n=sql(db.conn().execute("UPDATE relay_attempts SET state=?1,state_version=state_version+1,pid=?2,process_creation_utc=?3,exit_code=?4,terminal=?5,reclaim=?6,session_id=?7,stdout_bytes=?8,stdout_sha256=?9,stderr_bytes=?10,stderr_sha256=?11,result_sha256=?12,model_claim_json=?13,usage_json=?14,started_utc=CASE WHEN ?1='RUNNING' THEN ?15 ELSE started_utc END,ended_utc=CASE WHEN ?1 IN ('EXITED','STOPPED','LAUNCH_FAILED','UNKNOWN') THEN ?15 ELSE ended_utc END WHERE attempt_id=?16 AND state=?17 AND state_version=?18 AND plan_id=?19",params![to,a.pid,a.process_creation_utc,a.exit_code,a.terminal,a.reclaim,a.session_id,a.stdout_bytes,a.stdout_sha256,a.stderr_bytes,a.stderr_sha256,a.result_sha256,a.model_claim_json,a.usage_json,utc,a.attempt_id,a.state,a.state_version,p.id]))?;
+        if n != 1 {
+            return Err("ATTEMPT_CAS_CONFLICT");
+        }
+        if to == "RUNNING" {
+            a.started_utc = Some(utc.clone());
+        }
+        if ["EXITED", "STOPPED", "LAUNCH_FAILED", "UNKNOWN"].contains(&to) {
+            a.ended_utc = Some(utc);
+        }
+        a.state = to.into();
+        a.state_version += 1;
+        Ok(())
+    }
 }

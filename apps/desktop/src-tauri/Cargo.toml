@@ -73,8 +73,18 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Credentials",
     "Win32_Foundation",
     "Win32_System_JobObjects",
+    "Win32_System_Console",
     "Win32_System_Threading",
     "Win32_System_Pipes",
     "Win32_Security",
     "Win32_Storage_FileSystem",
 ] }
+
+[[bin]]
+name = "nova_scheduler_relay"
+path = "tests/fixtures/scheduler_relay_main.rs"
+required-features = ["scheduler-validation"]
+[[bin]]
+name = "nova_scheduler_relay_fake_cli"
+path = "tests/fixtures/scheduler_relay_fake_cli.rs"
+required-features = ["scheduler-validation"]

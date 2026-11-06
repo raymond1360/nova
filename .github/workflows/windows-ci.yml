@@ -284,23 +284,32 @@ jobs:
               'default-list'=0;'default-tests'=0;'default-build'=0
             }
           }
+          function Get-Sh1IgnoredNames {
+            return @('scheduler::tests::ar0::ar0_actual_created_assign_query_resume_and_persist_failure_cleanup','scheduler::tests::ar0::ar0_actual_duplex_input_output_avoids_pipe_deadlock','scheduler::tests::ar0::ar0_actual_fake_blocked_conflict_changes_and_unknowns','scheduler::tests::ar0::ar0_actual_fake_cancel_signal_reclaims_job_and_readers','scheduler::tests::ar0::ar0_actual_fake_deadline_and_inherited_pipe_descendant_reclaimed','scheduler::tests::ar0::ar0_actual_fake_develop_errors_never_launch_review','scheduler::tests::ar0::ar0_actual_fake_parent_credentials_do_not_reach_child','scheduler::tests::ar0::ar0_actual_fake_review_isolation_and_schema_failures','scheduler::tests::ar0::ar0_actual_fake_two_stage_success_and_restart_no_third','scheduler::tests::ar0::ar0_actual_isolated_console_c_and_break_handler_unregistered','scheduler::tests::ar0::ar0_actual_running_cas_failure_still_reclaims_resources','scheduler::tests::ar0::ar0_actual_running_fixture_drift_preserves_terminal','scheduler::tests::ar0::ar0_actual_stdin_128k_stdout_concurrent_and_write_failure','scheduler::tests::ar0::ar0_actual_unknown_reclaim_never_launches_review','scheduler::tests::ar0::ar0_cancel_before_creation_never_obtains_a_process','scheduler::tests::ar0::ar0_createprocess_failure_is_distinct_from_created_cleanup','scheduler::tests::ar0::ar0_evidence_create_new_failure_does_not_start_review','scheduler::tests::ar0::ar0_injected_crashes_before_create_before_resume_after_resume_never_replay','scheduler::tests::ar0::ar0_plan_unique_and_lease_write_failure_has_zero_spawn')
+          }
           function Get-Sh1TestNames([string]$List, [string]$Run, [string[]]$Required, [switch]$Adapter) {
             $namePattern = '[A-Za-z_][A-Za-z0-9_:]{0,255}'
             $ok = [Collections.Generic.List[string]]::new()
+            $ignored = [Collections.Generic.List[string]]::new()
             $blocks = [regex]::Matches($Run, "(?ms)^test ($namePattern) \.\.\. (.*?)(?=^test $namePattern \.\.\. |^test result:|\z)")
             foreach ($block in $blocks) {
-              Assert-Sh1 ($block.Groups[2].Value -match '(?m)(?:^|\n)ok\s*\z') 'SH1_TEST_REJECTED'
-              $ok.Add($block.Groups[1].Value)
+              if ($block.Groups[2].Value -match '^ignored(?:, [^\r\n]*)?\r?\n?\z') { $ignored.Add($block.Groups[1].Value) }
+              else {
+                Assert-Sh1 ($block.Groups[2].Value -match '(?m)(?:^|\n)ok\s*\z') 'SH1_TEST_REJECTED'
+                $ok.Add($block.Groups[1].Value)
+              }
             }
-            Assert-Sh1 ($ok.Count -gt 0 -and $ok.Count -le 2048 -and @($ok | Sort-Object -Unique).Count -eq $ok.Count) 'SH1_TEST_REJECTED'
-            $summary = [regex]::Matches($Run,'(?m)^test result: ok\. ([0-9]+) passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s\s*$')
-            Assert-Sh1 ($summary.Count -eq 1 -and [long]$summary[0].Groups[1].Value -eq $ok.Count) 'SH1_TEST_REJECTED'
-            if ($Adapter) { $expected = @($Required | Sort-Object) } else {
-              $expected = @([regex]::Matches($List,"(?m)^($namePattern): test\s*$") | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
+            $all = @(@($ok) + @($ignored) | Sort-Object)
+            Assert-Sh1 ($ok.Count -gt 0 -and $all.Count -le 2048 -and @($all | Sort-Object -Unique).Count -eq $all.Count) 'SH1_TEST_REJECTED'
+            $allowedIgnored = if ($Adapter) { @() } else { @(Get-Sh1IgnoredNames | Sort-Object) }
+            Assert-Sh1 ($ignored.Count -eq $allowedIgnored.Count -and ($ignored.Count -eq 0 -or -not (Compare-Object @($ignored | Sort-Object) $allowedIgnored))) 'SH1_TEST_REJECTED'
+            $summary = [regex]::Matches($Run,'(?m)^test result: ok\. ([0-9]+) passed; 0 failed; ([0-9]+) ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s\s*$')
+            Assert-Sh1 ($summary.Count -eq 1 -and [long]$summary[0].Groups[1].Value -eq $ok.Count -and [long]$summary[0].Groups[2].Value -eq $ignored.Count) 'SH1_TEST_REJECTED'
+            if ($Adapter) { $declared = @($Required | Sort-Object) } else {
+              $declared = @([regex]::Matches($List,"(?m)^($namePattern): test\s*$") | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
             }
-            Assert-Sh1 ($expected.Count -eq $ok.Count -and @($expected | Sort-Object -Unique).Count -eq $expected.Count) 'SH1_TEST_REJECTED'
+            Assert-Sh1 ($declared.Count -eq $all.Count -and @($declared | Sort-Object -Unique).Count -eq $declared.Count -and -not (Compare-Object $declared $all)) 'SH1_TEST_REJECTED'
             $actual = @($ok | Sort-Object)
-            for ($i=0; $i -lt $actual.Count; $i++) { Assert-Sh1 ($actual[$i] -ceq $expected[$i]) 'SH1_TEST_REJECTED' }
             foreach ($requiredName in $Required) { Assert-Sh1 ($actual -ccontains $requiredName) 'SH1_TEST_REJECTED' }
             return ,$actual
           }
@@ -530,3 +539,353 @@ jobs:
             ${{ runner.temp }}/wp2a-validation-artifacts/facility-tests.log
             ${{ runner.temp }}/wp2a-validation-artifacts/normal-build.log
             ${{ runner.temp }}/wp2a-validation-artifacts/release-guard.log
+
+  ar0-validation:
+    # A separate runner: never reuse SH1/default targets or a cached fake CLI.
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CI: 'true'
+      RUSTUP_TOOLCHAIN: 1.98.0-x86_64-pc-windows-msvc
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Checkout AR0 candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare fresh short AR0 paths and tools
+        id: ar0_paths
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($PSVersionTable.PSEdition -cne 'Core' -or $PSVersionTable.PSVersion.Major -ne 7) { throw 'AR0_PWSH_REQUIRED' }
+          Write-Output ('AR0 PowerShell ' + $PSVersionTable.PSVersion.ToString())
+          if ((git rev-parse HEAD).Trim() -cne $env:GITHUB_SHA) { throw 'AR0_SHA_REJECTED' }
+          if ($env:GITHUB_RUN_ID -cnotmatch '^[1-9][0-9]{0,19}$' -or $env:GITHUB_RUN_ATTEMPT -cnotmatch '^[1-9][0-9]{0,9}$') { throw 'AR0_CONTEXT_REJECTED' }
+          # Drive root is canonical, short, local; never trust a possibly abbreviated TEMP.
+          $root = [IO.Path]::GetFullPath("C:\ar0-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)")
+          if (Test-Path -LiteralPath $root) { throw 'AR0_PATH_EXISTS' }
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+          foreach ($n in @('tmp','public')) { New-Item -ItemType Directory -Path (Join-Path $root $n) -ErrorAction Stop | Out-Null }
+          foreach ($dir in @($root,(Join-Path $root 'tmp'),(Join-Path $root 'public'))) {
+            $item = Get-Item -LiteralPath $dir -Force
+            for ($q=$item; $null -ne $q; $q=$q.Parent) { if (($q.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'AR0_LINK_REJECTED' } }
+            if ($item.FullName -cne $dir -or $dir.Contains('~') -or $dir.Length -gt 80) { throw 'AR0_PATH_REJECTED' }
+          }
+          [IO.File]::AppendAllText($env:GITHUB_OUTPUT,"root=$root`n",[Text.UTF8Encoding]::new($false))
+          [IO.File]::AppendAllText($env:GITHUB_ENV,"TEMP=$root\tmp`nTMP=$root\tmp`n",[Text.UTF8Encoding]::new($false))
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+          if ((rustc --version) -notmatch '^rustc 1\.98\.0 ' -or (cargo --version) -notmatch '^cargo 1\.98\.0 ') { throw 'AR0_TOOL_REJECTED' }
+          # Dependencies only. No build/cache restoration and no fake CLI before SH1.
+          cargo fetch --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+      - name: Run unchanged AR0 validation script
+        id: ar0_run
+        timeout-minutes: 62
+        env:
+          AR0_ROOT: ${{ steps.ar0_paths.outputs.root }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:AR0_ROOT
+          $pwsh = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
+          if (-not $pwsh -or $PSVersionTable.PSVersion.Major -ne 7) { throw 'AR0_PWSH_REQUIRED' }
+          $info = [Diagnostics.ProcessStartInfo]::new()
+          $info.FileName=$pwsh; $info.WorkingDirectory=$env:GITHUB_WORKSPACE
+          $info.UseShellExecute=$false; $info.CreateNoWindow=$true
+          $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
+          $info.Environment['TEMP']=(Join-Path $root 'tmp'); $info.Environment['TMP']=(Join-Path $root 'tmp')
+          [void]$info.Environment.Remove('NOVA_AR0_TEST_FAKE_SHA256')
+          foreach ($a in @('-NoProfile','-NonInteractive','-File',(Join-Path $env:GITHUB_WORKSPACE 'scripts/test_scheduler_relay.ps1'),'-EvidenceDirectory',(Join-Path $root 'ev'),'-TargetDirectory',(Join-Path $root 't'))) { $info.ArgumentList.Add($a) }
+          $p=[Diagnostics.Process]::new(); $p.StartInfo=$info
+          $state='START_FAILED'; $exitCode=$null; $started=$false
+          $clock=[Diagnostics.Stopwatch]::StartNew()
+          try {
+            if (-not $p.Start()) { throw 'AR0_START_FAILED' }; $started=$true; $state='PARTIAL'
+            $streams=@($p.StandardOutput,$p.StandardError); $buffers=@(([char[]]::new(4096)),([char[]]::new(4096)))
+            $tasks=@($streams[0].ReadAsync($buffers[0],0,4096),$streams[1].ReadAsync($buffers[1],0,4096)); $done=@($false,$false); $sizes=@(0L,0L)
+            while (-not ($done[0] -and $done[1] -and $p.HasExited)) {
+              if ($clock.ElapsedMilliseconds -ge 3630000) { throw 'AR0_WRAPPER_DEADLINE' }
+              for ($i=0; $i -lt 2; $i++) {
+                if (-not $done[$i] -and $tasks[$i].IsCompleted) {
+                  $n=$tasks[$i].GetAwaiter().GetResult()
+                  if ($n -eq 0) { $done[$i]=$true; continue }
+                  $sizes[$i]+=$n; if ($sizes[$i] -gt 65536) { throw 'AR0_WRAPPER_OUTPUT_BOUND' }
+                  # Drain concurrently; arbitrary exception text is not public evidence.
+                  $tasks[$i]=$streams[$i].ReadAsync($buffers[$i],0,4096)
+                }
+              }
+              [Threading.Thread]::Sleep(10)
+            }
+            $exitCode=$p.ExitCode; $state='COMPLETE'
+          } finally {
+            if ($started -and $state -ceq 'PARTIAL') { try { $p.Kill($true); if ($p.WaitForExit(5000)) { $exitCode=$p.ExitCode } } catch { $exitCode=$null } }
+            @{schema='nova.ar0.ci-execution/1';sha=$env:GITHUB_SHA;run_id=$env:GITHUB_RUN_ID;attempt=$env:GITHUB_RUN_ATTEMPT;state=$state;exit_code=$exitCode;pwsh=$PSVersionTable.PSVersion.ToString()} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'execution.json') -Encoding utf8
+            $p.Dispose()
+          }
+          if ($state -cne 'COMPLETE' -or $exitCode -ne 0) { throw 'AR0_SCRIPT_FAILED' }
+
+      - name: Verify and reconstruct bounded AR0 evidence
+        if: ${{ always() && steps.ar0_paths.outputs.root != '' }}
+        env:
+          AR0_ROOT: ${{ steps.ar0_paths.outputs.root }}
+        run: |
+          function Get-Sh1ExpectedCommands {
+            # Closed ledger contract of the reviewed runner, not arbitrary command input.
+            return [ordered]@{
+              'debug-build'=0;'scheduler-list'=0;'scheduler-tests'=0;'adapter-tests'=0
+              'default-required-features'=101;'release-guard'=101
+              'fixture-init'=0;'fixture-add-base'=0;'fixture-commit-base'=0;'fixture-base-sha'=0;'root-commit-rejected'=2
+              'fixture-add-change'=0;'fixture-commit-change'=0;'bin-init'=0;'absent-nested-init'=0;'handoff-missing-slots'=2
+              'legacy-index-only'=0;'bin-import-REVIEW'=0;'bin-import-CI'=0;'bin-import-DEVELOPMENT'=0
+              'bin-status'=0;'bin-handoff'=0;'bin-repeat'=0;'outside-untracked'=0;'outside-filter'=0
+              'scope-filter'=2;'scope-filter-set'=2;'scope-dirty-repeat'=2;'crlf-false-dirty'=2
+              'crlf-init-true'=0;'crlf-status-true'=0;'crlf-init-input'=0;'crlf-status-input'=0
+              'explicit-eol-crlf'=0;'contradictory-attributes'=2;'junction-rejected'=2;'unknown-command'=2
+              'fixture-add-staged'=0;'staged-scope'=2;'fixture-add-extra'=0;'fixture-commit-extra'=0;'cumulative-scope-rejected'=2
+              'default-list'=0;'default-tests'=0;'default-build'=0
+            }
+          }
+          function Get-Sh1IgnoredNames {
+            return @('scheduler::tests::ar0::ar0_actual_created_assign_query_resume_and_persist_failure_cleanup','scheduler::tests::ar0::ar0_actual_duplex_input_output_avoids_pipe_deadlock','scheduler::tests::ar0::ar0_actual_fake_blocked_conflict_changes_and_unknowns','scheduler::tests::ar0::ar0_actual_fake_cancel_signal_reclaims_job_and_readers','scheduler::tests::ar0::ar0_actual_fake_deadline_and_inherited_pipe_descendant_reclaimed','scheduler::tests::ar0::ar0_actual_fake_develop_errors_never_launch_review','scheduler::tests::ar0::ar0_actual_fake_parent_credentials_do_not_reach_child','scheduler::tests::ar0::ar0_actual_fake_review_isolation_and_schema_failures','scheduler::tests::ar0::ar0_actual_fake_two_stage_success_and_restart_no_third','scheduler::tests::ar0::ar0_actual_isolated_console_c_and_break_handler_unregistered','scheduler::tests::ar0::ar0_actual_running_cas_failure_still_reclaims_resources','scheduler::tests::ar0::ar0_actual_running_fixture_drift_preserves_terminal','scheduler::tests::ar0::ar0_actual_stdin_128k_stdout_concurrent_and_write_failure','scheduler::tests::ar0::ar0_actual_unknown_reclaim_never_launches_review','scheduler::tests::ar0::ar0_cancel_before_creation_never_obtains_a_process','scheduler::tests::ar0::ar0_createprocess_failure_is_distinct_from_created_cleanup','scheduler::tests::ar0::ar0_evidence_create_new_failure_does_not_start_review','scheduler::tests::ar0::ar0_injected_crashes_before_create_before_resume_after_resume_never_replay','scheduler::tests::ar0::ar0_plan_unique_and_lease_write_failure_has_zero_spawn')
+          }
+          function Get-Sh1TestNames([string]$List, [string]$Run, [string[]]$Required, [switch]$Adapter) {
+            $namePattern = '[A-Za-z_][A-Za-z0-9_:]{0,255}'
+            $ok = [Collections.Generic.List[string]]::new()
+            $ignored = [Collections.Generic.List[string]]::new()
+            $blocks = [regex]::Matches($Run, "(?ms)^test ($namePattern) \.\.\. (.*?)(?=^test $namePattern \.\.\. |^test result:|\z)")
+            foreach ($block in $blocks) {
+              if ($block.Groups[2].Value -match '^ignored(?:, [^\r\n]*)?\r?\n?\z') { $ignored.Add($block.Groups[1].Value) }
+              else {
+                Assert-Sh1 ($block.Groups[2].Value -match '(?m)(?:^|\n)ok\s*\z') 'SH1_TEST_REJECTED'
+                $ok.Add($block.Groups[1].Value)
+              }
+            }
+            $all = @(@($ok) + @($ignored) | Sort-Object)
+            Assert-Sh1 ($ok.Count -gt 0 -and $all.Count -le 2048 -and @($all | Sort-Object -Unique).Count -eq $all.Count) 'SH1_TEST_REJECTED'
+            $allowedIgnored = if ($Adapter) { @() } else { @(Get-Sh1IgnoredNames | Sort-Object) }
+            Assert-Sh1 ($ignored.Count -eq $allowedIgnored.Count -and ($ignored.Count -eq 0 -or -not (Compare-Object @($ignored | Sort-Object) $allowedIgnored))) 'SH1_TEST_REJECTED'
+            $summary = [regex]::Matches($Run,'(?m)^test result: ok\. ([0-9]+) passed; 0 failed; ([0-9]+) ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s\s*$')
+            Assert-Sh1 ($summary.Count -eq 1 -and [long]$summary[0].Groups[1].Value -eq $ok.Count -and [long]$summary[0].Groups[2].Value -eq $ignored.Count) 'SH1_TEST_REJECTED'
+            if ($Adapter) { $declared = @($Required | Sort-Object) } else {
+              $declared = @([regex]::Matches($List,"(?m)^($namePattern): test\s*$") | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
+            }
+            Assert-Sh1 ($declared.Count -eq $all.Count -and @($declared | Sort-Object -Unique).Count -eq $declared.Count -and -not (Compare-Object $declared $all)) 'SH1_TEST_REJECTED'
+            $actual = @($ok | Sort-Object)
+            foreach ($requiredName in $Required) { Assert-Sh1 ($actual -ccontains $requiredName) 'SH1_TEST_REJECTED' }
+            return ,$actual
+          }
+          # Consumer functions are extracted verbatim by local static tests; no AI/CLI is invoked.
+          function Assert-Ar0($Condition) { if (-not $Condition) { throw 'AR0_CONTRACT_REJECTED' } }
+          function Assert-Sh1($Condition,[string]$Code) { if (-not $Condition) { throw $Code } }
+          function Test-Int($v) { return (($v -is [int] -or $v -is [long]) -and $v -ge 0 -and $v -le 2147483647) }
+          function Check-JsonElement($e) {
+            if ($e.ValueKind -eq [Text.Json.JsonValueKind]::Object) {
+              $keys=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+              foreach ($v in $e.EnumerateObject()) { Assert-Ar0 ($keys.Add($v.Name)); Check-JsonElement $v.Value }
+            } elseif ($e.ValueKind -eq [Text.Json.JsonValueKind]::Array) { foreach ($v in $e.EnumerateArray()) { Check-JsonElement $v } }
+          }
+          function Parse-Ar0([string]$text) {
+            $doc=[Text.Json.JsonDocument]::Parse($text)
+            try { Check-JsonElement $doc.RootElement } finally { $doc.Dispose() }
+            return ConvertFrom-Json -InputObject $text -AsHashtable -Depth 50 -ErrorAction Stop
+          }
+          function Read-Ar0([string]$Relative,[long]$Limit=16777216) {
+            # All callers pass fixed paths; no paths from result JSON are opened.
+            $p=Join-Path $script:root $Relative
+            $item=Get-Item -LiteralPath $p -Force -ErrorAction Stop
+            Assert-Ar0 (-not $item.PSIsContainer -and $item.Length -le $Limit)
+            for ($q=$item; $null -ne $q; $q=$q.Parent) { Assert-Ar0 (($q.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) }
+            $bytes=[IO.File]::ReadAllBytes($p); Assert-Ar0 ($bytes.Length -eq $item.Length -and $bytes.Length -le $Limit)
+            $script:inputs.Add(@{name=$Relative.Replace('\','/');bytes=$bytes.Length;sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant();state=if($bytes.Length -eq 0){'EMPTY'}else{'READ_LOCAL_ONLY'}})
+            return [Text.UTF8Encoding]::new($false,$true).GetString($bytes).TrimStart([char]0xfeff)
+          }
+          function Json-Ar0([string]$Relative,[long]$Limit=262144) { return Parse-Ar0 (Read-Ar0 $Relative $Limit) }
+          function Same-Names($a,$b) {
+            Assert-Ar0 ($a -is [array] -and $b -is [array] -and $a.Count -eq $b.Count)
+            foreach ($v in @($a)+@($b)) { Assert-Ar0 ($v -is [string] -and $v -cmatch '^[A-Za-z_][A-Za-z0-9_:]{0,255}$') }
+            Assert-Ar0 (@($a|Sort-Object -Unique).Count -eq $a.Count -and @($b|Sort-Object -Unique).Count -eq $b.Count)
+            if ($a.Count -gt 0) { Assert-Ar0 (-not (Compare-Object $a $b -CaseSensitive)) }
+          }
+          function Check-Ledger($result,$expected) {
+            Assert-Ar0 ($result.commands -is [array] -and $result.commands.Count -eq $expected.Count)
+            $seen=@{}
+            foreach ($v in $result.commands) {
+              Assert-Ar0 ($v -is [Collections.IDictionary] -and $v.name -is [string] -and @($expected.Keys) -ccontains $v.name -and -not $seen.ContainsKey($v.name))
+              Assert-Ar0 ($v.state -ceq 'COMPLETE' -and (Test-Int $v.exit_code) -and $v.exit_code -eq $expected[$v.name])
+              $seen[$v.name]=$true
+            }
+          }
+          function Check-Guard([string]$Stem,[string]$Bin) {
+            $err=Read-Ar0 "ev/$Stem.stderr.log"
+            Assert-Ar0 ($err -cmatch ('(?m)^error: target `'+$Bin+'` in package `nova` requires the features: `scheduler-validation`\r?$') -and $err -notmatch 'could not compile')
+          }
+          function Check-Release([string]$Stem) {
+            $errors=@(foreach ($line in ((Read-Ar0 "ev/$Stem.stdout.log") -split '\r?\n')) {
+              if ($line.StartsWith('{')) { $x=Parse-Ar0 $line; if ($x.reason -ceq 'compiler-message' -and $x.message.level -ceq 'error') { $x } }
+            })
+            Assert-Ar0 ($errors.Count -eq 1 -and $errors[0].target.name -ceq 'nova_lib' -and $errors[0].message.message -ceq 'scheduler-validation is debug-only and must never ship' -and $null -eq $errors[0].message.code)
+          }
+          function Check-Summary($v,$hash) {
+            Assert-Ar0 ($v.schema -ceq 'nova.relay.summary/1' -and $v.package_id -ceq 'ar0-fixed-pilot' -and $v.next_action -ceq 'PM_REVIEW' -and $v.candidate_kind -ceq 'PATCH_PROPOSAL')
+            Assert-Ar0 ($v.mock -is [bool] -and $v.mock -and $v.execution_authorized -is [bool] -and -not $v.execution_authorized -and $null -eq $v.delivery_sha -and $v.unknowns -is [array] -and $v.unknowns.Count -eq 0)
+            Assert-Ar0 ($v.input_base_sha -is [string] -and $v.input_base_sha -cmatch '^[0-9a-f]{40}$' -and $v.input_delivery_identity -cmatch '^[0-9a-f]{64}$' -and $v.plan_id -cmatch '^[0-9a-f]{64}$')
+            Assert-Ar0 ($v.facts -is [array] -and $v.facts.Count -eq 2 -and $v.facts[0].role -ceq 'DEVELOP' -and $v.facts[1].role -ceq 'REVIEW' -and $null -eq $v.facts[0].parent_attempt_id -and $v.facts[1].parent_attempt_id -ceq $v.facts[0].attempt_id)
+            foreach ($f in $v.facts) {
+              Assert-Ar0 ($f.state -ceq 'EXITED' -and (Test-Int $f.exit_code) -and $f.exit_code -eq 0 -and $f.reclaim -ceq 'CONFIRMED' -and $f.terminal -ceq 'SUCCESS' -and $f.exe_sha256 -ceq $hash)
+              foreach ($key in @('stdout_sha256','stderr_sha256','input_identity','result_sha256')) { Assert-Ar0 ($f[$key] -is [string] -and $f[$key] -cmatch '^[0-9a-f]{64}$') }
+              foreach ($key in @('stdout_bytes','stderr_bytes')) { Assert-Ar0 (Test-Int $f[$key]) }
+              $u=Parse-Ar0 $f.usage_json
+              Assert-Ar0 ($u.evidence.state -ceq 'COMPLETE' -and -not $u.evidence.Contains('summary_error') -and $u.unknowns -is [array] -and $u.unknowns.Count -eq 0)
+            }
+          }
+          function Verify-Ar0 {
+            $script:checkStage='EXECUTION'
+            $execution=Json-Ar0 'execution.json' 8192
+            Assert-Ar0 ($execution.schema -ceq 'nova.ar0.ci-execution/1' -and $execution.sha -ceq $env:GITHUB_SHA -and $execution.run_id -ceq $env:GITHUB_RUN_ID -and $execution.attempt -ceq $env:GITHUB_RUN_ATTEMPT -and $execution.state -ceq 'COMPLETE' -and (Test-Int $execution.exit_code) -and $execution.exit_code -eq 0 -and $execution.pwsh -cmatch '^7\.')
+            $r=Json-Ar0 'ev/result.json'; $old=Json-Ar0 'ev/sh1-regression/result.json'
+            Assert-Ar0 ($r.schema -ceq 'nova.relay.local-validation/1' -and $r.verdict -ceq 'PASS' -and $r.stage -ceq 'RELAY_THREE_COMMANDS' -and $r.mock -is [bool] -and $r.mock -and $r.real_execution_authorized -is [bool] -and -not $r.real_execution_authorized -and $r.github_verified -is [bool] -and -not $r.github_verified)
+            Assert-Ar0 ($old.schema -ceq 'nova.scheduler.local-validation/1' -and $old.verdict -ceq 'PASS' -and $old.stage -ceq 'DEFAULT_REGRESSION' -and $old.default_regression_executed -is [bool] -and $old.default_regression_executed)
+            Check-Ledger $old (Get-Sh1ExpectedCommands)
+            $expected=[ordered]@{'sh1-wrapper'=0;'relay-debug-build'=0;'ignored-list'=0}
+            for ($i=0;$i -lt 19;$i++) { $expected["explicit-$i"]=0 }
+            foreach ($n in @('missing','mismatch')) { $expected["reject-hash-$n"]=101 }
+            foreach ($bin in @('nova_scheduler_relay','nova_scheduler_relay_fake_cli')) { $expected["default-$bin"]=101; $expected["release-$bin"]=101 }
+            foreach ($n in @('fixture-init','fixture-add','fixture-base-commit','fixture-base','fixture-second-commit','source-init','relay-init','relay-run','relay-status','relay-no-replay')) { $expected[$n]=0 }
+            $expected['real-false-rejected']=2; $expected['v2-history-not-cloned']=2
+            $script:checkStage='LEDGER'
+            Check-Ledger $r $expected
+            # Missing logs fail even if their command/result claims PASS. Raw bytes stay private.
+            foreach ($pair in @(@{prefix='ev';ledger=$r},@{prefix='ev/sh1-regression';ledger=$old})) {
+              foreach ($row in $pair.ledger.commands) { foreach ($suffix in @('stdout','stderr')) { [void](Read-Ar0 "$($pair.prefix)/$($row.name).$suffix.log") } }
+            }
+            $script:checkStage='CLEAN_TARGET'
+            foreach ($n in @('before','after')) { $c=Json-Ar0 "ev/clean-target-$n.json"; Assert-Ar0 ($c.fake_exists -is [bool] -and -not $c.fake_exists -and $c.source -ceq 'ACTUAL_FILESYSTEM') }
+            $script:checkStage='FAKE_IDENTITY'
+            $id=Json-Ar0 'ev/fake-cli-identity.json'
+            $fake=Get-Item -LiteralPath (Join-Path $root 't/debug/nova_scheduler_relay_fake_cli.exe') -Force
+            Assert-Ar0 (($fake.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and $id.path -is [string] -and [IO.Path]::GetFullPath($id.path) -ceq $fake.FullName -and $id.source -ceq 'BUILT_THIS_RUN' -and $id.expected_hash_test_variable -ceq 'NOVA_AR0_TEST_FAKE_SHA256' -and (Test-Int $id.bytes) -and $id.bytes -gt 0 -and $id.bytes -eq $fake.Length -and $id.sha256 -cmatch '^[0-9a-f]{64}$')
+            Assert-Ar0 ((Get-FileHash -LiteralPath $fake.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $id.sha256)
+            $script:checkStage='TEST_SETS'
+            $ignored=@(Get-Sh1IgnoredNames); Assert-Ar0 ($ignored.Count -eq 19)
+            $explicit=Json-Ar0 'ev/explicit-names.json'
+            Assert-Ar0 ($explicit.source -ceq 'ACTUAL_EXACT_IGNORED_EXECUTION' -and $explicit.expected_hash -ceq $id.sha256)
+            Same-Names $explicit.listed $ignored; Same-Names $explicit.passed $ignored
+            $ignoredListed=@([regex]::Matches((Read-Ar0 'ev/ignored-list.stdout.log'),'(?m)^([A-Za-z_][A-Za-z0-9_:]{0,255}): test\r?$') | ForEach-Object {$_.Groups[1].Value})
+            Same-Names $ignoredListed $ignored
+            $parsed=@{}
+            foreach ($stem in @('scheduler','default')) {
+              $rec=Json-Ar0 "ev/$stem-names.json"
+              Assert-Ar0 ($rec.source -ceq 'ACTUAL_LOCAL_TEST_OUTPUT' -and (Test-Int $rec.count))
+              $actual=Get-Sh1TestNames (Read-Ar0 "ev/sh1-regression/$stem-list.stdout.log") (Read-Ar0 "ev/sh1-regression/$stem-tests.stdout.log") @('scheduler::tests::every_pm_decision_requires_author_role_and_references')
+              Same-Names $rec.passed $actual; Same-Names $rec.ignored $ignored; Same-Names $rec.listed @(@($actual)+@($ignored))
+              Assert-Ar0 ($rec.count -eq $actual.Count)
+              $parsed[$stem]=@{passed=$actual;ignored=$ignored}
+            }
+            $adapterNames=@('remediation_tests::absent_nested_path_guards_existing_ancestor_without_creating_directories','remediation_tests::actual_git_launcher_tree_timeout_reclaims_job_children_and_pipe_readers','remediation_tests::lifecycle_unknown_retains_owned_temp_and_latches_admission','remediation_tests::owned_temp_normal_cleanup_and_unknown_children_are_not_recursive','remediation_tests::substituted_temp_entry_is_never_deleted','tests::blocked_reader_returns_unknown_without_unbounded_join','tests::raw_diff_checks_all_paths_without_pathspec','tests::typed_graph_bounds_and_merge_rejection')
+            $parsed['adapter']=Get-Sh1TestNames '' (Read-Ar0 'ev/sh1-regression/adapter-tests.stdout.log') $adapterNames -Adapter
+            for ($i=0;$i -lt 19;$i++) {
+              $txt=Read-Ar0 "ev/explicit-$i.stdout.log"
+              $named=@([regex]::Matches($txt,'(?m)^test ([A-Za-z_][A-Za-z0-9_:]{0,255}) \.\.\. ') | ForEach-Object {$_.Groups[1].Value})
+              Same-Names $named @($ignored[$i])
+              Assert-Ar0 ($txt -match '(?m)^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' -and $txt -notmatch '(?m)^FAILED\s*$|\.\.\. FAILED')
+              $blocks=[regex]::Matches($txt,'(?ms)^test [A-Za-z_][A-Za-z0-9_:]{0,255} \.\.\. (.*?)(?=^test result:|\z)')
+              Assert-Ar0 ($blocks.Count -eq 1 -and $blocks[0].Groups[1].Value -match '(?m)(?:^|\n)ok\s*\z')
+            }
+            $script:checkStage='GUARDS'
+            foreach ($mode in @('missing','mismatch')) {
+              $txt=Read-Ar0 "ev/reject-hash-$mode.stdout.log"
+              $code=if($mode -ceq 'missing'){'FAKE_EXPECTED_HASH_MISSING'}else{'FAKE_EXPECTED_HASH_MISMATCH'}
+              Assert-Ar0 ($txt.Contains($code) -and $txt -match '(?m)^test result: FAILED\. 0 passed; 1 failed; 0 ignored;')
+            }
+            Check-Guard 'sh1-regression/default-required-features' 'nova_scheduler_handoff'; Check-Release 'sh1-regression/release-guard'
+            foreach ($bin in @('nova_scheduler_relay','nova_scheduler_relay_fake_cli')) { Check-Guard "default-$bin" $bin; Check-Release "release-$bin" }
+            $real=Json-Ar0 'ev/real-false-rejected.stdout.log'; Assert-Ar0 ($real.error_code -ceq 'REAL_PILOT_NOT_AUTHORIZED' -and $real.execution_authorized -is [bool] -and -not $real.execution_authorized)
+            $clone=Json-Ar0 'ev/v2-history-not-cloned.stdout.log'; Assert-Ar0 ($clone.error_code -ceq 'SOURCE_REGISTRATION_NOT_FRESH')
+            $script:checkStage='RELAY_FACTS'
+            $first=Json-Ar0 'ev/relay-run.stdout.log'; $status=Json-Ar0 'ev/relay-status.stdout.log'; $again=Json-Ar0 'ev/relay-no-replay.stdout.log'
+            foreach ($v in @($first,$status,$again)) { Check-Summary $v $id.sha256; Assert-Ar0 ($v.plan_id -ceq $first.plan_id -and $v.input_base_sha -ceq $first.input_base_sha -and $v.input_delivery_identity -ceq $first.input_delivery_identity); Assert-Ar0 (($v.facts|ConvertTo-Json -Depth 30 -Compress) -ceq ($first.facts|ConvertTo-Json -Depth 30 -Compress)) }
+            $plan=Json-Ar0 'ev/plan.json'; Assert-Ar0 ($plan.mock -is [bool] -and $plan.mock -and $plan.input_base_sha -ceq $first.input_base_sha -and $plan.input_delivery_identity -ceq $first.input_delivery_identity)
+            $script:checkStage='FIXTURE'
+            $fixture=Read-Ar0 'ev/git-fixture/pilot/src/normalize_label.rs' 4096
+            $fixtureHash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($fixture))).ToLowerInvariant()
+            Assert-Ar0 ($fixture -ceq "pub fn normalize_label(s: &str) -> String {`n    s.to_string()`n}`n" -and $fixtureHash -ceq $plan.base_sha256)
+            foreach ($f in $first.facts) {
+              $u=Parse-Ar0 $f.usage_json
+              foreach ($suffix in @('stdout','stderr')) {
+                [void](Read-Ar0 "ev/relay-run/$($f.role).$suffix" 2097152)
+                $item=$script:inputs[$script:inputs.Count-1]
+                Assert-Ar0 ($item.sha256 -ceq $f["${suffix}_sha256"] -and $item.bytes -eq $f["${suffix}_bytes"])
+              }
+              if ($f.role -ceq 'DEVELOP') {
+                [void](Read-Ar0 'ev/relay-run/review-package.txt' 1048576); $pkg=$script:inputs[$script:inputs.Count-1]
+                Assert-Ar0 ($u.binding.plan_id -ceq $first.plan_id -and $u.binding.review_input_sha256 -ceq $pkg.sha256 -and $first.facts[1].input_identity -ceq $pkg.sha256 -and $u.binding.candidate_sha256 -cmatch '^[0-9a-f]{64}$')
+              }
+            }
+            return @{commands=@($r.commands|ForEach-Object {@{name=$_.name;state='COMPLETE';exit_code=$_.exit_code}});tests=$parsed;explicit=$ignored;fake=@{bytes=$id.bytes;sha256=$id.sha256;source='BUILT_THIS_RUN'};facts=@($first.facts|ForEach-Object {@{role=$_.role;state=$_.state;exit_code=$_.exit_code;reclaim=$_.reclaim;exe_sha256=$_.exe_sha256;stdout_bytes=$_.stdout_bytes;stdout_sha256=$_.stdout_sha256;stderr_bytes=$_.stderr_bytes;stderr_sha256=$_.stderr_sha256}});fixture_unchanged=$true;no_replay=$true;real_execution_authorized=$false}
+          }
+          function Write-Public([string]$Name,$Value,[long]$Limit) {
+            $b=[Text.Encoding]::UTF8.GetBytes(($Value|ConvertTo-Json -Depth 30))
+            Assert-Ar0 ($b.Length -le $Limit)
+            $f=[IO.File]::Open((Join-Path $root "public/$Name"),[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read)
+            try { $f.Write($b,0,$b.Length); $f.Flush($true) } finally { $f.Dispose() }
+          }
+          # MAIN: no caller-selected paths or arbitrary exception text in public evidence.
+          $root=$env:AR0_ROOT; $inputs=[Collections.Generic.List[object]]::new(); $verified=$null; $state='FAIL'; $code='AR0_CONTRACT_REJECTED'
+          $identity=@{sha=if($env:GITHUB_SHA -cmatch '^[0-9a-f]{40}$'){$env:GITHUB_SHA}else{$null};run_id=if($env:GITHUB_RUN_ID -cmatch '^[1-9][0-9]{0,19}$'){$env:GITHUB_RUN_ID}else{$null};attempt=if($env:GITHUB_RUN_ATTEMPT -cmatch '^[1-9][0-9]{0,9}$'){$env:GITHUB_RUN_ATTEMPT}else{$null}}
+          $checkStage='CONTEXT'
+          try {
+            Assert-Ar0 ($identity.sha -cmatch '^[0-9a-f]{40}$' -and $identity.run_id -cmatch '^[1-9][0-9]{0,19}$' -and $identity.attempt -cmatch '^[1-9][0-9]{0,9}$')
+            $verified=Verify-Ar0; $state='PASS'; $code='NONE'
+          } catch {
+            $state='FAIL'
+            if ($checkStage -cin @('CONTEXT','EXECUTION','LEDGER','CLEAN_TARGET','FAKE_IDENTITY','TEST_SETS','GUARDS','RELAY_FACTS','FIXTURE')) { $code='AR0_'+$checkStage+'_REJECTED' }
+          }
+          # Failure inventory is independent of successful parsing. Fixed names only;
+          # MISSING/EMPTY/PRESENT_LOCAL_ONLY/OVERSIZE are not fabricated log content.
+          $diagnostics=@()
+          $fixed=@('execution.json','ev/result.json','ev/fake-cli-identity.json','ev/explicit-names.json','ev/sh1-regression/result.json')
+          $outer=@('sh1-wrapper','relay-debug-build','ignored-list','reject-hash-missing','reject-hash-mismatch','default-nova_scheduler_relay','release-nova_scheduler_relay','default-nova_scheduler_relay_fake_cli','release-nova_scheduler_relay_fake_cli','fixture-init','fixture-add','fixture-base-commit','fixture-base','fixture-second-commit','source-init','real-false-rejected','relay-init','relay-run','relay-status','relay-no-replay','v2-history-not-cloned')
+          for ($i=0;$i -lt 19;$i++) { $outer+="explicit-$i" }
+          foreach ($n in $outer) { foreach ($ext in @('stdout','stderr')) { $fixed+="ev/$n.$ext.log" } }
+          foreach ($n in (Get-Sh1ExpectedCommands).Keys) { foreach ($ext in @('stdout','stderr')) { $fixed+="ev/sh1-regression/$n.$ext.log" } }
+          foreach ($name in $fixed) {
+            $entry=@{name=$name;state='MISSING';bytes=$null;sha256=$null;markers=@()}
+            try {
+              $before=$inputs.Count; $localText=Read-Ar0 $name 16777216; $fact=$inputs[$before]
+                        # Only closed diagnostics/result lines are publishable, never raw errors.
+                        $marks=@([regex]::Matches($localText,'(?m)^test result: (?:ok|FAILED)\. [0-9]{1,5} passed; [0-9]{1,5} failed; [0-9]{1,5} ignored; [0-9]{1,5} measured; [0-9]{1,5} filtered out; finished in [0-9.]{1,16}s\r?$') | Select-Object -First 2 | ForEach-Object {$_.Value.TrimEnd([char]13)})
+                        foreach ($marker in @('FAKE_EXPECTED_HASH_MISSING','FAKE_EXPECTED_HASH_MISMATCH','scheduler-validation is debug-only and must never ship')) { if ($localText.Contains($marker)) { $marks+=$marker } }
+                        $entry.markers=$marks
+              $entry.state=if($fact.bytes -eq 0){'EMPTY'}else{'PRESENT_LOCAL_ONLY'}; $entry.bytes=$fact.bytes; $entry.sha256=$fact.sha256
+            } catch {
+              $p=Join-Path $root $name
+              if (Test-Path -LiteralPath $p) { $entry.state='REJECTED_OR_OVERSIZE' }
+            }
+            $diagnostics+=$entry
+          }
+          Write-Public 'summary.json' @{schema='nova.ar0.ci-summary/1';identity=$identity;verdict=$state;failure_code=$code;scope='FIXED_FAKE_CLI_ONLY';real_execution_authorized=$false} 8192
+          Write-Public 'checks.json' @{schema='nova.ar0.ci-checks/1';identity=$identity;state=$state;verified=$verified;claims_are_not_machine_verdicts=$true} 524288
+          # Bounded input inventory is diagnostic evidence, not publication of raw logs or secrets.
+          Write-Public 'logs.json' @{schema='nova.ar0.ci-local-inputs/1';identity=$identity;state=$state;inputs=@($inputs|Sort-Object name -Unique);diagnostics=$diagnostics;raw_content='NOT_EXPORTED';missing_or_invalid_input=($state -cne 'PASS')} 131072
+          $files=@('summary.json','checks.json','logs.json')|ForEach-Object {$p=Join-Path $root "public/$_";@{name=$_;bytes=(Get-Item -LiteralPath $p).Length;sha256=(Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()}}
+          Write-Public 'files.json' @{schema='nova.ar0.ci-files/1';identity=$identity;files=@($files)} 8192
+          if ($state -cne 'PASS') { throw $code }
+
+      - name: Upload only closed AR0 evidence
+        if: ${{ always() && steps.ar0_paths.outputs.root != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: AR0-fake-relay-ci-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: error
+          include-hidden-files: false
+          path: |
+            ${{ steps.ar0_paths.outputs.root }}/public/summary.json
+            ${{ steps.ar0_paths.outputs.root }}/public/checks.json
+            ${{ steps.ar0_paths.outputs.root }}/public/logs.json
+            ${{ steps.ar0_paths.outputs.root }}/public/files.json

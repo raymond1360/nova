@@ -1219,19 +1219,15 @@ impl Store {
             || revision != p.registration_revision
             || mock != i64::from(p.mock)
             || !p.mock
-            || p.input_base_sha != self.audit_envelope()?.head
-            || p.input_delivery_identity != snap.delivery
         {
             return Err("BINDING_MISMATCH");
         }
-        let guard = Guard::open(Path::new(&path), true)?;
-        if guard.identity != identity {
-            return Err("RUN_ROOT_IDENTITY");
-        }
+        // History is ledger-bound, not dependent on the live fixture/evidence directory.
+        safe_location(Path::new(&path))?;
         Ok(StoredPlan {
             id,
             plan: p,
-            run_root: guard.path,
+            run_root: PathBuf::from(path),
             run_identity: identity,
         })
     }
@@ -1314,31 +1310,21 @@ impl Store {
                 }
             }
         }
-        let base = super::relay::read_base(self, &p.plan)?;
         for a in &out {
-            let expected = if a.role == RelayRole::Develop {
-                super::relay::develop_input(&p.plan, &base)?
-            } else {
-                let d = out
-                    .iter()
-                    .find(|x| x.role == RelayRole::Develop)
-                    .ok_or("BINDING_MISMATCH")?;
-                super::relay::prepare_review(
-                    &p.plan,
-                    &base,
-                    d.model_claim_json
-                        .as_ref()
-                        .ok_or("BINDING_MISMATCH")?
-                        .as_bytes(),
-                )?
-                .1
-            };
-            if hash(&expected) != a.input_identity {
-                return Err("BINDING_MISMATCH");
-            }
             if let Some(claim) = &a.model_claim_json {
                 if a.result_sha256.as_deref() != Some(hash(claim.as_bytes()).as_str()) {
                     return Err("BINDING_MISMATCH");
+                }
+            }
+            if a.role == RelayRole::Review {
+                let d = out
+                    .iter()
+                    .find(|d| d.role == RelayRole::Develop)
+                    .ok_or("BINDING_MISMATCH")?;
+                if let Some((_, input)) = super::relay::bound_review(d, &p.id)? {
+                    if input != a.input_identity {
+                        return Err("BINDING_MISMATCH");
+                    }
                 }
             }
         }
@@ -1354,6 +1340,16 @@ impl Store {
         env_hash: &str,
     ) -> Result<Reservation> {
         let p = self.relay_plan()?;
+        let live = self.snapshot()?;
+        let root = Guard::open(&p.run_root, true)?;
+        if root.identity != p.run_identity {
+            return Err("RUN_ROOT_IDENTITY");
+        }
+        if live.delivery != p.plan.input_delivery_identity
+            || self.audit_envelope()?.head != p.plan.input_base_sha
+        {
+            return Err("REGISTRATION_CHANGED");
+        }
         let existing = self.relay_attempts()?;
         if existing.iter().any(|a| a.role == role) {
             return Err("LEASE_EXISTS");
@@ -1369,10 +1365,15 @@ impl Store {
                         && a.terminal.as_deref() == Some("SUCCESS")
                 })
                 .ok_or("BINDING_MISMATCH")?;
+            if !super::relay::evidence_ready(actual)? {
+                return Err("EVIDENCE_NOT_CONFIRMED");
+            }
             let base = super::relay::read_base(self, &p.plan)?;
             let proposal = actual.model_claim_json.as_ref().ok_or("SCHEMA_REJECTED")?;
             let (_, review) = super::relay::prepare_review(&p.plan, &base, proposal.as_bytes())?;
-            if review != input {
+            if review != input
+                || super::relay::bound_review(actual, &p.id)?.map(|(_, h)| h) != Some(hash(input))
+            {
                 return Err("BINDING_MISMATCH");
             }
         } else if parent.is_some() {
@@ -1438,6 +1439,21 @@ impl Store {
         Ok(Reservation { attempt: a })
     }
     pub fn relay_launching(&self, r: Reservation) -> Result<LaunchPermit> {
+        // Only new launch admission consults the live fixture; terminal/history CAS never does.
+        let p = self.relay_plan()?;
+        let live = self.snapshot()?;
+        let root = Guard::open(&p.run_root, true)?;
+        if root.identity != p.run_identity {
+            return Err("RUN_ROOT_IDENTITY");
+        }
+        if live.revision != p.plan.registration_revision
+            || live.delivery != p.plan.input_delivery_identity
+            || live.invalidated
+            || live.closed
+        {
+            return Err("REGISTRATION_CHANGED");
+        }
+        super::relay::read_base(self, &p.plan)?;
         let mut a = r.attempt;
         self.relay_cas(&mut a, "LAUNCHING")?;
         Ok(LaunchPermit {
@@ -1491,5 +1507,77 @@ impl Store {
         a.state = to.into();
         a.state_version += 1;
         Ok(())
+    }
+    pub(super) fn relay_evidence(&self, a: &mut Attempt, update: EvidenceWrite) -> Result<()> {
+        let p = self.relay_plan()?;
+        let rows = self.relay_attempts()?;
+        let mut actual = rows
+            .into_iter()
+            .find(|v| v.attempt_id == a.attempt_id)
+            .ok_or("BINDING_MISMATCH")?;
+        if actual.state != a.state || actual.state_version != a.state_version {
+            return Err("ATTEMPT_CAS_CONFLICT");
+        }
+        if !["EXITED", "STOPPED", "LAUNCH_FAILED", "UNKNOWN"].contains(&actual.state.as_str()) {
+            return Err("ATTEMPT_EDGE_REJECTED");
+        }
+        let mut meta: Value = match &actual.usage_json {
+            Some(v) => relay_json(v.as_bytes(), 65536)?,
+            None => serde_json::json!({}),
+        };
+        if !meta.is_object() {
+            return Err("BINDING_MISMATCH");
+        }
+        match update {
+            EvidenceWrite::Complete => {
+                if meta["evidence"]["state"] != "PENDING" {
+                    return Err("EVIDENCE_STATE_CONFLICT");
+                }
+                meta["evidence"]["state"] = serde_json::json!("COMPLETE");
+            }
+            EvidenceWrite::Failed(code) => {
+                if meta["evidence"]["state"] != "PENDING" {
+                    return Err("EVIDENCE_STATE_CONFLICT");
+                }
+                meta["evidence"]["state"] = serde_json::json!("FAILED");
+                meta["evidence"]["error"] = serde_json::json!(evidence_code(code));
+            }
+            EvidenceWrite::SummaryFailed(code) => {
+                if !meta.get("evidence").is_some_and(|v| v.is_object()) {
+                    meta["evidence"] = serde_json::json!({"state":"UNRECORDED"});
+                }
+                meta["evidence"]["summary_error"] = serde_json::json!(evidence_code(code));
+            }
+        }
+        let encoded = serde_json::to_string(&meta).map_err(|_| "ENCODING")?;
+        if encoded.len() > 65536 {
+            return Err("BOUND");
+        }
+        let db = self.write_connection()?;
+        let n=sql(db.conn().execute("UPDATE relay_attempts SET usage_json=?1,state_version=state_version+1 WHERE attempt_id=?2 AND plan_id=?3 AND state=?4 AND state_version=?5",params![encoded,a.attempt_id,p.id,a.state,a.state_version]))?;
+        if n != 1 {
+            return Err("ATTEMPT_CAS_CONFLICT");
+        }
+        actual.usage_json = Some(encoded);
+        actual.state_version += 1;
+        *a = actual;
+        Ok(())
+    }
+}
+
+// Terminal metadata update only; lifecycle/claim/reclaim columns are never rewritten.
+pub(super) enum EvidenceWrite {
+    Complete,
+    Failed(&'static str),
+    SummaryFailed(&'static str),
+}
+fn evidence_code(code: &str) -> &'static str {
+    match code {
+        "EVIDENCE_CREATE_NEW" => "EVIDENCE_CREATE_NEW",
+        "EVIDENCE_WRITE" => "EVIDENCE_WRITE",
+        "EVIDENCE_FLUSH" => "EVIDENCE_FLUSH",
+        "EVIDENCE_ROOT_CHANGED" => "EVIDENCE_ROOT_CHANGED",
+        "ENCODING" => "ENCODING",
+        _ => "EVIDENCE_IO_ERROR",
     }
 }

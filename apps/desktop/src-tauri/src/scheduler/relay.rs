@@ -1,7 +1,7 @@
 //! Provider-independent, fixed two-role orchestration. No external action is authorized by a claim.
 use super::{
     contract::*,
-    store::{read_file, Guard, LaunchPermit, Store},
+    store::{read_file, EvidenceWrite, Guard, LaunchPermit, Store, StoredPlan},
     Result,
 };
 use serde::{Deserialize, Serialize};
@@ -330,68 +330,151 @@ fn next_action(
     }
     "STOPPED".into()
 }
+pub(super) fn bound_review(a: &Attempt, plan_id: &str) -> Result<Option<(String, String)>> {
+    let Some(raw) = &a.usage_json else {
+        return Ok(None);
+    };
+    let v: Value = relay_json(raw.as_bytes(), 65536)?;
+    let Some(bind) = v.get("binding") else {
+        return Ok(None);
+    };
+    let candidate = bind["candidate_sha256"]
+        .as_str()
+        .ok_or("BINDING_MISMATCH")?;
+    let input = bind["review_input_sha256"]
+        .as_str()
+        .ok_or("BINDING_MISMATCH")?;
+    if bind["plan_id"].as_str() != Some(plan_id) || !hex(candidate, 64) || !hex(input, 64) {
+        return Err("BINDING_MISMATCH");
+    }
+    Ok(Some((candidate.into(), input.into())))
+}
+pub(super) fn evidence_ready(a: &Attempt) -> Result<bool> {
+    let Some(raw) = &a.usage_json else {
+        return Ok(false);
+    };
+    let v: Value = relay_json(raw.as_bytes(), 65536)?;
+    Ok(v["evidence"]["state"] == "COMPLETE" && v["evidence"].get("summary_error").is_none())
+}
 pub fn status(store: &Store) -> Result<RelaySummary> {
+    status_inner(store, true)
+}
+fn status_inner(store: &Store, check_missing_summary: bool) -> Result<RelaySummary> {
     let p = store.relay_plan()?;
     let facts = store.relay_attempts()?;
     let mut unknowns = vec![];
     let mut claims = vec![];
     let mut review = None;
+    if read_base(store, &p.plan).is_err() {
+        unknowns.push("FIXTURE_CHANGED".into());
+    }
+    let root_valid = Guard::open(&p.run_root, true).is_ok_and(|g| g.identity == p.run_identity);
+    if !root_valid {
+        unknowns.push("EVIDENCE_ROOT_CHANGED".into());
+    }
     for a in &facts {
-        if let Some(u) = &a.usage_json {
-            let v: Value = relay_json(u.as_bytes(), 65536)?;
-            if let Some(a) = v["unknowns"].as_array() {
-                for x in a {
-                    unknowns.push(x.as_str().ok_or("SCHEMA_REJECTED")?.into())
+        if let Some(raw) = &a.usage_json {
+            let v: Value = relay_json(raw.as_bytes(), 65536)?;
+            if let Some(items) = v["unknowns"].as_array() {
+                for item in items {
+                    unknowns.push(item.as_str().ok_or("SCHEMA_REJECTED")?.into())
+                }
+            }
+            match v["evidence"]["state"].as_str() {
+                Some("COMPLETE") => {}
+                Some("FAILED") => unknowns.push("EVIDENCE_SAVE_FAILED".into()),
+                Some("PENDING") => unknowns.push("EVIDENCE_PENDING".into()),
+                _ => {
+                    if a.stdout_bytes.is_some() {
+                        unknowns.push("EVIDENCE_UNRECORDED".into())
+                    }
+                }
+            }
+            if v["evidence"].get("summary_error").is_some() {
+                unknowns.push("EVIDENCE_SUMMARY_FAILED".into());
+            }
+            // Hashes describe captured buffers; only completed, checked files prove preservation.
+            if v["evidence"]["state"] == "COMPLETE" && root_valid {
+                if let Some(items) = v["evidence"]["artifacts"].as_array() {
+                    for item in items {
+                        let name = item["name"].as_str().ok_or("BINDING_MISMATCH")?;
+                        let stdout = format!("{}.stdout", a.role.name());
+                        let stderr = format!("{}.stderr", a.role.name());
+                        let cap = if name == stdout {
+                            8388608
+                        } else if name == stderr {
+                            1048576
+                        } else if name == "review-package.txt" && a.role == RelayRole::Develop {
+                            65536
+                        } else {
+                            return Err("BINDING_MISMATCH");
+                        };
+                        match read_file(&p.run_root.join(name), cap) {
+                            Ok((b, _))
+                                if item["bytes"].as_u64() == Some(b.len() as u64)
+                                    && item["sha256"].as_str() == Some(hash(&b).as_str()) => {}
+                            _ => unknowns.push("EVIDENCE_ARTIFACT_UNAVAILABLE".into()),
+                        }
+                    }
+                } else {
+                    unknowns.push("EVIDENCE_UNRECORDED".into());
                 }
             }
         }
-        if let Some(s) = &a.model_claim_json {
-            let v: Value = relay_json(s.as_bytes(), 65536)?;
+        if let Some(raw) = &a.model_claim_json {
+            let value: Value = relay_json(raw.as_bytes(), 65536)?;
             if a.role == RelayRole::Review {
-                let r: ReviewClaim = relay_json(s.as_bytes(), 65536)?;
+                let claim: ReviewClaim = relay_json(raw.as_bytes(), 65536)?;
                 let dev = facts
                     .iter()
-                    .find(|a| a.role == RelayRole::Develop)
+                    .find(|v| v.role == RelayRole::Develop)
                     .ok_or("BINDING_MISMATCH")?;
-                let candidate = prepare_review(
-                    &p.plan,
-                    &read_base(store, &p.plan)?,
-                    dev.model_claim_json
-                        .as_ref()
-                        .ok_or("BINDING_MISMATCH")?
-                        .as_bytes(),
-                )?
-                .0;
-                r.validate(&p.plan.base_sha256, &candidate.candidate_sha256)?;
-                review = Some(r)
+                if let Some((candidate, _)) = bound_review(dev, &p.id)? {
+                    claim.validate(&p.plan.base_sha256, &candidate)?;
+                    review = Some(claim)
+                } else {
+                    unknowns.push("HISTORY_BINDING_UNAVAILABLE".into());
+                }
             }
-            claims.push(json!({"source":"MODEL_CLAIM","role":a.role,"claim":v}))
+            claims.push(json!({"source":"MODEL_CLAIM","role":a.role,"claim":value}));
         }
     }
-    // An earlier immutable summary can preserve additional stop diagnostics, never grant progress.
-    let archived = p.run_root.join("summary.json");
-    if archived.try_exists().map_err(|_| "EVIDENCE_READ")? {
-        let (b, _) = read_file(&archived, 262144)?;
-        let old: RelaySummary = relay_json(&b, 262144)?;
-        if old.plan_id != p.id
-            || old.input_base_sha != p.plan.input_base_sha
-            || old.input_delivery_identity != p.plan.input_delivery_identity
-            || serde_json::to_vec(&old.facts).map_err(|_| "ENCODING")?
-                != serde_json::to_vec(&facts).map_err(|_| "ENCODING")?
-            || old.unknowns.len() > 32
-            || old.unknowns.iter().any(|s| s.len() > 512)
-        {
-            return Err("EVIDENCE_BINDING_MISMATCH");
+    if root_valid {
+        let archive = p.run_root.join("summary.json");
+        match archive.try_exists() {
+            Ok(true) => {
+                let parsed = read_file(&archive, 262144)
+                    .and_then(|(b, _)| relay_json::<RelaySummary>(&b, 262144));
+                match parsed {
+                    Ok(old)
+                        if old.plan_id == p.id
+                            && old.input_base_sha == p.plan.input_base_sha
+                            && old.input_delivery_identity == p.plan.input_delivery_identity
+                            && serde_json::to_vec(&old.facts).map_err(|_| "ENCODING")?
+                                == serde_json::to_vec(&facts).map_err(|_| "ENCODING")?
+                            && old.unknowns.len() <= 32
+                            && old.unknowns.iter().all(|s| s.len() <= 512) =>
+                    {
+                        unknowns.extend(old.unknowns)
+                    }
+                    _ => unknowns.push("EVIDENCE_SUMMARY_INVALID".into()),
+                }
+            }
+            Ok(false) => {
+                if check_missing_summary && !facts.is_empty() {
+                    unknowns.push("EVIDENCE_SUMMARY_MISSING".into())
+                }
+            }
+            Err(_) => unknowns.push("EVIDENCE_SUMMARY_INVALID".into()),
         }
-        unknowns.extend(old.unknowns);
     }
     let next_action = next_action(&facts, review.as_ref(), &mut unknowns);
     Ok(RelaySummary {
         schema: "nova.relay.summary/1".into(),
         package_id: p.plan.package_id,
+        plan_id: p.id,
         input_base_sha: p.plan.input_base_sha,
         input_delivery_identity: p.plan.input_delivery_identity,
-        plan_id: p.id,
         delivery_sha: None,
         candidate_kind: "PATCH_PROPOSAL".into(),
         execution_authorized: false,
@@ -402,15 +485,51 @@ pub fn status(store: &Store) -> Result<RelaySummary> {
         next_action,
     })
 }
-fn save_new(root: &Path, name: &str, bytes: &[u8]) -> Result<()> {
-    let g = Guard::open(root, true)?;
-    let mut f = fs::OpenOptions::new()
+#[cfg(test)]
+thread_local! {static SAVE_FAULT:std::cell::Cell<Option<(&'static str,&'static str)>>=const{std::cell::Cell::new(None)};}
+#[cfg(test)]
+pub(super) fn with_save_fault<T>(
+    name: &'static str,
+    kind: &'static str,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SAVE_FAULT.with(|c| c.set(None));
+        }
+    }
+    SAVE_FAULT.with(|c| c.set(Some((name, kind))));
+    let _reset = Reset;
+    f()
+}
+fn save_new(p: &StoredPlan, name: &str, bytes: &[u8]) -> Result<()> {
+    let g = Guard::open(&p.run_root, true).map_err(|_| "EVIDENCE_ROOT_CHANGED")?;
+    if g.identity != p.run_identity {
+        return Err("EVIDENCE_ROOT_CHANGED");
+    }
+    #[cfg(not(test))]
+    let fault = None::<&str>;
+    #[cfg(test)]
+    let fault = SAVE_FAULT.with(|v| v.get().filter(|(n, _)| *n == name).map(|(_, k)| k));
+    if fault == Some("CREATE") {
+        return Err("EVIDENCE_CREATE_NEW");
+    }
+    let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(g.path.join(name))
         .map_err(|_| "EVIDENCE_CREATE_NEW")?;
-    f.write_all(bytes).map_err(|_| "EVIDENCE_WRITE")?;
-    f.sync_all().map_err(|_| "EVIDENCE_FLUSH")
+    if fault == Some("SHORT") {
+        file.write_all(&bytes[..bytes.len() / 2])
+            .map_err(|_| "EVIDENCE_WRITE")?;
+        return Err("EVIDENCE_WRITE");
+    }
+    file.write_all(bytes).map_err(|_| "EVIDENCE_WRITE")?;
+    if fault == Some("FLUSH") {
+        return Err("EVIDENCE_FLUSH");
+    }
+    file.sync_all().map_err(|_| "EVIDENCE_FLUSH")
 }
 /// Existing attempts are NEVER adopted, including RESERVED. Crash recovery never acquires a permit.
 pub fn run<D: Driver>(store: &Store, driver: &mut D) -> Result<RelaySummary> {
@@ -445,6 +564,10 @@ pub fn run<D: Driver>(store: &Store, driver: &mut D) -> Result<RelaySummary> {
             unknowns.push("BUDGET_EXHAUSTED".into());
             break;
         }
+        if read_base(store, &p.plan).is_err() {
+            unknowns.push("FIXTURE_CHANGED".into());
+            break;
+        }
         let hard = (Instant::now() + Duration::from_millis(p.plan.limits.stage_ms)).min(total);
         if hard.saturating_duration_since(Instant::now()) <= Duration::from_secs(15) {
             return Err("BUDGET_EXHAUSTED");
@@ -461,16 +584,19 @@ pub fn run<D: Driver>(store: &Store, driver: &mut D) -> Result<RelaySummary> {
         )?;
         let permit = store.relay_launching(reservation)?;
         let mut attempt = permit.attempt().clone();
-        let mut e = driver.execute(&spec, &input, &permit, end, &mut |pid, created| {
-            attempt.pid = Some(pid);
-            attempt.process_creation_utc = Some(created);
-            store.relay_cas(&mut attempt, "RUNNING")
-        });
+        let mut e = if read_base(store, &p.plan).is_err() {
+            let mut e = Execution::failed("BINDING_MISMATCH");
+            e.unknowns.push("FIXTURE_CHANGED".into());
+            e
+        } else {
+            driver.execute(&spec, &input, &permit, end, &mut |pid, created| {
+                attempt.pid = Some(pid);
+                attempt.process_creation_utc = Some(created);
+                store.relay_cas(&mut attempt, "RUNNING")
+            })
+        };
         unknowns.extend(e.unknowns.clone());
-        // Always preserve bounded raw output as quarantined evidence, never in the summary.
         let role_name = role.name();
-        save_new(&p.run_root, &format!("{role_name}.stdout"), &e.stdout)?;
-        save_new(&p.run_root, &format!("{role_name}.stderr"), &e.stderr)?;
         attempt.pid = attempt.pid.or(e.pid);
         attempt.process_creation_utc = attempt
             .process_creation_utc
@@ -531,6 +657,30 @@ pub fn run<D: Driver>(store: &Store, driver: &mut D) -> Result<RelaySummary> {
                 }
             }
         }
+        let drift = read_base(store, &p.plan).is_err();
+        let mut meta: Value = relay_json(
+            attempt.usage_json.as_ref().ok_or("ENCODING")?.as_bytes(),
+            65536,
+        )?;
+        if drift {
+            meta["unknowns"]
+                .as_array_mut()
+                .ok_or("ENCODING")?
+                .push(json!("FIXTURE_CHANGED"));
+        }
+        // Save immutable reviewer binding as tool metadata, never as a model claim.
+        if let Some((candidate, package)) = &c {
+            meta["binding"] = json!({"plan_id":p.id,"candidate_sha256":candidate.candidate_sha256,"review_input_sha256":hash(package)});
+        }
+        let mut artifacts = vec![
+            (format!("{role_name}.stdout"), e.stdout.as_slice()),
+            (format!("{role_name}.stderr"), e.stderr.as_slice()),
+        ];
+        if let Some((_, package)) = &c {
+            artifacts.push(("review-package.txt".into(), package.as_slice()));
+        }
+        meta["evidence"] = json!({"state":"PENDING","artifacts":artifacts.iter().map(|(name,b)|json!({"name":name,"bytes":b.len(),"sha256":hash(b)})).collect::<Vec<_>>()});
+        attempt.usage_json = Some(meta.to_string());
         let target = if e.reclaim != "CONFIRMED" {
             "UNKNOWN"
         } else if !e.created && e.create_process_failed {
@@ -543,27 +693,36 @@ pub fn run<D: Driver>(store: &Store, driver: &mut D) -> Result<RelaySummary> {
             "STOPPED"
         };
         store.relay_cas(&mut attempt, target)?;
-        let success = attempt.state == "EXITED" && attempt.terminal.as_deref() == Some("SUCCESS");
+        // The real terminal facts are durable BEFORE any evidence write.
+        let saved = artifacts
+            .iter()
+            .try_for_each(|(name, b)| save_new(&p, name, b));
+        match saved {
+            Ok(()) => store.relay_evidence(&mut attempt, EvidenceWrite::Complete)?,
+            Err(code) => store.relay_evidence(&mut attempt, EvidenceWrite::Failed(code))?,
+        }
+        let success = saved.is_ok()
+            && !drift
+            && attempt.state == "EXITED"
+            && attempt.terminal.as_deref() == Some("SUCCESS");
         parent = Some(attempt);
         if !success {
             break;
         }
         if role == RelayRole::Develop {
-            let (_, package) = c.ok_or("SCHEMA_REJECTED")?;
-            save_new(&p.run_root, "review-package.txt", &package)?;
-            input = package;
+            input = c.ok_or("SCHEMA_REJECTED")?.1;
         }
     }
-    if read_base(store, &p.plan)? != base {
-        return Err("FIXTURE_CHANGED");
-    }
-    let mut summary = status(store)?;
+    let mut summary = status_inner(store, false)?;
     summary.unknowns.extend(unknowns);
     summary.next_action = next_action(&summary.facts, review_claim.as_ref(), &mut summary.unknowns);
-    save_new(
-        &p.run_root,
-        "summary.json",
-        &serde_json::to_vec_pretty(&summary).map_err(|_| "SCHEMA_REJECTED")?,
-    )?;
+    let encoded = serde_json::to_vec_pretty(&summary).map_err(|_| "ENCODING")?;
+    if let Err(code) = save_new(&p, "summary.json", &encoded) {
+        if let Some(mut last) = summary.facts.last().cloned() {
+            store.relay_evidence(&mut last, EvidenceWrite::SummaryFailed(code))?;
+            return status(store);
+        }
+        return Err(code);
+    }
     Ok(summary)
 }

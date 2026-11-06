@@ -144,6 +144,7 @@ pub fn argv(role: RelayRole, root: &Path, model: &str, session: &str) -> Vec<Str
             "--output-format".into(),
             "stream-json".into(),
             "--verbose".into(),
+            "--include-hook-events".into(),
             "--json-schema".into(),
             review_schema(),
             "--tools".into(),
@@ -323,7 +324,7 @@ impl Parser {
                     "api_retry" => {
                         self.unknowns.push("UPSTREAM_RETRY".into());
                         self.retry_count = self.retry_count.checked_add(1).ok_or("BOUND")?;
-                        let raw = v["error"]["type"].as_str().unwrap_or("");
+                        let raw = v["error"].as_str().ok_or("PROTOCOL_ERROR")?;
                         let class = if [
                             "authentication_failed",
                             "oauth_org_not_allowed",
@@ -344,11 +345,12 @@ impl Parser {
                             "account_on_hold",
                             "billing_error",
                         ]
-                        .contains(&v["error"]["type"].as_str().unwrap_or(""))
+                        .contains(&v["error"].as_str().ok_or("PROTOCOL_ERROR")?)
                         {
                             self.auth_failed = true;
                         }
                     }
+                    sub if sub.starts_with("hook_") => return Err("TOOL_USE_OBSERVED"),
                     _ => (),
                 },
                 "assistant" | "user" => {
@@ -494,12 +496,18 @@ pub struct NativeDriver {
 impl NativeDriver {
     pub fn new() -> Result<Self> {
         let exe = std::env::current_exe().map_err(|_| "SELF_PATH")?;
-        Self::from_directory(exe.parent().ok_or("SELF_PATH")?)
+        Self::from_directory(exe.parent().ok_or("SELF_PATH")?, None)
     }
-    fn from_directory(dir: &Path) -> Result<Self> {
+    fn from_directory(dir: &Path, expected: Option<&str>) -> Result<Self> {
+        if let Some(v) = expected {
+            Self::validate_test_hash(Some(v))?;
+        }
         let fake = dir.join("nova_scheduler_relay_fake_cli.exe");
         let mut g = Guard::tool(&fake)?;
         let h = hash(&g.bytes(16777216)?);
+        if expected.is_some_and(|v| v != h) {
+            return Err("FAKE_EXPECTED_HASH_MISMATCH");
+        }
         Ok(Self {
             fake: g.path.clone(),
             fake_hash: h,
@@ -519,15 +527,37 @@ impl NativeDriver {
     pub fn test_execute_io(&mut self, spec: &Spec, input: &[u8], end: Instant) -> Execution {
         native::execute(self, spec, input, end, &mut |_, _| Ok(()))
     }
+    pub fn validate_test_hash(v: Option<&str>) -> Result<&str> {
+        let v = v.ok_or("FAKE_EXPECTED_HASH_MISSING")?;
+        if !hex(v, 64) {
+            return Err("FAKE_EXPECTED_HASH_INVALID");
+        }
+        Ok(v)
+    }
+    #[cfg(test)]
+    pub fn for_test_at(dir: &Path, expected: &str) -> Result<Self> {
+        Self::from_directory(dir, Some(expected))
+    }
+    #[cfg(test)]
+    pub fn test_executable(&self) -> Result<&Path> {
+        self._guard.verify()?;
+        Ok(&self.fake)
+    }
     #[cfg(test)]
     pub fn for_test() -> Result<Self> {
+        let value =
+            std::env::var("NOVA_AR0_TEST_FAKE_SHA256").map_err(|_| "FAKE_EXPECTED_HASH_MISSING")?;
+        let expected = Self::validate_test_hash(Some(&value))?;
         let exe = std::env::current_exe().map_err(|_| "SELF_PATH")?;
         let dir = exe.parent().ok_or("SELF_PATH")?;
-        Self::from_directory(if dir.file_name().is_some_and(|n| n == "deps") {
-            dir.parent().ok_or("SELF_PATH")?
-        } else {
-            dir
-        })
+        Self::from_directory(
+            if dir.file_name().is_some_and(|n| n == "deps") {
+                dir.parent().ok_or("SELF_PATH")?
+            } else {
+                dir
+            },
+            Some(expected),
+        )
     }
 }
 impl Driver for NativeDriver {
@@ -644,6 +674,7 @@ pub fn mock_scenario(s: &str) -> bool {
         "tools",
         "mcp",
         "hook",
+        "hook-top",
         "tool-use",
         "denial",
         "result-error",

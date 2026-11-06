@@ -1149,7 +1149,7 @@ mod ar0 {
             RelayRole::Review,
             &[
                 init(),
-                json!({"type":"system","subtype":"api_retry","error":{"type":"authentication_failed"}}),
+                json!({"type":"system","subtype":"api_retry","error":"authentication_failed"}),
                 result,
             ],
             Some(0),
@@ -1313,7 +1313,10 @@ mod ar0 {
         let f = RF::new("ok", "ok");
         fs::write(f.f.repo.join(".git/HEAD"), sha('c')).unwrap();
         assert_eq!(relay::read_base(&f.s, &f.p), Err("VERSION_MISMATCH"));
-        assert_eq!(f.s.relay_attempts().err(), Some("VERSION_MISMATCH"));
+        assert!(f.s.relay_attempts().unwrap().is_empty());
+        let view = relay::status(&f.s).unwrap();
+        assert_eq!(view.next_action, "PM_REQUIRED");
+        assert!(view.unknowns.contains(&"FIXTURE_CHANGED".into()));
         let c = rusqlite::Connection::open(f.f.root.join("v2/handoff.sqlite3")).unwrap();
         assert_eq!(
             c.query_row("SELECT COUNT(*) FROM relay_attempts", [], |r| r
@@ -1335,7 +1338,29 @@ mod ar0 {
         (f, s)
     }
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_actual_fake_two_stage_success_and_restart_no_third() {
+        let verified = NativeDriver::for_test().unwrap();
+        let exe = verified.test_executable().unwrap();
+        let expected = std::env::var("NOVA_AR0_TEST_FAKE_SHA256").unwrap();
+        let replacement =
+            std::env::temp_dir().join(format!("ar0-substitute-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&replacement).unwrap();
+        let copy = replacement.join("nova_scheduler_relay_fake_cli.exe");
+        fs::copy(exe, &copy).unwrap();
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().append(true).open(&copy).unwrap();
+        file.write_all(b"AR0_FIXED_SUBSTITUTE").unwrap();
+        drop(file);
+        assert_eq!(
+            NativeDriver::for_test_at(&replacement, &expected).err(),
+            Some("FAKE_EXPECTED_HASH_MISMATCH")
+        );
+        assert_eq!(
+            NativeDriver::for_test_at(exe.parent().unwrap(), &"0".repeat(64)).err(),
+            Some("FAKE_EXPECTED_HASH_MISMATCH")
+        );
+
         let (f, s) = native_run("ok", "ok");
         assert_eq!(s.next_action, "PM_REVIEW", "{s:?}");
         assert_eq!(s.facts.len(), 2);
@@ -1349,6 +1374,7 @@ mod ar0 {
         assert!(!serde_json::to_string(&s).unwrap().contains("QUARANTINED"));
     }
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_actual_fake_blocked_conflict_changes_and_unknowns() {
         for (case, action) in [
             ("blocked", "PM_REQUIRED"),
@@ -1362,6 +1388,7 @@ mod ar0 {
         }
     }
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_actual_fake_develop_errors_never_launch_review() {
         for case in [
             "turn-failed",
@@ -1385,11 +1412,13 @@ mod ar0 {
         }
     }
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_actual_fake_review_isolation_and_schema_failures() {
         for case in [
             "tools",
             "mcp",
             "hook",
+            "hook-top",
             "tool-use",
             "denial",
             "result-error",
@@ -1405,6 +1434,7 @@ mod ar0 {
         }
     }
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_actual_fake_deadline_and_inherited_pipe_descendant_reclaimed() {
         for case in ["hang", "no-read", "descendant"] {
             let start = Instant::now();
@@ -1437,6 +1467,7 @@ mod ar0 {
         }
     }
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_actual_fake_cancel_signal_reclaims_job_and_readers() {
         let f = RF::new("hang", "ok");
         let mut d = NativeDriver::for_test().unwrap();
@@ -1452,15 +1483,11 @@ mod ar0 {
         assert_eq!(s.facts[0].reclaim.as_deref(), Some("CONFIRMED"));
     }
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_actual_isolated_console_c_and_break_handler_unregistered() {
         use std::os::windows::process::CommandExt;
-        let exe = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("nova_scheduler_relay_fake_cli.exe");
+        let verified = NativeDriver::for_test().unwrap();
+        let exe = verified.test_executable().unwrap();
         for mode in ["--cancel-controller-c", "--cancel-controller-break"] {
             let out = std::process::Command::new(&exe)
                 .arg(mode)
@@ -1479,6 +1506,7 @@ mod ar0 {
         }
     }
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_actual_created_assign_query_resume_and_persist_failure_cleanup() {
         for point in ["created", "assign", "query", "resume", "persist"] {
             let f = RF::new("ok", "ok");
@@ -1495,6 +1523,7 @@ mod ar0 {
         }
     }
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_actual_unknown_reclaim_never_launches_review() {
         let f = RF::new("ok", "ok");
         let mut d = NativeDriver::for_test().unwrap();
@@ -1505,6 +1534,7 @@ mod ar0 {
         assert_eq!(s.next_action, "PM_REQUIRED");
     }
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_createprocess_failure_is_distinct_from_created_cleanup() {
         let f = RF::new("ok", "ok");
         let mut d = NativeDriver::for_test().unwrap();
@@ -1552,6 +1582,7 @@ mod ar0 {
         assert_eq!(e.reclaim, "CONFIRMED");
     }
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_actual_running_cas_failure_still_reclaims_resources() {
         let f = RF::new("hang", "ok");
         let mut d = NativeDriver::for_test().unwrap();
@@ -1583,6 +1614,7 @@ mod ar0 {
         assert_eq!(f.s.relay_attempts().unwrap()[0].state, "LAUNCHING");
     }
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_actual_duplex_input_output_avoids_pipe_deadlock() {
         let f = RF::new_plan("duplex", "duplex", |p| {
             p.constraints = vec!["x".repeat(1024); 16];
@@ -1595,19 +1627,34 @@ mod ar0 {
         assert!(s.facts.iter().all(|a| a.stdout_bytes.unwrap() > 65536));
     }
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_evidence_create_new_failure_does_not_start_review() {
         let f = RF::new("ok", "ok");
         fs::write(f.run.join("DEVELOP.stdout"), b"prior evidence").unwrap();
         let mut d = NativeDriver::for_test().unwrap();
-        assert_eq!(relay::run(&f.s, &mut d).err(), Some("EVIDENCE_CREATE_NEW"));
-        assert_eq!(f.s.relay_attempts().unwrap().len(), 1);
+        let view = relay::run(&f.s, &mut d).unwrap();
+        assert_eq!(view.next_action, "PM_REQUIRED");
+        assert_eq!(view.facts.len(), 1);
+        let a = &view.facts[0];
+        assert_eq!(a.state, "EXITED");
+        assert_eq!(a.exit_code, Some(0));
+        assert_eq!(a.reclaim.as_deref(), Some("CONFIRMED"));
+        assert!(a.stdout_bytes.unwrap() > 0);
+        assert_ne!(
+            a.stdout_sha256.as_deref(),
+            Some(hash(b"prior evidence").as_str())
+        );
         assert_eq!(
             fs::read(f.run.join("DEVELOP.stdout")).unwrap(),
             b"prior evidence"
         );
-        let s = relay::run(&f.s, &mut Never).unwrap();
-        assert_eq!(s.next_action, "PM_REQUIRED");
+        let again = relay::run(&Store::open(&f.f.root.join("v2")).unwrap(), &mut Never).unwrap();
+        assert_eq!(again.next_action, "PM_REQUIRED");
+        assert_eq!(again.facts[0].state, "EXITED");
+        assert_eq!(again.facts[0].exit_code, Some(0));
+        assert!(again.unknowns.contains(&"EVIDENCE_SAVE_FAILED".into()));
     }
+
     #[test]
     fn ar0_registration_revision_and_review_input_binding() {
         let f = RF::new("ok", "ok");
@@ -1643,6 +1690,7 @@ mod ar0 {
         }
     }
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_cancel_before_creation_never_obtains_a_process() {
         let f = RF::new("ok", "ok");
         let mut d = NativeDriver::for_test().unwrap();
@@ -1676,6 +1724,7 @@ mod ar0 {
         }
     }
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_injected_crashes_before_create_before_resume_after_resume_never_replay() {
         for point in 0..3 {
             let f = RF::new("ok", "ok");
@@ -1721,6 +1770,7 @@ mod ar0 {
         );
     }
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_actual_stdin_128k_stdout_concurrent_and_write_failure() {
         for case in ["io", "no-stdin-exit"] {
             let f = RF::new(case, "ok");
@@ -1774,6 +1824,7 @@ mod ar0 {
         assert_eq!(f.s.relay_attempts().unwrap().len(), 1);
     }
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_plan_unique_and_lease_write_failure_has_zero_spawn() {
         let f = RF::new("ok", "ok");
         assert_eq!(
@@ -1848,14 +1899,10 @@ mod ar0 {
     }
 
     #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_actual_fake_parent_credentials_do_not_reach_child() {
-        let exe = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("nova_scheduler_relay_fake_cli.exe");
+        let verified = NativeDriver::for_test().unwrap();
+        let exe = verified.test_executable().unwrap();
         let out = std::process::Command::new(exe)
             .arg("--env-controller")
             .env_clear()
@@ -1874,5 +1921,376 @@ mod ar0 {
         let v: Value = relay_json(&out.stdout, 65536).unwrap();
         assert_eq!(v["credential_names_absent"], true);
         assert!(!String::from_utf8_lossy(&out.stdout).contains("AR0_FAKE_ONLY"));
+    }
+    #[test]
+    fn ar0_expected_hash_is_mandatory_before_file_lookup() {
+        assert_eq!(
+            NativeDriver::validate_test_hash(None),
+            Err("FAKE_EXPECTED_HASH_MISSING")
+        );
+        for v in ["", "abc", "NOT_A_HASH"] {
+            assert_eq!(
+                NativeDriver::validate_test_hash(Some(v)),
+                Err("FAKE_EXPECTED_HASH_INVALID")
+            );
+        }
+    }
+    #[test]
+    fn ar0_documented_retry_string_auth_billing_and_other() {
+        // Independent documented-shape samples, not emitted by our fake generator.
+        for class in [
+            "authentication_failed",
+            "oauth_org_not_allowed",
+            "account_on_hold",
+            "billing_error",
+            "unrecognized_category",
+        ] {
+            let mut p = cli_adapter::Parser::new(RelayRole::Review, "s");
+            p.feed(br#"{"type":"system","subtype":"init","session_id":"s","tools":[],"plugins":[],"mcp_servers":[]}
+"#).unwrap();
+            p.feed(
+                format!(
+                    "{{\"type\":\"system\",\"subtype\":\"api_retry\",\"error\":\"{class}\"}}\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            p.feed(br#"{"type":"result","session_id":"s","subtype":"success","is_error":false,"structured_output":{"schema":"nova.relay.review/1","base_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","candidate_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","verdict":"PASS","issues":[],"unknowns":[]}}
+"#).unwrap();
+            let e = p.finish(Some(0));
+            assert_eq!(e.retry_count, Some(1));
+            if class == "unrecognized_category" {
+                assert_eq!(e.terminal, "SUCCESS");
+                assert_eq!(e.retry_classes.get("OTHER"), Some(&1));
+            } else {
+                assert_eq!(e.terminal, "RESULT_ERROR");
+                assert!(e.claim.is_none());
+                assert_eq!(e.retry_classes.get(class), Some(&1));
+            }
+        }
+        let mut p = cli_adapter::Parser::new(RelayRole::Review, "s");
+        assert_eq!(p.feed(b"{\"type\":\"system\",\"subtype\":\"api_retry\",\"error\":{\"type\":\"billing_error\"}}\n"),Err("PROTOCOL_ERROR"));
+    }
+    #[test]
+    fn ar0_hook_top_and_system_shapes_are_both_rejected() {
+        for kind in ["hook_started", "hook_progress", "hook_response"] {
+            for v in [
+                json!({"type":kind}),
+                json!({"type":"system","subtype":kind}),
+            ] {
+                let e = parse(RelayRole::Review, &[init(), v], Some(0));
+                assert_eq!(e.terminal, "TOOL_USE_OBSERVED");
+                assert!(e.claim.is_none());
+            }
+        }
+        let a = cli_adapter::argv(RelayRole::Review, Path::new("E:\\owned"), "mock:ok", "s");
+        assert!(a.iter().any(|v| v == "--include-hook-events"));
+    }
+    struct Injected {
+        root: PathBuf,
+        count: usize,
+        drift: Option<&'static str>,
+    }
+    impl Driver for Injected {
+        fn prepare(&mut self, p: &RelayPlan, r: RelayRole, root: &Path, _: &[u8]) -> Result<Spec> {
+            Ok(Spec {
+                role: r,
+                profile: if r == RelayRole::Develop {
+                    p.develop_profile.clone()
+                } else {
+                    p.review_profile.clone()
+                },
+                exe: root.join("INJECTED_NOT_EXECUTED.exe"),
+                exe_sha256: "a".repeat(64),
+                argv: vec![],
+                env: BTreeMap::new(),
+                cwd: root.to_path_buf(),
+                session: "INJECTED".into(),
+            })
+        }
+        fn execute(
+            &mut self,
+            spec: &Spec,
+            input: &[u8],
+            _: &LaunchPermit,
+            _: Instant,
+            running: &mut dyn FnMut(u32, String) -> Result<()>,
+        ) -> Execution {
+            self.count += 1;
+            running(424242, "INJECTED".into()).unwrap();
+            if let Some(kind) = self.drift.take() {
+                if kind == "HEAD" {
+                    fs::write(self.root.join(".git/HEAD"), sha('c')).unwrap();
+                } else {
+                    fs::write(
+                        self.root.join("pilot/src/normalize_label.rs"),
+                        b"INJECTED concurrent edit",
+                    )
+                    .unwrap();
+                }
+            }
+            let claim = if spec.role == RelayRole::Develop {
+                proposal()
+            } else {
+                let h: Value =
+                    serde_json::from_slice(input.split(|b| *b == 10).next().unwrap()).unwrap();
+                serde_json::to_vec(&json!({"schema":"nova.relay.review/1","base_sha256":h["base_sha256"],"candidate_sha256":h["candidate_sha256"],"verdict":"PASS","issues":[],"unknowns":[]})).unwrap()
+            };
+            let mut e = Execution::failed("SUCCESS");
+            e.created = true;
+            e.natural = true;
+            e.pid = Some(424242);
+            e.process_creation_utc = Some("INJECTED".into());
+            e.exit_code = Some(0);
+            e.stdout = b"INJECTED captured output".to_vec();
+            e.stderr = b"INJECTED diagnostic".to_vec();
+            e.claim = Some(claim);
+            e
+        }
+    }
+    #[test]
+    fn ar0_injected_fixture_drift_keeps_terminal_facts_and_stops_review() {
+        let early = RF::new("ok", "ok");
+        let reservation = early.reserve();
+        fs::write(early.f.repo.join(".git/HEAD"), sha('c')).unwrap();
+        assert_eq!(
+            early.s.relay_launching(reservation).err(),
+            Some("VERSION_MISMATCH")
+        );
+        let old = relay::run(&early.s, &mut Never).unwrap();
+        assert_eq!(old.facts[0].state, "RESERVED");
+        assert_eq!(old.next_action, "PM_REQUIRED");
+        for drift in ["HEAD", "BASE"] {
+            let f = RF::new("ok", "ok");
+            let mut d = Injected {
+                root: f.f.repo.clone(),
+                count: 0,
+                drift: Some(drift),
+            };
+            let s = relay::run(&f.s, &mut d).unwrap();
+            assert_eq!(d.count, 1);
+            assert_eq!(s.next_action, "PM_REQUIRED");
+            assert!(s.unknowns.contains(&"FIXTURE_CHANGED".into()));
+            assert_eq!(s.facts[0].state, "EXITED");
+            assert_eq!(s.facts[0].exit_code, Some(0));
+            assert_eq!(s.facts[0].reclaim.as_deref(), Some("CONFIRMED"));
+            assert_eq!(
+                s.facts[0].stdout_sha256,
+                Some(hash(b"INJECTED captured output"))
+            );
+            let reopened = Store::open(&f.f.root.join("v2")).unwrap();
+            let again = relay::run(&reopened, &mut Never).unwrap();
+            assert_eq!(again.facts.len(), 1);
+            assert_eq!(again.facts[0].exit_code, Some(0));
+            assert_eq!(again.next_action, "PM_REQUIRED");
+            assert_eq!(
+                f.s.relay_reserve(
+                    RelayRole::Review,
+                    b"bad",
+                    Some(&s.facts[0]),
+                    &"a".repeat(64),
+                    &"b".repeat(64),
+                    &"c".repeat(64)
+                )
+                .err(),
+                Some(if drift == "HEAD" {
+                    "VERSION_MISMATCH"
+                } else {
+                    "BASE_CHANGED"
+                })
+            );
+        }
+    }
+    #[test]
+    fn ar0_injected_evidence_create_short_flush_and_summary_failure_persist() {
+        for name in [
+            "DEVELOP.stdout",
+            "DEVELOP.stderr",
+            "review-package.txt",
+            "summary.json",
+        ] {
+            for fault in ["CREATE", "SHORT", "FLUSH"] {
+                let f = RF::new("ok", "ok");
+                let mut d = Injected {
+                    root: f.f.repo.clone(),
+                    count: 0,
+                    drift: None,
+                };
+                let s = relay::with_save_fault(name, fault, || relay::run(&f.s, &mut d)).unwrap();
+                assert_eq!(s.next_action, "PM_REQUIRED", "{name}/{fault}");
+                assert_eq!(d.count, if name == "summary.json" { 2 } else { 1 });
+                assert!(s.facts.iter().all(|a| a.state == "EXITED"
+                    && a.exit_code == Some(0)
+                    && a.reclaim.as_deref() == Some("CONFIRMED")));
+                let rows = f.s.relay_attempts().unwrap();
+                assert_eq!(
+                    rows[0].stdout_bytes,
+                    Some(b"INJECTED captured output".len() as u64)
+                );
+                assert_eq!(
+                    rows[0].stdout_sha256,
+                    Some(hash(b"INJECTED captured output"))
+                );
+                let again =
+                    relay::run(&Store::open(&f.f.root.join("v2")).unwrap(), &mut Never).unwrap();
+                assert_eq!(again.next_action, "PM_REQUIRED");
+                assert!(again.unknowns.iter().any(|x| x.starts_with("EVIDENCE_")));
+                assert_eq!(again.facts[0].exit_code, Some(0));
+            }
+        }
+    }
+    #[test]
+    fn ar0_injected_success_keeps_independent_binding_without_live_fixture() {
+        let f = RF::new("ok", "ok");
+        let mut d = Injected {
+            root: f.f.repo.clone(),
+            count: 0,
+            drift: None,
+        };
+        let s = relay::run(&f.s, &mut d).unwrap();
+        assert_eq!(d.count, 2);
+        assert_eq!(s.next_action, "PM_REVIEW");
+        fs::write(f.f.repo.join(".git/HEAD"), sha('c')).unwrap();
+        let s = relay::status(&f.s).unwrap();
+        assert_eq!(s.facts.len(), 2);
+        assert_eq!(s.next_action, "PM_REQUIRED");
+        assert_eq!(s.model_claims.len(), 2);
+        assert!(s
+            .facts
+            .iter()
+            .all(|a| a.reclaim.as_deref() == Some("CONFIRMED")));
+        let old = relay::run(&f.s, &mut Never).unwrap();
+        assert_eq!(old.facts.len(), 2);
+        assert!(old.unknowns.contains(&"FIXTURE_CHANGED".into()));
+    }
+
+    struct NativeDrift {
+        inner: NativeDriver,
+        started: std::sync::mpsc::Sender<()>,
+        calls: usize,
+    }
+    impl Driver for NativeDrift {
+        fn prepare(
+            &mut self,
+            p: &RelayPlan,
+            r: RelayRole,
+            root: &Path,
+            input: &[u8],
+        ) -> Result<Spec> {
+            self.inner.prepare(p, r, root, input)
+        }
+        fn execute(
+            &mut self,
+            s: &Spec,
+            b: &[u8],
+            permit: &LaunchPermit,
+            end: Instant,
+            running: &mut dyn FnMut(u32, String) -> Result<()>,
+        ) -> Execution {
+            self.calls += 1;
+            let signal = self.started.clone();
+            self.inner.execute(s, b, permit, end, &mut |pid, created| {
+                running(pid, created)?;
+                signal.send(()).map_err(|_| "INJECTED_SIGNAL")?;
+                Ok(())
+            })
+        }
+    }
+    #[test]
+    #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
+    fn ar0_actual_running_fixture_drift_preserves_terminal() {
+        for kind in ["HEAD", "BASE"] {
+            let f = RF::new("hang", "ok");
+            let inner = NativeDriver::for_test().unwrap();
+            let cancel = inner.cancel.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let path = f.f.repo.join(if kind == "HEAD" {
+                ".git/HEAD"
+            } else {
+                "pilot/src/normalize_label.rs"
+            });
+            let edit = std::thread::spawn(move || {
+                rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                fs::write(
+                    path,
+                    if kind == "HEAD" {
+                        sha('c').into_bytes()
+                    } else {
+                        b"concurrent fixture edit".to_vec()
+                    },
+                )
+                .unwrap();
+                cancel.store(true, Ordering::Release);
+            });
+            let mut d = NativeDrift {
+                inner,
+                started: tx,
+                calls: 0,
+            };
+            let view = relay::run(&f.s, &mut d).unwrap();
+            edit.join().unwrap();
+            assert_eq!(d.calls, 1);
+            assert_eq!(view.next_action, "PM_REQUIRED");
+            let a = &view.facts[0];
+            assert_eq!(a.state, "STOPPED");
+            assert_eq!(a.terminal.as_deref(), Some("CANCELLED"));
+            assert_eq!(a.exit_code, Some(1));
+            assert_eq!(a.reclaim.as_deref(), Some("CONFIRMED"));
+            assert!(a.stdout_sha256.is_some());
+            let reopened = Store::open(&f.f.root.join("v2")).unwrap();
+            let again = relay::run(&reopened, &mut Never).unwrap();
+            assert_eq!(again.facts.len(), 1);
+            assert_eq!(again.facts[0].exit_code, a.exit_code);
+            assert!(again.unknowns.contains(&"FIXTURE_CHANGED".into()));
+            assert_eq!(again.next_action, "PM_REQUIRED");
+        }
+    }
+    #[test]
+    fn ar0_terminal_pending_evidence_survives_restart_without_reclassifying_reclaim() {
+        let f = RF::new("ok", "ok");
+        let permit = f.s.relay_launching(f.reserve()).unwrap();
+        let mut a = permit.attempt().clone();
+        a.pid = Some(424242);
+        a.process_creation_utc = Some("INJECTED".into());
+        f.s.relay_cas(&mut a, "RUNNING").unwrap();
+        a.exit_code = Some(0);
+        a.terminal = Some("RESULT_ERROR".into());
+        a.reclaim = Some("CONFIRMED".into());
+        a.stdout_bytes = Some(7);
+        a.stdout_sha256 = Some(hash(b"partial"));
+        a.usage_json = Some(
+            json!({"source":"UNKNOWN","unknowns":[],"evidence":{"state":"PENDING","artifacts":[]}})
+                .to_string(),
+        );
+        f.s.relay_cas(&mut a, "EXITED").unwrap();
+        let view = relay::run(&Store::open(&f.f.root.join("v2")).unwrap(), &mut Never).unwrap();
+        assert_eq!(view.facts[0].state, "EXITED");
+        assert_eq!(view.facts[0].exit_code, Some(0));
+        assert_eq!(view.facts[0].reclaim.as_deref(), Some("CONFIRMED"));
+        assert!(view.unknowns.contains(&"EVIDENCE_PENDING".into()));
+        assert_eq!(view.next_action, "PM_REQUIRED");
+    }
+    #[test]
+    fn ar0_evidence_root_loss_keeps_ledger_readable() {
+        let f = RF::new("ok", "ok");
+        let mut d = Injected {
+            root: f.f.repo.clone(),
+            count: 0,
+            drift: None,
+        };
+        let first = relay::run(&f.s, &mut d).unwrap();
+        assert_eq!(first.next_action, "PM_REVIEW");
+        let preserved = f.f.root.join("preserved-run");
+        assert!(inside(&preserved, &f.f.root) && inside(&f.run, &f.f.root));
+        fs::rename(&f.run, &preserved).unwrap();
+        let view = relay::run(&Store::open(&f.f.root.join("v2")).unwrap(), &mut Never).unwrap();
+        assert_eq!(view.facts.len(), 2);
+        assert!(view
+            .facts
+            .iter()
+            .all(|a| a.exit_code == Some(0) && a.reclaim.as_deref() == Some("CONFIRMED")));
+        assert!(view.unknowns.contains(&"EVIDENCE_ROOT_CHANGED".into()));
+        assert_eq!(view.next_action, "PM_REQUIRED");
+        assert!(preserved.join("DEVELOP.stdout").exists());
     }
 }

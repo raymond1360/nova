@@ -14,12 +14,13 @@ $commandTemp=Join-Path $EvidenceDirectory 'command-temp';New-Item -ItemType Dire
 $clock=[Diagnostics.Stopwatch]::StartNew();$deadline=3600000
 $rows=[Collections.Generic.List[object]]::new();$verdict='FAIL';$stage='BUILD'
 $gitElapsedMs=0L
-function Invoke-Fixed([string]$Name,[string]$Exe,[string[]]$Vector,[string]$Cwd=$crate,[switch]$FixtureGit) {
+function Invoke-Fixed([string]$Name,[string]$Exe,[string[]]$Vector,[string]$Cwd=$crate,[switch]$FixtureGit,[string]$FakeHash) {
  if($clock.ElapsedMilliseconds -ge $deadline){throw 'TOTAL_DEADLINE'}
  $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$Exe;$info.WorkingDirectory=$Cwd
  $info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
  $info.Environment['CARGO_TARGET_DIR']=$TargetDirectory;$info.Environment['CARGO_NET_OFFLINE']='true'
  $info.Environment['TEMP']=$commandTemp;$info.Environment['TMP']=$commandTemp
+ [void]$info.Environment.Remove('NOVA_AR0_TEST_FAKE_SHA256');if($FakeHash){$info.Environment['NOVA_AR0_TEST_FAKE_SHA256']=$FakeHash};
  $info.Environment['RUSTUP_AUTO_INSTALL']='0';$info.Environment['NOVA_SH1_TEST_ROOT']=$EvidenceDirectory
  if($FixtureGit){
   $info.Environment.Clear();$info.Environment['SystemRoot']=$env:SystemRoot
@@ -62,7 +63,7 @@ function Invoke-Fixed([string]$Name,[string]$Exe,[string[]]$Vector,[string]$Cwd=
  }
  return $row.exit_code
 }
-function Require-Zero([string]$Name,[string]$Exe,[string[]]$Vector,[string]$Cwd=$crate,[switch]$FixtureGit){if((Invoke-Fixed $Name $Exe $Vector $Cwd -FixtureGit:$FixtureGit) -ne 0){throw "Fixed stage failed: $Name"}}
+function Require-Zero([string]$Name,[string]$Exe,[string[]]$Vector,[string]$Cwd=$crate,[switch]$FixtureGit,[string]$FakeHash){if((Invoke-Fixed $Name $Exe $Vector $Cwd -FixtureGit:$FixtureGit -FakeHash:$FakeHash) -ne 0){throw "Fixed stage failed: $Name"}}
 function Output-Json([string]$Name){Get-Content -LiteralPath (Join-Path $EvidenceDirectory "$Name.stdout.log") -Raw | ConvertFrom-Json -AsHashtable}
 function Write-Json([string]$Path,$Value){[IO.File]::WriteAllText($Path,($Value|ConvertTo-Json -Depth 30),[Text.UTF8Encoding]::new($false))}
 # Serial libtest output may contain inherited child stdout between the test header and its `ok`.
@@ -75,7 +76,7 @@ function Read-ActualPassed([string[]]$Lines,[string[]]$Declared) {
   if($line -cmatch '^test (.+?) \.\.\.(.*)$'){
    if($pending -or -not $allowed.Contains($Matches[1])){throw 'TEST_SEQUENCE_REJECTED'}
    $pending=$Matches[1];$suffix=$Matches[2]
-   if($suffix -ceq ' ok'){if(-not $done.Add($pending)){throw 'DUPLICATE_TEST_RESULT'};$pending=$null}
+   if($suffix -ceq ' ok'){if(-not $done.Add($pending)){throw 'DUPLICATE_TEST_RESULT'};$pending=$null}elseif($suffix.StartsWith(' ignored')){$pending=$null}
   } elseif($line -ceq 'ok') {
    if(-not $pending -or -not $done.Add($pending)){throw 'ORPHAN_TEST_RESULT'};$pending=$null
   } elseif($line -ceq 'FAILED' -or $line -cmatch '^test .+ \.\.\. FAILED$'){throw 'FAILED_TEST_RESULT'}
@@ -88,9 +89,12 @@ $bin=Join-Path $TargetDirectory 'debug/nova_scheduler_handoff.exe'
 $relay=Join-Path $TargetDirectory 'debug/nova_scheduler_relay.exe'
 $fake=Join-Path $TargetDirectory 'debug/nova_scheduler_relay_fake_cli.exe'
 try {
- Require-Zero 'relay-debug-build' $cargo @('build','--offline','--locked','--features','scheduler-validation','--bin','nova_scheduler_relay','--bin','nova_scheduler_relay_fake_cli','--bin','nova_scheduler_handoff')
+ if(Test-Path -LiteralPath $fake){throw 'CLEAN_NO_FAKE_TARGET_REQUIRED'}
+ Write-Json (Join-Path $EvidenceDirectory 'clean-target-before.json') @{fake_exists=$false;target=$TargetDirectory;source='ACTUAL_FILESYSTEM'}
  $stage='SH1_AND_DEFAULT_REGRESSION'
  Require-Zero 'sh1-wrapper' (Get-Process -Id $PID).Path @('-NoProfile','-File',(Join-Path $PSScriptRoot 'test_scheduler_handoff.ps1'),'-EvidenceDirectory',(Join-Path $EvidenceDirectory 'sh1-regression'),'-TargetDirectory',$TargetDirectory) $repo
+ if(Test-Path -LiteralPath $fake){throw 'STANDARD_TESTS_CREATED_FAKE'}
+ Write-Json (Join-Path $EvidenceDirectory 'clean-target-after.json') @{fake_exists=$false;source='ACTUAL_FILESYSTEM'}
  $old=Get-Content (Join-Path $EvidenceDirectory 'sh1-regression/result.json') -Raw | ConvertFrom-Json -AsHashtable
  if($old.verdict -cne 'PASS' -or $old.default_regression_executed -isnot [bool] -or -not $old.default_regression_executed){throw 'INCOMPLETE_OLD_REGRESSION'}
  foreach($stem in @('scheduler','default')){
@@ -98,8 +102,37 @@ try {
   $ok=Get-Content (Join-Path $EvidenceDirectory "sh1-regression/$stem-tests.stdout.log")
   $names=@($list | ForEach-Object {if($_ -cmatch '^(.+): test$'){$Matches[1]}} | Sort-Object)
   $passed=@(Read-ActualPassed $ok $names)
-  if($names.Count -eq 0 -or (Compare-Object $names $passed)){throw 'TEST_NAME_SET_MISMATCH'}
-  Write-Json (Join-Path $EvidenceDirectory "$stem-names.json") @{source='ACTUAL_LOCAL_TEST_OUTPUT';listed=$names;passed=$passed;count=$passed.Count}
+  $ignored=@($ok|ForEach-Object{if($_ -cmatch '^test (.+?) [.]{3} ignored(?:,.*)?$'){$Matches[1]}}|Sort-Object)
+  $all=@(@($passed)+@($ignored)|Sort-Object)
+  if($names.Count -eq 0 -or $all.Count -ne $names.Count -or (Compare-Object $names $all)){throw 'TEST_NAME_SET_MISMATCH'}
+  Write-Json (Join-Path $EvidenceDirectory "$stem-names.json") @{source='ACTUAL_LOCAL_TEST_OUTPUT';listed=$names;passed=$passed;ignored=$ignored;count=$passed.Count}
+ }
+
+ $stage='EXPLICIT_FIXED_FAKE_TESTS'
+ Require-Zero 'relay-debug-build' $cargo @('build','--offline','--locked','--features','scheduler-validation','--bin','nova_scheduler_relay','--bin','nova_scheduler_relay_fake_cli')
+ $fakeHash=(Get-FileHash -LiteralPath $fake -Algorithm SHA256).Hash.ToLowerInvariant()
+ Write-Json (Join-Path $EvidenceDirectory 'fake-cli-identity.json') @{path=[IO.Path]::GetFullPath($fake);sha256=$fakeHash;bytes=(Get-Item -LiteralPath $fake).Length;source='BUILT_THIS_RUN';expected_hash_test_variable='NOVA_AR0_TEST_FAKE_SHA256'}
+ $expected=@('scheduler::tests::ar0::ar0_actual_created_assign_query_resume_and_persist_failure_cleanup','scheduler::tests::ar0::ar0_actual_duplex_input_output_avoids_pipe_deadlock','scheduler::tests::ar0::ar0_actual_fake_blocked_conflict_changes_and_unknowns','scheduler::tests::ar0::ar0_actual_fake_cancel_signal_reclaims_job_and_readers','scheduler::tests::ar0::ar0_actual_fake_deadline_and_inherited_pipe_descendant_reclaimed','scheduler::tests::ar0::ar0_actual_fake_develop_errors_never_launch_review','scheduler::tests::ar0::ar0_actual_fake_parent_credentials_do_not_reach_child','scheduler::tests::ar0::ar0_actual_fake_review_isolation_and_schema_failures','scheduler::tests::ar0::ar0_actual_fake_two_stage_success_and_restart_no_third','scheduler::tests::ar0::ar0_actual_isolated_console_c_and_break_handler_unregistered','scheduler::tests::ar0::ar0_actual_running_cas_failure_still_reclaims_resources','scheduler::tests::ar0::ar0_actual_running_fixture_drift_preserves_terminal','scheduler::tests::ar0::ar0_actual_stdin_128k_stdout_concurrent_and_write_failure','scheduler::tests::ar0::ar0_actual_unknown_reclaim_never_launches_review','scheduler::tests::ar0::ar0_cancel_before_creation_never_obtains_a_process','scheduler::tests::ar0::ar0_createprocess_failure_is_distinct_from_created_cleanup','scheduler::tests::ar0::ar0_evidence_create_new_failure_does_not_start_review','scheduler::tests::ar0::ar0_injected_crashes_before_create_before_resume_after_resume_never_replay','scheduler::tests::ar0::ar0_plan_unique_and_lease_write_failure_has_zero_spawn')
+ Require-Zero 'ignored-list' $cargo @('test','--offline','--locked','--lib','scheduler::','--','--ignored','--list')
+ $listed=@(Get-Content (Join-Path $EvidenceDirectory 'ignored-list.stdout.log')|ForEach-Object{if($_ -cmatch '^(.+): test$'){$Matches[1]}}|Sort-Object)
+ if($listed.Count -ne $expected.Count -or (Compare-Object $listed $expected)){throw 'IGNORED_SET_CHANGED'}
+ $completed=@();$n=0
+ foreach($test in $expected){
+  if((Get-FileHash -LiteralPath $fake -Algorithm SHA256).Hash.ToLowerInvariant() -cne $fakeHash){throw 'FAKE_IDENTITY_CHANGED'}
+  $name='explicit-'+$n;$n++
+  Require-Zero $name $cargo @('test','--offline','--locked','--lib',$test,'--','--ignored','--exact','--test-threads=1') -FakeHash $fakeHash
+  $actual=@(Read-ActualPassed (Get-Content (Join-Path $EvidenceDirectory "$name.stdout.log")) @($test))
+  if($actual.Count -ne 1 -or $actual[0] -cne $test){throw 'EXPLICIT_TEST_NOT_RUN'}
+  $completed+=$test
+ }
+ Write-Json (Join-Path $EvidenceDirectory 'explicit-names.json') @{source='ACTUAL_EXACT_IGNORED_EXECUTION';listed=$listed;passed=$completed;expected_hash=$fakeHash}
+ $probe='scheduler::tests::ar0::ar0_actual_fake_two_stage_success_and_restart_no_third'
+ foreach($mode in @('missing','mismatch')){
+  $hash=if($mode -ceq 'missing'){$null}else{'0'*64}
+  $code=Invoke-Fixed "reject-hash-$mode" $cargo @('test','--offline','--locked','--lib',$probe,'--','--ignored','--exact','--test-threads=1') -FakeHash $hash
+  $out=[string](Get-Content (Join-Path $EvidenceDirectory "reject-hash-$mode.stdout.log") -Raw)
+  $errorCode=if($mode -ceq 'missing'){'FAKE_EXPECTED_HASH_MISSING'}else{'FAKE_EXPECTED_HASH_MISMATCH'}
+  if($code -ne 101 -or -not $out.Contains($errorCode) -or $out -notmatch '0 passed; 1 failed; 0 ignored'){throw 'HASH_NEGATIVE_NOT_EXACT'}
  }
  $stage='RELAY_GUARDS'
  foreach($name in @('nova_scheduler_relay','nova_scheduler_relay_fake_cli')){
@@ -136,6 +169,7 @@ try {
  Require-Zero 'relay-init' $relay @('relay-init','--workspace',$v2,'--source',$owned,'--plan',$plan,'--run-root',$run)
  Require-Zero 'relay-run' $relay @('relay-run','--workspace',$v2)
  $out=Output-Json 'relay-run'
+ if(@($out.facts|Where-Object {$_.exe_sha256 -cne $fakeHash}).Count -ne 0){throw 'RELAY_FAKE_HASH_MISMATCH'}
  if($out.next_action -cne 'PM_REVIEW' -or $out.facts.Count -ne 2 -or $out.delivery_sha -ne $null -or $out.execution_authorized -isnot [bool] -or $out.execution_authorized){throw 'RELAY_RESULT_REJECTED'}
  Require-Zero 'relay-status' $relay @('relay-status','--workspace',$v2)
  Require-Zero 'relay-no-replay' $relay @('relay-run','--workspace',$v2)

@@ -187,6 +187,10 @@ fn go() -> Result<(), &'static str> {
             json!({"type":"system","subtype":"init","session_id":session,"tools":if case=="tools"{json!(["bad"])}else{json!([])},"mcp_servers":if case=="mcp"{json!(["bad"])}else{json!([])},"plugins":[]}),
         );
         if case == "hook" {
+            emit(json!({"type":"system","subtype":"hook_started"}));
+            return Ok(());
+        }
+        if case == "hook-top" {
             emit(json!({"type":"hook_started"}));
             return Ok(());
         }
@@ -197,9 +201,7 @@ fn go() -> Result<(), &'static str> {
             return Ok(());
         }
         if case == "auth-retry" {
-            emit(
-                json!({"type":"system","subtype":"api_retry","error":{"type":"authentication_failed"}}),
-            );
+            emit(json!({"type":"system","subtype":"api_retry","error":"authentication_failed"}));
         }
         if case != "missing" {
             let mut v = json!({"type":"result","subtype":if case=="result-error"{"error_max_turns"}else{"success"},"is_error":case=="result-error","session_id":if case=="session"{"wrong-session"}else{&session},"permission_denials":if case=="denial"{json!(["fixed"])}else{json!([])},"structured_output":claim});

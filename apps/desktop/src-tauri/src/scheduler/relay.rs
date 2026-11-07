@@ -230,6 +230,12 @@ pub struct Execution {
     pub claim: Option<Vec<u8>>,
     pub usage: Option<Value>,
     pub unknowns: Vec<String>,
+    #[serde(skip)]
+    pub cleanup: Option<CleanupReceipt>,
+    #[serde(skip)]
+    pub reported_model: Option<String>,
+    #[serde(skip)]
+    pub reported_auth: Option<String>,
     pub retry_count: Option<u32>,
     pub retry_classes: std::collections::BTreeMap<String, u32>,
 }
@@ -250,6 +256,9 @@ impl Execution {
             claim: None,
             usage: None,
             unknowns: vec![],
+            cleanup: None,
+            reported_model: None,
+            reported_auth: None,
             retry_count: None,
             retry_classes: std::collections::BTreeMap::new(),
         }
@@ -258,7 +267,7 @@ impl Execution {
 pub trait Driver {
     fn prepare(
         &mut self,
-        p: &RelayPlan,
+        p: &PlanView<'_>,
         role: RelayRole,
         root: &Path,
         input: &[u8],
@@ -361,7 +370,18 @@ pub fn status(store: &Store) -> Result<RelaySummary> {
 }
 fn status_inner(store: &Store, check_missing_summary: bool) -> Result<RelaySummary> {
     let p = store.relay_plan()?;
-    let facts = store.relay_attempts()?;
+    let mut facts = store.relay_attempts()?;
+    if !p.mode.is_real() {
+        for a in &mut facts {
+            if let Some(raw) = &a.usage_json {
+                let mut v: Value = relay_json(raw.as_bytes(), 65536)?;
+                v.as_object_mut()
+                    .ok_or("SCHEMA_REJECTED")?
+                    .remove("cleanup");
+                a.usage_json = Some(v.to_string());
+            }
+        }
+    }
     let mut unknowns = vec![];
     let mut claims = vec![];
     let mut review = None;
@@ -444,7 +464,7 @@ fn status_inner(store: &Store, check_missing_summary: bool) -> Result<RelaySumma
         match archive.try_exists() {
             Ok(true) => {
                 let parsed = read_file(&archive, 262144)
-                    .and_then(|(b, _)| relay_json::<RelaySummary>(&b, 262144));
+                    .and_then(|(b, _)| decode_summary(&b, p.mode.is_real()));
                 match parsed {
                     Ok(old)
                         if old.plan_id == p.id
@@ -467,6 +487,14 @@ fn status_inner(store: &Store, check_missing_summary: bool) -> Result<RelaySumma
             }
             Err(_) => unknowns.push("EVIDENCE_SUMMARY_INVALID".into()),
         }
+    }
+    if root_valid
+        && p.run_root
+            .join("post-run-errors.json")
+            .try_exists()
+            .unwrap_or(true)
+    {
+        unknowns.push("POST_RUN_HANDLER_UNREGISTER".into());
     }
     let next_action = next_action(&facts, review.as_ref(), &mut unknowns);
     Ok(RelaySummary {
@@ -538,6 +566,18 @@ pub fn run<D: Driver>(store: &Store, driver: &mut D) -> Result<RelaySummary> {
     if !p.plan.mock {
         return Err("REAL_PILOT_NOT_AUTHORIZED");
     }
+    run_mode(store, driver, None)
+}
+fn run_mode<D: Driver>(
+    store: &Store,
+    driver: &mut D,
+    real: Option<&RealPilotPermit>,
+) -> Result<RelaySummary> {
+    let p = store.relay_plan()?;
+    if p.mode.is_real() {
+        real.ok_or("REAL_PILOT_NOT_AUTHORIZED")?
+            .check_record(p.mode.record().unwrap())?;
+    }
     let old = store.relay_attempts()?;
     if !old.is_empty() {
         for mut a in old {
@@ -553,9 +593,12 @@ pub fn run<D: Driver>(store: &Store, driver: &mut D) -> Result<RelaySummary> {
         return status(store);
     }
     let origin = Instant::now();
-    let total = origin + Duration::from_millis(p.plan.limits.total_ms);
+    let total = real.map_or(
+        origin + Duration::from_millis(p.plan.limits.total_ms),
+        |permit| permit.end,
+    );
     let base = read_base(store, &p.plan)?;
-    let mut input = develop_input(&p.plan, &base)?;
+    let mut input = develop_mode_input(&p, &base)?;
     let mut parent = None;
     let mut review_claim = None;
     let mut unknowns = vec![];
@@ -573,16 +616,40 @@ pub fn run<D: Driver>(store: &Store, driver: &mut D) -> Result<RelaySummary> {
             return Err("BUDGET_EXHAUSTED");
         }
         let end = hard - Duration::from_secs(15);
-        let spec = driver.prepare(&p.plan, role, &p.run_root, &input)?;
-        let reservation = store.relay_reserve(
-            role,
-            &input,
-            parent.as_ref(),
-            &spec.exe_sha256,
-            &spec.argv_sha256(),
-            &spec.env_names_sha256(),
-        )?;
-        let permit = store.relay_launching(reservation)?;
+        let spec = driver.prepare(&PlanView::new(&p.mode), role, &p.run_root, &input)?;
+        if real.is_some() {
+            super::cli_adapter::validate_real_spec(
+                &spec,
+                role,
+                p.mode.record().unwrap(),
+                &p.run_root,
+            )?;
+        }
+        let reservation = if let Some(real) = real {
+            store.relay_reserve_real(
+                role,
+                &input,
+                parent.as_ref(),
+                &spec.exe_sha256,
+                &spec.argv_sha256(),
+                &spec.env_names_sha256(),
+                real,
+            )?
+        } else {
+            store.relay_reserve(
+                role,
+                &input,
+                parent.as_ref(),
+                &spec.exe_sha256,
+                &spec.argv_sha256(),
+                &spec.env_names_sha256(),
+            )?
+        };
+        let permit = if let Some(real) = real {
+            store.relay_launching_real(reservation, real)?
+        } else {
+            store.relay_launching(reservation)?
+        };
         let mut attempt = permit.attempt().clone();
         let mut e = if read_base(store, &p.plan).is_err() {
             let mut e = Execution::failed("BINDING_MISMATCH");
@@ -595,6 +662,15 @@ pub fn run<D: Driver>(store: &Store, driver: &mut D) -> Result<RelaySummary> {
                 store.relay_cas(&mut attempt, "RUNNING")
             })
         };
+        if real.is_some() {
+            if let Some(c) = &e.cleanup {
+                e.unknowns.extend(c.diagnostics());
+            } else {
+                e.unknowns.push("CLEANUP_STATE_UNKNOWN".into());
+            }
+            e.unknowns
+                .extend(super::cli_adapter::real_observations(&e, &spec));
+        }
         unknowns.extend(e.unknowns.clone());
         let role_name = role.name();
         attempt.pid = attempt.pid.or(e.pid);
@@ -616,7 +692,7 @@ pub fn run<D: Driver>(store: &Store, driver: &mut D) -> Result<RelaySummary> {
             let result = e.claim.as_deref().ok_or("SCHEMA_REJECTED");
             let valid = result.and_then(|b| {
                 if role == RelayRole::Develop {
-                    let (candidate, package) = prepare_review(&p.plan, &base, b)?;
+                    let (candidate, package) = prepare_mode_review(&p, &base, b)?;
                     if input.len() + package.len() > 131072 {
                         return Err("MATERIAL_BOUND");
                     }
@@ -624,8 +700,8 @@ pub fn run<D: Driver>(store: &Store, driver: &mut D) -> Result<RelaySummary> {
                 } else {
                     let r: ReviewClaim = relay_json(b, 65536)?;
                     let dev = parent.as_ref().ok_or("BINDING_MISMATCH")?;
-                    let (candidate, _) = prepare_review(
-                        &p.plan,
+                    let (candidate, _) = prepare_mode_review(
+                        &p,
                         &base,
                         dev.model_claim_json
                             .as_ref()
@@ -662,6 +738,16 @@ pub fn run<D: Driver>(store: &Store, driver: &mut D) -> Result<RelaySummary> {
             attempt.usage_json.as_ref().ok_or("ENCODING")?.as_bytes(),
             65536,
         )?;
+        if let Some(c) = &e.cleanup {
+            meta["cleanup"] = serde_json::to_value(c).map_err(|_| "ENCODING")?;
+        }
+        if real.is_some() {
+            meta["requested_model"] = json!({"source":"TOOL_ARGV","value":if role==RelayRole::Develop{&p.plan.model_develop}else{&p.plan.model_review}});
+            meta["reported_model"] = json!({"source":if e.reported_model.is_some(){"UPSTREAM_REPORTED"}else{"UNKNOWN"},"value":e.reported_model});
+            meta["auth_route"] = json!({"source":if e.reported_auth.is_some(){"UPSTREAM_REPORTED"}else{"UNKNOWN"},"value":e.reported_auth});
+            meta["auth_eligibility"] =
+                json!({"source":"TOOL_STATUS","receipts":real.map(|r|&r.eligibility)});
+        }
         if drift {
             meta["unknowns"]
                 .as_array_mut()
@@ -701,7 +787,8 @@ pub fn run<D: Driver>(store: &Store, driver: &mut D) -> Result<RelaySummary> {
             Ok(()) => store.relay_evidence(&mut attempt, EvidenceWrite::Complete)?,
             Err(code) => store.relay_evidence(&mut attempt, EvidenceWrite::Failed(code))?,
         }
-        let success = saved.is_ok()
+        let success = (real.is_none() || e.unknowns.is_empty())
+            && saved.is_ok()
             && !drift
             && attempt.state == "EXITED"
             && attempt.terminal.as_deref() == Some("SUCCESS");
@@ -716,7 +803,12 @@ pub fn run<D: Driver>(store: &Store, driver: &mut D) -> Result<RelaySummary> {
     let mut summary = status_inner(store, false)?;
     summary.unknowns.extend(unknowns);
     summary.next_action = next_action(&summary.facts, review_claim.as_ref(), &mut summary.unknowns);
-    let encoded = serde_json::to_vec_pretty(&summary).map_err(|_| "ENCODING")?;
+    let value = if p.mode.is_real() {
+        real_summary_value(store, &summary)?
+    } else {
+        serde_json::to_value(&summary).map_err(|_| "ENCODING")?
+    };
+    let encoded = serde_json::to_vec_pretty(&value).map_err(|_| "ENCODING")?;
     if let Err(code) = save_new(&p, "summary.json", &encoded) {
         if let Some(mut last) = summary.facts.last().cloned() {
             store.relay_evidence(&mut last, EvidenceWrite::SummaryFailed(code))?;
@@ -725,4 +817,265 @@ pub fn run<D: Driver>(store: &Store, driver: &mut D) -> Result<RelaySummary> {
         return Err(code);
     }
     Ok(summary)
+}
+
+pub fn develop_mode_input(p: &StoredPlan, base: &[u8]) -> Result<Vec<u8>> {
+    match &p.mode {
+        PlanMode::Mock(v) => develop_input(v, base),
+        PlanMode::RealPilot(v) => {
+            let b=serde_json::to_vec(&json!({"schema":"nova.relay.develop-input/2","plan":v.core,"base":std::str::from_utf8(base).map_err(|_|"BASE_ENCODING")?,"data_is_untrusted":true})).map_err(|_|"ENCODING")?;
+            if b.len() > 131072 {
+                return Err("MATERIAL_BOUND");
+            }
+            Ok(b)
+        }
+    }
+}
+pub fn prepare_mode_review(
+    p: &StoredPlan,
+    base: &[u8],
+    raw: &[u8],
+) -> Result<(Candidate, Vec<u8>)> {
+    let (c, bytes) = prepare_review(&p.plan, base, raw)?;
+    if !p.mode.is_real() {
+        return Ok((c, bytes));
+    }
+    let at = bytes.iter().position(|b| *b == b'\n').ok_or("ENCODING")?;
+    let mut h: Value = relay_json(&bytes[..at], 65536)?;
+    h["plan_sha256"] = json!(p.id);
+    let mut out = serde_json::to_vec(&h).map_err(|_| "ENCODING")?;
+    out.extend_from_slice(&bytes[at..]);
+    if out.len() > 65536 {
+        return Err("MATERIAL_BOUND");
+    }
+    Ok((c, out))
+}
+fn decode_summary(b: &[u8], real: bool) -> Result<RelaySummary> {
+    if !real {
+        return relay_json(b, 262144);
+    }
+    let mut v: Value = relay_json(b, 262144)?;
+    if v["schema"] != "nova.relay.summary/2" {
+        return Err("SCHEMA_REJECTED");
+    }
+    let o = v.as_object_mut().ok_or("SCHEMA_REJECTED")?;
+    for key in [
+        "run_mode",
+        "requested_model",
+        "reported_model",
+        "authentication",
+        "cleanup",
+        "approval",
+        "next_execution_authorized",
+    ] {
+        o.remove(key);
+    }
+    o.insert("schema".into(), json!("nova.relay.summary/1"));
+    serde_json::from_value(v).map_err(|_| "SCHEMA_REJECTED")
+}
+pub fn real_summary_value(store: &Store, s: &RelaySummary) -> Result<Value> {
+    let p = store.relay_plan()?;
+    let r = p.mode.record().ok_or("REAL_PILOT_NOT_AUTHORIZED")?;
+    let mut v = serde_json::to_value(s).map_err(|_| "ENCODING")?;
+    v["schema"] = json!("nova.relay.summary/2");
+    v["run_mode"] = json!("REAL_PILOT_ONCE");
+    v["next_execution_authorized"] = json!(false);
+    v["requested_model"] =
+        json!({"source":"TOOL_ARGV","DEVELOP":r.core.model_develop,"REVIEW":r.core.model_review});
+    v["reported_model"] = json!({"source":"UNKNOWN","value":null});
+    v["approval"] = json!({"source":"HUMAN_ATTESTED","approval_id":r.approval.approval_id,"file_hash":{"source":"TOOL_FILE_HASH","value":r.approval_file_sha256}});
+    let metadata: Vec<Value> = s
+        .facts
+        .iter()
+        .filter_map(|a| {
+            a.usage_json
+                .as_ref()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        })
+        .collect();
+    v["cleanup"] = json!(metadata.iter().map(|v| &v["cleanup"]).collect::<Vec<_>>());
+    v["reported_model"] = json!({"DEVELOP":metadata.first().map(|v|v["reported_model"].clone()).unwrap_or(json!({"source":"UNKNOWN","value":null})),"REVIEW":metadata.get(1).map(|v|v["reported_model"].clone()).unwrap_or(json!({"source":"UNKNOWN","value":null}))});
+    v["authentication"] = json!({"expected_source":"HUMAN_ATTESTED","expected":r.approval.tools.iter().map(|t|&t.auth_category).collect::<Vec<_>>(),"eligibility":metadata.first().map(|m|m["auth_eligibility"].clone()).unwrap_or(json!({"source":"UNKNOWN"})),"actual_route":{"source":"UNKNOWN","value":null}});
+    Ok(v)
+}
+pub fn status_real(store: &Store) -> Result<Value> {
+    real_summary_value(store, &status(store)?)
+}
+/// Not Clone/Copy/serializable. Only the validated entry and cfg(test) injection can create it.
+pub struct RealPilotPermit {
+    record: RealPlanRecord,
+    end: Instant,
+    guards: Vec<Guard>,
+    eligibility: Vec<EligibilityReceipt>,
+}
+impl RealPilotPermit {
+    pub fn check_record(&self, r: &RealPlanRecord) -> Result<()> {
+        if relay_encoded(r)? != relay_encoded(&self.record)? || Instant::now() >= self.end {
+            return Err("APPROVAL_MISMATCH");
+        }
+        r.approval.check_time(chrono::Utc::now())?;
+        if self.eligibility.len() != 2 {
+            return Err("AUTH_ELIGIBILITY_MISMATCH");
+        }
+        for g in &self.guards {
+            g.verify()?;
+        }
+        Ok(())
+    }
+    pub fn verify_tool(&self, g: &Guard) -> Result<()> {
+        if self
+            .guards
+            .iter()
+            .skip(1)
+            .any(|h| h.path == g.path && h.identity == g.identity)
+        {
+            g.verify()
+        } else {
+            Err("TOOL_HASH_MISMATCH")
+        }
+    }
+    pub fn record(&self) -> &RealPlanRecord {
+        &self.record
+    }
+    pub fn end(&self) -> Instant {
+        self.end
+    }
+    pub fn qualify<P: EligibilityProbe>(&mut self, p: &mut P) -> Result<()> {
+        if !self.eligibility.is_empty() {
+            return Err("APPROVAL_ALREADY_USED");
+        }
+        for role in [RelayRole::Develop, RelayRole::Review] {
+            self.record.approval.check_time(chrono::Utc::now())?;
+            if Instant::now() >= self.end {
+                return Err("AUTH_ELIGIBILITY_DEADLINE");
+            }
+            let e = p.probe(
+                role,
+                (Instant::now() + Duration::from_secs(30)).min(self.end),
+            )?;
+            let expected = self.record.approval.tools[usize::from(role == RelayRole::Review)]
+                .auth_category
+                .as_str();
+            if e.exit_code != Some(0)
+                || e.category != expected
+                || e.stdout_bytes > 4096
+                || e.stderr_bytes > 4096
+            {
+                return Err("AUTH_ELIGIBILITY_MISMATCH");
+            }
+            self.eligibility.push(e);
+        }
+        Ok(())
+    }
+}
+pub trait EligibilityProbe {
+    fn probe(&mut self, role: RelayRole, end: Instant) -> Result<EligibilityReceipt>;
+}
+pub fn authorize_real_once(
+    core: RealPlanCore,
+    approval: RealPilotApproval,
+    approval_raw: &[u8],
+    receipt: BuildReceipt,
+    receipt_raw: &[u8],
+    origin: Instant,
+) -> Result<RealPilotPermit> {
+    let original: RealPilotApproval = relay_json(approval_raw, 16384)?;
+    if relay_encoded(&original)? != relay_encoded(&approval)? {
+        return Err("APPROVAL_MISMATCH");
+    }
+    let original_receipt: BuildReceipt = relay_json(receipt_raw, 16384)?;
+    if relay_encoded(&original_receipt)? != relay_encoded(&receipt)? {
+        return Err("BUILD_RECEIPT_MISMATCH");
+    }
+    approval.validate(&core)?;
+    approval.check_time(chrono::Utc::now())?;
+    receipt.validate(&approval, receipt_raw)?;
+    super::cli_adapter::validate_real_tools(&approval)?;
+    #[cfg(test)]
+    {
+        let _ = (core, approval, origin);
+        return Err("REAL_DRIVER_DISABLED_IN_TEST");
+    }
+    #[cfg(not(test))]
+    {
+        let total = origin + Duration::from_millis(core.limits.total_ms);
+        let mut own = Guard::tool(&std::env::current_exe().map_err(|_| "SELF_PATH")?)?;
+        own.verify_sha256_stream(
+            approval.controller.exe_bytes,
+            &approval.controller.exe_sha256,
+            (Instant::now() + Duration::from_secs(30)).min(total),
+        )?;
+        let mut guards = vec![own];
+        for t in &approval.tools {
+            let mut g = Guard::tool(Path::new(&t.exe_path))?;
+            g.verify_sha256_stream(
+                t.exe_bytes,
+                &t.exe_sha256,
+                (Instant::now() + Duration::from_secs(30)).min(total),
+            )?;
+            guards.push(g);
+        }
+        let record = RealPlanRecord {
+            schema: "nova.relay.plan/2".into(),
+            core,
+            approval: approval.clone(),
+            approval_file_sha256: hash(approval_raw),
+            build_receipt_sha256: hash(receipt_raw),
+        };
+        record.validate()?;
+        Ok(RealPilotPermit {
+            record,
+            end: total,
+            guards,
+            eligibility: vec![],
+        })
+    }
+}
+
+pub fn run_real_once<D: Driver>(
+    store: &Store,
+    driver: &mut D,
+    permit: RealPilotPermit,
+) -> Result<Value> {
+    permit.check_record(
+        store
+            .relay_plan()?
+            .mode
+            .record()
+            .ok_or("REAL_PILOT_NOT_AUTHORIZED")?,
+    )?;
+    let s = run_mode(store, driver, Some(&permit))?;
+    real_summary_value(store, &s)
+}
+/// Fixed post-run exception preserves the original outcome; never overwrites summary.
+pub fn post_run_failure(store: &Store, outcome: Value) -> Value {
+    let persisted=(||{let p=store.relay_plan()?;let digest=read_file(&p.run_root.join("summary.json"),262144).ok().map(|(b,_)|hash(&b));save_new(&p,"post-run-errors.json",&serde_json::to_vec(&json!({"schema":"nova.relay.post-run-errors/1","error_code":"HANDLER_UNREGISTER","summary_sha256":digest})).map_err(|_|"ENCODING")?)})().is_ok();
+    json!({"schema":"nova.relay.run-outcome/1","outcome":outcome,"post_run_errors":["HANDLER_UNREGISTER"],"next_action":"PM_REQUIRED","next_execution_authorized":false,"persisted":persisted})
+}
+
+#[cfg(test)]
+pub(super) fn permit_for_test(record: RealPlanRecord) -> Result<RealPilotPermit> {
+    record.validate()?;
+    super::cli_adapter::validate_real_tools(&record.approval)?;
+    Ok(RealPilotPermit {
+        end: Instant::now() + Duration::from_millis(record.core.limits.total_ms),
+        record,
+        guards: vec![],
+        eligibility: vec![],
+    })
+}
+
+/// Close is an injectable result boundary, not permission to perform another action.
+pub fn finish_run(store: &Store, outcome: Result<Value>, close: Result<()>) -> Result<Value> {
+    if close.is_ok() {
+        outcome
+    } else {
+        Ok(post_run_failure(
+            store,
+            match outcome {
+                Ok(v) => v,
+                Err(e) => json!({"error_code":e}),
+            },
+        ))
+    }
 }

@@ -176,6 +176,20 @@ try {
  $again=Output-Json 'relay-no-replay';if(($out.facts|ConvertTo-Json -Depth 20 -Compress) -cne ($again.facts|ConvertTo-Json -Depth 20 -Compress)){throw 'RELAY_REPLAY'}
  if((Get-FileHash $target -Algorithm SHA256).Hash.ToLowerInvariant() -cne $fixtureHash){throw 'CANDIDATE_APPLIED'}
  if((Invoke-Fixed 'v2-history-not-cloned' $relay @('relay-init','--workspace',(Join-Path $EvidenceDirectory 'never-copy'),'--source',$v2,'--plan',$plan,'--run-root',(Join-Path $EvidenceDirectory 'never-copy-run'))) -ne 2 -or (Output-Json 'v2-history-not-cloned').error_code -cne 'SOURCE_REGISTRATION_NOT_FRESH' -or (Test-Path (Join-Path $EvidenceDirectory 'never-copy'))){throw 'HISTORY_CLONE_NOT_REJECTED'}
+
+ $stage='PILOT_PREAPPROVAL_NEGATIVES'
+ # Deliberately invalid: never a valid approval for this controller or either model.
+ $pilotWorkspace=Join-Path $EvidenceDirectory 'pilot-never-created'
+ $pilotRun=Join-Path $EvidenceDirectory 'pilot-run-never-created'
+ $approvalPath=Join-Path $EvidenceDirectory 'expired-invalid-approval.json'
+ $pilotArgs=@('relay-pilot-once','--source',$owned,'--workspace',$pilotWorkspace,'--plan',(Join-Path $EvidenceDirectory 'nonexistent-core.json'),'--approval',$approvalPath,'--build-receipt',(Join-Path $EvidenceDirectory 'nonexistent-build.json'),'--run-root',$pilotRun)
+ $code=Invoke-Fixed 'pilot-approval-missing' $relay $pilotArgs
+ $v=Output-Json 'pilot-approval-missing'
+ if($code -ne 2 -or $v.error_code -cne 'APPROVAL_MISSING' -or $v.tool_reads_started -isnot [bool] -or $v.tool_reads_started -or $v.next_execution_authorized -isnot [bool] -or $v.next_execution_authorized -or $v.residuals.Count -ne 0 -or (Test-Path $pilotWorkspace) -or (Test-Path $pilotRun)){throw 'PILOT_MISSING_NOT_PRETOOL'}
+ Write-Json $approvalPath @{schema='nova.relay.real-approval/1';attestation='HUMAN_ATTESTED';approval_id=('0'*32);pm_task_ref='INVALID EXPIRED MOCK TEST ONLY';approver_note='NOT AN APPROVAL';issued_utc='2000-01-01T00:00:00Z';expires_utc='2000-01-01T01:00:00Z';plan_core_sha256=('0'*64);controller=@{source_sha=('0'*40);build_receipt_sha256=('0'*64);exe_sha256=('0'*64);exe_bytes=1;cargo_profile='dev';features=@('scheduler-validation')};roots=@{source_registration=$owned;workspace=$pilotWorkspace;run_root=$pilotRun};tools=@();limits=@{stage_ms=1;total_ms=60000};billing=@{route='SUBSCRIPTION_ONLY';extra_usage_allowed=$false;hard_cap_claimed=$false};single_use=$true}
+ $code=Invoke-Fixed 'pilot-approval-expired' $relay $pilotArgs
+ $v=Output-Json 'pilot-approval-expired'
+ if($code -ne 2 -or $v.error_code -cne 'APPROVAL_EXPIRED' -or $v.tool_reads_started -isnot [bool] -or $v.tool_reads_started -or $v.next_execution_authorized -isnot [bool] -or $v.next_execution_authorized -or $v.residuals.Count -ne 0 -or (Test-Path $pilotWorkspace) -or (Test-Path $pilotRun)){throw 'PILOT_EXPIRED_NOT_PRETOOL'}
  $verdict='PASS'
 } finally {
  $inventory=@(Get-ChildItem -LiteralPath $EvidenceDirectory -File | Where-Object {$_.Extension -eq '.log'} | ForEach-Object {@{name=$_.Name;bytes=$_.Length;sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}})

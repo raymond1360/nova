@@ -18,6 +18,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub const TOOL_HASH_CAP: u64 = 512 * 1024 * 1024;
 pub struct Guard {
     file: File,
     pub path: PathBuf,
@@ -137,6 +138,66 @@ impl Guard {
             return Err("FILE_CHANGED");
         }
         Ok(())
+    }
+    pub fn verify_sha256_stream(
+        &mut self,
+        bytes: u64,
+        expected: &str,
+        end: std::time::Instant,
+    ) -> Result<()> {
+        if !hex(expected, 64) || self.sha256_stream(bytes, end)? != expected {
+            return Err("TOOL_HASH_MISMATCH");
+        }
+        Ok(())
+    }
+    pub fn sha256_stream(
+        &mut self,
+        expected_bytes: u64,
+        end: std::time::Instant,
+    ) -> Result<String> {
+        use std::io::{Seek, SeekFrom};
+        if expected_bytes > TOOL_HASH_CAP {
+            return Err("FILE_BOUND");
+        }
+        let before = self.file.metadata().map_err(|_| "FILE_STAT")?;
+        if !before.is_file() || before.len() != expected_bytes {
+            return Err("TOOL_SIZE_MISMATCH");
+        }
+        self.verify()?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| "FILE_READ")?;
+        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+        let mut buf = vec![0u8; 1048576];
+        let mut count = 0u64;
+        loop {
+            if std::time::Instant::now() >= end {
+                return Err("TOOL_HASH_DEADLINE");
+            }
+            let n = self.file.read(&mut buf).map_err(|_| "FILE_READ")?;
+            if n == 0 {
+                break;
+            }
+            count = count.checked_add(n as u64).ok_or("FILE_BOUND")?;
+            if count > expected_bytes {
+                return Err("FILE_CHANGED");
+            }
+            ctx.update(&buf[..n]);
+        }
+        let after = self.file.metadata().map_err(|_| "FILE_STAT")?;
+        self.verify()?;
+        if count != expected_bytes
+            || after.len() != before.len()
+            || before.modified().ok() != after.modified().ok()
+        {
+            return Err("FILE_CHANGED");
+        }
+        Ok(ctx
+            .finish()
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect())
     }
     pub fn bytes(&mut self, limit: usize) -> Result<Vec<u8>> {
         let before = self.file.metadata().map_err(|_| "FILE_STAT")?;
@@ -260,7 +321,7 @@ impl Store {
     }
     // Fixed fault points only accessible to this crate's tests; never an input/CLI flag.
     fn init_stage(root: &Path, m: &Manifest, e: &Envelope, fault: u8) -> Result<Self> {
-        Self::init_version(root, m, e, fault, 1)
+        Self::init_version(root, m, e, fault, 1, None)
     }
     fn init_version(
         root: &Path,
@@ -268,6 +329,7 @@ impl Store {
         e: &Envelope,
         fault: u8,
         version: i64,
+        created: Option<&mut bool>,
     ) -> Result<Self> {
         m.validate()?;
         safe_location(root)?;
@@ -293,6 +355,9 @@ impl Store {
             let _ = Guard::open(Path::new(r), true)?;
         }
         fs::create_dir(root).map_err(|_| "CREATE_NEW_REJECTED")?;
+        if let Some(flag) = created {
+            *flag = true;
+        }
         let rg = Guard::open(root, true)?;
         new_file(&root.join("handoff.sqlite3"), &[])?;
         let dg = Guard::open(&root.join("handoff.sqlite3"), true)?;
@@ -1112,12 +1177,13 @@ impl LaunchPermit {
 pub struct StoredPlan {
     pub id: String,
     pub plan: RelayPlan,
+    pub mode: PlanMode,
     pub run_root: PathBuf,
     pub run_identity: String,
 }
 impl Store {
     pub fn relay_init(root: &Path, m: &Manifest, e: &Envelope) -> Result<Self> {
-        Self::init_version(root, m, e, 0, 2)
+        Self::init_version(root, m, e, 0, 2, None)
     }
     pub fn relay_require_v2(&self) -> Result<()> {
         let c = self.read_connection()?;
@@ -1136,6 +1202,31 @@ impl Store {
         if !p.mock {
             return Err("REAL_PILOT_NOT_AUTHORIZED");
         }
+        self.relay_bind_mode(PlanMode::Mock(p.clone()), run_root, None)
+    }
+    pub fn relay_bind_real(
+        &self,
+        record: &RealPlanRecord,
+        permit: &super::relay::RealPilotPermit,
+    ) -> Result<StoredPlan> {
+        permit.check_record(record)?;
+        if self.root.to_string_lossy() != record.approval.roots.workspace {
+            return Err("APPROVAL_MISMATCH");
+        }
+        self.relay_bind_mode(
+            PlanMode::RealPilot(record.clone()),
+            Path::new(&record.approval.roots.run_root),
+            None,
+        )
+    }
+    fn relay_bind_mode(
+        &self,
+        mode: PlanMode,
+        run_root: &Path,
+        created: Option<&mut bool>,
+    ) -> Result<StoredPlan> {
+        self.relay_require_v2()?;
+        let p = mode.common();
         p.validate()?;
         let snap = self.snapshot()?;
         if !snap.manifest.allowed_paths.contains(&p.target_path) {
@@ -1166,8 +1257,14 @@ impl Store {
             return Err("PLAN_EXISTS");
         }
         fs::create_dir(run_root).map_err(|_| "CREATE_NEW_REJECTED")?;
+        if let Some(flag) = created {
+            *flag = true;
+        }
         let guard = Guard::open(run_root, true)?;
-        let encoded = encoded(p)?;
+        let encoded = match &mode {
+            PlanMode::Mock(p) => encoded(p)?,
+            PlanMode::RealPilot(p) => encoded(p)?,
+        };
         let digest = hash(encoded.as_bytes());
         let id = digest.clone();
         let db = self.write_connection()?;
@@ -1179,7 +1276,7 @@ impl Store {
                 return Err("REGISTRATION_CHANGED");
             }
             sql(db.conn().execute(
-                "INSERT INTO relay_plans VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8)",
+                "INSERT INTO relay_plans VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                 params![
                     id,
                     p.package_id,
@@ -1188,6 +1285,7 @@ impl Store {
                     p.registration_revision,
                     guard.path.to_string_lossy(),
                     guard.identity,
+                    i64::from(!mode.is_real()),
                     chrono::Utc::now().to_rfc3339()
                 ],
             ))?;
@@ -1206,11 +1304,34 @@ impl Store {
         self.relay_require_v2()?;
         let c = self.read_connection()?;
         let (id,pkg,text,digest,revision,path,identity,mock):(String,String,String,String,i64,String,String,i64)=sql(c.query_row("SELECT plan_id,package_id,plan_json,plan_sha256,registration_revision,run_root,run_root_identity,mock FROM relay_plans",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))))?;
-        let p: RelayPlan = relay_json(text.as_bytes(), 65536)?;
-        if !p.mock {
-            return Err("REAL_PILOT_NOT_AUTHORIZED");
-        }
-        p.validate()?;
+        let value: Value = relay_json(text.as_bytes(), 65536)?;
+        let mode = match value["schema"].as_str() {
+            Some("nova.relay.plan/1") => {
+                let p: RelayPlan = relay_json(text.as_bytes(), 65536)?;
+                if !p.mock {
+                    return Err("REAL_PILOT_NOT_AUTHORIZED");
+                }
+                p.validate()?;
+                if mock != 1 {
+                    return Err("BINDING_MISMATCH");
+                }
+                PlanMode::Mock(p)
+            }
+            Some("nova.relay.plan/2") => {
+                let r: RealPlanRecord = relay_json(text.as_bytes(), 65536)?;
+                r.validate()?;
+                super::cli_adapter::validate_real_tools(&r.approval)?;
+                if mock != 0
+                    || r.approval.roots.workspace != self.root.to_string_lossy()
+                    || r.approval.roots.run_root != path
+                {
+                    return Err("BINDING_MISMATCH");
+                }
+                PlanMode::RealPilot(r)
+            }
+            _ => return Err("SCHEMA_REJECTED"),
+        };
+        let p = mode.common();
         let snap = self.snapshot()?;
         if hash(text.as_bytes()) != digest
             || id != digest
@@ -1218,7 +1339,6 @@ impl Store {
             || pkg != snap.manifest.package_id
             || revision != p.registration_revision
             || mock != i64::from(p.mock)
-            || !p.mock
         {
             return Err("BINDING_MISMATCH");
         }
@@ -1227,6 +1347,7 @@ impl Store {
         Ok(StoredPlan {
             id,
             plan: p,
+            mode,
             run_root: PathBuf::from(path),
             run_identity: identity,
         })
@@ -1339,6 +1460,34 @@ impl Store {
         argv_hash: &str,
         env_hash: &str,
     ) -> Result<Reservation> {
+        if self.relay_plan()?.mode.is_real() {
+            return Err("REAL_PILOT_NOT_AUTHORIZED");
+        }
+        self.reserve_inner(role, input, parent, exe_hash, argv_hash, env_hash)
+    }
+    pub fn relay_reserve_real(
+        &self,
+        role: RelayRole,
+        input: &[u8],
+        parent: Option<&Attempt>,
+        exe_hash: &str,
+        argv_hash: &str,
+        env_hash: &str,
+        permit: &super::relay::RealPilotPermit,
+    ) -> Result<Reservation> {
+        let p = self.relay_plan()?;
+        permit.check_record(p.mode.record().ok_or("BINDING_MISMATCH")?)?;
+        self.reserve_inner(role, input, parent, exe_hash, argv_hash, env_hash)
+    }
+    fn reserve_inner(
+        &self,
+        role: RelayRole,
+        input: &[u8],
+        parent: Option<&Attempt>,
+        exe_hash: &str,
+        argv_hash: &str,
+        env_hash: &str,
+    ) -> Result<Reservation> {
         let p = self.relay_plan()?;
         let live = self.snapshot()?;
         let root = Guard::open(&p.run_root, true)?;
@@ -1370,7 +1519,7 @@ impl Store {
             }
             let base = super::relay::read_base(self, &p.plan)?;
             let proposal = actual.model_claim_json.as_ref().ok_or("SCHEMA_REJECTED")?;
-            let (_, review) = super::relay::prepare_review(&p.plan, &base, proposal.as_bytes())?;
+            let (_, review) = super::relay::prepare_mode_review(&p, &base, proposal.as_bytes())?;
             if review != input
                 || super::relay::bound_review(actual, &p.id)?.map(|(_, h)| h) != Some(hash(input))
             {
@@ -1378,7 +1527,7 @@ impl Store {
             }
         } else if parent.is_some() {
             return Err("BINDING_MISMATCH");
-        } else if super::relay::develop_input(&p.plan, &super::relay::read_base(self, &p.plan)?)?
+        } else if super::relay::develop_mode_input(&p, &super::relay::read_base(self, &p.plan)?)?
             != input
         {
             return Err("BINDING_MISMATCH");
@@ -1439,6 +1588,20 @@ impl Store {
         Ok(Reservation { attempt: a })
     }
     pub fn relay_launching(&self, r: Reservation) -> Result<LaunchPermit> {
+        if self.relay_plan()?.mode.is_real() {
+            return Err("REAL_PILOT_NOT_AUTHORIZED");
+        }
+        self.launching_inner(r)
+    }
+    pub fn relay_launching_real(
+        &self,
+        r: Reservation,
+        permit: &super::relay::RealPilotPermit,
+    ) -> Result<LaunchPermit> {
+        permit.check_record(self.relay_plan()?.mode.record().ok_or("BINDING_MISMATCH")?)?;
+        self.launching_inner(r)
+    }
+    fn launching_inner(&self, r: Reservation) -> Result<LaunchPermit> {
         // Only new launch admission consults the live fixture; terminal/history CAS never does.
         let p = self.relay_plan()?;
         let live = self.snapshot()?;
@@ -1579,5 +1742,37 @@ fn evidence_code(code: &str) -> &'static str {
         "EVIDENCE_ROOT_CHANGED" => "EVIDENCE_ROOT_CHANGED",
         "ENCODING" => "ENCODING",
         _ => "EVIDENCE_IO_ERROR",
+    }
+}
+
+impl Store {
+    pub fn relay_init_real(
+        root: &Path,
+        m: &Manifest,
+        e: &Envelope,
+        permit: &super::relay::RealPilotPermit,
+        created: &mut bool,
+    ) -> Result<Self> {
+        permit.check_record(permit.record())?;
+        if root.to_string_lossy() != permit.record().approval.roots.workspace {
+            return Err("APPROVAL_MISMATCH");
+        }
+        Self::init_version(root, m, e, 0, 2, Some(created))
+    }
+    pub fn relay_bind_real_tracked(
+        &self,
+        permit: &super::relay::RealPilotPermit,
+        created: &mut bool,
+    ) -> Result<StoredPlan> {
+        let record = permit.record();
+        permit.check_record(record)?;
+        if self.root.to_string_lossy() != record.approval.roots.workspace {
+            return Err("APPROVAL_MISMATCH");
+        }
+        self.relay_bind_mode(
+            PlanMode::RealPilot(record.clone()),
+            Path::new(&record.approval.roots.run_root),
+            Some(created),
+        )
     }
 }

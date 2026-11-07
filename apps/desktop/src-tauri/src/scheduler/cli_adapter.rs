@@ -187,6 +187,7 @@ impl Spec {
 pub struct Parser {
     role: RelayRole,
     session: String,
+    metadata: bool,
     pending: Vec<u8>,
     total: usize,
     first: bool,
@@ -205,6 +206,7 @@ impl Parser {
         Self {
             role,
             session: session.into(),
+            metadata: false,
             pending: vec![],
             total: 0,
             first: false,
@@ -220,6 +222,14 @@ impl Parser {
         }
     }
     pub fn feed(&mut self, b: &[u8]) -> Result<()> {
+        if self.metadata {
+            if self.pending.len() + b.len() > 4096 {
+                return Err("BOUND");
+            }
+            self.pending.extend_from_slice(b);
+            return Ok(());
+        }
+
         self.total = self.total.checked_add(b.len()).ok_or("BOUND")?;
         if self.total > 8388608 {
             return Err("BOUND");
@@ -399,6 +409,17 @@ impl Parser {
         Ok(())
     }
     pub fn finish(mut self, exit: Option<i64>) -> Execution {
+        if self.metadata {
+            let mut e = Execution::failed(if exit == Some(0) {
+                "SUCCESS"
+            } else {
+                "RESULT_ERROR"
+            });
+            e.created = true;
+            e.natural = true;
+            e.exit_code = exit;
+            return e;
+        }
         let mut e = Execution::failed("TERMINAL_MISSING");
         e.created = true;
         e.natural = true;
@@ -486,6 +507,8 @@ fn raw_field(line: &[u8], key: &str) -> Result<Option<Vec<u8>>> {
 pub struct NativeDriver {
     fake: PathBuf,
     fake_hash: String,
+    streamed_identity: Option<String>,
+    metadata: bool,
     _guard: Guard,
     pub cancel: Arc<AtomicBool>,
     #[cfg(test)]
@@ -511,6 +534,8 @@ impl NativeDriver {
         Ok(Self {
             fake: g.path.clone(),
             fake_hash: h,
+            streamed_identity: None,
+            metadata: false,
             _guard: g,
             cancel: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -563,7 +588,7 @@ impl NativeDriver {
 impl Driver for NativeDriver {
     fn prepare(
         &mut self,
-        p: &RelayPlan,
+        p: &PlanView<'_>,
         role: RelayRole,
         root: &Path,
         _input: &[u8],
@@ -843,7 +868,7 @@ mod native {
         err: Option<File>,
     }
     impl Tree {
-        fn create(s: &Spec, end: Instant) -> Result<Self> {
+        fn create(s: &Spec, end: Instant, streamed: Option<&str>) -> Result<Self> {
             let _serial = loop {
                 match SPAWN.try_lock() {
                     Ok(g) => break g,
@@ -858,7 +883,11 @@ mod native {
             };
             unsafe {
                 let mut g = Guard::tool(&s.exe)?;
-                if hash(&g.bytes(16777216)?) != s.exe_sha256 {
+                if if let Some(id) = streamed {
+                    g.identity != id
+                } else {
+                    hash(&g.bytes(16777216)?) != s.exe_sha256
+                } {
                     return Err("BINDING_MISMATCH");
                 }
                 let job = H(CreateJobObjectW(null(), null()));
@@ -1106,8 +1135,10 @@ mod native {
         writer: Option<JoinHandle<bool>>,
     }
     impl Session {
-        fn cleanup(&mut self, hard: Instant) -> bool {
-            if !self.tree.confirmed() {
+        fn cleanup(&mut self, hard: Instant) -> CleanupReceipt {
+            let (_, active_before, root_exited_before) = self.tree.query();
+            let terminated = !self.tree.confirmed();
+            if terminated {
                 self.tree.kill()
             }
             let job_end = (Instant::now() + Duration::from_secs(5)).min(hard);
@@ -1132,7 +1163,13 @@ mod native {
                     _ => self.writer.as_ref().is_none_or(|h| h.is_finished()),
                 };
             }
-            job && readers
+            CleanupReceipt {
+                root_exited_before,
+                active_before,
+                terminated,
+                job_confirmed: job,
+                readers_finished: readers,
+            }
         }
     }
     impl Drop for Session {
@@ -1168,7 +1205,7 @@ mod native {
         if Instant::now() >= end {
             return Execution::failed("DEADLINE");
         }
-        let tree = match Tree::create(s, end) {
+        let tree = match Tree::create(s, end, driver.streamed_identity.as_deref()) {
             Ok(t) => t,
             Err(c) => {
                 let mut result = Execution::failed(match c {
@@ -1211,12 +1248,14 @@ mod native {
         result.process_creation_utc = Some(session.tree.created.clone());
         let (tx, rx) = mpsc::sync_channel::<&'static str>(4);
         if error.is_none() {
+            let metadata = driver.metadata;
             let mut out = session.tree.out.take().unwrap();
             let role = s.role;
             let id = s.session.clone();
             let t = tx.clone();
             session.out = Some(thread::spawn(move || {
                 let mut p = Parser::new(role, &id);
+                p.metadata = metadata;
                 let mut data = vec![];
                 let mut buf = [0u8; 8192];
                 let mut fail = None;
@@ -1224,7 +1263,10 @@ mod native {
                     match out.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            let keep = n.min(8388608usize.saturating_sub(data.len()));
+                            let keep = n.min(
+                                (if metadata { 4096usize } else { 8388608usize })
+                                    .saturating_sub(data.len()),
+                            );
                             data.extend_from_slice(&buf[..keep]);
                             if let Err(c) = p.feed(&buf[..n]) {
                                 let _ = t.try_send(c);
@@ -1251,7 +1293,10 @@ mod native {
                     match err.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            let keep = n.min(1048576usize.saturating_sub(data.len()));
+                            let keep = n.min(
+                                (if metadata { 4096usize } else { 1048576usize })
+                                    .saturating_sub(data.len()),
+                            );
                             data.extend_from_slice(&buf[..keep]);
                             if keep < n {
                                 ok = false;
@@ -1310,7 +1355,9 @@ mod native {
             session.tree.err.take();
         }
         let observed = session.cleanup(hard);
-        let reclaimed = observed && fault != Some("reclaim");
+        let reclaimed =
+            observed.job_confirmed && observed.readers_finished && fault != Some("reclaim");
+        result.cleanup = Some(observed.clone());
         result.exit_code = session.tree.code();
         result.reclaim = if reclaimed { "CONFIRMED" } else { "UNKNOWN" }.into();
         if reclaimed {
@@ -1325,6 +1372,7 @@ mod native {
                                 parsed.process_creation_utc = result.process_creation_utc;
                                 parsed.stdout = result.stdout;
                                 parsed.natural = result.natural;
+                                parsed.cleanup = Some(observed.clone());
                                 result = parsed
                             }
                             Err(c) => error = Some(c),
@@ -1506,4 +1554,432 @@ pub fn isolated_environment_check() -> Result<()> {
 #[cfg(not(windows))]
 pub fn isolated_environment_check() -> Result<()> {
     Err("WINDOWS_REQUIRED")
+}
+
+/// Only this immutable table is eligible for a real pilot. No PATH or caller exe override.
+pub struct RealTool {
+    pub role: RelayRole,
+    pub profile_id: &'static str,
+    pub exe_path: &'static str,
+    pub exe_bytes: u64,
+    pub exe_sha256: &'static str,
+}
+pub const REAL_TOOLS: [RealTool; 2] = [
+    RealTool {
+        role: RelayRole::Develop,
+        profile_id: DEVELOP_PROFILE,
+        exe_path: r"C:\Users\Lenovo\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe",
+        exe_bytes: 333479728,
+        exe_sha256: DEVELOP_HASH,
+    },
+    RealTool {
+        role: RelayRole::Review,
+        profile_id: REVIEW_PROFILE,
+        exe_path: r"C:\Users\Lenovo\AppData\Local\Claude-3p\claude-code\2.1.197\claude.exe",
+        exe_bytes: 236121248,
+        exe_sha256: REVIEW_HASH,
+    },
+];
+pub fn validate_real_tools(a: &RealPilotApproval) -> Result<()> {
+    if a.tools.len() != 2 {
+        return Err("APPROVAL_MISMATCH");
+    }
+    for (t, e) in a.tools.iter().zip(REAL_TOOLS.iter()) {
+        if t.role != e.role
+            || t.profile_id != e.profile_id
+            || t.exe_path != e.exe_path
+            || t.exe_bytes != e.exe_bytes
+            || t.exe_sha256 != e.exe_sha256
+        {
+            return Err("APPROVAL_MISMATCH");
+        }
+    }
+    Ok(())
+}
+pub fn validate_real_argv(args: &[String]) -> Result<()> {
+    for a in args {
+        if [
+            "--fallback-model",
+            "--continue",
+            "--resume",
+            "-c",
+            "--config",
+            "--profile",
+            "--oss",
+            "--api-key",
+            "--settings",
+            "--add-dir",
+            "--max-budget-usd",
+        ]
+        .contains(&a.split('=').next().unwrap_or(a))
+            || a.starts_with("--dangerously")
+            || a.contains("://")
+        {
+            return Err("ARGUMENT_REJECTED");
+        }
+    }
+    Ok(())
+}
+pub fn real_observations(e: &Execution, s: &Spec) -> Vec<String> {
+    let mut u = vec![];
+    let requested = s
+        .argv
+        .windows(2)
+        .find(|w| w[0] == "-m" || w[0] == "--model")
+        .map(|w| w[1].as_str());
+    match &e.reported_model {
+        Some(m) if Some(m.as_str()) != requested => u.push("MODEL_REPORT_MISMATCH".into()),
+        None => u.push("MODEL_REPORT_UNVERIFIED".into()),
+        _ => {}
+    }
+    match &e.reported_auth {
+        Some(a)
+            if a != if s.role == RelayRole::Develop {
+                "CODEX_CHATGPT"
+            } else {
+                "CLAUDE_AI_SUBSCRIPTION"
+            } =>
+        {
+            u.push("AUTH_ROUTE_MISMATCH".into())
+        }
+        None => u.push("AUTH_ROUTE_UNVERIFIED".into()),
+        _ => {}
+    }
+    u
+}
+pub fn classify_eligibility(
+    role: RelayRole,
+    code: Option<i64>,
+    out: &[u8],
+    err: &[u8],
+) -> Result<EligibilityReceipt> {
+    if out.len() > 4096 || err.len() > 4096 {
+        return Err("BOUND");
+    }
+    let category = if role == RelayRole::Develop {
+        let t = std::str::from_utf8(err).map_err(|_| "AUTH_ELIGIBILITY_MISMATCH")?;
+        if code == Some(0) && t.trim() == "Logged in using ChatGPT" {
+            "CODEX_CHATGPT"
+        } else {
+            "UNKNOWN"
+        }
+    } else {
+        let v: Value = relay_json(out, 4096)?;
+        if code == Some(0)
+            && v["loggedIn"] == true
+            && v["authMethod"] == "claude.ai"
+            && v["apiProvider"] == "firstParty"
+        {
+            "CLAUDE_AI_SUBSCRIPTION"
+        } else {
+            "UNKNOWN"
+        }
+    };
+    Ok(EligibilityReceipt {
+        exit_code: code,
+        category: category.into(),
+        stdout_bytes: out.len() as u64,
+        stderr_bytes: err.len() as u64,
+    })
+}
+pub struct RealDriver {
+    inner: NativeDriver,
+    tools: Vec<Guard>,
+    core: RealPlanCore,
+    eligibility_root: PathBuf,
+    run_root: PathBuf,
+    end: Instant,
+}
+impl RealDriver {
+    #[cfg(not(test))]
+    pub fn new(p: &super::relay::RealPilotPermit) -> Result<Self> {
+        let r = p.record();
+        validate_real_tools(&r.approval)?;
+        let mut tools = vec![];
+        for t in &r.approval.tools {
+            let g = Guard::tool(Path::new(&t.exe_path))?;
+            p.verify_tool(&g)?;
+            tools.push(g);
+        }
+        let g = Guard::tool(&tools[0].path)?;
+        let inner = NativeDriver {
+            fake: g.path.clone(),
+            fake_hash: DEVELOP_HASH.into(),
+            _guard: g,
+            streamed_identity: Some(tools[0].identity.clone()),
+            metadata: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            #[cfg(windows)]
+            residuals: vec![],
+        };
+        Ok(Self {
+            inner,
+            tools,
+            core: r.core.clone(),
+            run_root: PathBuf::from(&r.approval.roots.run_root),
+            end: p.end(),
+            eligibility_root: Path::new(&r.approval.roots.run_root)
+                .parent()
+                .ok_or("PATH_REJECTED")?
+                .join(format!("eligibility-{}", r.approval.approval_id)),
+        })
+    }
+    #[cfg(test)]
+    pub fn new(_: &super::relay::RealPilotPermit) -> Result<Self> {
+        Err("REAL_DRIVER_DISABLED_IN_TEST")
+    }
+    #[cfg(test)]
+    pub fn with_tools_for_test(
+        tools: Vec<Guard>,
+        core: RealPlanCore,
+        root: PathBuf,
+    ) -> Result<Self> {
+        if tools.len() != 2 {
+            return Err("APPROVAL_MISMATCH");
+        }
+        let g = Guard::tool(&tools[0].path)?;
+        Ok(Self {
+            inner: NativeDriver {
+                fake: g.path.clone(),
+                fake_hash: "0".repeat(64),
+                _guard: g,
+                streamed_identity: Some(tools[0].identity.clone()),
+                metadata: false,
+                cancel: Arc::new(AtomicBool::new(false)),
+                fault: None,
+                #[cfg(windows)]
+                residuals: vec![],
+            },
+            tools,
+            core,
+            run_root: root.clone(),
+            end: Instant::now() + Duration::from_secs(600),
+            eligibility_root: root,
+        })
+    }
+    fn select(&mut self, role: RelayRole) -> Result<()> {
+        let i = usize::from(role == RelayRole::Review);
+        let g = &self.tools[i];
+        g.verify()?;
+        self.inner._guard = Guard::tool(&g.path)?;
+        self.inner.fake = g.path.clone();
+        self.inner.fake_hash = REAL_TOOLS[i].exe_sha256.into();
+        self.inner.streamed_identity = Some(g.identity.clone());
+        Ok(())
+    }
+}
+impl Driver for RealDriver {
+    fn prepare(
+        &mut self,
+        p: &PlanView<'_>,
+        role: RelayRole,
+        root: &Path,
+        _input: &[u8],
+    ) -> Result<Spec> {
+        if !p.mode.is_real()
+            || relay_encoded(&p.mode.record().ok_or("APPROVAL_MISMATCH")?.core)?
+                != relay_encoded(&self.core)?
+        {
+            return Err("APPROVAL_MISMATCH");
+        }
+        self.select(role)?;
+        self.inner.metadata = false;
+        let cwd = root.join(if role == RelayRole::Develop {
+            "develop-cwd"
+        } else {
+            "review-cwd"
+        });
+        fs::create_dir(&cwd).map_err(|_| "CREATE_NEW_REJECTED")?;
+        self.tools.push(Guard::open(&cwd, true)?);
+        if role == RelayRole::Develop {
+            fs::create_dir(root.join("tmp")).map_err(|_| "CREATE_NEW_REJECTED")?;
+            let mut f = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(root.join("proposal.schema.json"))
+                .map_err(|_| "EVIDENCE_CREATE_NEW")?;
+            f.write_all(proposal_schema().as_bytes())
+                .map_err(|_| "EVIDENCE_WRITE")?;
+            f.sync_all().map_err(|_| "EVIDENCE_FLUSH")?;
+        }
+        let session = uuid::Uuid::new_v4().to_string();
+        let args = argv(
+            role,
+            root,
+            if role == RelayRole::Develop {
+                &p.model_develop
+            } else {
+                &p.model_review
+            },
+            &session,
+        );
+        validate_real_argv(&args)?;
+        let parent = ENV_ALLOW
+            .iter()
+            .filter_map(|k| {
+                std::env::var_os(k).map(|v| ((*k).into(), v.to_string_lossy().into_owned()))
+            })
+            .collect();
+        Ok(Spec {
+            role,
+            profile: if role == RelayRole::Develop {
+                p.develop_profile.clone()
+            } else {
+                p.review_profile.clone()
+            },
+            exe: self.inner.fake.clone(),
+            exe_sha256: self.inner.fake_hash.clone(),
+            argv: args,
+            env: environment(&parent, root)?,
+            cwd,
+            session,
+        })
+    }
+    fn execute(
+        &mut self,
+        s: &Spec,
+        b: &[u8],
+        p: &LaunchPermit,
+        end: Instant,
+        running: &mut dyn FnMut(u32, String) -> Result<()>,
+    ) -> Execution {
+        let model = if s.role == RelayRole::Develop {
+            &self.core.model_develop
+        } else {
+            &self.core.model_review
+        };
+        let cwd = self.run_root.join(if s.role == RelayRole::Develop {
+            "develop-cwd"
+        } else {
+            "review-cwd"
+        });
+        if s.cwd != cwd
+            || s.argv != argv(s.role, &self.run_root, model, &s.session)
+            || p.attempt().argv_sha256 != s.argv_sha256()
+            || p.attempt().env_names_sha256 != s.env_names_sha256()
+            || validate_real_argv(&s.argv).is_err()
+        {
+            return Execution::failed("BINDING_MISMATCH");
+        }
+        self.inner.execute(s, b, p, end.min(self.end), running)
+    }
+}
+impl super::relay::EligibilityProbe for RealDriver {
+    fn probe(&mut self, role: RelayRole, end: Instant) -> Result<EligibilityReceipt> {
+        #[cfg(test)]
+        {
+            let _ = (role, end);
+            return Err("ELIGIBILITY_PROBE_DISABLED_IN_TEST");
+        }
+        #[cfg(not(test))]
+        {
+            self.select(role)?;
+            self.inner.metadata = true;
+            let _parent =
+                Guard::open(self.eligibility_root.parent().ok_or("PATH_REJECTED")?, true)?;
+            // Temporary sibling, never either approved create-new root. No recursive cleanup.
+            if role == RelayRole::Develop {
+                fs::create_dir(&self.eligibility_root).map_err(|_| "CREATE_NEW_REJECTED")?;
+                fs::create_dir(self.eligibility_root.join("tmp"))
+                    .map_err(|_| "CREATE_NEW_REJECTED")?;
+            }
+            let _eligibility = Guard::open(&self.eligibility_root, true)?;
+            let cwd = self.eligibility_root.join(role.name());
+            fs::create_dir(&cwd).map_err(|_| "CREATE_NEW_REJECTED")?;
+            let _cwd_guard = Guard::open(&cwd, true)?;
+            let parent = ENV_ALLOW
+                .iter()
+                .filter_map(|k| {
+                    std::env::var_os(k).map(|v| ((*k).into(), v.to_string_lossy().into_owned()))
+                })
+                .collect();
+            let args = if role == RelayRole::Develop {
+                vec!["--no-daemon", "login", "status"]
+            } else {
+                vec!["--safe-mode", "auth", "status", "--json"]
+            };
+            let s = Spec {
+                role,
+                profile: REAL_TOOLS[usize::from(role == RelayRole::Review)]
+                    .profile_id
+                    .into(),
+                exe: self.inner.fake.clone(),
+                exe_sha256: self.inner.fake_hash.clone(),
+                argv: args.into_iter().map(str::to_string).collect(),
+                env: environment(&parent, &self.eligibility_root)?,
+                cwd,
+                session: String::new(),
+            };
+            #[cfg(windows)]
+            {
+                let until = end
+                    .checked_sub(Duration::from_secs(15))
+                    .ok_or("AUTH_ELIGIBILITY_DEADLINE")?;
+                if Instant::now() >= until {
+                    return Err("AUTH_ELIGIBILITY_DEADLINE");
+                }
+                let e = native::execute(&mut self.inner, &s, b"", until, &mut |_, _| Ok(()));
+                if e.reclaim != "CONFIRMED" || e.terminal != "SUCCESS" {
+                    return Err("AUTH_ELIGIBILITY_DEADLINE");
+                }
+                let receipt = classify_eligibility(role, e.exit_code, &e.stdout, &e.stderr)?;
+                Ok(receipt)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (s, end);
+                Err("WINDOWS_REQUIRED")
+            }
+        }
+    }
+}
+
+pub fn cancel_requested() -> bool {
+    #[cfg(windows)]
+    {
+        CONSOLE_CANCEL.load(Ordering::Acquire)
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+/// Run-level admission validates driver output before any real-mode lease is written.
+pub fn validate_real_spec(
+    s: &Spec,
+    role: RelayRole,
+    r: &RealPlanRecord,
+    root: &Path,
+) -> Result<()> {
+    let i = usize::from(role == RelayRole::Review);
+    let t = &REAL_TOOLS[i];
+    let model = &r.approval.tools[i].model;
+    if s.role != role
+        || s.exe != Path::new(t.exe_path)
+        || s.exe_sha256 != t.exe_sha256
+        || s.profile != t.profile_id
+        || uuid::Uuid::parse_str(&s.session).is_err()
+        || s.cwd != root.join(if i == 0 { "develop-cwd" } else { "review-cwd" })
+        || s.argv != argv(role, root, model, &s.session)
+    {
+        return Err("BINDING_MISMATCH");
+    }
+    validate_real_argv(&s.argv)?;
+    for (k, v) in &s.env {
+        if forbidden_env(k)
+            || v.contains('\0')
+            || (!ENV_ALLOW.contains(&k.as_str()) && !["PATH", "TEMP", "TMP"].contains(&k.as_str()))
+        {
+            return Err("BINDING_MISMATCH");
+        }
+    }
+    let sr = s.env.get("SystemRoot").ok_or("SYSTEMROOT_MISSING")?;
+    if s.env.get("PATH") != Some(&format!("{sr}\\System32;{sr}"))
+        || s.env.get("TEMP") != root.join("tmp").to_str().map(|s| s.to_string()).as_ref()
+        || s.env.get("TMP") != s.env.get("TEMP")
+    {
+        return Err("BINDING_MISMATCH");
+    }
+    Ok(())
 }

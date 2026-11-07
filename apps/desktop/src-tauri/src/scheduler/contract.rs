@@ -764,3 +764,366 @@ pub struct Attempt {
     pub model_claim_json: Option<String>,
     pub usage_json: Option<String>,
 }
+// RP1 is a separate wire contract. RelayPlan above is deliberately unchanged.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RealPlanCore {
+    pub schema: String,
+    pub run_mode: String,
+    pub package_id: String,
+    pub registration_revision: i64,
+    pub input_base_sha: String,
+    pub input_delivery_identity: String,
+    pub target_path: String,
+    pub base_sha256: String,
+    pub goal: String,
+    pub constraints: Vec<String>,
+    pub examples: Vec<String>,
+    pub develop_profile: String,
+    pub review_profile: String,
+    pub model_develop: String,
+    pub model_review: String,
+    pub pm_decision_ref: String,
+    pub limits: RelayLimits,
+}
+impl RealPlanCore {
+    /// An internal common-data view, never encoded as a real plan or accepted by old run.
+    pub fn common(&self) -> RelayPlan {
+        RelayPlan {
+            schema: "nova.relay.plan/1".into(),
+            package_id: self.package_id.clone(),
+            registration_revision: self.registration_revision,
+            input_base_sha: self.input_base_sha.clone(),
+            input_delivery_identity: self.input_delivery_identity.clone(),
+            target_path: self.target_path.clone(),
+            base_sha256: self.base_sha256.clone(),
+            goal: self.goal.clone(),
+            constraints: self.constraints.clone(),
+            examples: self.examples.clone(),
+            develop_profile: self.develop_profile.clone(),
+            review_profile: self.review_profile.clone(),
+            model_develop: self.model_develop.clone(),
+            model_review: self.model_review.clone(),
+            pm_decision_ref: self.pm_decision_ref.clone(),
+            limits: self.limits.clone(),
+            mock: false,
+        }
+    }
+    pub fn validate(&self) -> Result<()> {
+        self.common().validate()?;
+        if self.schema != "nova.relay.plan-core/2"
+            || self.run_mode != "REAL_PILOT_ONCE"
+            || !real_model(&self.model_develop)
+            || !real_model(&self.model_review)
+        {
+            return Err("SCHEMA_REJECTED");
+        }
+        Ok(())
+    }
+}
+pub fn real_model(s: &str) -> bool {
+    let b = s.as_bytes();
+    if !(3..=64).contains(&b.len())
+        || !b[0].is_ascii_lowercase()
+        || !b.iter().any(u8::is_ascii_digit)
+    {
+        return false;
+    }
+    let mut sep = false;
+    let mut had_sep = false;
+    for &c in b {
+        if c == b'.' || c == b'-' {
+            if sep {
+                return false;
+            }
+            sep = true;
+            had_sep = true;
+        } else if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            sep = false;
+        } else {
+            return false;
+        }
+    }
+    !sep && had_sep && !["default", "sonnet", "opus", "haiku", "best", "opusplan"].contains(&s)
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedController {
+    pub source_sha: String,
+    pub build_receipt_sha256: String,
+    pub exe_sha256: String,
+    pub exe_bytes: u64,
+    pub cargo_profile: String,
+    pub features: Vec<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedRoots {
+    pub source_registration: String,
+    pub workspace: String,
+    pub run_root: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedTool {
+    pub role: RelayRole,
+    pub profile_id: String,
+    pub exe_path: String,
+    pub exe_bytes: u64,
+    pub exe_sha256: String,
+    pub model: String,
+    pub auth_category: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedBilling {
+    pub route: String,
+    pub extra_usage_allowed: bool,
+    pub hard_cap_claimed: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RealPilotApproval {
+    pub schema: String,
+    pub attestation: String,
+    pub approval_id: String,
+    pub pm_task_ref: String,
+    pub approver_note: String,
+    pub issued_utc: String,
+    pub expires_utc: String,
+    pub plan_core_sha256: String,
+    pub controller: ApprovedController,
+    pub roots: ApprovedRoots,
+    pub tools: Vec<ApprovedTool>,
+    pub limits: RelayLimits,
+    pub billing: ApprovedBilling,
+    pub single_use: bool,
+}
+impl RealPilotApproval {
+    pub fn check_time(&self, now: chrono::DateTime<chrono::Utc>) -> Result<()> {
+        let parse = |s: &str| {
+            if !s.ends_with('Z') {
+                return Err("APPROVAL_TIME");
+            }
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|v| v.with_timezone(&chrono::Utc))
+                .map_err(|_| "APPROVAL_TIME")
+        };
+        let issued = parse(&self.issued_utc)?;
+        let expires = parse(&self.expires_utc)?;
+        if expires <= issued
+            || expires - issued > chrono::Duration::hours(24)
+            || now < issued - chrono::Duration::minutes(5)
+            || now >= expires
+        {
+            return Err("APPROVAL_EXPIRED");
+        }
+        Ok(())
+    }
+    pub fn validate(&self, c: &RealPlanCore) -> Result<()> {
+        c.validate()?;
+        if self.schema != "nova.relay.real-approval/1"
+            || self.attestation != "HUMAN_ATTESTED"
+            || !hex(&self.approval_id, 32)
+            || self.pm_task_ref.trim().is_empty()
+            || self.pm_task_ref.len() > 512
+            || self.approver_note.len() > 256
+            || !self.single_use
+            || self.billing.route != "SUBSCRIPTION_ONLY"
+            || self.billing.hard_cap_claimed
+            || self.tools.len() != 2
+            || !hex(&self.controller.source_sha, 40)
+            || !hex(&self.controller.build_receipt_sha256, 64)
+            || !hex(&self.controller.exe_sha256, 64)
+            || self.controller.exe_bytes == 0
+            || self.controller.cargo_profile != "dev"
+            || self.controller.features != ["scheduler-validation"]
+            || self.plan_core_sha256 != hash(relay_encoded(c)?.as_bytes())
+            || self.limits.stage_ms != c.limits.stage_ms
+            || self.limits.total_ms != c.limits.total_ms
+        {
+            return Err("APPROVAL_MISMATCH");
+        }
+        for (i, role) in [RelayRole::Develop, RelayRole::Review].iter().enumerate() {
+            let t = &self.tools[i];
+            if t.role != *role
+                || t.profile_id.as_str()
+                    != if i == 0 {
+                        c.develop_profile.as_str()
+                    } else {
+                        c.review_profile.as_str()
+                    }
+                || t.model.as_str()
+                    != if i == 0 {
+                        c.model_develop.as_str()
+                    } else {
+                        c.model_review.as_str()
+                    }
+                || t.auth_category
+                    != if i == 0 {
+                        "CODEX_CHATGPT"
+                    } else {
+                        "CLAUDE_AI_SUBSCRIPTION"
+                    }
+            {
+                return Err("APPROVAL_MISMATCH");
+            }
+        }
+        for p in [
+            &self.roots.source_registration,
+            &self.roots.workspace,
+            &self.roots.run_root,
+        ] {
+            super::store::absolute(p.as_ref())?;
+            super::store::safe_location(p.as_ref())?;
+        }
+        if self.roots.workspace == self.roots.run_root
+            || self.roots.workspace == self.roots.source_registration
+            || self.roots.run_root == self.roots.source_registration
+        {
+            return Err("APPROVAL_MISMATCH");
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildReceipt {
+    pub schema: String,
+    pub source_sha: String,
+    pub source_claim_source: String,
+    pub clean: bool,
+    pub cargo_profile: String,
+    pub features: Vec<String>,
+    pub cargo_command: Vec<String>,
+    pub exe_bytes: u64,
+    pub exe_sha256: String,
+    pub exe_identity_source: String,
+}
+impl BuildReceipt {
+    pub fn validate(&self, a: &RealPilotApproval, raw: &[u8]) -> Result<()> {
+        if self.schema != "nova.relay.build-receipt/1"
+            || self.source_claim_source != "HUMAN_ATTESTED"
+            || self.exe_identity_source != "TOOL_FILE_HASH"
+            || !self.clean
+            || self.source_sha != a.controller.source_sha
+            || self.cargo_profile != "dev"
+            || self.features != a.controller.features
+            || self.exe_bytes != a.controller.exe_bytes
+            || self.exe_sha256 != a.controller.exe_sha256
+            || hash(raw) != a.controller.build_receipt_sha256
+            || self.cargo_command
+                != [
+                    "cargo",
+                    "build",
+                    "--offline",
+                    "--locked",
+                    "--features",
+                    "scheduler-validation",
+                    "--bin",
+                    "nova_scheduler_relay",
+                ]
+        {
+            return Err("BUILD_RECEIPT_MISMATCH");
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RealPlanRecord {
+    pub schema: String,
+    pub core: RealPlanCore,
+    pub approval: RealPilotApproval,
+    pub approval_file_sha256: String,
+    pub build_receipt_sha256: String,
+}
+impl RealPlanRecord {
+    pub fn validate(&self) -> Result<()> {
+        if relay_encoded(self)?.len() > 65536 {
+            return Err("BOUND");
+        }
+        if self.schema != "nova.relay.plan/2"
+            || !hex(&self.approval_file_sha256, 64)
+            || self.build_receipt_sha256 != self.approval.controller.build_receipt_sha256
+        {
+            return Err("BINDING_MISMATCH");
+        }
+        self.approval
+            .validate(&self.core)
+            .map_err(|_| "BINDING_MISMATCH")
+    }
+}
+#[derive(Clone, Debug)]
+pub enum PlanMode {
+    Mock(RelayPlan),
+    RealPilot(RealPlanRecord),
+}
+impl PlanMode {
+    pub fn common(&self) -> RelayPlan {
+        match self {
+            Self::Mock(p) => p.clone(),
+            Self::RealPilot(p) => p.core.common(),
+        }
+    }
+    pub fn is_real(&self) -> bool {
+        matches!(self, Self::RealPilot(_))
+    }
+    pub fn record(&self) -> Option<&RealPlanRecord> {
+        if let Self::RealPilot(r) = self {
+            Some(r)
+        } else {
+            None
+        }
+    }
+}
+/// Mode-bearing driver input. Common v1-shaped data is only an internal compatibility view.
+pub struct PlanView<'a> {
+    pub mode: &'a PlanMode,
+    common: RelayPlan,
+}
+impl<'a> PlanView<'a> {
+    pub fn new(mode: &'a PlanMode) -> Self {
+        Self {
+            common: mode.common(),
+            mode,
+        }
+    }
+}
+impl std::ops::Deref for PlanView<'_> {
+    type Target = RelayPlan;
+    fn deref(&self) -> &RelayPlan {
+        &self.common
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CleanupReceipt {
+    pub root_exited_before: bool,
+    pub active_before: Option<u32>,
+    pub terminated: bool,
+    pub job_confirmed: bool,
+    pub readers_finished: bool,
+}
+impl CleanupReceipt {
+    pub fn diagnostics(&self) -> Vec<String> {
+        let mut v = vec![];
+        if self.root_exited_before && self.active_before.is_some_and(|n| n > 0) {
+            v.push("DESCENDANT_TERMINATED".into());
+        }
+        if self.active_before.is_none() {
+            v.push("CLEANUP_STATE_UNKNOWN".into());
+        }
+        v
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EligibilityReceipt {
+    pub exit_code: Option<i64>,
+    pub category: String,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+}
+
+pub fn relay_encoded<T: Serialize>(v: &T) -> Result<String> {
+    serde_json::to_string(v).map_err(|_| "ENCODING")
+}

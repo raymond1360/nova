@@ -1259,7 +1259,7 @@ mod ar0 {
     }
     struct Never;
     impl Driver for Never {
-        fn prepare(&mut self, _: &RelayPlan, _: RelayRole, _: &Path, _: &[u8]) -> Result<Spec> {
+        fn prepare(&mut self, _: &PlanView<'_>, _: RelayRole, _: &Path, _: &[u8]) -> Result<Spec> {
             panic!("must not prepare")
         }
         fn execute(
@@ -1447,6 +1447,14 @@ mod ar0 {
             } else {
                 assert_eq!(s.facts.len(), 2);
                 assert_eq!(s.facts[0].terminal.as_deref(), Some("SUCCESS"));
+                let ledger = fixture.s.relay_attempts().unwrap();
+                let usage: Value =
+                    relay_json(ledger[0].usage_json.as_ref().unwrap().as_bytes(), 65536).unwrap();
+                assert_eq!(usage["cleanup"]["root_exited_before"], true);
+                assert!(usage["cleanup"]["active_before"].as_u64().unwrap() > 0);
+                assert_eq!(usage["cleanup"]["terminated"], true);
+                assert_eq!(usage["cleanup"]["job_confirmed"], true);
+                assert_eq!(usage["cleanup"]["readers_finished"], true);
                 let bytes = fs::read(fixture.run.join("DEVELOP.stdout")).unwrap();
                 let rows: Vec<Value> = bytes
                     .split(|b| *b == 10)
@@ -1539,7 +1547,12 @@ mod ar0 {
         let f = RF::new("ok", "ok");
         let mut d = NativeDriver::for_test().unwrap();
         let mut spec = d
-            .prepare(&f.p, RelayRole::Develop, &f.run, &f.input())
+            .prepare(
+                &PlanView::new(&PlanMode::Mock(f.p.clone())),
+                RelayRole::Develop,
+                &f.run,
+                &f.input(),
+            )
             .unwrap();
         spec.cwd = f.run.join("missing");
         let reservation =
@@ -1587,7 +1600,12 @@ mod ar0 {
         let f = RF::new("hang", "ok");
         let mut d = NativeDriver::for_test().unwrap();
         let spec = d
-            .prepare(&f.p, RelayRole::Develop, &f.run, &f.input())
+            .prepare(
+                &PlanView::new(&PlanMode::Mock(f.p.clone())),
+                RelayRole::Develop,
+                &f.run,
+                &f.input(),
+            )
             .unwrap();
         let r =
             f.s.relay_reserve(
@@ -1706,7 +1724,13 @@ mod ar0 {
         point: u8,
     }
     impl Driver for CrashDriver {
-        fn prepare(&mut self, p: &RelayPlan, r: RelayRole, path: &Path, b: &[u8]) -> Result<Spec> {
+        fn prepare(
+            &mut self,
+            p: &PlanView<'_>,
+            r: RelayRole,
+            path: &Path,
+            b: &[u8],
+        ) -> Result<Spec> {
             self.native.prepare(p, r, path, b)
         }
         fn execute(
@@ -1777,7 +1801,14 @@ mod ar0 {
             let mut d = NativeDriver::for_test().unwrap();
             let mut input = f.input();
             input.resize(131072, b' ');
-            let spec = d.prepare(&f.p, RelayRole::Develop, &f.run, &input).unwrap();
+            let spec = d
+                .prepare(
+                    &PlanView::new(&PlanMode::Mock(f.p.clone())),
+                    RelayRole::Develop,
+                    &f.run,
+                    &input,
+                )
+                .unwrap();
             let e = d.test_execute_io(&spec, &input, Instant::now() + Duration::from_secs(2));
             assert!(e.created);
             assert_eq!(e.reclaim, "CONFIRMED");
@@ -1882,7 +1913,13 @@ mod ar0 {
         spawns: usize,
     }
     impl Driver for CountingDriver {
-        fn prepare(&mut self, p: &RelayPlan, r: RelayRole, path: &Path, b: &[u8]) -> Result<Spec> {
+        fn prepare(
+            &mut self,
+            p: &PlanView<'_>,
+            r: RelayRole,
+            path: &Path,
+            b: &[u8],
+        ) -> Result<Spec> {
             self.native.prepare(p, r, path, b)
         }
         fn execute(
@@ -1992,7 +2029,13 @@ mod ar0 {
         drift: Option<&'static str>,
     }
     impl Driver for Injected {
-        fn prepare(&mut self, p: &RelayPlan, r: RelayRole, root: &Path, _: &[u8]) -> Result<Spec> {
+        fn prepare(
+            &mut self,
+            p: &PlanView<'_>,
+            r: RelayRole,
+            root: &Path,
+            _: &[u8],
+        ) -> Result<Spec> {
             Ok(Spec {
                 role: r,
                 profile: if r == RelayRole::Develop {
@@ -2172,7 +2215,7 @@ mod ar0 {
     impl Driver for NativeDrift {
         fn prepare(
             &mut self,
-            p: &RelayPlan,
+            p: &PlanView<'_>,
             r: RelayRole,
             root: &Path,
             input: &[u8],
@@ -2292,5 +2335,792 @@ mod ar0 {
         assert!(view.unknowns.contains(&"EVIDENCE_ROOT_CHANGED".into()));
         assert_eq!(view.next_action, "PM_REQUIRED");
         assert!(preserved.join("DEVELOP.stdout").exists());
+    }
+
+    mod rp1 {
+        use super::*;
+        fn core(p: &RelayPlan) -> RealPlanCore {
+            let mut v = serde_json::to_value(p).unwrap();
+            v.as_object_mut().unwrap().remove("mock");
+            v["schema"] = json!("nova.relay.plan-core/2");
+            v["run_mode"] = json!("REAL_PILOT_ONCE");
+            v["model_develop"] = json!("test-develop-1");
+            v["model_review"] = json!("test-review-1");
+            serde_json::from_value(v).unwrap()
+        }
+        fn record(f: &RF) -> RealPlanRecord {
+            let c = core(&f.p);
+            let t = cli_adapter::REAL_TOOLS
+                .iter()
+                .enumerate()
+                .map(|(i, t)| ApprovedTool {
+                    role: t.role,
+                    profile_id: t.profile_id.into(),
+                    exe_path: t.exe_path.into(),
+                    exe_bytes: t.exe_bytes,
+                    exe_sha256: t.exe_sha256.into(),
+                    model: if i == 0 {
+                        c.model_develop.clone()
+                    } else {
+                        c.model_review.clone()
+                    },
+                    auth_category: if i == 0 {
+                        "CODEX_CHATGPT"
+                    } else {
+                        "CLAUDE_AI_SUBSCRIPTION"
+                    }
+                    .into(),
+                })
+                .collect();
+            let a = RealPilotApproval {
+                schema: "nova.relay.real-approval/1".into(),
+                attestation: "HUMAN_ATTESTED".into(),
+                approval_id: "1".repeat(32),
+                pm_task_ref: "SYNTHETIC TEST ONLY; not valid for this controller".into(),
+                approver_note: "INJECTED".into(),
+                issued_utc: (chrono::Utc::now() - chrono::Duration::minutes(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                expires_utc: (chrono::Utc::now() + chrono::Duration::hours(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                plan_core_sha256: hash(relay_encoded(&c).unwrap().as_bytes()),
+                controller: ApprovedController {
+                    source_sha: "a".repeat(40),
+                    build_receipt_sha256: "2".repeat(64),
+                    exe_sha256: "0".repeat(64),
+                    exe_bytes: 1,
+                    cargo_profile: "dev".into(),
+                    features: vec!["scheduler-validation".into()],
+                },
+                roots: ApprovedRoots {
+                    source_registration: f.f.root.join("source").to_str().unwrap().into(),
+                    workspace: f.f.root.join("v2").to_str().unwrap().into(),
+                    run_root: f.run.to_str().unwrap().into(),
+                },
+                tools: t,
+                limits: c.limits.clone(),
+                billing: ApprovedBilling {
+                    route: "SUBSCRIPTION_ONLY".into(),
+                    extra_usage_allowed: false,
+                    hard_cap_claimed: false,
+                },
+                single_use: true,
+            };
+            RealPlanRecord {
+                schema: "nova.relay.plan/2".into(),
+                core: c,
+                approval: a,
+                approval_file_sha256: "3".repeat(64),
+                build_receipt_sha256: "2".repeat(64),
+            }
+        }
+        struct Probe {
+            calls: usize,
+            fail: bool,
+        }
+        impl relay::EligibilityProbe for Probe {
+            fn probe(&mut self, r: RelayRole, _: Instant) -> Result<EligibilityReceipt> {
+                self.calls += 1;
+                Ok(EligibilityReceipt {
+                    exit_code: Some(0),
+                    category: if self.fail {
+                        "UNKNOWN"
+                    } else if r == RelayRole::Develop {
+                        "CODEX_CHATGPT"
+                    } else {
+                        "CLAUDE_AI_SUBSCRIPTION"
+                    }
+                    .into(),
+                    stdout_bytes: 0,
+                    stderr_bytes: 0,
+                })
+            }
+        }
+        fn setup() -> (RF, RealPlanRecord, relay::RealPilotPermit) {
+            let f = RF::new("ok", "ok");
+            let r = record(&f);
+            let text = relay_encoded(&r).unwrap();
+            let id = hash(text.as_bytes());
+            let c = rusqlite::Connection::open(f.f.root.join("v2/handoff.sqlite3")).unwrap();
+            c.execute(
+                "UPDATE relay_plans SET plan_id=?1,plan_json=?2,plan_sha256=?1,mock=0",
+                rusqlite::params![id, text],
+            )
+            .unwrap();
+            drop(c);
+            let mut permit = relay::permit_for_test(r.clone()).unwrap();
+            permit
+                .qualify(&mut Probe {
+                    calls: 0,
+                    fail: false,
+                })
+                .unwrap();
+            (f, r, permit)
+        }
+        struct Pilot {
+            inner: Injected,
+            unknown: bool,
+            descendant: bool,
+        }
+        impl Driver for Pilot {
+            fn prepare(
+                &mut self,
+                p: &PlanView<'_>,
+                role: RelayRole,
+                root: &Path,
+                b: &[u8],
+            ) -> Result<Spec> {
+                assert!(p.mode.is_real());
+                let mut s = self.inner.prepare(p, role, root, b)?;
+                let tool = &cli_adapter::REAL_TOOLS[usize::from(role == RelayRole::Review)];
+                s.exe = PathBuf::from(tool.exe_path);
+                s.exe_sha256 = tool.exe_sha256.into();
+                s.session = "00000000-0000-4000-8000-000000000001".into();
+                s.argv = cli_adapter::argv(
+                    role,
+                    root,
+                    if role == RelayRole::Develop {
+                        &p.model_develop
+                    } else {
+                        &p.model_review
+                    },
+                    &s.session,
+                );
+                s.cwd = root.join(if role == RelayRole::Develop {
+                    "develop-cwd"
+                } else {
+                    "review-cwd"
+                });
+                let mut env = BTreeMap::new();
+                env.insert("SystemRoot".into(), "C:\\Windows".into());
+                s.env = cli_adapter::environment(&env, root)?;
+                Ok(s)
+            }
+            fn execute(
+                &mut self,
+                s: &Spec,
+                b: &[u8],
+                p: &LaunchPermit,
+                e: Instant,
+                f: &mut dyn FnMut(u32, String) -> Result<()>,
+            ) -> Execution {
+                let mut v = self.inner.execute(s, b, p, e, f);
+                v.cleanup = Some(CleanupReceipt {
+                    root_exited_before: true,
+                    active_before: Some(if self.descendant { 1 } else { 0 }),
+                    terminated: self.descendant,
+                    job_confirmed: true,
+                    readers_finished: true,
+                });
+                if !self.unknown {
+                    v.reported_model = s
+                        .argv
+                        .windows(2)
+                        .find(|w| w[0] == "-m" || w[0] == "--model")
+                        .map(|w| w[1].clone());
+                    v.reported_auth = Some(
+                        if s.role == RelayRole::Develop {
+                            "CODEX_CHATGPT"
+                        } else {
+                            "CLAUDE_AI_SUBSCRIPTION"
+                        }
+                        .into(),
+                    );
+                }
+                v
+            }
+        }
+        fn driver(f: &RF) -> Pilot {
+            Pilot {
+                inner: Injected {
+                    root: f.f.repo.clone(),
+                    count: 0,
+                    drift: None,
+                },
+                unknown: false,
+                descendant: false,
+            }
+        }
+        #[test]
+        fn rp1_v1_wire_golden_and_mock_summary_shape() {
+            let p = plan();
+            assert_eq!(
+                hash(relay_encoded(&p).unwrap().as_bytes()),
+                "008129c1c80ad5ab72e14c78ab5896370280ce97dc192be33d131e4f23100218"
+            );
+            let f = RF::new("ok", "ok");
+            let mut d = Injected {
+                root: f.f.repo.clone(),
+                count: 0,
+                drift: None,
+            };
+            let s = relay::run(&f.s, &mut d).unwrap();
+            let v = serde_json::to_value(s).unwrap();
+            assert_eq!(v["schema"], "nova.relay.summary/1");
+            assert!(v.get("next_execution_authorized").is_none());
+            assert!(v.get("run_mode").is_none());
+            assert_eq!(v.as_object().unwrap().len(), 13);
+        }
+        #[test]
+        fn rp1_model_grammar_and_exact_token_permissions() {
+            for s in ["gpt-6-luna", "test-model-1", "claude-sonnet-4-6"] {
+                assert!(real_model(s));
+            }
+            for s in [
+                "-x", "x-1 ", "a-1/2", "a-1:2", "a-1[1m]", "a1..b", "a1-", "sonnet", "mock:ok",
+                "abc-def", "a1--x", "A-1",
+            ] {
+                assert!(!real_model(s), "{s}");
+            }
+            assert!(cli_adapter::validate_real_argv(&["-C".into(), "read-only".into()]).is_ok());
+            for s in ["-c", "--config", "--dangerously-bypass", "https://bad"] {
+                assert_eq!(
+                    cli_adapter::validate_real_argv(&[s.into()]),
+                    Err("ARGUMENT_REJECTED")
+                );
+            }
+        }
+        #[test]
+        fn rp1_approval_mutations_expiry_and_no_attempts() {
+            let f = RF::new("ok", "ok");
+            let r = record(&f);
+            r.validate().unwrap();
+            assert!(r.approval.check_time(chrono::Utc::now()).is_ok());
+            for which in 0..9 {
+                let mut q = r.clone();
+                match which {
+                    0 => q.core.goal.push('x'),
+                    1 => q.approval.limits.stage_ms += 1,
+                    2 => q.approval.tools[0].model.push('x'),
+                    3 => q.approval.tools[0].auth_category = "API_KEY".into(),
+                    4 => q.approval.single_use = false,
+                    5 => q.schema = "bad".into(),
+                    6 => q.approval.controller.features.push("bad".into()),
+                    7 => q.approval.billing.hard_cap_claimed = true,
+                    _ => q.core.model_develop = "--help".into(),
+                };
+                assert!(q.validate().is_err(), "{which}");
+                assert!(f.s.relay_attempts().unwrap().is_empty());
+            }
+            let mut q = r.approval.clone();
+            q.expires_utc = "2000-01-01T00:00:00Z".into();
+            assert!(q.check_time(chrono::Utc::now()).is_err());
+            let mut q = r.approval.clone();
+            q.tools[0].exe_path = "E:\\unknown.exe".into();
+            assert_eq!(
+                cli_adapter::validate_real_tools(&q),
+                Err("APPROVAL_MISMATCH")
+            );
+        }
+        #[test]
+        fn rp1_real_driver_test_build_cannot_open_real_tools() {
+            let f = RF::new("ok", "ok");
+            let p = relay::permit_for_test(record(&f)).unwrap();
+            assert!(matches!(
+                cli_adapter::RealDriver::new(&p),
+                Err("REAL_DRIVER_DISABLED_IN_TEST")
+            ));
+            assert!(f.s.relay_attempts().unwrap().is_empty());
+        }
+        #[test]
+        fn rp1_eligibility_injected_failure_never_reserves() {
+            let f = RF::new("ok", "ok");
+            let mut p = relay::permit_for_test(record(&f)).unwrap();
+            let mut probe = Probe {
+                calls: 0,
+                fail: true,
+            };
+            assert_eq!(p.qualify(&mut probe), Err("AUTH_ELIGIBILITY_MISMATCH"));
+            assert_eq!(probe.calls, 1);
+            assert!(f.s.relay_attempts().unwrap().is_empty());
+        }
+        #[test]
+        fn rp1_status_reading_never_grants_old_run() {
+            let (f, _, _) = setup();
+            assert!(f.s.relay_plan().unwrap().mode.is_real());
+            assert!(relay::status_real(&f.s).is_ok());
+            let mut d = driver(&f);
+            assert_eq!(
+                relay::run(&f.s, &mut d).unwrap_err(),
+                "REAL_PILOT_NOT_AUTHORIZED"
+            );
+            assert_eq!(d.inner.count, 0);
+            assert!(f.s.relay_attempts().unwrap().is_empty());
+        }
+        #[test]
+        fn rp1_injected_success_real_summary_and_replay_refusal() {
+            let (f, r, p) = setup();
+            let mut d = driver(&f);
+            let v = relay::run_real_once(&f.s, &mut d, p).unwrap();
+            assert_eq!(d.inner.count, 2);
+            assert_eq!(v["schema"], "nova.relay.summary/2");
+            assert_eq!(v["mock"], false);
+            assert_eq!(v["next_execution_authorized"], false);
+            assert_eq!(v["next_action"], "PM_REVIEW");
+            let mut p = relay::permit_for_test(r).unwrap();
+            p.qualify(&mut Probe {
+                calls: 0,
+                fail: false,
+            })
+            .unwrap();
+            relay::run_real_once(&f.s, &mut d, p).unwrap();
+            assert_eq!(d.inner.count, 2);
+            assert_eq!(
+                fs::read(f.f.repo.join("pilot/src/normalize_label.rs")).unwrap(),
+                base()
+            );
+        }
+        #[test]
+        fn rp1_unknown_and_descendant_stop_before_review() {
+            for mode in 0..3 {
+                let (f, _, p) = setup();
+                let mut d = driver(&f);
+                d.unknown = mode == 0;
+                d.descendant = mode == 1;
+                if mode == 2 {
+                    d.inner.drift = Some("HEAD");
+                }
+                let v = relay::run_real_once(&f.s, &mut d, p).unwrap();
+                assert_eq!(d.inner.count, 1);
+                assert_eq!(v["next_action"], "PM_REQUIRED");
+                assert_eq!(v["facts"][0]["reclaim"], "CONFIRMED");
+            }
+        }
+        #[test]
+        fn rp1_real_plan_dispatch_rejects_column_shape_and_binding() {
+            let (f, r, _) = setup();
+            let db = rusqlite::Connection::open(f.f.root.join("v2/handoff.sqlite3")).unwrap();
+            for which in 0..4 {
+                let mut v = serde_json::to_value(&r).unwrap();
+                match which {
+                    0 => {
+                        v["mock"] = json!(false);
+                    }
+                    1 => {
+                        v["schema"] = json!("other");
+                    }
+                    2 => {
+                        v["core"]["goal"] = json!("changed");
+                    }
+                    _ => {}
+                }
+                let text = serde_json::to_string(&v).unwrap();
+                let id = hash(text.as_bytes());
+                db.execute(
+                    "UPDATE relay_plans SET plan_json=?1,plan_id=?2,plan_sha256=?2,mock=?3",
+                    rusqlite::params![text, id, if which == 3 { 1 } else { 0 }],
+                )
+                .unwrap();
+                assert!(f.s.relay_plan().is_err(), "{which}");
+            }
+        }
+        #[test]
+        fn rp1_post_run_error_preserves_original_and_is_visible() {
+            let f = RF::new("ok", "ok");
+            let mut d = Injected {
+                root: f.f.repo.clone(),
+                count: 0,
+                drift: None,
+            };
+            let s = relay::run(&f.s, &mut d).unwrap();
+            let original = fs::read(f.run.join("summary.json")).unwrap();
+            let value = serde_json::to_value(s).unwrap();
+            let v = relay::post_run_failure(&f.s, value.clone());
+            assert_eq!(v["outcome"], value);
+            assert_eq!(v["persisted"], true);
+            assert_eq!(v["next_execution_authorized"], false);
+            assert_eq!(fs::read(f.run.join("summary.json")).unwrap(), original);
+            assert_eq!(relay::status(&f.s).unwrap().next_action, "PM_REQUIRED");
+            let v = relay::post_run_failure(&f.s, value);
+            assert_eq!(v["persisted"], false);
+        }
+        #[test]
+        fn rp1_stream_hash_large_exact_deadline_size_and_write_delete_denial() {
+            let f = Fixture::new();
+            let path = f.root.join("large-tool.bin");
+            let b = vec![0x5au8; 17 * 1024 * 1024 + 1];
+            fs::write(&path, &b).unwrap();
+            let mut g = Guard::tool(&path).unwrap();
+            let until = Instant::now() + Duration::from_secs(10);
+            assert_eq!(g.sha256_stream(b.len() as u64, until).unwrap(), hash(&b));
+            assert_eq!(
+                g.sha256_stream((b.len() - 1) as u64, until),
+                Err("TOOL_SIZE_MISMATCH")
+            );
+            assert_eq!(
+                g.sha256_stream((b.len() + 1) as u64, until),
+                Err("TOOL_SIZE_MISMATCH")
+            );
+            assert_eq!(
+                g.sha256_stream(b.len() as u64, Instant::now()),
+                Err("TOOL_HASH_DEADLINE")
+            );
+            assert!(fs::read(&path).is_ok());
+            assert!(fs::write(&path, b"bad").is_err());
+            assert!(fs::remove_file(&path).is_err());
+        }
+        #[test]
+        fn rp1_eligibility_parser_redacts_and_rejects_routes() {
+            let a = cli_adapter::classify_eligibility(
+                RelayRole::Develop,
+                Some(0),
+                b"",
+                b"Logged in using ChatGPT\n",
+            )
+            .unwrap();
+            assert_eq!(a.category, "CODEX_CHATGPT");
+            assert!(!serde_json::to_string(&a).unwrap().contains("Logged"));
+            let a=cli_adapter::classify_eligibility(RelayRole::Review,Some(0),br#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"synthetic@example.invalid"}"#,b"").unwrap();
+            assert_eq!(a.category, "CLAUDE_AI_SUBSCRIPTION");
+            assert!(!serde_json::to_string(&a).unwrap().contains("email"));
+            assert_eq!(
+                cli_adapter::classify_eligibility(
+                    RelayRole::Develop,
+                    Some(0),
+                    b"",
+                    b"Logged in using API key"
+                )
+                .unwrap()
+                .category,
+                "UNKNOWN"
+            );
+            assert!(cli_adapter::classify_eligibility(
+                RelayRole::Review,
+                Some(0),
+                &vec![b'x'; 4097],
+                b""
+            )
+            .is_err());
+        }
+        #[test]
+        fn rp1_cleanup_diagnostics_preserve_confirmed_reclaim() {
+            let c = CleanupReceipt {
+                root_exited_before: true,
+                active_before: Some(2),
+                terminated: true,
+                job_confirmed: true,
+                readers_finished: true,
+            };
+            assert_eq!(c.diagnostics(), vec!["DESCENDANT_TERMINATED"]);
+            let c = CleanupReceipt {
+                active_before: None,
+                ..c
+            };
+            assert_eq!(c.diagnostics(), vec!["CLEANUP_STATE_UNKNOWN"]);
+        }
+
+        #[test]
+        fn rp1_fixed_argv_matches_original_vectors_and_environment() {
+            let root = Path::new("E:\\owned");
+            let d = cli_adapter::argv(RelayRole::Develop, root, "test-develop-1", "s");
+            let expected = [
+                "--no-daemon",
+                "-a",
+                "never",
+                "exec",
+                "-C",
+                "E:\\owned\\develop-cwd",
+                "--skip-git-repo-check",
+                "--ignore-user-config",
+                "--sandbox",
+                "read-only",
+                "--ephemeral",
+                "--json",
+                "--color",
+                "never",
+                "-m",
+                "test-develop-1",
+                "--output-schema",
+                "E:\\owned\\proposal.schema.json",
+                "-",
+            ];
+            assert_eq!(d, expected);
+            let r = cli_adapter::argv(RelayRole::Review, root, "test-review-1", "s");
+            let expected = vec![
+                "--safe-mode".into(),
+                "--print".into(),
+                "--input-format".into(),
+                "text".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+                "--verbose".into(),
+                "--include-hook-events".into(),
+                "--json-schema".into(),
+                cli_adapter::review_schema(),
+                "--tools".into(),
+                "".into(),
+                "--permission-mode".into(),
+                "dontAsk".into(),
+                "--strict-mcp-config".into(),
+                "--mcp-config".into(),
+                "{\"mcpServers\":{}}".into(),
+                "--disable-slash-commands".into(),
+                "--no-chrome".into(),
+                "--no-session-persistence".into(),
+                "--session-id".into(),
+                "s".into(),
+                "--model".into(),
+                "test-review-1".into(),
+            ];
+            assert_eq!(r, expected);
+            cli_adapter::validate_real_argv(&d).unwrap();
+            cli_adapter::validate_real_argv(&r).unwrap();
+            assert!(cli_adapter::validate_real_argv(&["--config=x".into()]).is_err());
+            let mut env = BTreeMap::new();
+            env.insert("SystemRoot".into(), "C:\\Windows".into());
+            env.insert("ANTHROPIC_API_KEY".into(), "SYNTHETIC_NOT_A_KEY".into());
+            let a = cli_adapter::environment(&env, root).unwrap();
+            assert!(!a.contains_key("ANTHROPIC_API_KEY"));
+            assert!(include_str!("cli_adapter.rs")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+                .contains("env:environment(&parent,root)?"));
+        }
+        #[test]
+        fn rp1_v1_v2_read_rejection_table_and_legacy_parse() {
+            let f = RF::new("ok", "ok");
+            let r = record(&f);
+            let db = rusqlite::Connection::open(f.f.root.join("v2/handoff.sqlite3")).unwrap();
+            assert_eq!(
+                relay_json::<RelayPlan>(relay_encoded(&r).unwrap().as_bytes(), 65536).unwrap_err(),
+                "SCHEMA_REJECTED"
+            );
+            let old = relay_encoded(&f.p).unwrap();
+            for (text, col, code) in [
+                (old.clone(), 0, "BINDING_MISMATCH"),
+                {
+                    let mut p = f.p.clone();
+                    p.mock = false;
+                    (relay_encoded(&p).unwrap(), 0, "REAL_PILOT_NOT_AUTHORIZED")
+                },
+                ("{\"schema\":\"unsupported\"}".into(), 1, "SCHEMA_REJECTED"),
+            ] {
+                let digest = hash(text.as_bytes());
+                db.execute(
+                    "UPDATE relay_plans SET plan_id=?1,plan_sha256=?1,plan_json=?2,mock=?3",
+                    rusqlite::params![digest, text, col],
+                )
+                .unwrap();
+                assert_eq!(f.s.relay_plan().err(), Some(code));
+            }
+            let huge = "x".repeat(65537);
+            let digest = hash(huge.as_bytes());
+            db.execute(
+                "UPDATE relay_plans SET plan_id=?1,plan_sha256=?1,plan_json=?2",
+                rusqlite::params![digest, huge],
+            )
+            .unwrap();
+            assert_eq!(f.s.relay_plan().err(), Some("BOUND"));
+        }
+        #[test]
+        fn rp1_both_tool_roles_exact_and_approval_clock_bounds() {
+            let f = RF::new("ok", "ok");
+            let r = record(&f);
+            for i in 0..2 {
+                for field in 0..4 {
+                    let mut a = r.approval.clone();
+                    match field {
+                        0 => a.tools[i].exe_path.push('x'),
+                        1 => a.tools[i].exe_bytes += 1,
+                        2 => a.tools[i].exe_sha256 = "0".repeat(64),
+                        _ => a.tools[i].profile_id.push('x'),
+                    };
+                    assert_eq!(
+                        cli_adapter::validate_real_tools(&a),
+                        Err("APPROVAL_MISMATCH")
+                    );
+                }
+            }
+            let now = chrono::Utc::now();
+            for delta in [25, 0] {
+                let mut a = r.approval.clone();
+                a.issued_utc = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                a.expires_utc = (now + chrono::Duration::hours(delta))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                assert!(a.check_time(now).is_err());
+            }
+            let mut a = r.approval.clone();
+            a.issued_utc = (now + chrono::Duration::minutes(6))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            a.expires_utc = (now + chrono::Duration::hours(2))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            assert!(a.check_time(now).is_err());
+        }
+        #[test]
+        fn rp1_single_qualification_and_deadline_are_not_replenished() {
+            let f = RF::new("ok", "ok");
+            let mut p = relay::permit_for_test(record(&f)).unwrap();
+            let end = p.end();
+            let mut probe = Probe {
+                calls: 0,
+                fail: false,
+            };
+            p.qualify(&mut probe).unwrap();
+            assert_eq!(probe.calls, 2);
+            assert_eq!(p.end(), end);
+            assert_eq!(p.qualify(&mut probe), Err("APPROVAL_ALREADY_USED"));
+            assert_eq!(probe.calls, 2);
+        }
+        #[test]
+        fn rp1_model_and_auth_mismatch_and_missing_observations() {
+            let f = RF::new("ok", "ok");
+            let mut d = driver(&f);
+            let mode = PlanMode::RealPilot(record(&f));
+            let spec = d
+                .prepare(&PlanView::new(&mode), RelayRole::Develop, &f.run, b"")
+                .unwrap();
+            let mut e = Execution::failed("SUCCESS");
+            let u = cli_adapter::real_observations(&e, &spec);
+            assert!(u.contains(&"AUTH_ROUTE_UNVERIFIED".into()));
+            assert!(u.contains(&"MODEL_REPORT_UNVERIFIED".into()));
+            e.reported_model = Some("other-model-1".into());
+            e.reported_auth = Some("API_KEY".into());
+            let u = cli_adapter::real_observations(&e, &spec);
+            assert!(u.contains(&"MODEL_REPORT_MISMATCH".into()));
+            assert!(u.contains(&"AUTH_ROUTE_MISMATCH".into()));
+        }
+        #[test]
+        fn rp1_hash_mismatch_cap_and_identity_rejection() {
+            let f = Fixture::new();
+            let p = f.root.join("tool.bin");
+            fs::write(&p, b"self owned").unwrap();
+            let mut g = Guard::tool(&p).unwrap();
+            let end = Instant::now() + Duration::from_secs(5);
+            assert_eq!(
+                g.verify_sha256_stream(10, &"0".repeat(64), end),
+                Err("TOOL_HASH_MISMATCH")
+            );
+            assert_eq!(
+                g.sha256_stream(super::super::super::store::TOOL_HASH_CAP + 1, end),
+                Err("FILE_BOUND")
+            );
+            g.identity = "INJECTED WRONG ID".into();
+            assert_eq!(g.sha256_stream(10, end), Err("FILE_CHANGED"));
+        }
+        #[test]
+        fn rp1_r7_no_parallel_command_and_no_permit_derives() {
+            for src in [
+                include_str!("cli_adapter.rs"),
+                include_str!("relay.rs"),
+                include_str!("store.rs"),
+                include_str!("contract.rs"),
+            ] {
+                assert!(!src.contains("Command::new("));
+                assert!(!src.contains("std::process::Command"));
+            }
+            let src = include_str!("relay.rs");
+            let at = src.find("pub struct RealPilotPermit").unwrap();
+            assert!(!src[at.saturating_sub(120)..at].contains("derive("));
+            assert!(src
+                .replace("\r\n", "\n")
+                .contains("#[cfg(test)]\npub(super) fn permit_for_test"));
+        }
+        #[test]
+        fn rp1_close_boundary_success_is_identical_failure_keeps_error() {
+            let f = RF::new("ok", "ok");
+            let value = json!({"schema":"SYNTHETIC","fact":"preserved"});
+            assert_eq!(
+                relay::finish_run(&f.s, Ok(value.clone()), Ok(())).unwrap(),
+                value
+            );
+            let result =
+                relay::finish_run(&f.s, Err("INJECTED_RUN_FAILURE"), Err("HANDLER_UNREGISTER"))
+                    .unwrap();
+            assert_eq!(result["outcome"]["error_code"], "INJECTED_RUN_FAILURE");
+            assert_eq!(result["next_execution_authorized"], false);
+            assert_eq!(result["persisted"], true);
+            assert_eq!(relay::status(&f.s).unwrap().next_action, "PM_REQUIRED");
+        }
+
+        #[test]
+        fn rp1_run_spec_cannot_expand_approved_role_tool_model_or_environment() {
+            let f = RF::new("ok", "ok");
+            let r = record(&f);
+            let mode = PlanMode::RealPilot(r.clone());
+            let mut d = driver(&f);
+            let mut s = d
+                .prepare(&PlanView::new(&mode), RelayRole::Develop, &f.run, b"")
+                .unwrap();
+            cli_adapter::validate_real_spec(&s, RelayRole::Develop, &r, &f.run).unwrap();
+            s.argv.push("--config=unapproved".into());
+            assert!(cli_adapter::validate_real_spec(&s, RelayRole::Develop, &r, &f.run).is_err());
+            s = d
+                .prepare(&PlanView::new(&mode), RelayRole::Develop, &f.run, b"")
+                .unwrap();
+            s.exe = f.run.join("other.exe");
+            assert!(cli_adapter::validate_real_spec(&s, RelayRole::Develop, &r, &f.run).is_err());
+            s = d
+                .prepare(&PlanView::new(&mode), RelayRole::Develop, &f.run, b"")
+                .unwrap();
+            s.env
+                .insert("OPENAI_API_KEY".into(), "SYNTHETIC_NOT_A_KEY".into());
+            assert!(cli_adapter::validate_real_spec(&s, RelayRole::Develop, &r, &f.run).is_err());
+            assert!(f.s.relay_attempts().unwrap().is_empty());
+            assert_eq!(d.inner.count, 0);
+        }
+
+        #[test]
+        fn rp1_wrong_root_record_and_expired_qualification_have_zero_admission() {
+            let f = RF::new("ok", "ok");
+            let r = record(&f);
+            let mut p = relay::permit_for_test(r.clone()).unwrap();
+            p.qualify(&mut Probe {
+                calls: 0,
+                fail: false,
+            })
+            .unwrap();
+            let mut wrong = r.clone();
+            wrong.approval.roots.run_root.push('x');
+            assert_eq!(p.check_record(&wrong), Err("APPROVAL_MISMATCH"));
+            let mut expired = r;
+            expired.approval.issued_utc = "2000-01-01T00:00:00Z".into();
+            expired.approval.expires_utc = "2000-01-01T01:00:00Z".into();
+            let mut p = relay::permit_for_test(expired).unwrap();
+            let mut probe = Probe {
+                calls: 0,
+                fail: false,
+            };
+            assert_eq!(p.qualify(&mut probe), Err("APPROVAL_EXPIRED"));
+            assert_eq!(probe.calls, 0);
+            assert!(f.s.relay_attempts().unwrap().is_empty());
+        }
+        #[test]
+        fn rp1_existing_reserved_and_launching_never_replayed() {
+            for launch in [false, true] {
+                let (f, _, p) = setup();
+                let bound = f.s.relay_plan().unwrap();
+                let input = relay::develop_mode_input(&bound, &base()).unwrap();
+                let mut d = driver(&f);
+                let spec = d
+                    .prepare(
+                        &PlanView::new(&bound.mode),
+                        RelayRole::Develop,
+                        &f.run,
+                        &input,
+                    )
+                    .unwrap();
+                let lease =
+                    f.s.relay_reserve_real(
+                        RelayRole::Develop,
+                        &input,
+                        None,
+                        &spec.exe_sha256,
+                        &spec.argv_sha256(),
+                        &spec.env_names_sha256(),
+                        &p,
+                    )
+                    .unwrap();
+                if launch {
+                    f.s.relay_launching_real(lease, &p).unwrap();
+                }
+                let v = relay::run_real_once(&f.s, &mut d, p).unwrap();
+                assert_eq!(d.inner.count, 0);
+                assert_eq!(v["next_action"], "PM_REQUIRED");
+                assert_eq!(
+                    v["facts"][0]["state"],
+                    if launch { "UNKNOWN" } else { "RESERVED" }
+                );
+            }
+        }
     }
 }

@@ -265,6 +265,68 @@ jobs:
             }
             return @{ledger_state=$parse;commands=$commands;logs=$logs}
           }
+          function Get-Nb2TestFailure([string]$Private, $Commands) {
+            # Diagnostic metadata only: never a replacement for Confirm-Nb2Evidence.
+            $d = @{schema='NB2_TEST_FAILURE_V1';parsing_status='UNKNOWN';reason='COMMAND_NOT_COMPLETE';exit_code=$null;summary=$null;failed_tests=$null;names_bound_to_list=$false;scope='DIAGNOSTIC_ONLY_NOT_TEST_SET_VERIFICATION'}
+            try {
+              $row = @($Commands | Where-Object { $_.name -ceq 'injected-tests' })
+              if ($row.Count -ne 1 -or $row[0].state -cne 'COMPLETE' -or ($row[0].exit_code -isnot [int] -and $row[0].exit_code -isnot [long])) { return $d }
+              $d.exit_code = [long]$row[0].exit_code
+              $listRow = @($Commands | Where-Object { $_.name -ceq 'test-list' })
+              if ($listRow.Count -ne 1 -or $listRow[0].state -cne 'COMPLETE' -or ($listRow[0].exit_code -isnot [int] -and $listRow[0].exit_code -isnot [long]) -or $listRow[0].exit_code -ne 0) { $d.reason='LIST_NOT_COMPLETE'; return $d }
+              $d.reason = 'LIST_UNTRUSTED'
+              $list = Read-Nb2Text (Join-Path $Private 'test-list.stdout')
+              $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+              $footer = 0
+              foreach ($line in $list -split '\r?\n') {
+                if ($line -ceq '') { continue }
+                if ($line -ceq '225 tests, 0 benchmarks') { $footer++; continue }
+                if ($line -cnotmatch '^(t1_api_eval::[A-Za-z0-9_:]+): test$' -or $Matches[1].Length -gt 256 -or -not $names.Add($Matches[1])) { $d.parsing_status='REJECTED'; return $d }
+              }
+              if ($names.Count -ne 225 -or $footer -ne 1 -or (Get-Nb2SetHash @($names)) -cne '2f81318e8555db9dbf2c759ea03d532921ecdf7eedee7ccab09306e7e7e30eb1') { $d.parsing_status='REJECTED'; return $d }
+              $log = Read-Nb2Text (Join-Path $Private 'injected-tests.stdout')
+              $failed = [Collections.Generic.List[string]]::new()
+              $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+              $summaries = [Collections.Generic.List[object]]::new()
+              foreach ($line in $log -split '\r?\n') {
+                if ($line.StartsWith('test ') -and $line.Contains(' ... FAILED')) {
+                  if ($line -cnotmatch '^test (t1_api_eval::[A-Za-z0-9_:]+) \.\.\. FAILED$' -or $Matches[1].Length -gt 256) { $d.parsing_status='REJECTED'; $d.reason='FAILED_NAME_FORMAT'; return $d }
+                  $name = $Matches[1]
+                  if (-not $names.Contains($name)) { $d.parsing_status='REJECTED'; $d.reason='FAILED_NAME_NOT_LISTED'; return $d }
+                  if (-not $seen.Add($name)) { $d.parsing_status='REJECTED'; $d.reason='FAILED_NAME_DUPLICATE'; return $d }
+                  if ($failed.Count -ge 16) { $d.parsing_status='REJECTED'; $d.reason='FAILED_NAME_LIMIT'; return $d }
+                  $failed.Add($name)
+                }
+                if ($line.StartsWith('test result:')) {
+                  if ($line -cnotmatch '^test result: (ok|FAILED)\. ([0-9]{1,3}) passed; ([0-9]{1,3}) failed; ([0-9]{1,3}) ignored; ([0-9]{1,3}) measured; ([0-9]{1,6}) filtered out; finished in [0-9]{1,4}(?:\.[0-9]{1,3})?s$') { $d.reason='SUMMARY_FORMAT'; return $d }
+                  $summary = @{outcome=$Matches[1];passed=[int]$Matches[2];failed=[int]$Matches[3];ignored=[int]$Matches[4];measured=[int]$Matches[5];filtered_out=[int]$Matches[6]}
+                  if ($summary.passed + $summary.failed + $summary.ignored -ne 225 -or $summary.measured -ne 0 -or $summary.filtered_out -gt 100000) { $d.parsing_status='REJECTED'; $d.reason='SUMMARY_RANGE'; return $d }
+                  $summaries.Add($summary)
+                }
+              }
+              # Even a truncated log may preserve bounded names, but NEVER full-set verification.
+              if ($failed.Count -gt 0) { $d.failed_tests=[string[]]$failed.ToArray(); $d.names_bound_to_list=$true }
+              if ($summaries.Count -ne 1) { $d.reason='SUMMARY_MISSING_OR_MULTIPLE'; return $d }
+              $d.summary = $summaries[0]
+              if ($d.summary.failed -ne $failed.Count) { $d.reason='FAILED_NAMES_INCOMPLETE'; return $d }
+              if ($d.exit_code -eq 101 -and $d.summary.outcome -ceq 'FAILED' -and $failed.Count -gt 0) {
+                $d.parsing_status='PARSED_FAILURE'; $d.reason='NONE'; return $d
+              }
+              if ($d.exit_code -eq 0 -and $d.summary.outcome -ceq 'ok' -and $d.summary.failed -eq 0 -and $failed.Count -eq 0) {
+                $d.parsing_status='PARSED_PASS'; $d.reason='NONE'; $d.failed_tests=[string[]]@(); $d.names_bound_to_list=$true; return $d
+              }
+              $d.reason='EXIT_SUMMARY_CONFLICT'; return $d
+            } catch {
+              # No panic text, exception message, path, stderr, or arbitrary log fragment is exported.
+              $d.parsing_status='UNKNOWN'; $d.failed_tests=$null; $d.names_bound_to_list=$false
+              $d.reason = switch -CaseSensitive ([string]$_.Exception.Message) {
+                'NB2_LOG_MISSING' { 'LOG_MISSING' }
+                'NB2_LOG_BOUND' { 'LOG_BOUND' }
+                default { 'DIAGNOSTIC_PARSE_ERROR' }
+              }
+              return $d
+            }
+          }
           # NB2_CONSUMER_END
           $identity = @{sha=$env:GITHUB_SHA;run_id=$env:GITHUB_RUN_ID;attempt=$env:GITHUB_RUN_ATTEMPT;source_candidate='69c2d4e9e36d7f46e72da532c5534677fa1bba13'}
           $failure = 'NB2_EVIDENCE_INCOMPLETE'; $verified = $null; $tools = $null
@@ -286,8 +348,9 @@ jobs:
           $pass = $failure -ceq 'NONE'
           $upload = Join-Path $env:NB2_ROOT 'upload'
           $diagnostics = Get-Nb2Diagnostics (Join-Path $env:NB2_ROOT 'private')
+          $testFailure = Get-Nb2TestFailure (Join-Path $env:NB2_ROOT 'private') $diagnostics.commands
           $summary = @{schema='NB2_CI_V1';identity=$identity;verdict=$(if($pass){'PASS'}else{'FAIL'});failure_code=$failure;checks_verified=$pass;tools=$(if($pass){$tools}else{$null});helper=$(if($pass){$verified.helper}else{$null});helper_executed=$false;ignored_native_tests_executed=$false;scope='COMPILE_AND_INJECTED_TEST_CONTRACT_NOT_NATIVE_OBSERVATION'}
-          $checks = @{schema='NB2_CHECKS_V1';identity=$identity;verified=$pass;ledger_state=$diagnostics.ledger_state;commands=$diagnostics.commands;logs=$diagnostics.logs}
+          $checks = @{schema='NB2_CHECKS_V1';identity=$identity;verified=$pass;ledger_state=$diagnostics.ledger_state;commands=$diagnostics.commands;logs=$diagnostics.logs;test_failure=$testFailure}
           $tests = @{schema='NB2_TESTS_V1';identity=$identity;verified=$pass;ok=$(if($pass){$verified.ok}else{@()});ignored=$(if($pass){$verified.ignored}else{@()});listed=$(if($pass){$verified.listed}else{@()})}
           $manifest = @()
           foreach ($pair in @(@('summary.json',$summary,16384),@('checks.json',$checks,16384),@('tests.json',$tests,131072))) {

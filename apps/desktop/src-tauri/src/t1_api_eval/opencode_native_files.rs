@@ -61,6 +61,15 @@ pub const MAX_ADS: usize = 16;
 pub const MAX_STREAM: usize = 1024 * 1024;
 pub const MAX_ADS_BYTES: usize = 8 * 1024 * 1024;
 pub const DACL_MASK: u16 = 0x150c;
+/// ADS handles identify the owning file, not an independent stream identity.
+/// Shared by native collection and memory-only tests. Missing facts are UNKNOWN.
+pub(super) fn validate_ads_identity(main: &str, stream: Option<&str>) -> Result<()> {
+    if main.is_empty() || stream.is_none_or(|id| id.is_empty() || id != main) {
+        return Err("ADS owning file identity UNKNOWN/mismatch".into());
+    }
+    Ok(())
+}
+
 pub fn relative(p: &str) -> bool {
     p == "."
         || (p.is_ascii()
@@ -587,7 +596,11 @@ pub mod native {
             }
         }
     }
-    fn stream_facts(path: &Path, deadline: Instant) -> Result<Vec<(String, Vec<u8>)>> {
+    fn stream_facts(
+        path: &Path,
+        main_id: &str,
+        deadline: Instant,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
         unsafe {
             let mut data: WIN32_FIND_STREAM_DATA = std::mem::zeroed();
             let h = FindFirstStreamW(
@@ -633,6 +646,7 @@ pub mod native {
                     let stream_path = PathBuf::from(format!("{}:{n}", path.display()));
                     let mut f = open_impl(&stream_path, None)?;
                     let before = meta(&f)?;
+                    validate_ads_identity(main_id, Some(&before.id))?;
                     let mut b = Vec::new();
                     (&mut f)
                         .take((MAX_STREAM + 1) as u64)
@@ -739,7 +753,7 @@ pub mod native {
                         return Err("short/oversize default stream".into());
                     }
                 }
-                let ads = stream_facts(&path, deadline)?;
+                let ads = stream_facts(&path, &before.id, deadline)?;
                 if dir {
                     for e in std::fs::read_dir(&path).map_err(|_| "directory start UNKNOWN")? {
                         let e = e.map_err(|_| "directory end UNKNOWN")?;
@@ -857,7 +871,7 @@ pub mod native {
         let (owner, dacl) = security(&f)?;
         let mut b = Vec::new();
         f.read_to_end(&mut b).map_err(|_| "fixture read")?;
-        let ads = stream_facts(&path, Instant::now() + Duration::from_secs(1))?;
+        let ads = stream_facts(&path, &before.id, Instant::now() + Duration::from_secs(1))?;
         let after = meta(&f)?;
         assert!(stable(&before, &after));
         assert_eq!(b, b"fixture");

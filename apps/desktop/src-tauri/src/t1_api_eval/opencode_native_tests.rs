@@ -1,4 +1,5 @@
 //! New ordinary tests are PURE INJECTION: no socket, randomness, process/Job or filesystem call.
+// N-2/N-3/N-4 additions below also use only memory ownership tokens and the fake clock.
 use super::{
     opencode_native_files::*, opencode_native_process::*, opencode_nonce::*, opencode_paths::*,
     opencode_probe::*,
@@ -173,6 +174,7 @@ struct FakeProcess {
     create_ms: u64,
     termination_ms: u64,
     identity_ok: bool,
+    resume_count: u32,
     exit_after: u64,
     fail: &'static str,
     calls: Vec<&'static str>,
@@ -185,6 +187,7 @@ impl FakeProcess {
             create_ms: 0,
             termination_ms: 0,
             identity_ok: true,
+            resume_count: 1,
             exit_after: 0,
             fail: "",
             calls: vec![],
@@ -235,7 +238,8 @@ impl ProcessOps for FakeProcess {
         ))
     }
     fn resume(&mut self) -> super::Result<()> {
-        self.hit("resume")
+        self.hit("resume")?;
+        validate_resume_count(self.resume_count)
     }
     fn terminate_suspended(&mut self) -> super::Result<()> {
         self.ms += self.termination_ms;
@@ -766,4 +770,321 @@ fn n1_review_rejects_wrong_after_source_even_with_valid_native_before() {
         FactSource::NativePrepared
     )
     .is_err());
+}
+
+#[test]
+fn n3_ads_identity_matches_main_and_rejects_missing_empty_or_replaced() {
+    assert!(validate_ads_identity("owner-id", Some("owner-id")).is_ok());
+    for other in [None, Some(""), Some("replacement-id")] {
+        assert_eq!(
+            validate_ads_identity("owner-id", other).unwrap_err(),
+            "ADS owning file identity UNKNOWN/mismatch"
+        );
+    }
+    assert!(validate_ads_identity("", Some("")).is_err());
+}
+#[test]
+fn n4_resume_exactly_one_succeeds_other_counts_cleanup_and_stop() {
+    let mut good = FakeProcess::new();
+    assert!(launch_verified(&mut good).is_ok());
+    assert_eq!(good.calls.iter().filter(|n| **n == "resume").count(), 1);
+    assert!(!good.calls.contains(&"stop-job"));
+    for count in [0, 2, 17, u32::MAX] {
+        let mut p = FakeProcess::new();
+        p.resume_count = count;
+        let e = launch_verified(&mut p).unwrap_err();
+        assert!(e.resume_attempted, "count={count}");
+        assert_eq!(e.reason, "resume previous suspension count UNKNOWN");
+        assert!(e.direct_cleanup_confirmed());
+        assert_eq!(p.calls.last(), Some(&"exit"));
+        assert!(p.calls.contains(&"stop-job"));
+        assert_eq!(p.calls.iter().filter(|n| **n == "resume").count(), 1);
+    }
+}
+#[test]
+fn n4_bad_resume_with_unknown_exit_does_not_report_cleanup_success() {
+    let mut p = FakeProcess::new();
+    p.resume_count = 2;
+    p.fail = "exit";
+    let e = launch_verified(&mut p).unwrap_err();
+    assert!(e.resume_attempted);
+    assert!(!e.direct_cleanup_confirmed());
+    assert_eq!(e.cleanup.unwrap().error, Some(StopError::QueryFailed));
+}
+
+// These tokens simulate ownership, not native handles or native reader execution.
+struct N2Process {
+    p: FakeProcess,
+    drops: std::rc::Rc<std::cell::Cell<u32>>,
+}
+impl Drop for N2Process {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+    }
+}
+impl ProcessOps for N2Process {
+    fn now(&self) -> Instant {
+        self.p.now()
+    }
+    fn pause(&mut self) {
+        self.p.pause()
+    }
+    fn create_suspended(&mut self) -> super::Result<()> {
+        self.p.create_suspended()
+    }
+    fn validate_identity(&mut self) -> super::Result<()> {
+        self.p.validate_identity()
+    }
+    fn assign(&mut self) -> super::Result<()> {
+        self.p.assign()
+    }
+    fn flags_and_active(&mut self) -> super::Result<(u32, u32)> {
+        self.p.flags_and_active()
+    }
+    fn resume(&mut self) -> super::Result<()> {
+        self.p.resume()
+    }
+    fn terminate_suspended(&mut self) -> super::Result<()> {
+        self.p.terminate_suspended()
+    }
+    fn terminate_job(&mut self) -> super::Result<()> {
+        self.p.terminate_job()
+    }
+    fn exited(&mut self) -> super::Result<bool> {
+        self.p.exited()
+    }
+}
+struct N2Io {
+    drops: std::rc::Rc<std::cell::Cell<u32>>,
+    fail_start: bool,
+    fail_finish: bool,
+    overflow: bool,
+    started: bool,
+}
+impl Drop for N2Io {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+    }
+}
+impl GitIo<N2Process> for N2Io {
+    fn start(&mut self, _: &mut N2Process) -> super::Result<()> {
+        self.started = true; // models stdout acquired before stderr start failure
+        if self.fail_start {
+            Err("injected second reader start".into())
+        } else {
+            Ok(())
+        }
+    }
+    fn overflow(&self) -> bool {
+        self.overflow
+    }
+    fn finish(&mut self, _: &mut N2Process, _: Instant) -> super::Result<Vec<u8>> {
+        if !self.started || self.fail_finish {
+            Err("injected EOF/reader UNKNOWN".into())
+        } else {
+            Ok(b"fixed-root\n".to_vec())
+        }
+    }
+}
+fn n2_resources() -> (N2Process, N2Io, std::rc::Rc<std::cell::Cell<u32>>) {
+    let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+    (
+        N2Process {
+            p: FakeProcess::new(),
+            drops: drops.clone(),
+        },
+        N2Io {
+            drops: drops.clone(),
+            fail_start: false,
+            fail_finish: false,
+            overflow: false,
+            started: false,
+        },
+        drops,
+    )
+}
+#[test]
+fn n2_each_failure_returns_process_job_and_reader_responsibility() {
+    for point in [
+        "create", "identity", "assign", "query", "resume", "exit", "start", "finish", "overflow",
+        "timeout",
+    ] {
+        let (mut p, mut io, drops) = n2_resources();
+        match point {
+            "start" => io.fail_start = true,
+            "finish" => io.fail_finish = true,
+            "overflow" => io.overflow = true,
+            "timeout" => p.p.exit_after = 3500,
+            _ => p.p.fail = point,
+        }
+        let base = p.p.base;
+        let plan = DeadlinePlan::git(0, 30000, 120000, 240000).unwrap();
+        let e = supervise_owned_git(p, io, base, plan).err().expect(point);
+        assert_eq!(drops.get(), 0, "premature release: {point}");
+        let r = e.resources.as_ref().expect("ownership retained");
+        if ["create", "identity", "assign", "query"].contains(&point) {
+            assert!(!r.process.p.calls.contains(&"resume"), "{point}");
+            assert!(!r.io.started, "{point}");
+        }
+        if point == "finish" {
+            assert!(!e.stage.readers_confirmed);
+            assert!(e.stage.stop.is_some());
+        }
+        if point == "query" || point == "exit" {
+            assert!(e.stage.stop.is_none());
+        }
+        assert!(r.process.p.ms <= 5000);
+        drop(e);
+        assert_eq!(drops.get(), 2, "explicit owner release: {point}");
+    }
+}
+#[test]
+fn n2_reader_unknown_is_retained_and_later_confirmed_without_relaunch() {
+    let (p, mut io, drops) = n2_resources();
+    io.fail_finish = true;
+    let base = p.p.base;
+    let mut e = supervise_owned_git(
+        p,
+        io,
+        base,
+        DeadlinePlan::git(0, 30000, 120000, 240000).unwrap(),
+    )
+    .err()
+    .unwrap();
+    assert!(!e.stage.readers_confirmed);
+    let owner = e.resources.as_mut().unwrap();
+    let first = owner.reclaim();
+    assert!(!first.confirmed());
+    assert!(first.stop.as_ref().unwrap().validate().is_ok());
+    assert!(!first.readers_confirmed);
+    owner.io.fail_finish = false;
+    let next = owner.reclaim();
+    assert!(next.confirmed());
+    assert_eq!(
+        owner
+            .process
+            .p
+            .calls
+            .iter()
+            .filter(|n| **n == "create")
+            .count(),
+        1
+    );
+    assert_eq!(
+        owner
+            .process
+            .p
+            .calls
+            .iter()
+            .filter(|n| **n == "resume")
+            .count(),
+        1
+    );
+    assert_eq!(drops.get(), 0);
+    assert!(!e.stage.readers_confirmed); // historical failure is NOT rewritten
+}
+#[test]
+fn n2_expired_retained_cleanup_is_unknown_without_new_budget_or_calls() {
+    let (p, mut io, drops) = n2_resources();
+    io.fail_finish = true;
+    let base = p.p.base;
+    let mut e = supervise_owned_git(
+        p,
+        io,
+        base,
+        DeadlinePlan::git(0, 30000, 120000, 240000).unwrap(),
+    )
+    .err()
+    .unwrap();
+    let owner = e.resources.as_mut().unwrap();
+    owner.process.p.ms = 5000;
+    let calls = owner.process.p.calls.clone();
+    let r = owner.reclaim();
+    assert!(!r.confirmed());
+    // Preserve the earlier observed Job0, but expired readers still prevent confirmation.
+    assert!(r.stop.as_ref().unwrap().validate().is_ok());
+    assert!(!r.readers_confirmed);
+    assert_eq!(owner.process.p.calls, calls);
+    assert_eq!(owner.process.p.ms, 5000);
+    assert_eq!(drops.get(), 0);
+}
+#[test]
+fn n2_termination_request_or_query_failure_never_means_job_zero() {
+    for point in ["stop-job", "query", "exit"] {
+        let (mut p, mut io, _) = n2_resources();
+        p.p.fail = point;
+        io.overflow = true;
+        io.fail_finish = true;
+        let base = p.p.base;
+        // Cleanup was never confirmed; a termination request is not a receipt.
+        let mut e = supervise_owned_git(
+            p,
+            io,
+            base,
+            DeadlinePlan::git(0, 30000, 120000, 240000).unwrap(),
+        )
+        .err()
+        .unwrap();
+        let owner = e.resources.as_mut().unwrap();
+        let r = owner.reclaim();
+        assert!(!r.confirmed(), "{point}");
+        assert!(r.stop.is_none(), "{point}");
+        assert!(r.error.is_some());
+    }
+}
+#[test]
+fn n2_owned_success_preserves_complete_receipt_and_does_not_relaunch() {
+    let (p, io, drops) = n2_resources();
+    let base = p.p.base;
+    let (r, owner) = supervise_owned_git(
+        p,
+        io,
+        base,
+        DeadlinePlan::git(0, 30000, 120000, 240000).unwrap(),
+    )
+    .unwrap();
+    assert!(r.natural);
+    assert!(r.job.validate().is_ok());
+    assert_eq!(r.stdout, b"fixed-root\n");
+    assert_eq!(drops.get(), 0);
+    assert_eq!(
+        owner
+            .process
+            .p
+            .calls
+            .iter()
+            .filter(|n| **n == "create")
+            .count(),
+        1
+    );
+    drop(owner);
+    assert_eq!(drops.get(), 2);
+}
+
+#[test]
+fn n2_failed_reclaim_does_not_extend_original_reader_cutoff() {
+    let (p, mut io, _) = n2_resources();
+    io.fail_finish = true;
+    let base = p.p.base;
+    let mut e = supervise_owned_git(
+        p,
+        io,
+        base,
+        DeadlinePlan::git(0, 30000, 120000, 240000).unwrap(),
+    )
+    .err()
+    .unwrap();
+    let owner = e.resources.as_mut().unwrap();
+    owner.process.p.ms = 900;
+    assert!(!owner.reclaim().confirmed());
+    owner.process.p.ms = 1001;
+    owner.io.fail_finish = false;
+    let r = owner.reclaim();
+    assert!(!r.confirmed());
+    assert!(!r.readers_confirmed);
+    assert_eq!(
+        r.error.as_deref(),
+        Some("Git retained readers deadline UNKNOWN")
+    );
+    assert_eq!(owner.process.p.ms, 1001);
 }

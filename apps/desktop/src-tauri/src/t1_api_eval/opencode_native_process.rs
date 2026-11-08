@@ -285,6 +285,14 @@ impl FrozenImage {
         Ok(())
     }
 }
+/// ResumeThread returns the PREVIOUS suspension count. Only one releases our suspension.
+pub(super) fn validate_resume_count(previous: u32) -> Result<()> {
+    if previous != 1 {
+        return Err("resume previous suspension count UNKNOWN".into());
+    }
+    Ok(())
+}
+
 /// Same Git scheduling skeleton is used by native IO and injected tests.
 pub trait GitIo<P: super::opencode_probe::ProcessOps> {
     fn start(&mut self, p: &mut P) -> Result<()>;
@@ -303,6 +311,128 @@ pub struct GitStageFailure {
     pub launch: Option<super::opencode_probe::LaunchFailure>,
     pub stop: Option<super::opencode_paths::JobStopReceipt>,
     pub readers_confirmed: bool,
+    // Original per-operation cutoffs. Retention must never grant a new cleanup/reader budget.
+    pub cleanup_deadline: Option<Instant>,
+    pub reader_deadline: Option<Instant>,
+}
+/// Failure ownership is returned, never implicitly detached by execute_git.
+/// For native P this retains child/thread/pipe/image handles AND borrows the original Job.
+/// Dropping it is only a last-resort termination request, never confirmation of reclamation.
+pub struct GitResources<P, I> {
+    pub process: P,
+    pub io: I,
+    cleanup_end: Instant,
+    reader_end: Instant,
+    confirmed_stop: Option<super::opencode_paths::JobStopReceipt>,
+    confirmed_readers: bool,
+}
+pub struct OwnedGitFailure<P, I> {
+    pub stage: GitStageFailure,
+    pub resources: Option<GitResources<P, I>>,
+}
+impl<P, I> std::fmt::Debug for OwnedGitFailure<P, I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedGitFailure")
+            .field("stage", &self.stage)
+            .field("resources_retained", &self.resources.is_some())
+            .finish()
+    }
+}
+#[derive(Debug)]
+pub struct GitReclaimReceipt {
+    pub stop: Option<super::opencode_paths::JobStopReceipt>,
+    pub readers_confirmed: bool,
+    pub error: Option<String>,
+}
+impl GitReclaimReceipt {
+    pub fn confirmed(&self) -> bool {
+        self.error.is_none()
+            && self.readers_confirmed
+            && self.stop.as_ref().is_some_and(|r| r.validate().is_ok())
+    }
+}
+impl<P: super::opencode_probe::ProcessOps, I: GitIo<P>> GitResources<P, I> {
+    /// No new stage budget: both retries are capped by the ORIGINAL reserved deadlines.
+    /// The owner remains held even on UNKNOWN, so callers may preserve responsibility.
+    pub fn reclaim(&mut self) -> GitReclaimReceipt {
+        let stop = if let Some(r) = &self.confirmed_stop {
+            // Already proved before failure; not a new termination or a Drop observation.
+            Ok(r.clone())
+        } else if self.process.now() < self.cleanup_end {
+            super::opencode_probe::confirm_stopped(&mut self.process, self.cleanup_end)
+        } else {
+            Err("Git retained cleanup deadline UNKNOWN".into())
+        };
+        if let Ok(r) = &stop {
+            self.confirmed_stop = Some(r.clone());
+        }
+        let end = self.reader_end;
+        let readers = if self.confirmed_readers {
+            Ok(Vec::new()) // Preserve a completed join; no second reader operation.
+        } else if self.process.now() < end {
+            self.io.finish(&mut self.process, end)
+        } else {
+            Err("Git retained readers deadline UNKNOWN".into())
+        };
+        let readers_confirmed =
+            self.confirmed_readers || (readers.is_ok() && self.process.now() < end);
+        self.confirmed_readers = readers_confirmed;
+        let error = stop
+            .as_ref()
+            .err()
+            .cloned()
+            .or_else(|| readers.err())
+            .or_else(|| (!readers_confirmed).then(|| "Git retained readers late UNKNOWN".into()));
+        GitReclaimReceipt {
+            stop: stop.ok(),
+            readers_confirmed,
+            error,
+        }
+    }
+}
+pub fn supervise_owned_git<P: super::opencode_probe::ProcessOps, I: GitIo<P>>(
+    process: P,
+    io: I,
+    origin: Instant,
+    plan: DeadlinePlan,
+) -> std::result::Result<(GitStageReceipt, GitResources<P, I>), OwnedGitFailure<P, I>> {
+    // Even an invalid plan returns ownership; never lose resources on an error conversion.
+    let cleanup_end = origin
+        .checked_add(Duration::from_millis(plan.cleanup_end))
+        .unwrap_or(origin);
+    let reader_end = origin
+        .checked_add(Duration::from_millis(plan.reader_end))
+        .unwrap_or(origin);
+    let mut resources = GitResources {
+        process,
+        io,
+        cleanup_end,
+        reader_end,
+        confirmed_stop: None,
+        confirmed_readers: false,
+    };
+    match supervise_git(&mut resources.process, &mut resources.io, origin, plan) {
+        Ok(r) => {
+            resources.confirmed_stop = Some(r.job.clone());
+            resources.confirmed_readers = true;
+            Ok((r, resources))
+        }
+        Err(stage) => {
+            // Launch failure does not expose unused cleanup time: fail closed, hold ownership.
+            resources.cleanup_end = stage
+                .cleanup_deadline
+                .unwrap_or_else(|| resources.process.now());
+            resources.reader_end = stage
+                .reader_deadline
+                .unwrap_or_else(|| resources.process.now());
+            resources.confirmed_stop = stage.stop.clone();
+            resources.confirmed_readers = stage.readers_confirmed;
+            Err(OwnedGitFailure {
+                stage,
+                resources: Some(resources),
+            })
+        }
+    }
 }
 pub fn supervise_git<P: super::opencode_probe::ProcessOps, I: GitIo<P>>(
     p: &mut P,
@@ -316,12 +446,16 @@ pub fn supervise_git<P: super::opencode_probe::ProcessOps, I: GitIo<P>>(
         launch: None,
         stop: None,
         readers_confirmed: false,
+        cleanup_deadline: None,
+        reader_deadline: None,
     })?;
     launch_verified_until(p, chain, cleanup_end).map_err(|e| GitStageFailure {
         reason: "Git launch refused".into(),
         launch: Some(e),
         stop: None,
         readers_confirmed: false,
+        cleanup_deadline: None,
+        reader_deadline: None,
     })?;
     let mut started = false;
     let mut natural = false;
@@ -347,6 +481,7 @@ pub fn supervise_git<P: super::opencode_probe::ProcessOps, I: GitIo<P>>(
             p.pause();
         }
     })();
+    let cleanup_deadline = cleanup_end.min(p.now() + Duration::from_secs(1));
     let stopped = if natural {
         Ok(super::opencode_paths::JobStopReceipt {
             flags: Some(0x2000),
@@ -355,7 +490,7 @@ pub fn supervise_git<P: super::opencode_probe::ProcessOps, I: GitIo<P>>(
             error: None,
         })
     } else {
-        confirm_stopped(p, cleanup_end.min(p.now() + Duration::from_secs(1)))
+        confirm_stopped(p, cleanup_deadline)
     };
     // Always attempt bounded reader collection after a stop; never hide an earlier failure.
     let reader_deadline = reader_end.min(p.now() + Duration::from_secs(1));
@@ -375,6 +510,8 @@ pub fn supervise_git<P: super::opencode_probe::ProcessOps, I: GitIo<P>>(
             launch: None,
             stop: stopped.ok(),
             readers_confirmed: readers_ok,
+            cleanup_deadline: Some(cleanup_deadline),
+            reader_deadline: Some(reader_deadline),
         });
     }
     Ok(GitStageReceipt {
@@ -885,9 +1022,9 @@ pub mod native {
         }
         fn resume(&mut self) -> Result<()> {
             unsafe {
-                if ResumeThread(self.child.as_ref().ok_or("no process")?.thread.0) == u32::MAX {
-                    return Err(err());
-                }
+                validate_resume_count(ResumeThread(
+                    self.child.as_ref().ok_or("no process")?.thread.0,
+                ))?;
             }
             Ok(())
         }
@@ -980,114 +1117,138 @@ pub mod native {
                 let _ = tx.send(result);
             })
             .map_err(|_| "reader start UNKNOWN")?;
-        Ok(OwnedReader { rx, handle })
+        Ok(OwnedReader {
+            rx,
+            handle: Some(handle),
+            result: None,
+        })
     }
     struct OwnedReader {
         rx: std::sync::mpsc::Receiver<Result<Vec<u8>>>,
-        handle: std::thread::JoinHandle<()>,
+        handle: Option<std::thread::JoinHandle<()>>,
+        result: Option<Result<Vec<u8>>>,
     }
     impl OwnedReader {
-        fn finish(self, deadline: Instant) -> Result<Vec<u8>> {
-            let result = self
-                .rx
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .map_err(|_| "reader EOF deadline UNKNOWN")?;
-            while !self.handle.is_finished() {
-                if Instant::now() >= deadline {
-                    return Err("reader reclaim UNKNOWN".into());
-                }
-                std::thread::yield_now();
+        fn finish(&mut self, deadline: Instant) -> Result<Vec<u8>> {
+            if self.result.is_none() {
+                // Timeout MUST NOT consume/drop the JoinHandle; owner retains it for follow-up.
+                self.result = Some(
+                    self.rx
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .map_err(|_| "reader EOF deadline UNKNOWN")?,
+                );
             }
-            self.handle.join().map_err(|_| "reader panicked UNKNOWN")?;
+            if let Some(handle) = &self.handle {
+                while !handle.is_finished() {
+                    if Instant::now() >= deadline {
+                        return Err("reader reclaim UNKNOWN".into());
+                    }
+                    std::thread::yield_now();
+                }
+                if self.handle.take().unwrap().join().is_err() {
+                    self.result = Some(Err("reader panicked UNKNOWN".into()));
+                }
+            }
             if Instant::now() >= deadline {
                 return Err("reader reclaim late UNKNOWN".into());
             }
-            result
+            self.result.as_ref().ok_or("reader result UNKNOWN")?.clone()
         }
     }
-    struct NativeGitIo {
-        readers: Option<(OwnedReader, OwnedReader)>,
+    pub struct NativeGitIo {
+        // Store each reader immediately: a failure starting stderr cannot detach stdout.
+        readers: Vec<OwnedReader>,
         overflow: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
     impl GitIo<NativeProcessOps<'_>> for NativeGitIo {
         fn start(&mut self, p: &mut NativeProcessOps<'_>) -> Result<()> {
             let (out, err) = p.take_output()?;
-            self.readers = Some((
-                reader(out, 1024, self.overflow.clone())?,
-                reader(err, 32768, self.overflow.clone())?,
-            ));
+            self.readers.push(reader(out, 1024, self.overflow.clone())?);
+            self.readers
+                .push(reader(err, 32768, self.overflow.clone())?);
             Ok(())
         }
         fn overflow(&self) -> bool {
             self.overflow.load(std::sync::atomic::Ordering::SeqCst)
         }
         fn finish(&mut self, _: &mut NativeProcessOps<'_>, deadline: Instant) -> Result<Vec<u8>> {
-            let (a, b) = self.readers.take().ok_or("readers absent")?;
+            let mut failure = (self.readers.len() != 2)
+                .then(|| "Git reader start incomplete UNKNOWN".to_string());
             let mut output = Vec::new();
-            for (i, rx) in [a, b].into_iter().enumerate() {
-                let remain = deadline.saturating_duration_since(Instant::now());
-                if remain.is_zero() {
-                    return Err("Git reader deadline UNKNOWN".into());
-                }
-                let bytes = rx.finish(deadline)?;
-                if i == 0 {
-                    output = bytes
+            // Try BOTH within one deadline; never move either reader out on a failure.
+            for (i, r) in self.readers.iter_mut().enumerate() {
+                match r.finish(deadline) {
+                    Ok(b) if i == 0 => output = b,
+                    Ok(_) => {}
+                    Err(e) => {
+                        if failure.is_none() {
+                            failure = Some(e);
+                        }
+                    }
                 }
             }
-            Ok(output)
+            if let Some(e) = failure {
+                Err(e)
+            } else {
+                Ok(output)
+            }
         }
     }
-    pub fn execute_git(
-        job: &ProbeJob,
+    pub fn execute_git<'a>(
+        job: &'a ProbeJob,
         image: FrozenImage,
         sid: String,
         root: RootReservation,
         origin: Instant,
         plan: DeadlinePlan,
-    ) -> std::result::Result<GitExecution, GitStageFailure> {
-        let (chain, _, _) = plan.instants(origin).map_err(|e| GitStageFailure {
-            reason: e,
-            launch: None,
-            stop: None,
-            readers_confirmed: false,
-        })?;
-        let mut p =
-            NativeProcessOps::git(job, image, sid.clone(), root.clone(), chain).map_err(|e| {
-                GitStageFailure {
-                    reason: e,
-                    launch: None,
-                    stop: None,
-                    readers_confirmed: false,
-                }
-            })?;
-        let mut io = NativeGitIo {
-            readers: None,
+    ) -> std::result::Result<GitExecution, OwnedGitFailure<NativeProcessOps<'a>, NativeGitIo>> {
+        let early = |reason| OwnedGitFailure {
+            stage: GitStageFailure {
+                reason,
+                launch: None,
+                stop: None,
+                readers_confirmed: false,
+                cleanup_deadline: None,
+                reader_deadline: None,
+            },
+            resources: None,
+        };
+        let (chain, _, _) = plan.instants(origin).map_err(&early)?;
+        let p =
+            NativeProcessOps::git(job, image, sid.clone(), root.clone(), chain).map_err(early)?;
+        let io = NativeGitIo {
+            readers: Vec::new(),
             overflow: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
-        let receipt = supervise_git(&mut p, &mut io, origin, plan)?;
-        let process = p
-            .identity()
-            .ok_or(GitStageFailure {
-                reason: "Git identity missing".into(),
-                launch: None,
-                stop: Some(receipt.job.clone()),
-                readers_confirmed: true,
-            })?
-            .clone();
-        let exit = p.final_exit().map_err(|e| GitStageFailure {
-            reason: e,
-            launch: None,
-            stop: Some(receipt.job.clone()),
-            readers_confirmed: true,
-        })?;
-        if Instant::now() >= origin + Duration::from_millis(plan.reader_end) {
-            return Err(GitStageFailure {
-                reason: "final exit query late UNKNOWN".into(),
-                launch: None,
-                stop: Some(receipt.job),
-                readers_confirmed: true,
-            });
-        }
+        let (receipt, resources) = supervise_owned_git(p, io, origin, plan)?;
+        let facts = (|| -> Result<_> {
+            let process = resources
+                .process
+                .identity()
+                .ok_or("Git identity missing")?
+                .clone();
+            let exit = resources.process.final_exit()?;
+            if Instant::now() >= resources.reader_end {
+                return Err("final exit query late UNKNOWN".into());
+            }
+            Ok((process, exit))
+        })();
+        let (process, exit) = match facts {
+            Ok(f) => f,
+            Err(reason) => {
+                return Err(OwnedGitFailure {
+                    stage: GitStageFailure {
+                        reason,
+                        launch: None,
+                        stop: Some(receipt.job),
+                        readers_confirmed: true,
+                        cleanup_deadline: None,
+                        reader_deadline: None,
+                    },
+                    resources: Some(resources),
+                })
+            }
+        };
         Ok(GitExecution {
             process,
             stdout_eof: true,
@@ -1162,10 +1323,10 @@ pub mod native {
         };
         job.assign(child.process.0)?;
         assert_eq!(job.query()?, 1);
-        unsafe { assert_ne!(ResumeThread(child.thread.0), u32::MAX) }
+        unsafe { assert_eq!(ResumeThread(child.thread.0), 1) }
         let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let out = reader(child.stdout.take().unwrap(), 1024, overflow.clone())?;
-        let err = reader(child.stderr.take().unwrap(), 1024, overflow)?;
+        let mut out = reader(child.stdout.take().unwrap(), 1024, overflow.clone())?;
+        let mut err = reader(child.stderr.take().unwrap(), 1024, overflow)?;
         let deadline = Instant::now() + Duration::from_secs(2);
         if child_wait {
             while job.query()? < 2 {

@@ -62,3 +62,258 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           compression-level: 6
+
+  # Separate from the existing Node/fixture pipeline. No helper or native test execution.
+  nb2-validation:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.0-x86_64-pc-windows-msvc
+      CARGO_TERM_COLOR: never
+      RUSTUP_AUTO_INSTALL: '0'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout NB2 CI candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Prepare fresh NB2 paths and locked Rust inputs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'NB2_PWSH_VERSION' }
+          if ((git rev-parse HEAD).Trim() -cne $env:GITHUB_SHA) { throw 'NB2_CHECKOUT_SHA' }
+          # New short root per run/attempt/job, not a cached build or a user directory.
+          $root = Join-Path ([IO.Path]::GetPathRoot($env:RUNNER_TEMP)) ('nb2-ci-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT)
+          if (Test-Path -LiteralPath $root) { throw 'NB2_ROOT_EXISTS' }
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+          foreach ($name in @('target','tmp','private','upload')) {
+            New-Item -ItemType Directory -Path (Join-Path $root $name) -ErrorAction Stop | Out-Null
+          }
+          "NB2_ROOT=$root" >> $env:GITHUB_ENV
+          $env:TEMP = Join-Path $root 'tmp'; $env:TMP = $env:TEMP
+          "TEMP=$env:TEMP" >> $env:GITHUB_ENV
+          "TMP=$env:TMP" >> $env:GITHUB_ENV
+          "CARGO_TARGET_DIR=$(Join-Path $root 'target')" >> $env:GITHUB_ENV
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+          $rust = [string](rustc --version); $cargo = [string](cargo --version)
+          if ($rust -notmatch '^rustc 1\.98\.0 \([a-z0-9]+ [0-9-]+\)$' -or
+              $cargo -notmatch '^cargo 1\.98\.0 \([a-z0-9]+ [0-9-]+\)$') { throw 'NB2_TOOL_VERSION' }
+          Write-Host "pwsh=$($PSVersionTable.PSVersion); $rust; $cargo"
+          @{pwsh=$PSVersionTable.PSVersion.ToString();rust=$rust;cargo=$cargo} |
+            ConvertTo-Json | Set-Content (Join-Path $root 'private/tools.json') -Encoding utf8
+          Push-Location apps/desktop/src-tauri
+          try {
+            # Only preparation is online. Every validation command below is offline and locked.
+            cargo fetch --locked
+          } finally { Pop-Location }
+      - name: Run fixed NB2 checks without executing helper or ignored tests
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          $private = Join-Path $env:NB2_ROOT 'private'
+          $rows = [Collections.Generic.List[object]]::new()
+          function Invoke-Nb2Cargo([string]$Name, [string[]]$Vector, [int]$Expected) {
+            $row = [ordered]@{name=$Name;state='PARTIAL';exit_code=$null;elapsed_ms=0L}
+            $rows.Add($row)
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            try {
+              & $cargo @Vector 1> (Join-Path $private ($Name+'.stdout')) 2> (Join-Path $private ($Name+'.stderr'))
+              $row.exit_code = $LASTEXITCODE; $row.state = 'COMPLETE'
+            } finally {
+              $row.elapsed_ms = $clock.ElapsedMilliseconds
+              ConvertTo-Json -InputObject @($rows.ToArray()) -Depth 4 |
+                Set-Content (Join-Path $private 'commands.json') -Encoding utf8
+            }
+            foreach ($suffix in @('stdout','stderr')) {
+              if ((Get-Item -LiteralPath (Join-Path $private ($Name+'.'+$suffix))).Length -gt 16777216) { throw 'NB2_LOG_BOUND' }
+            }
+            if ($row.exit_code -ne $Expected) { throw 'NB2_COMMAND_EXIT' }
+          }
+          $lock = Join-Path $env:GITHUB_WORKSPACE 'apps/desktop/src-tauri/Cargo.lock'
+          (Get-FileHash -LiteralPath $lock -Algorithm SHA256).Hash |
+            Set-Content (Join-Path $private 'lock-before.txt') -Encoding ascii
+          Push-Location apps/desktop/src-tauri
+          try {
+            Invoke-Nb2Cargo 'test-list' @('test','--offline','--locked','--features','t1-api-eval','--lib','t1_api_eval::','--','--list') 0
+            Invoke-Nb2Cargo 'injected-tests' @('test','--offline','--locked','--features','t1-api-eval','--lib','t1_api_eval::','--','--test-threads=1') 0
+            Invoke-Nb2Cargo 'default-lib' @('check','--offline','--locked','--lib') 0
+            Invoke-Nb2Cargo 'helper-debug-build' @('build','--offline','--locked','--features','t1-api-eval','--bin','nova_t1_m0b_native_helper','--message-format=json') 0
+            Invoke-Nb2Cargo 'helper-default-guard' @('build','--offline','--locked','--bin','nova_t1_m0b_native_helper') 101
+            Invoke-Nb2Cargo 'helper-release-guard' @('check','--offline','--locked','--release','--features','t1-api-eval','--bin','nova_t1_m0b_native_helper','--message-format=json') 101
+          } finally { Pop-Location }
+          $global:LASTEXITCODE = 0
+      - name: Verify NB2 sets and exact gates and write bounded evidence
+        if: ${{ always() && env.NB2_ROOT != '' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # NB2_CONSUMER_BEGIN: extracted unchanged for local SYNTHETIC positive/negative checks.
+          function Read-Nb2Text([string]$Path, [int]$Limit = 16777216) {
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw 'NB2_LOG_MISSING' }
+            if ((Get-Item -LiteralPath $Path).Length -gt $Limit) { throw 'NB2_LOG_BOUND' }
+            return [IO.File]::ReadAllText($Path)
+          }
+          function Read-Nb2Json([string]$Text) {
+            $doc = [System.Text.Json.JsonDocument]::Parse($Text)
+            try {
+              $stack = [Collections.Generic.Stack[System.Text.Json.JsonElement]]::new()
+              $stack.Push($doc.RootElement)
+              while ($stack.Count -gt 0) {
+                $v = $stack.Pop()
+                if ($v.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                  $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                  foreach ($p in $v.EnumerateObject()) {
+                    if (-not $seen.Add($p.Name)) { throw 'NB2_JSON_DUPLICATE' }
+                    $stack.Push($p.Value)
+                  }
+                } elseif ($v.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+                  foreach ($p in $v.EnumerateArray()) { $stack.Push($p) }
+                }
+              }
+            } finally { $doc.Dispose() }
+            return ConvertFrom-Json -InputObject $Text -AsHashtable -ErrorAction Stop
+          }
+          function Get-Nb2SetHash([string[]]$Names) {
+            $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($n in $Names) {
+              if ($n -cnotmatch '^t1_api_eval::[A-Za-z0-9_:]+$' -or -not $seen.Add($n)) { throw 'NB2_TEST_DUPLICATE_OR_NAME' }
+            }
+            $sorted = [string[]]@($Names); [Array]::Sort($sorted, [StringComparer]::Ordinal)
+            $bytes = [Text.Encoding]::UTF8.GetBytes(($sorted -join "`n") + "`n")
+            return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+          }
+          function Confirm-Nb2Evidence([string]$Private, [string]$Target) {
+            $expected = [ordered]@{'test-list'=0;'injected-tests'=0;'default-lib'=0;'helper-debug-build'=0;'helper-default-guard'=101;'helper-release-guard'=101}
+            $rows = @(Read-Nb2Json (Read-Nb2Text (Join-Path $Private 'commands.json') 16384))
+            if ($rows.Count -ne 6) { throw 'NB2_COMMAND_SET' }
+            $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            $checks = @()
+            foreach ($row in $rows) {
+              if ($row.name -isnot [string] -or -not $expected.Contains($row.name) -or -not $names.Add($row.name)) { throw 'NB2_COMMAND_SET' }
+              if ($row.state -cne 'COMPLETE' -or ($row.exit_code -isnot [long] -and $row.exit_code -isnot [int]) -or
+                  $row.exit_code -ne $expected[$row.name] -or ($row.elapsed_ms -isnot [long] -and $row.elapsed_ms -isnot [int]) -or $row.elapsed_ms -lt 0) { throw 'NB2_COMMAND_RESULT' }
+              foreach ($suffix in @('stdout','stderr')) { $null = Read-Nb2Text (Join-Path $Private ($row.name+'.'+$suffix)) }
+              $checks += @{name=$row.name;state='COMPLETE';exit_code=[long]$row.exit_code;elapsed_ms=[long]$row.elapsed_ms}
+            }
+            $listed = @([regex]::Matches((Read-Nb2Text (Join-Path $Private 'test-list.stdout')), '(?m)^(t1_api_eval::[A-Za-z0-9_:]+): test\r?$') | ForEach-Object { $_.Groups[1].Value })
+            $testLog = Read-Nb2Text (Join-Path $Private 'injected-tests.stdout')
+            $ok = @([regex]::Matches($testLog, '(?m)^test (t1_api_eval::[A-Za-z0-9_:]+) \.\.\. ok\r?$') | ForEach-Object { $_.Groups[1].Value })
+            $ignored = @([regex]::Matches($testLog, '(?m)^test (t1_api_eval::[A-Za-z0-9_:]+) \.\.\. ignored(?:, [^\r\n]*)?\r?$') | ForEach-Object { $_.Groups[1].Value })
+            # Full ordinal name-set digests from the independently reviewed 69c2d4e source/coverage.
+            if ($ok.Count -ne 221 -or $ignored.Count -ne 4 -or $listed.Count -ne 225 -or
+                $testLog -notmatch '(?m)^test result: ok\. 221 passed; 0 failed; 4 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s\r?$' -or
+                (Get-Nb2SetHash $ok) -cne 'fa692aef64578aad4bb6a600f03b2b8d3041c835df88f28ae7221217430902b3' -or
+                (Get-Nb2SetHash $ignored) -cne 'b216119f18088b4ad0ee4d1916c778e674cb0c148346ac5d01318786ff7e2fd3' -or
+                (Get-Nb2SetHash $listed) -cne '2f81318e8555db9dbf2c759ea03d532921ecdf7eedee7ccab09306e7e7e30eb1' -or
+                (Get-Nb2SetHash @($ok + $ignored)) -cne (Get-Nb2SetHash $listed)) { throw 'NB2_TEST_SET' }
+            $default = Read-Nb2Text (Join-Path $Private 'helper-default-guard.stderr')
+            if ($default -notmatch '(?m)^error: target `nova_t1_m0b_native_helper` in package `nova` requires the features: `t1-api-eval`\r?$' -or
+                @([regex]::Matches($default, '(?m)^error(?:\[|:)')).Count -ne 1 -or $default -match 'could not compile') { throw 'NB2_DEFAULT_GUARD' }
+            $errors = @(); $artifact = @()
+            foreach ($pair in @(@('helper-release-guard.stdout','release'),@('helper-debug-build.stdout','debug'))) {
+              foreach ($line in (Read-Nb2Text (Join-Path $Private $pair[0])) -split "`n") {
+                if (-not $line.StartsWith('{')) { continue }
+                $v = Read-Nb2Json $line
+                if ($pair[1] -ceq 'release' -and $v.reason -ceq 'compiler-message' -and $v.message.level -ceq 'error') { $errors += ,$v }
+                if ($pair[1] -ceq 'debug' -and $v.reason -ceq 'compiler-artifact' -and $v.target.name -ceq 'nova_t1_m0b_native_helper' -and $null -ne $v.executable) { $artifact += ,$v }
+              }
+            }
+            if ($errors.Count -ne 1 -or $errors[0].target.name -cne 'nova_lib' -or $errors[0].message.message -cne 't1-api-eval is debug-only and must never ship' -or
+                $null -ne $errors[0].message.code -or @($errors[0].message.spans | Where-Object { $_.is_primary -is [bool] -and $_.is_primary -eq $true -and $_.file_name -is [string] -and $_.file_name -match '(^|[/\\])src[/\\]lib\.rs$' -and ($_.line_start -is [int] -or $_.line_start -is [long]) -and $_.line_start -eq 2 }).Count -ne 1) { throw 'NB2_RELEASE_GUARD' }
+            $exe = Join-Path $Target 'debug/nova_t1_m0b_native_helper.exe'
+            if ($artifact.Count -ne 1 -or $artifact[0].profile.test -isnot [bool] -or $artifact[0].profile.test -ne $false -or
+                $artifact[0].profile.debug_assertions -isnot [bool] -or $artifact[0].profile.debug_assertions -ne $true -or
+                $artifact[0].profile.opt_level -isnot [string] -or $artifact[0].profile.opt_level -cne '0' -or $artifact[0].target.kind -isnot [array] -or @($artifact[0].target.kind) -cnotcontains 'bin' -or
+                $artifact[0].executable -isnot [string] -or $artifact[0].executable -cne $exe -or -not (Test-Path -LiteralPath $exe -PathType Leaf) -or
+                (Get-Item -LiteralPath $exe).Length -le 0) { throw 'NB2_HELPER_ARTIFACT' }
+            return @{checks=$checks;ok=$ok;ignored=$ignored;listed=$listed;helper=@{name='nova_t1_m0b_native_helper.exe';bytes=(Get-Item -LiteralPath $exe).Length;sha256=(Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()}}
+          }
+          function Get-Nb2Diagnostics([string]$Private) {
+            # Failure evidence is reconstructed even when the full verifier could not return.
+            $rows = @(); $parse = 'UNKNOWN'
+            try { $rows = @(Read-Nb2Json (Read-Nb2Text (Join-Path $Private 'commands.json') 16384)); $parse = 'PARSED' } catch { }
+            $commands = @(); $logs = @()
+            foreach ($name in @('test-list','injected-tests','default-lib','helper-debug-build','helper-default-guard','helper-release-guard')) {
+              $found = @($rows | Where-Object { $_.name -is [string] -and $_.name -ceq $name })
+              $state = 'MISSING'; $exitCode = $null; $elapsed = $null
+              if ($found.Count -gt 1) { $state = 'CONFLICT' }
+              elseif ($found.Count -eq 1) {
+                $v = $found[0]
+                if ($v.state -cin @('COMPLETE','PARTIAL') -and
+                    ($null -eq $v.exit_code -or $v.exit_code -is [int] -or $v.exit_code -is [long]) -and
+                    ($v.elapsed_ms -is [int] -or $v.elapsed_ms -is [long]) -and $v.elapsed_ms -ge 0 -and $v.elapsed_ms -le 2700000) {
+                  $state = $v.state; $exitCode = $v.exit_code; $elapsed = $v.elapsed_ms
+                } else { $state = 'REJECTED' }
+              }
+              $commands += @{name=$name;state=$state;exit_code=$exitCode;elapsed_ms=$elapsed}
+              foreach ($suffix in @('stdout','stderr')) {
+                $file = $name+'.'+$suffix; $path = Join-Path $Private $file
+                $logState = 'MISSING'; $bytes = $null; $hash = $null
+                if (Test-Path -LiteralPath $path -PathType Leaf) {
+                  $bytes = (Get-Item -LiteralPath $path).Length
+                  if ($bytes -gt 16777216) { $logState = 'REJECTED_OVERSIZE' }
+                  else {
+                    $logState = if ($state -cne 'COMPLETE') {'PARTIAL'} elseif ($bytes -eq 0) {'EMPTY'} else {'PRESENT_LOCAL_ONLY'}
+                    $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+                  }
+                }
+                $logs += @{name=$file;state=$logState;bytes=$bytes;sha256=$hash}
+              }
+            }
+            return @{ledger_state=$parse;commands=$commands;logs=$logs}
+          }
+          # NB2_CONSUMER_END
+          $identity = @{sha=$env:GITHUB_SHA;run_id=$env:GITHUB_RUN_ID;attempt=$env:GITHUB_RUN_ATTEMPT;source_candidate='69c2d4e9e36d7f46e72da532c5534677fa1bba13'}
+          $failure = 'NB2_EVIDENCE_INCOMPLETE'; $verified = $null; $tools = $null
+          try {
+            if ($identity.sha -cnotmatch '^[0-9a-f]{40}$' -or $identity.run_id -notmatch '^[0-9]+$' -or $identity.attempt -notmatch '^[1-9][0-9]*$') { throw 'NB2_IDENTITY' }
+            $verified = Confirm-Nb2Evidence (Join-Path $env:NB2_ROOT 'private') (Join-Path $env:NB2_ROOT 'target')
+            $lock = Join-Path $env:GITHUB_WORKSPACE 'apps/desktop/src-tauri/Cargo.lock'
+            $before = (Read-Nb2Text (Join-Path $env:NB2_ROOT 'private/lock-before.txt') 128).Trim()
+            if ($before -cnotmatch '^[0-9A-F]{64}$' -or (Get-FileHash -LiteralPath $lock -Algorithm SHA256).Hash -cne $before) { throw 'NB2_LOCK_CHANGED' }
+            $tools = Read-Nb2Json (Read-Nb2Text (Join-Path $env:NB2_ROOT 'private/tools.json') 1024)
+            if ($tools.pwsh -notmatch '^7\.[0-9.]+$' -or $tools.rust -notmatch '^rustc 1\.98\.0 \([a-z0-9]+ [0-9-]+\)$' -or $tools.cargo -notmatch '^cargo 1\.98\.0 \([a-z0-9]+ [0-9-]+\)$') { throw 'NB2_TOOL_VERSION' }
+            $tools = @{pwsh=[string]$tools.pwsh;rust=[string]$tools.rust;cargo=[string]$tools.cargo}
+            $failure = 'NONE'
+          } catch {
+            # Never export arbitrary exceptions, log bodies, paths or environment.
+            $code = [string]$_.Exception.Message
+            $failure = if ($code -cmatch '^NB2_[A-Z_]+$') { $code } else { 'NB2_EVIDENCE_PARSE' }
+          }
+          $pass = $failure -ceq 'NONE'
+          $upload = Join-Path $env:NB2_ROOT 'upload'
+          $diagnostics = Get-Nb2Diagnostics (Join-Path $env:NB2_ROOT 'private')
+          $summary = @{schema='NB2_CI_V1';identity=$identity;verdict=$(if($pass){'PASS'}else{'FAIL'});failure_code=$failure;checks_verified=$pass;tools=$(if($pass){$tools}else{$null});helper=$(if($pass){$verified.helper}else{$null});helper_executed=$false;ignored_native_tests_executed=$false;scope='COMPILE_AND_INJECTED_TEST_CONTRACT_NOT_NATIVE_OBSERVATION'}
+          $checks = @{schema='NB2_CHECKS_V1';identity=$identity;verified=$pass;ledger_state=$diagnostics.ledger_state;commands=$diagnostics.commands;logs=$diagnostics.logs}
+          $tests = @{schema='NB2_TESTS_V1';identity=$identity;verified=$pass;ok=$(if($pass){$verified.ok}else{@()});ignored=$(if($pass){$verified.ignored}else{@()});listed=$(if($pass){$verified.listed}else{@()})}
+          $manifest = @()
+          foreach ($pair in @(@('summary.json',$summary,16384),@('checks.json',$checks,16384),@('tests.json',$tests,131072))) {
+            $data = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject $pair[1] -Depth 12))
+            if ($data.Length -gt $pair[2]) { throw 'NB2_UPLOAD_BOUND' }
+            $path = Join-Path $upload $pair[0]
+            $f = [IO.File]::Open($path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read)
+            try { $f.Write($data,0,$data.Length); $f.Flush($true) } finally { $f.Dispose() }
+            $manifest += @{name=$pair[0];bytes=$data.Length;sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()}
+          }
+          $data = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject @{schema='NB2_FILES_V1';identity=$identity;files=$manifest} -Depth 8))
+          if ($data.Length -gt 16384) { throw 'NB2_UPLOAD_BOUND' }
+          $f = [IO.File]::Open((Join-Path $upload 'files.json'),[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read)
+          try { $f.Write($data,0,$data.Length); $f.Flush($true) } finally { $f.Dispose() }
+          if (-not $pass) { throw $failure }
+          $global:LASTEXITCODE = 0
+      - name: Upload only closed NB2 evidence (not a release)
+        if: ${{ always() && env.NB2_ROOT != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: NB2-injected-and-helper-compile-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: error
+          include-hidden-files: false
+          path: |
+            ${{ env.NB2_ROOT }}/upload/summary.json
+            ${{ env.NB2_ROOT }}/upload/checks.json
+            ${{ env.NB2_ROOT }}/upload/tests.json
+            ${{ env.NB2_ROOT }}/upload/files.json

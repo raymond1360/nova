@@ -748,7 +748,7 @@ jobs:
             $execution=Json-Ar0 'execution.json' 8192
             Assert-Ar0 ($execution.schema -ceq 'nova.ar0.ci-execution/1' -and $execution.sha -ceq $env:GITHUB_SHA -and $execution.run_id -ceq $env:GITHUB_RUN_ID -and $execution.attempt -ceq $env:GITHUB_RUN_ATTEMPT -and $execution.state -ceq 'COMPLETE' -and (Test-Int $execution.exit_code) -and $execution.exit_code -eq 0 -and $execution.pwsh -cmatch '^7\.')
             $r=Json-Ar0 'ev/result.json'; $old=Json-Ar0 'ev/sh1-regression/result.json'
-            Assert-Ar0 ($r.schema -ceq 'nova.relay.local-validation/1' -and $r.verdict -ceq 'PASS' -and $r.stage -ceq 'RELAY_THREE_COMMANDS' -and $r.mock -is [bool] -and $r.mock -and $r.real_execution_authorized -is [bool] -and -not $r.real_execution_authorized -and $r.github_verified -is [bool] -and -not $r.github_verified)
+            Assert-Ar0 ($r.schema -ceq 'nova.relay.local-validation/1' -and $r.verdict -ceq 'PASS' -and $r.stage -ceq 'PILOT_PREAPPROVAL_NEGATIVES' -and $r.mock -is [bool] -and $r.mock -and $r.real_execution_authorized -is [bool] -and -not $r.real_execution_authorized -and $r.github_verified -is [bool] -and -not $r.github_verified)
             Assert-Ar0 ($old.schema -ceq 'nova.scheduler.local-validation/1' -and $old.verdict -ceq 'PASS' -and $old.stage -ceq 'DEFAULT_REGRESSION' -and $old.default_regression_executed -is [bool] -and $old.default_regression_executed)
             Check-Ledger $old (Get-Sh1ExpectedCommands)
             $expected=[ordered]@{'sh1-wrapper'=0;'relay-debug-build'=0;'ignored-list'=0}
@@ -757,11 +757,24 @@ jobs:
             foreach ($bin in @('nova_scheduler_relay','nova_scheduler_relay_fake_cli')) { $expected["default-$bin"]=101; $expected["release-$bin"]=101 }
             foreach ($n in @('fixture-init','fixture-add','fixture-base-commit','fixture-base','fixture-second-commit','source-init','relay-init','relay-run','relay-status','relay-no-replay')) { $expected[$n]=0 }
             $expected['real-false-rejected']=2; $expected['v2-history-not-cloned']=2
+            $expected['pilot-approval-missing']=2; $expected['pilot-approval-expired']=2
             $script:checkStage='LEDGER'
             Check-Ledger $r $expected
             # Missing logs fail even if their command/result claims PASS. Raw bytes stay private.
             foreach ($pair in @(@{prefix='ev';ledger=$r},@{prefix='ev/sh1-regression';ledger=$old})) {
               foreach ($row in $pair.ledger.commands) { foreach ($suffix in @('stdout','stderr')) { [void](Read-Ar0 "$($pair.prefix)/$($row.name).$suffix.log") } }
+            }
+            $script:checkStage='PILOT_PREAPPROVAL'
+            $pilotRejections=@()
+            foreach ($kind in @('missing','expired')) {
+              $v=Json-Ar0 "ev/pilot-approval-$kind.stdout.log" 8192
+              $code=if($kind -ceq 'missing'){'APPROVAL_MISSING'}else{'APPROVAL_EXPIRED'}
+              Assert-Ar0 ($v.schema -ceq 'nova.relay.error/1' -and $v.error_code -ceq $code -and $v.tool_reads_started -is [bool] -and -not $v.tool_reads_started -and $v.next_execution_authorized -is [bool] -and -not $v.next_execution_authorized -and $v.residuals -is [array] -and $v.residuals.Count -eq 0)
+              $pilotRejections+=@{command="pilot-approval-$kind";error_code=$code;tool_reads_started=$false;next_execution_authorized=$false;residuals=@();source='VALIDATED_FIXED_SCRIPT_OUTPUT'}
+            }
+            # Enumerate names without following a target: files/directories/broken links all reject.
+            foreach ($leaf in @('pilot-never-created','pilot-run-never-created')) {
+              Assert-Ar0 (@([IO.Directory]::EnumerateFileSystemEntries((Join-Path $root 'ev'),$leaf,[IO.SearchOption]::TopDirectoryOnly)).Count -eq 0)
             }
             $script:checkStage='CLEAN_TARGET'
             foreach ($n in @('before','after')) { $c=Json-Ar0 "ev/clean-target-$n.json"; Assert-Ar0 ($c.fake_exists -is [bool] -and -not $c.fake_exists -and $c.source -ceq 'ACTUAL_FILESYSTEM') }
@@ -826,7 +839,7 @@ jobs:
                 Assert-Ar0 ($u.binding.plan_id -ceq $first.plan_id -and $u.binding.review_input_sha256 -ceq $pkg.sha256 -and $first.facts[1].input_identity -ceq $pkg.sha256 -and $u.binding.candidate_sha256 -cmatch '^[0-9a-f]{64}$')
               }
             }
-            return @{commands=@($r.commands|ForEach-Object {@{name=$_.name;state='COMPLETE';exit_code=$_.exit_code}});tests=$parsed;explicit=$ignored;fake=@{bytes=$id.bytes;sha256=$id.sha256;source='BUILT_THIS_RUN'};facts=@($first.facts|ForEach-Object {@{role=$_.role;state=$_.state;exit_code=$_.exit_code;reclaim=$_.reclaim;exe_sha256=$_.exe_sha256;stdout_bytes=$_.stdout_bytes;stdout_sha256=$_.stdout_sha256;stderr_bytes=$_.stderr_bytes;stderr_sha256=$_.stderr_sha256}});fixture_unchanged=$true;no_replay=$true;real_execution_authorized=$false}
+            return @{commands=@($r.commands|ForEach-Object {@{name=$_.name;state='COMPLETE';exit_code=$_.exit_code}});pilot_rejections=$pilotRejections;tests=$parsed;explicit=$ignored;fake=@{bytes=$id.bytes;sha256=$id.sha256;source='BUILT_THIS_RUN'};facts=@($first.facts|ForEach-Object {@{role=$_.role;state=$_.state;exit_code=$_.exit_code;reclaim=$_.reclaim;exe_sha256=$_.exe_sha256;stdout_bytes=$_.stdout_bytes;stdout_sha256=$_.stdout_sha256;stderr_bytes=$_.stderr_bytes;stderr_sha256=$_.stderr_sha256}});fixture_unchanged=$true;no_replay=$true;real_execution_authorized=$false}
           }
           function Write-Public([string]$Name,$Value,[long]$Limit) {
             $b=[Text.Encoding]::UTF8.GetBytes(($Value|ConvertTo-Json -Depth 30))
@@ -843,13 +856,13 @@ jobs:
             $verified=Verify-Ar0; $state='PASS'; $code='NONE'
           } catch {
             $state='FAIL'
-            if ($checkStage -cin @('CONTEXT','EXECUTION','LEDGER','CLEAN_TARGET','FAKE_IDENTITY','TEST_SETS','GUARDS','RELAY_FACTS','FIXTURE')) { $code='AR0_'+$checkStage+'_REJECTED' }
+            if ($checkStage -cin @('CONTEXT','EXECUTION','LEDGER','PILOT_PREAPPROVAL','CLEAN_TARGET','FAKE_IDENTITY','TEST_SETS','GUARDS','RELAY_FACTS','FIXTURE')) { $code='AR0_'+$checkStage+'_REJECTED' }
           }
           # Failure inventory is independent of successful parsing. Fixed names only;
           # MISSING/EMPTY/PRESENT_LOCAL_ONLY/OVERSIZE are not fabricated log content.
           $diagnostics=@()
           $fixed=@('execution.json','ev/result.json','ev/fake-cli-identity.json','ev/explicit-names.json','ev/sh1-regression/result.json')
-          $outer=@('sh1-wrapper','relay-debug-build','ignored-list','reject-hash-missing','reject-hash-mismatch','default-nova_scheduler_relay','release-nova_scheduler_relay','default-nova_scheduler_relay_fake_cli','release-nova_scheduler_relay_fake_cli','fixture-init','fixture-add','fixture-base-commit','fixture-base','fixture-second-commit','source-init','real-false-rejected','relay-init','relay-run','relay-status','relay-no-replay','v2-history-not-cloned')
+          $outer=@('sh1-wrapper','relay-debug-build','ignored-list','reject-hash-missing','reject-hash-mismatch','default-nova_scheduler_relay','release-nova_scheduler_relay','default-nova_scheduler_relay_fake_cli','release-nova_scheduler_relay_fake_cli','fixture-init','fixture-add','fixture-base-commit','fixture-base','fixture-second-commit','source-init','real-false-rejected','relay-init','relay-run','relay-status','relay-no-replay','v2-history-not-cloned','pilot-approval-missing','pilot-approval-expired')
           for ($i=0;$i -lt 19;$i++) { $outer+="explicit-$i" }
           foreach ($n in $outer) { foreach ($ext in @('stdout','stderr')) { $fixed+="ev/$n.$ext.log" } }
           foreach ($n in (Get-Sh1ExpectedCommands).Keys) { foreach ($ext in @('stdout','stderr')) { $fixed+="ev/sh1-regression/$n.$ext.log" } }

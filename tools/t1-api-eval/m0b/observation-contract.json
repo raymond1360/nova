@@ -1,0 +1,28 @@
+{
+  "schema": "NB3_OBSERVATION_CONTRACT_V1",
+  "format": "NB3_SYNTHETIC_V1",
+  "source": "Injected",
+  "execution_authorized": false,
+  "native_schema": null,
+  "native_loss_source": null,
+  "native_coverage_receipt": null,
+  "limits": {
+    "input_bytes": 16777216,
+    "events": 65536,
+    "line_bytes": 16384,
+    "depth": 16,
+    "path_utf16": 2048,
+    "string_bytes": 4096,
+    "process_edges": 4096,
+    "projected_writes": 64,
+    "network_attempts": 4096
+  },
+  "body_identity": "SHA256 of exact NDJSON event lines including each LF",
+  "time": "FILETIME u64 (100ns)",
+  "tail": "NB3_END_V1, same count and body_sha256",
+  "native_error": "BLOCKED_NATIVE_OBSERVATION_SCHEMA_LOSS_COVERAGE",
+  "ownership": "caller-held typed Injected NoPriorCapture/Started/Stopped/OutputsClosed receipts, same run/attempt/capture/generation and matching FILETIME",
+  "write_paths": "fixed ROOT plus canonical relative components; ordinary backslash normalized to slash; aliases/case/ADS cannot become marker",
+  "write_open_access": "u32 mask; write/delete/WRITE_DAC/WRITE_OWNER/attributes/EA opens project Unknown",
+  "coverage": "three unique End records with exact category counts and loss=0; no native coverage claim"
+}

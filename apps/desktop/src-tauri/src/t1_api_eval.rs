@@ -154,3 +154,8 @@ pub fn mock_run() -> Result<serde_json::Value> {
 
 #[cfg(test)]
 mod tests;
+
+pub mod opencode_observation;
+pub mod opencode_cas_bridge;
+#[cfg(test)]
+mod opencode_evidence_tests;

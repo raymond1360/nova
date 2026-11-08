@@ -75,6 +75,8 @@ pub enum ObservationClass {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationReview {
+    #[serde(default)]
+    pub source: Option<FactSource>,
     pub exclusive_vm: bool,
     pub same_generation: bool,
     pub no_prior_capture: bool,
@@ -89,6 +91,12 @@ pub struct ObservationReview {
     pub etl_bytes: u64,
 }
 impl ObservationReview {
+    pub fn validate_source(&self, expected: FactSource) -> Result<()> {
+        if self.source != Some(expected) {
+            return Err("observation source mismatch/UNKNOWN".into());
+        }
+        Ok(())
+    }
     pub fn validate(&self) -> Result<()> {
         if self.classes.len() != 3
             || ![
@@ -209,6 +217,7 @@ pub enum JournalState {
     Prepared,
     Uncertain,
     CommittedHistorical,
+    RecoveredHistorical,
     UncertainRecovery,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -356,6 +365,7 @@ fn run_mode<O: Ops>(
         clock.enter(Phase::Export, ops.now_ms())?;
         let observation = ops.export_and_review()?;
         observation.validate()?;
+        observation.validate_source(expected)?;
         super::opencode_paths::review_agent_tree(
             &before,
             &observation.tree,
@@ -611,6 +621,7 @@ pub(super) fn injected_observation() -> ObservationReview {
         .unwrap()
         .write = 2;
     ObservationReview {
+        source: Some(FactSource::Injected),
         exclusive_vm: true,
         same_generation: true,
         no_prior_capture: true,

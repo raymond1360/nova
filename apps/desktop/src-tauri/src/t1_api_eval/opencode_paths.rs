@@ -408,3 +408,115 @@ pub fn review_agent_tree(
         attributed,
     )
 }
+
+/// Capability constructed only after the unchanged Agent checker has accepted all projected writes.
+#[derive(Clone, Debug)]
+pub struct ReviewedAgentTree {
+    snapshot: TreeSnapshot,
+    reservation: FixtureReservation,
+    source: FactSource,
+}
+impl ReviewedAgentTree {
+    pub fn review(
+        before: &TreeSnapshot,
+        receipt: &AgentTreeReceipt,
+        r: &FixtureReservation,
+        target: &ProcessIdentity,
+        expected: FactSource,
+    ) -> Result<Self> {
+        review_agent_tree(before, receipt, r, target, expected)?;
+        let logo = receipt
+            .after
+            .files
+            .iter()
+            .find(|f| f.path == "Logo.tsx")
+            .ok_or("NOVA_LOGO_MISSING")?;
+        if logo.attributes != 0x20 {
+            return Err("NOVA_LOGO_FROZEN_ATTRIBUTES".into());
+        }
+        Ok(Self {
+            snapshot: receipt.after.clone(),
+            reservation: r.clone(),
+            source: expected,
+        })
+    }
+    pub fn snapshot(&self) -> &TreeSnapshot {
+        &self.snapshot
+    }
+    pub fn reservation(&self) -> &FixtureReservation {
+        &self.reservation
+    }
+    pub fn source(&self) -> FactSource {
+        self.source
+    }
+}
+/// FILETIME consistency only; real NTFS timing/granularity remains unverified.
+pub fn review_nova_tree(
+    agent: &ReviewedAgentTree,
+    nova: &TreeSnapshot,
+    receipt: &super::journal::Receipt,
+    post: &[u8],
+    t0: u64,
+    t1: u64,
+) -> Result<()> {
+    use super::opencode_native_files::{same_except_access, validate_collected_snapshot};
+    let r = agent.reservation();
+    validate_collected_snapshot(nova, r, false, agent.source)?;
+    if nova.complete != Some(true) || t1.checked_sub(t0).is_none_or(|d| d > 30 * 10_000_000) {
+        return Err("NOVA_TIME_UNKNOWN".into());
+    }
+    let low = t0.checked_sub(200000).ok_or("NOVA_TIME_UNDERFLOW")?;
+    let map = |s: &TreeSnapshot| -> Result<std::collections::BTreeMap<String, FileFact>> {
+        let mut m = std::collections::BTreeMap::new();
+        for f in &s.files {
+            if m.insert(f.path.to_ascii_uppercase(), f.clone()).is_some() {
+                return Err("NOVA_PATH_AMBIGUOUS".into());
+            }
+        }
+        Ok(m)
+    };
+    let a = map(&agent.snapshot)?;
+    let b = map(nova)?;
+    if a.keys().ne(b.keys()) {
+        return Err("NOVA_TREE_SET".into());
+    }
+    for (path, old) in a {
+        let new = &b[&path];
+        if old.path != "Logo.tsx" {
+            if !same_except_access(&old, new) {
+                return Err("NOVA_UNDECLARED_CHANGE".into());
+            }
+            continue;
+        }
+        if new.bytes != post
+            || receipt.post_sha256 != super::hash(post)
+            || receipt.pre_sha256 != super::hash(&old.bytes)
+            || receipt.bytes != post.len()
+            || receipt.state != "COMMITTED"
+            || receipt.identity != r.logo_identity
+            || old.identity != r.logo_identity
+            || new.identity != r.logo_identity
+            || old.attributes != 0x20
+            || new.attributes != old.attributes
+            || new.owner != old.owner
+            || new.dacl != old.dacl
+            || new.links != old.links
+            || new.ads != old.ads
+            || !new.ads.is_empty()
+            || new.creation != old.creation
+            || new.path != old.path
+        {
+            return Err("NOVA_LOGO_FACT_MISMATCH".into());
+        }
+        if old.write >= low
+            || old.change >= low
+            || new.write < low
+            || new.write > t1
+            || new.change < low
+            || new.change > t1
+        {
+            return Err("NOVA_TIME_INDISCERNIBLE".into());
+        }
+    }
+    Ok(())
+}

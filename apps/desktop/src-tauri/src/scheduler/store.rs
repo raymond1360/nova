@@ -19,6 +19,26 @@ use std::{
 };
 
 pub const TOOL_HASH_CAP: u64 = 512 * 1024 * 1024;
+/// Approval paths are not normalized on behalf of their author.
+pub fn approved_final_path(approved: &Path, actual: &Path) -> Result<()> {
+    if approved.as_os_str() != actual.as_os_str() {
+        return Err("APPROVAL_MISMATCH");
+    }
+    Ok(())
+}
+pub fn approved_root(path: &Path, exists: bool) -> Result<()> {
+    absolute(path)?;
+    safe_location(path)?;
+    let parent = Guard::open(path.parent().ok_or("PATH_REJECTED")?, true)?;
+    let expected = parent.path.join(path.file_name().ok_or("PATH_REJECTED")?);
+    approved_final_path(path, &expected)?;
+    if exists {
+        approved_final_path(path, &Guard::open(path, true)?.path)?;
+    } else if path.try_exists().map_err(|_| "PATH_REJECTED")? {
+        return Err("CREATE_NEW_REJECTED");
+    }
+    Ok(())
+}
 pub struct Guard {
     file: File,
     pub path: PathBuf,
@@ -1209,7 +1229,7 @@ impl Store {
         record: &RealPlanRecord,
         permit: &super::relay::RealPilotPermit,
     ) -> Result<StoredPlan> {
-        permit.check_record(record)?;
+        permit.check_binding(record)?;
         if self.root.to_string_lossy() != record.approval.roots.workspace {
             return Err("APPROVAL_MISMATCH");
         }
@@ -1753,7 +1773,7 @@ impl Store {
         permit: &super::relay::RealPilotPermit,
         created: &mut bool,
     ) -> Result<Self> {
-        permit.check_record(permit.record())?;
+        permit.check_binding(permit.record())?;
         if root.to_string_lossy() != permit.record().approval.roots.workspace {
             return Err("APPROVAL_MISMATCH");
         }
@@ -1765,7 +1785,7 @@ impl Store {
         created: &mut bool,
     ) -> Result<StoredPlan> {
         let record = permit.record();
-        permit.check_record(record)?;
+        permit.check_binding(record)?;
         if self.root.to_string_lossy() != record.approval.roots.workspace {
             return Err("APPROVAL_MISMATCH");
         }

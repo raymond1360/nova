@@ -385,6 +385,30 @@ fn status_inner(store: &Store, check_missing_summary: bool) -> Result<RelaySumma
     let mut unknowns = vec![];
     let mut claims = vec![];
     let mut review = None;
+    if p.mode.is_real()
+        && p.run_root
+            .join("eligibility-start.json")
+            .try_exists()
+            .unwrap_or(true)
+    {
+        let result = read_file(&p.run_root.join("eligibility-result.json"), 4096)
+            .and_then(|(b, _)| relay_json::<Value>(&b, 4096));
+        let code = match result {
+            Ok(v) if v["schema"] == "nova.relay.eligibility-result/1" && v["plan_id"] == p.id => {
+                match v["error_code"].as_str() {
+                    Some("NONE") => None,
+                    Some("AUTH_ELIGIBILITY_DEADLINE") => Some("AUTH_ELIGIBILITY_DEADLINE"),
+                    Some("AUTH_ELIGIBILITY_EXPIRED") => Some("AUTH_ELIGIBILITY_EXPIRED"),
+                    Some("AUTH_ELIGIBILITY_MISMATCH") => Some("AUTH_ELIGIBILITY_MISMATCH"),
+                    _ => Some("AUTH_ELIGIBILITY_UNKNOWN"),
+                }
+            }
+            _ => Some("AUTH_ELIGIBILITY_UNKNOWN"),
+        };
+        if let Some(code) = code {
+            unknowns.push(code.into());
+        }
+    }
     if read_base(store, &p.plan).is_err() {
         unknowns.push("FIXTURE_CHANGED".into());
     }
@@ -787,7 +811,7 @@ fn run_mode<D: Driver>(
             Ok(()) => store.relay_evidence(&mut attempt, EvidenceWrite::Complete)?,
             Err(code) => store.relay_evidence(&mut attempt, EvidenceWrite::Failed(code))?,
         }
-        let success = (real.is_none() || e.unknowns.is_empty())
+        let success = (real.is_none() || review_observations_allow(&e.unknowns))
             && saved.is_ok()
             && !drift
             && attempt.state == "EXITED"
@@ -910,13 +934,17 @@ pub struct RealPilotPermit {
 }
 impl RealPilotPermit {
     pub fn check_record(&self, r: &RealPlanRecord) -> Result<()> {
+        self.check_binding(r)?;
+        if self.eligibility.len() != 2 {
+            return Err("AUTH_ELIGIBILITY_MISMATCH");
+        }
+        Ok(())
+    }
+    pub fn check_binding(&self, r: &RealPlanRecord) -> Result<()> {
         if relay_encoded(r)? != relay_encoded(&self.record)? || Instant::now() >= self.end {
             return Err("APPROVAL_MISMATCH");
         }
         r.approval.check_time(chrono::Utc::now())?;
-        if self.eligibility.len() != 2 {
-            return Err("AUTH_ELIGIBILITY_MISMATCH");
-        }
         for g in &self.guards {
             g.verify()?;
         }
@@ -971,6 +999,117 @@ impl RealPilotPermit {
 pub trait EligibilityProbe {
     fn probe(&mut self, role: RelayRole, end: Instant) -> Result<EligibilityReceipt>;
 }
+/// PM's two-code exception affects only stage admission, never the final verdict.
+fn review_observations_allow(items: &[String]) -> bool {
+    items.iter().all(|v| {
+        matches!(
+            v.as_str(),
+            "MODEL_REPORT_UNVERIFIED" | "AUTH_ROUTE_UNVERIFIED"
+        )
+    })
+}
+
+/// All cheap source/root/fixture checks precede tools and all directory creation.
+pub fn preflight_real(record: &RealPlanRecord) -> Result<(Manifest, Envelope)> {
+    use super::store::{approved_root, inside};
+    record.validate()?;
+    let a = &record.approval.roots;
+    approved_root(Path::new(&a.source_registration), true)?;
+    approved_root(Path::new(&a.workspace), false)?;
+    approved_root(Path::new(&a.run_root), false)?;
+    let source = Store::open(Path::new(&a.source_registration))?;
+    if source.relay_require_v2() != Err("RELAY_SCHEMA_UNSUPPORTED") {
+        return Err("SOURCE_REGISTRATION_NOT_FRESH");
+    }
+    let snap = source.snapshot()?;
+    if snap.revision != 0 || snap.invalidated || snap.closed {
+        return Err("SOURCE_REGISTRATION_NOT_FRESH");
+    }
+    let repo = Path::new(&snap.manifest.repo_path);
+    let w = Path::new(&a.workspace);
+    let r = Path::new(&a.run_root);
+    let s = Path::new(&a.source_registration);
+    if inside(w, repo)
+        || inside(repo, w)
+        || inside(w, s)
+        || inside(s, w)
+        || inside(r, repo)
+        || inside(repo, r)
+        || inside(r, w)
+        || inside(w, r)
+        || inside(r, s)
+        || inside(s, r)
+    {
+        return Err("RUN_ROOT_REJECTED");
+    }
+    let env = source.audit_envelope()?;
+    read_base(&source, &record.core.common())?;
+    if env.head != record.core.input_base_sha
+        || env.delivery_identity != record.core.input_delivery_identity
+        || snap.manifest.package_id != record.core.package_id
+    {
+        return Err("BINDING_MISMATCH");
+    }
+    Ok((snap.manifest, env))
+}
+
+/// Shared entry ordering; binding does not grant launch admission.
+pub fn bind_real_source(
+    permit: &RealPilotPermit,
+    workspace_created: &mut bool,
+    run_created: &mut bool,
+) -> Result<Store> {
+    permit.check_binding(permit.record())?;
+    let (m, e) = preflight_real(permit.record())?;
+    let store = Store::relay_init_real(
+        Path::new(&permit.record.approval.roots.workspace),
+        &m,
+        &e,
+        permit,
+        workspace_created,
+    )?;
+    store.relay_bind_real_tracked(permit, run_created)?;
+    Ok(store)
+}
+
+/// Start/result are create-new, bounded receipts; a partial result remains UNKNOWN.
+pub fn qualify_bound<P: EligibilityProbe>(
+    store: &Store,
+    permit: &mut RealPilotPermit,
+    probe: &mut P,
+) -> Result<()> {
+    let p = store.relay_plan()?;
+    permit.check_binding(p.mode.record().ok_or("BINDING_MISMATCH")?)?;
+    if !store.relay_attempts()?.is_empty() {
+        return Err("APPROVAL_ALREADY_USED");
+    }
+    save_new(
+        &p,
+        "eligibility-start.json",
+        &serde_json::to_vec(&json!({"schema":"nova.relay.eligibility-start/1","plan_id":p.id}))
+            .map_err(|_| "ENCODING")?,
+    )?;
+    let result = permit.qualify(probe);
+    let code = match result {
+        Ok(()) => "NONE",
+        Err("AUTH_ELIGIBILITY_DEADLINE") => "AUTH_ELIGIBILITY_DEADLINE",
+        Err("APPROVAL_EXPIRED") => "AUTH_ELIGIBILITY_EXPIRED",
+        Err(_) => "AUTH_ELIGIBILITY_MISMATCH",
+    };
+    save_new(
+        &p,
+        "eligibility-result.json",
+        &serde_json::to_vec(
+            &json!({"schema":"nova.relay.eligibility-result/1","plan_id":p.id,"error_code":code}),
+        )
+        .map_err(|_| "ENCODING")?,
+    )?;
+    if code == "NONE" {
+        Ok(())
+    } else {
+        Err(code)
+    }
+}
 pub fn authorize_real_once(
     core: RealPlanCore,
     approval: RealPilotApproval,
@@ -1008,6 +1147,7 @@ pub fn authorize_real_once(
         let mut guards = vec![own];
         for t in &approval.tools {
             let mut g = Guard::tool(Path::new(&t.exe_path))?;
+            super::store::approved_final_path(Path::new(&t.exe_path), &g.path)?;
             g.verify_sha256_stream(
                 t.exe_bytes,
                 &t.exe_sha256,

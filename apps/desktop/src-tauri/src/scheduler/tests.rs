@@ -1516,18 +1516,57 @@ mod ar0 {
     #[test]
     #[ignore = "Fixed fake CLI + expected hash required: scripts/test_scheduler_relay.ps1 (exact named tests)"]
     fn ar0_actual_created_assign_query_resume_and_persist_failure_cleanup() {
-        for point in ["created", "assign", "query", "resume", "persist"] {
-            let f = RF::new("ok", "ok");
+        for point in [
+            "created",
+            "assign",
+            "query",
+            "resume",
+            "persist",
+            "created+deadline",
+        ] {
+            let f = RF::new_plan("ok", "ok", |p| {
+                p.limits.stage_ms = 120000;
+                p.limits.total_ms = 180000;
+            });
             let mut d = NativeDriver::for_test().unwrap();
             d.fault = Some(point);
+            let origin = Instant::now();
             let s = relay::run(&f.s, &mut d).unwrap();
-            assert_eq!(s.facts.len(), 1);
+            let elapsed_ms = origin.elapsed().as_millis();
+            eprintln!("lifecycle point={point} elapsed_ms={elapsed_ms}");
+            let receipt = json!({"schema":"nova.relay.lifecycle-test/1","point":point,"elapsed_ms":elapsed_ms,"terminal":s.facts.first().and_then(|a|a.terminal.as_deref())});
+            use std::io::Write;
+            let mut log = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(f.f.root.join("lifecycle-timing.json"))
+                .unwrap();
+            log.write_all(serde_json::to_string(&receipt).unwrap().as_bytes())
+                .unwrap();
+            log.sync_all().unwrap();
+            assert_eq!(s.facts.len(), 1, "{point}");
             assert_eq!(s.facts[0].state, "STOPPED", "{point}");
-            assert_eq!(s.facts[0].reclaim.as_deref(), Some("CONFIRMED"));
-            assert!(s.facts[0].pid.is_some());
-            assert!(s.facts[0].process_creation_utc.is_some());
-            assert_eq!(s.facts[0].terminal.as_deref(), Some("LIFECYCLE_UNKNOWN"));
-            assert_eq!(s.next_action, "PM_REQUIRED");
+            assert_eq!(s.facts[0].reclaim.as_deref(), Some("CONFIRMED"), "{point}");
+            assert!(s.facts[0].pid.is_some(), "{point}");
+            assert!(s.facts[0].process_creation_utc.is_some(), "{point}");
+            assert_eq!(
+                s.facts[0].terminal.as_deref(),
+                Some(if point == "created+deadline" {
+                    "DEADLINE"
+                } else {
+                    "LIFECYCLE_UNKNOWN"
+                }),
+                "{point}"
+            );
+            assert_eq!(
+                s.next_action,
+                if point == "created+deadline" {
+                    "STOPPED"
+                } else {
+                    "PM_REQUIRED"
+                },
+                "{point}"
+            );
         }
     }
     #[test]
@@ -2460,6 +2499,8 @@ mod ar0 {
             inner: Injected,
             unknown: bool,
             descendant: bool,
+            extra_unknown: Option<String>,
+            mismatch: Option<&'static str>,
         }
         impl Driver for Pilot {
             fn prepare(
@@ -2526,6 +2567,17 @@ mod ar0 {
                         .into(),
                     );
                 }
+                if let Some(code) = &self.extra_unknown {
+                    v.unknowns.push(code.clone());
+                }
+                match self.mismatch {
+                    Some("model") => v.reported_model = Some("wrong-model-1".into()),
+                    Some("auth") => v.reported_auth = Some("API_KEY".into()),
+                    Some("failed") => v.terminal = "RESULT_ERROR".into(),
+                    Some("missing-model") => v.reported_model = None,
+                    Some("missing-auth") => v.reported_auth = None,
+                    _ => {}
+                }
                 v
             }
         }
@@ -2538,6 +2590,8 @@ mod ar0 {
                 },
                 unknown: false,
                 descendant: false,
+                extra_unknown: None,
+                mismatch: None,
             }
         }
         #[test]
@@ -2559,6 +2613,254 @@ mod ar0 {
             assert!(v.get("next_execution_authorized").is_none());
             assert!(v.get("run_mode").is_none());
             assert_eq!(v.as_object().unwrap().len(), 13);
+        }
+        #[test]
+        fn rp1_two_observations_allow_review_but_preserve_pm_required() {
+            let (f, _, p) = setup();
+            let mut d = driver(&f);
+            d.unknown = true;
+            let v = relay::run_real_once(&f.s, &mut d, p).unwrap();
+            assert_eq!(d.inner.count, 2);
+            assert_eq!(v["next_action"], "PM_REQUIRED");
+            assert_eq!(v["next_execution_authorized"], false);
+            for code in ["MODEL_REPORT_UNVERIFIED", "AUTH_ROUTE_UNVERIFIED"] {
+                assert!(v["unknowns"].as_array().unwrap().contains(&json!(code)));
+                for fact in v["facts"].as_array().unwrap() {
+                    let usage: Value =
+                        serde_json::from_str(fact["usage_json"].as_str().unwrap()).unwrap();
+                    assert!(usage["unknowns"].as_array().unwrap().contains(&json!(code)));
+                }
+            }
+            let reopened = Store::open(&f.f.root.join("v2")).unwrap();
+            assert_eq!(
+                relay::status_real(&reopened).unwrap()["next_action"],
+                "PM_REQUIRED"
+            );
+        }
+        #[test]
+        fn rp1_only_exact_missing_signals_can_continue_mismatch_and_auth_fail_stop() {
+            for mode in [
+                "OTHER",
+                "MODEL_REPORT_UNVERIFIED_suffix",
+                "model",
+                "auth",
+                "failed",
+            ] {
+                let (f, _, p) = setup();
+                let mut d = driver(&f);
+                if matches!(mode, "model" | "auth" | "failed") {
+                    d.mismatch = Some(mode);
+                } else {
+                    d.unknown = true;
+                    d.extra_unknown = Some(mode.into());
+                }
+                let v = relay::run_real_once(&f.s, &mut d, p).unwrap();
+                assert_eq!(d.inner.count, 1, "{mode}");
+                assert_ne!(v["next_action"], "PM_REVIEW", "{mode}");
+                if mode == "failed" {
+                    assert_eq!(v["facts"][0]["terminal"], "RESULT_ERROR");
+                }
+                if mode == "model" || mode == "auth" {
+                    assert!(v["unknowns"].as_array().unwrap().contains(&json!(
+                        if mode == "model" {
+                            "MODEL_REPORT_MISMATCH"
+                        } else {
+                            "AUTH_ROUTE_MISMATCH"
+                        }
+                    )));
+                }
+            }
+        }
+        #[test]
+        fn rp1_single_missing_signal_is_also_nonblocking_but_not_acceptance() {
+            for (mode, code) in [
+                ("missing-model", "MODEL_REPORT_UNVERIFIED"),
+                ("missing-auth", "AUTH_ROUTE_UNVERIFIED"),
+            ] {
+                let (f, _, p) = setup();
+                let mut d = driver(&f);
+                d.mismatch = Some(mode);
+                let v = relay::run_real_once(&f.s, &mut d, p).unwrap();
+                assert_eq!(d.inner.count, 2, "{mode}");
+                assert_eq!(v["next_action"], "PM_REQUIRED", "{mode}");
+                assert_eq!(v["unknowns"], json!([code]), "{mode}");
+            }
+        }
+        fn fresh_source() -> (RF, RealPlanRecord) {
+            let f = RF::new("ok", "ok");
+            let mut r = record(&f);
+            Store::init(
+                &PathBuf::from(&r.approval.roots.source_registration),
+                &f.f.m,
+                &f.f.e,
+            )
+            .unwrap();
+            r.approval.roots.workspace = f.f.root.join("fresh-v2").to_str().unwrap().into();
+            r.approval.roots.run_root = f.f.root.join("fresh-run").to_str().unwrap().into();
+            (f, r)
+        }
+        #[test]
+        fn rp1_preflight_forbidden_roots_stale_source_and_fixture_zero_qualification() {
+            for mode in [
+                "repo-run",
+                "workspace-run",
+                "repo-workspace",
+                "source-run",
+                "stale",
+                "fixture",
+            ] {
+                let (f, mut r) = fresh_source();
+                let mut probe = Probe {
+                    calls: 0,
+                    fail: false,
+                };
+                match mode {
+                    "repo-run" => {
+                        r.approval.roots.run_root =
+                            f.f.repo.join("forbidden").to_str().unwrap().into()
+                    }
+                    "workspace-run" => {
+                        r.approval.roots.run_root = Path::new(&r.approval.roots.workspace)
+                            .join("forbidden")
+                            .to_str()
+                            .unwrap()
+                            .into();
+                    }
+                    "repo-workspace" => {
+                        r.approval.roots.workspace =
+                            f.f.repo.join("forbidden").to_str().unwrap().into()
+                    }
+                    "source-run" => {
+                        r.approval.roots.run_root = Path::new(&r.approval.roots.source_registration)
+                            .join("forbidden")
+                            .to_str()
+                            .unwrap()
+                            .into()
+                    }
+                    "stale" => {
+                        let c = rusqlite::Connection::open(
+                            Path::new(&r.approval.roots.source_registration)
+                                .join("handoff.sqlite3"),
+                        )
+                        .unwrap();
+                        c.execute("UPDATE scheduler_packages SET revision=1", [])
+                            .unwrap();
+                    }
+                    "fixture" => fs::write(f.f.repo.join(&r.core.target_path), b"drift").unwrap(),
+                    _ => unreachable!(),
+                }
+                let p = relay::permit_for_test(r.clone()).unwrap();
+                let (mut w, mut run) = (false, false);
+                let result = relay::bind_real_source(&p, &mut w, &mut run);
+                assert!(result.is_err(), "{mode}");
+                if let Ok(store) = result {
+                    let mut p = p;
+                    let _ = relay::qualify_bound(&store, &mut p, &mut probe);
+                }
+                assert_eq!(probe.calls, 0, "{mode}");
+                assert!(!w && !run, "{mode}");
+                assert!(!Path::new(&r.approval.roots.workspace).exists(), "{mode}");
+                assert!(!Path::new(&r.approval.roots.run_root).exists(), "{mode}");
+            }
+        }
+        #[test]
+        fn rp1_bind_before_eligibility_failure_is_durable_and_launch_still_requires_qualification()
+        {
+            let (f, r) = fresh_source();
+            let mut p = relay::permit_for_test(r.clone()).unwrap();
+            let (mut w, mut run) = (false, false);
+            let s = relay::bind_real_source(&p, &mut w, &mut run).unwrap();
+            assert!(w && run);
+            assert!(s.relay_attempts().unwrap().is_empty());
+            assert_eq!(p.check_record(&r), Err("AUTH_ELIGIBILITY_MISMATCH"));
+            let input = relay::develop_mode_input(&s.relay_plan().unwrap(), &base()).unwrap();
+            assert_eq!(
+                s.relay_reserve_real(
+                    RelayRole::Develop,
+                    &input,
+                    None,
+                    &"a".repeat(64),
+                    &"b".repeat(64),
+                    &"c".repeat(64),
+                    &p
+                )
+                .err(),
+                Some("AUTH_ELIGIBILITY_MISMATCH")
+            );
+            let mut probe = Probe {
+                calls: 0,
+                fail: true,
+            };
+            assert_eq!(
+                relay::qualify_bound(&s, &mut p, &mut probe),
+                Err("AUTH_ELIGIBILITY_MISMATCH")
+            );
+            assert_eq!(probe.calls, 1);
+            assert!(s.relay_attempts().unwrap().is_empty());
+            let reopened = Store::open(Path::new(&r.approval.roots.workspace)).unwrap();
+            let v = relay::status_real(&reopened).unwrap();
+            assert_eq!(v["next_action"], "PM_REQUIRED");
+            assert!(v["unknowns"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("AUTH_ELIGIBILITY_MISMATCH")));
+            let mut d = driver(&f);
+            assert_eq!(
+                relay::run(&reopened, &mut d).err(),
+                Some("REAL_PILOT_NOT_AUTHORIZED")
+            );
+            assert_eq!(d.inner.count, 0);
+            assert!(relay::qualify_bound(&s, &mut p, &mut probe).is_err());
+            assert_eq!(probe.calls, 1);
+        }
+        #[test]
+        fn rp1_bound_eligibility_success_then_full_injected_chain() {
+            let (f, r) = fresh_source();
+            let mut p = relay::permit_for_test(r.clone()).unwrap();
+            let (mut w, mut run) = (false, false);
+            let s = relay::bind_real_source(&p, &mut w, &mut run).unwrap();
+            let mut probe = Probe {
+                calls: 0,
+                fail: false,
+            };
+            relay::qualify_bound(&s, &mut p, &mut probe).unwrap();
+            assert_eq!(probe.calls, 2);
+            let mut d = driver(&f);
+            let v = relay::run_real_once(&s, &mut d, p).unwrap();
+            assert_eq!(d.inner.count, 2);
+            assert_eq!(v["next_action"], "PM_REVIEW");
+            assert!(!v["unknowns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str().unwrap().starts_with("AUTH_ELIGIBILITY_")));
+        }
+        #[test]
+        fn rp1_canonical_roots_and_tools_reject_alias_before_admission() {
+            use super::super::super::store::{approved_final_path, approved_root};
+            let (f, mut r) = fresh_source();
+            let wrong = format!(
+                "{}{}",
+                r.approval.roots.workspace[..1].to_ascii_lowercase(),
+                &r.approval.roots.workspace[1..]
+            );
+            assert_ne!(wrong, r.approval.roots.workspace);
+            r.approval.roots.workspace = wrong;
+            assert_eq!(relay::preflight_real(&r).err(), Some("APPROVAL_MISMATCH"));
+            assert!(!Path::new(&r.approval.roots.workspace).exists());
+            assert!(!Path::new(&r.approval.roots.run_root).exists());
+            let file = f.f.root.join("tool.bin");
+            fs::write(&file, b"own tool not executed").unwrap();
+            let g = Guard::tool(&file).unwrap();
+            assert_eq!(approved_final_path(&file, &g.path), Ok(()));
+            assert_eq!(
+                approved_final_path(&f.f.root.join("TOOL.bin"), &g.path),
+                Err("APPROVAL_MISMATCH")
+            );
+            assert_eq!(
+                approved_root(&f.f.root.join("..\\alias"), false),
+                Err("PATH_REJECTED")
+            );
         }
         #[test]
         fn rp1_model_grammar_and_exact_token_permissions() {
@@ -2674,10 +2976,13 @@ mod ar0 {
             for mode in 0..3 {
                 let (f, _, p) = setup();
                 let mut d = driver(&f);
-                d.unknown = mode == 0;
                 d.descendant = mode == 1;
                 if mode == 2 {
                     d.inner.drift = Some("HEAD");
+                }
+                if mode == 0 {
+                    d.unknown = true;
+                    d.extra_unknown = Some("OTHER".into());
                 }
                 let v = relay::run_real_once(&f.s, &mut d, p).unwrap();
                 assert_eq!(d.inner.count, 1);

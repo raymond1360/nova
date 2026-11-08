@@ -1229,11 +1229,16 @@ mod native {
         let fault = None::<&str>;
         #[cfg(test)]
         let fault = driver.fault;
+        // A test-only late creation observation; production deadline ordering is unchanged.
+        #[cfg(test)]
+        let deadline_observed = Instant::now() >= end || fault == Some("created+deadline");
+        #[cfg(not(test))]
+        let deadline_observed = Instant::now() >= end;
         if driver.cancel.load(Ordering::Acquire) || CONSOLE_CANCEL.load(Ordering::Acquire) {
             error = Some("CANCELLED")
-        } else if Instant::now() >= end {
+        } else if deadline_observed {
             error = Some("DEADLINE")
-        } else if fault == Some("created") || fault == Some("assign") {
+        } else if matches!(fault, Some("created" | "assign" | "created+deadline")) {
             error = Some("LIFECYCLE_UNKNOWN")
         } else if let Err(e) = session.tree.start(fault) {
             error = Some(e)
@@ -1718,10 +1723,7 @@ impl RealDriver {
             core: r.core.clone(),
             run_root: PathBuf::from(&r.approval.roots.run_root),
             end: p.end(),
-            eligibility_root: Path::new(&r.approval.roots.run_root)
-                .parent()
-                .ok_or("PATH_REJECTED")?
-                .join(format!("eligibility-{}", r.approval.approval_id)),
+            eligibility_root: Path::new(&r.approval.roots.run_root).join("eligibility"),
         })
     }
     #[cfg(test)]
@@ -1877,7 +1879,7 @@ impl super::relay::EligibilityProbe for RealDriver {
             self.inner.metadata = true;
             let _parent =
                 Guard::open(self.eligibility_root.parent().ok_or("PATH_REJECTED")?, true)?;
-            // Temporary sibling, never either approved create-new root. No recursive cleanup.
+            // All qualification writes are inside the already bound approved run root.
             if role == RelayRole::Develop {
                 fs::create_dir(&self.eligibility_root).map_err(|_| "CREATE_NEW_REJECTED")?;
                 fs::create_dir(self.eligibility_root.join("tmp"))

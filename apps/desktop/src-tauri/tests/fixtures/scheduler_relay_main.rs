@@ -167,16 +167,15 @@ fn pilot(kv: &BTreeMap<String, String>, origin: std::time::Instant) -> Value {
         {
             return Err("APPROVAL_MISMATCH");
         }
-        for key in ["--workspace", "--run-root"] {
-            let p = Path::new(&kv[key]);
-            if p.try_exists().map_err(|_| "PATH_REJECTED")? {
-                return Err("CREATE_NEW_REJECTED");
-            }
-            let _ =
-                nova_lib::scheduler::store::Guard::open(p.parent().ok_or("PATH_REJECTED")?, true)?;
-        }
         let (b_raw, _) = read_file(Path::new(&kv["--build-receipt"]), 16384)?;
         let receipt: BuildReceipt = relay_json(&b_raw, 16384)?;
+        relay::preflight_real(&RealPlanRecord {
+            schema: "nova.relay.plan/2".into(),
+            core: core.clone(),
+            approval: approval.clone(),
+            approval_file_sha256: hash(&a_raw),
+            build_receipt_sha256: hash(&b_raw),
+        })?;
         #[cfg(windows)]
         {
             pilot_handler = Some(cli_adapter::ConsoleHandler::install()?);
@@ -185,7 +184,6 @@ fn pilot(kv: &BTreeMap<String, String>, origin: std::time::Instant) -> Value {
         let mut permit =
             relay::authorize_real_once(core, approval, &a_raw, receipt, &b_raw, origin)?;
         let mut driver = cli_adapter::RealDriver::new(&permit)?;
-        permit.qualify(&mut driver)?;
         if permit
             .end()
             .saturating_duration_since(std::time::Instant::now())
@@ -196,24 +194,8 @@ fn pilot(kv: &BTreeMap<String, String>, origin: std::time::Instant) -> Value {
         if cli_adapter::cancel_requested() {
             return Err("CANCELLED");
         }
-        let source = Store::open(Path::new(&kv["--source"]))?;
-        if source.relay_require_v2() != Err("RELAY_SCHEMA_UNSUPPORTED") {
-            return Err("SOURCE_REGISTRATION_NOT_FRESH");
-        }
-        let snap = source.snapshot()?;
-        if snap.revision != 0 {
-            return Err("SOURCE_REGISTRATION_NOT_FRESH");
-        }
-        let env = source.audit_envelope()?;
-        relay::read_base(&source, &permit.record().core.common())?;
-        let store = Store::relay_init_real(
-            Path::new(&kv["--workspace"]),
-            &snap.manifest,
-            &env,
-            &permit,
-            &mut workspace_created,
-        )?;
-        store.relay_bind_real_tracked(&permit, &mut run_created)?;
+        let store = relay::bind_real_source(&permit, &mut workspace_created, &mut run_created)?;
+        relay::qualify_bound(&store, &mut permit, &mut driver)?;
         let result = relay::run_real_once(&store, &mut driver, permit);
         drop(driver);
         result

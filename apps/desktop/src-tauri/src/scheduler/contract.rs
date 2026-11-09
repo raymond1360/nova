@@ -655,8 +655,11 @@ pub struct Proposal {
 }
 impl Proposal {
     pub fn validate(&self, p: &RelayPlan) -> Result<()> {
+        self.validate_target(&p.target_path)
+    }
+    pub fn validate_target(&self, target: &str) -> Result<()> {
         if self.schema != "nova.relay.proposal/1"
-            || self.target_path != p.target_path
+            || self.target_path != target
             || self.old_text.is_empty()
             || self.old_text.len() > 8192
             || self.new_text.len() > 16384
@@ -1126,4 +1129,244 @@ pub struct EligibilityReceipt {
 
 pub fn relay_encoded<T: Serialize>(v: &T) -> Result<String> {
     serde_json::to_string(v).map_err(|_| "ENCODING")
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ApiSource {
+    InjectedTest,
+}
+impl ApiSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InjectedTest => "INJECTED_TEST",
+        }
+    }
+}
+
+// API injected contract is deliberately separate from CLI wire types.
+pub const API_FIXTURE: &[u8] =
+    b"pub fn normalize_label(s: &str) -> String {\n    s.to_string()\n}\n";
+pub const API_TARGET: &str = "pilot/src/normalize_label.rs";
+pub const API_H: &str = "3333333333333333333333333333333333333333";
+pub const API_B: &str = "1111111111111111111111111111111111111111";
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiLimits {
+    pub stage_ms: u64,
+    pub total_ms: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiPlanRequest {
+    pub schema: String,
+    pub mode: String,
+    pub package_id: String,
+    pub registration_revision: i64,
+    pub input_base_sha: String,
+    pub target_path: String,
+    pub base_sha256: String,
+    pub goal: String,
+    pub constraints: Vec<String>,
+    pub examples: Vec<String>,
+    pub protocol: String,
+    pub model_develop: String,
+    pub model_review: String,
+    pub limits: ApiLimits,
+    pub pm_decision_ref: String,
+}
+impl ApiPlanRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.mode != "API_INJECTED_ONLY" {
+            return Err("REAL_API_NOT_AUTHORIZED");
+        }
+        if self.schema != "nova.scheduler.api-plan-request/1"
+            || !id(&self.package_id)
+            || self.registration_revision != 0
+            || self.input_base_sha != API_H
+            || self.target_path != API_TARGET
+            || self.base_sha256 != hash(API_FIXTURE)
+            || self.protocol != "API_JSON_INJECTED_V1"
+            || self.model_develop != "injected-develop-v1"
+            || self.model_review != "injected-review-v1"
+            || self.goal.is_empty()
+            || self.goal.len() > 4096
+            || self.constraints.len() > 16
+            || self.examples.len() > 16
+            || self
+                .constraints
+                .iter()
+                .chain(&self.examples)
+                .any(|s| s.len() > 1024)
+            || self.pm_decision_ref.trim().is_empty()
+            || self.pm_decision_ref.len() > 2048
+            || self.limits.stage_ms == 0
+            || self.limits.stage_ms > 45000
+            || self.limits.total_ms < 25000
+            || self.limits.total_ms > 120000
+            || self.limits.input_tokens == 0
+            || self.limits.input_tokens > 8192
+            || self.limits.output_tokens == 0
+            || self.limits.output_tokens > 4096
+        {
+            return Err("SCHEMA_REJECTED");
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiPlan {
+    pub schema: String,
+    pub mode: String,
+    pub package_id: String,
+    pub registration_revision: i64,
+    pub input_base_sha: String,
+    pub input_delivery_identity: String,
+    pub target_path: String,
+    pub base_sha256: String,
+    pub goal: String,
+    pub constraints: Vec<String>,
+    pub examples: Vec<String>,
+    pub protocol: String,
+    pub model_develop: String,
+    pub model_review: String,
+    pub limits: ApiLimits,
+    pub pm_decision_ref: String,
+    pub plan_request_sha256: String,
+}
+impl ApiPlan {
+    pub fn bind(r: ApiPlanRequest, delivery: String, request_hash: String) -> Self {
+        Self {
+            schema: "nova.scheduler.api-plan/1".into(),
+            mode: r.mode,
+            package_id: r.package_id,
+            registration_revision: r.registration_revision,
+            input_base_sha: r.input_base_sha,
+            input_delivery_identity: delivery,
+            target_path: r.target_path,
+            base_sha256: r.base_sha256,
+            goal: r.goal,
+            constraints: r.constraints,
+            examples: r.examples,
+            protocol: r.protocol,
+            model_develop: r.model_develop,
+            model_review: r.model_review,
+            limits: r.limits,
+            pm_decision_ref: r.pm_decision_ref,
+            plan_request_sha256: request_hash,
+        }
+    }
+    pub fn request(&self) -> ApiPlanRequest {
+        ApiPlanRequest {
+            schema: "nova.scheduler.api-plan-request/1".into(),
+            mode: self.mode.clone(),
+            package_id: self.package_id.clone(),
+            registration_revision: self.registration_revision,
+            input_base_sha: self.input_base_sha.clone(),
+            target_path: self.target_path.clone(),
+            base_sha256: self.base_sha256.clone(),
+            goal: self.goal.clone(),
+            constraints: self.constraints.clone(),
+            examples: self.examples.clone(),
+            protocol: self.protocol.clone(),
+            model_develop: self.model_develop.clone(),
+            model_review: self.model_review.clone(),
+            limits: self.limits.clone(),
+            pm_decision_ref: self.pm_decision_ref.clone(),
+        }
+    }
+    pub fn validate(&self) -> Result<()> {
+        self.request().validate()?;
+        if self.schema != "nova.scheduler.api-plan/1"
+            || !hex(&self.input_delivery_identity, 64)
+            || !hex(&self.plan_request_sha256, 64)
+        {
+            return Err("BINDING_MISMATCH");
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiRequestMeta {
+    pub schema: String,
+    pub protocol: String,
+    pub role: RelayRole,
+    pub plan_id: String,
+    pub input_sha256: String,
+    pub body_sha256: String,
+    pub body_bytes: u64,
+    pub logical_endpoint: String,
+    pub requested_model: String,
+    pub source: String,
+    pub parent_attempt_id: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiFacts {
+    pub schema: String,
+    pub source: String,
+    pub dispatch_invoked: bool,
+    pub response_status: Option<u16>,
+    pub request_bytes: u64,
+    pub response_bytes: u64,
+    pub response_sha256: Option<String>,
+    pub transport_state: String,
+    pub local_cancel_requested: bool,
+    pub local_resources_released: bool,
+    pub error_code: String,
+    pub unknowns: Vec<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiAttempt {
+    pub attempt_id: String,
+    pub role: RelayRole,
+    pub state: String,
+    pub state_version: i64,
+    pub input_identity: String,
+    pub parent_attempt_id: Option<String>,
+    pub meta: ApiRequestMeta,
+    pub request_sha256: String,
+    pub facts: Option<ApiFacts>,
+    pub model_claim: Option<serde_json::Value>,
+    pub binding: Option<serde_json::Value>,
+    pub evidence: Option<serde_json::Value>,
+}
+/// Duplicate-key rejection is shared; API has stricter independent traversal limits.
+pub fn api_json<T: serde::de::DeserializeOwned>(b: &[u8], cap: usize) -> Result<T> {
+    let v: serde_json::Value = relay_json(b, cap)?;
+    fn walk(v: &serde_json::Value, d: usize, n: &mut usize) -> Result<()> {
+        if d > 16 {
+            return Err("BOUND");
+        };
+        *n = n.checked_add(1).ok_or("BOUND")?;
+        if *n > 2048 {
+            return Err("BOUND");
+        }
+        match v {
+            serde_json::Value::String(s) if s.len() > 65536 => Err("BOUND"),
+            serde_json::Value::Array(a) => {
+                for x in a {
+                    walk(x, d + 1, n)?
+                }
+                Ok(())
+            }
+            serde_json::Value::Object(m) => {
+                for (k, x) in m {
+                    if k.len() > 4096 {
+                        return Err("BOUND");
+                    };
+                    walk(x, d + 1, n)?
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    walk(&v, 0, &mut 0)?;
+    serde_json::from_value(v).map_err(|_| "SCHEMA_REJECTED")
 }

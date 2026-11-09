@@ -985,6 +985,35 @@ mod ar0 {
         }
     }
     #[test]
+    fn api_ea7_behavior_byte_goldens() {
+        let p = plan();
+        let b = base();
+        let raw = proposal();
+        let c = relay::candidate(&p, &b, &raw).unwrap();
+        let (_, r) = relay::prepare_review(&p, &b, &raw).unwrap();
+        let dev = relay::develop_input(&p, &b).unwrap();
+        assert_eq!(
+            hash(c.text.as_bytes()),
+            "6f330f989c291db7fb4d8b9002624b1383f74e980fe7f55dffa4d025a9355f75",
+            "ea7 candidate golden"
+        );
+        assert_eq!(
+            hash(c.diff.as_bytes()),
+            "ed63925784acb8ab3cdd9ba54c6df1c7f09a45442a3118b3a716295fe28257eb",
+            "ea7 diff golden"
+        );
+        assert_eq!(
+            hash(r.as_slice()),
+            "d53de3915b005039a86bef5e4b1a0d94e319a25b1db60e9a1ad09456a089080b",
+            "ea7 review golden"
+        );
+        assert_eq!(
+            hash(dev.as_slice()),
+            "246193d983c874c199c1ab16c6f57a58730df9865e730f582234f98a66d5fa56",
+            "ea7 develop golden"
+        );
+    }
+    #[test]
     fn ar0_candidate_unique_signature_and_no_application() {
         let p = plan();
         let b = base();
@@ -3427,5 +3456,622 @@ mod ar0 {
                 );
             }
         }
+    }
+}
+
+#[cfg(windows)]
+mod api_injected {
+    use super::super::{api_adapter::*, relay};
+    use super::*;
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    fn request() -> ApiPlanRequest {
+        ApiPlanRequest {
+            schema: "nova.scheduler.api-plan-request/1".into(),
+            mode: "API_INJECTED_ONLY".into(),
+            package_id: "api-fixture".into(),
+            registration_revision: 0,
+            input_base_sha: API_H.into(),
+            target_path: API_TARGET.into(),
+            base_sha256: hash(API_FIXTURE),
+            goal: "Trim and lowercase".into(),
+            constraints: vec!["Keep signature".into()],
+            examples: vec![],
+            protocol: "API_JSON_INJECTED_V1".into(),
+            model_develop: "injected-develop-v1".into(),
+            model_review: "injected-review-v1".into(),
+            limits: ApiLimits {
+                stage_ms: 45000,
+                total_ms: 120000,
+                input_tokens: 8192,
+                output_tokens: 4096,
+            },
+            pm_decision_ref: "INJECTED human reference, not execution permission".into(),
+        }
+    }
+    struct F {
+        root: PathBuf,
+        workspace: PathBuf,
+        run: PathBuf,
+        raw: Vec<u8>,
+    }
+    impl F {
+        fn new() -> Self {
+            let parent = std::env::var_os("NOVA_SH1_TEST_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let root = parent.join(format!(
+                "api-fixture-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::SeqCst)
+            ));
+            fs::create_dir(&root).unwrap();
+            Self {
+                workspace: root.join("workspace"),
+                run: root.join("run"),
+                root,
+                raw: serde_json::to_vec(&request()).unwrap(),
+            }
+        }
+        fn init(&self) -> Store {
+            Store::api_init(&self.workspace, &self.run, &self.raw).unwrap()
+        }
+    }
+    struct FakeClock(Cell<u64>);
+    impl Clock for FakeClock {
+        fn now_ms(&self) -> u64 {
+            self.0.get()
+        }
+    }
+    struct Fault<'a> {
+        inner: InjectedTransport,
+        kind: &'a str,
+        clock: &'a FakeClock,
+    }
+    impl ApiTransport for Fault<'_> {
+        fn send(
+            &mut self,
+            q: &ApiRequest,
+            s: &SecretLease,
+            p: &ApiDispatchPermit,
+            e: u64,
+            c: &dyn Clock,
+            x: &AtomicBool,
+        ) -> TransportResult {
+            let mut r = self.inner.send(q, s, p, e, c, x);
+            let mut v: Value = serde_json::from_slice(&r.body).unwrap();
+            match self.kind {
+                "auth" => r.status = Some(401),
+                "billing" => r.status = Some(402),
+                "rate" => r.status = Some(429),
+                "redirect" => r.status = Some(302),
+                "unknown" => r.resources_released = false,
+                "late" => self.clock.0.set(e + 1),
+                "cancel" => x.store(true, Ordering::Release),
+                "usage" => v["usage"] = Value::Null,
+                "model" => v["model"] = json!("different"),
+                "truncated" => v["choices"][0]["finish_reason"] = json!("length"),
+                "tool" => v["choices"][0]["message"]["tool_calls"] = json!([]),
+                "secret" => v["id"] = json!("NOVA_INJECTED_ONLY_SECRET_SENTINEL"),
+                "unicode-secret" => {
+                    let escaped: String = "NOVA_INJECTED_ONLY_SECRET_SENTINEL"
+                        .chars()
+                        .map(|c| format!("\\u{:04x}", c as u32))
+                        .collect();
+                    r.body = format!("{{\"error\":\"{}\"}}", escaped).into_bytes();
+                    r.status = Some(401);
+                    return r;
+                }
+                "output-tokens" => {
+                    v["usage"] =
+                        json!({"prompt_tokens":64,"completion_tokens":5000,"total_tokens":5064})
+                }
+                "usage-sum" => v["usage"]["total_tokens"] = json!(1),
+                "extra-choice" => {
+                    let c = v["choices"][0].clone();
+                    v["choices"].as_array_mut().unwrap().push(c)
+                }
+                "duplicate" => {
+                    r.body = br#"{"id":"a","id":"b"}"#.to_vec();
+                    return r;
+                }
+                "malformed" => {
+                    r.body = b"{truncated".to_vec();
+                    return r;
+                }
+                "overflow" => {
+                    r.body = vec![b' '; 131073];
+                    return r;
+                }
+                "review-blocked" | "review-conflict" | "review-changes"
+                    if q.meta.role == RelayRole::Review =>
+                {
+                    let mut claim: Value = serde_json::from_str(
+                        v["choices"][0]["message"]["content"].as_str().unwrap(),
+                    )
+                    .unwrap();
+                    claim["verdict"] = json!(if self.kind == "review-blocked" {
+                        "BLOCKED"
+                    } else if self.kind == "review-changes" {
+                        "CHANGES_REQUIRED"
+                    } else {
+                        "PASS"
+                    });
+                    if self.kind == "review-conflict" {
+                        claim["issues"] = json!([{"id":"R-1","severity":"LOW","blocking":true,"location":"fixed","summary":"Injected"}]);
+                    }
+                    v["choices"][0]["message"]["content"] =
+                        json!(serde_json::to_string(&claim).unwrap());
+                }
+                _ => (),
+            }
+            r.body = serde_json::to_vec(&v).unwrap();
+            r
+        }
+    }
+    fn execute(s: &Store, kind: &str) -> (Value, usize) {
+        let clock = FakeClock(Cell::new(0));
+        let mut t = Fault {
+            inner: InjectedTransport { calls: 0 },
+            kind,
+            clock: &clock,
+        };
+        let v = relay::run_api_with(
+            s,
+            &mut t,
+            &mut InjectedSecrets,
+            &mut InjectedCounter,
+            &clock,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        (v, t.inner.calls)
+    }
+    #[test]
+    fn api_request_rejects_final_delivery_and_plan_id_before_roots() {
+        for key in ["input_delivery_identity", "plan_id", "unknown"] {
+            let f = F::new();
+            let mut v = serde_json::to_value(request()).unwrap();
+            v[key] = json!("a".repeat(64));
+            assert_eq!(
+                Store::api_init(&f.workspace, &f.run, &serde_json::to_vec(&v).unwrap()).err(),
+                Some("SCHEMA_REJECTED")
+            );
+            assert!(!f.workspace.exists() && !f.run.exists())
+        }
+    }
+    #[test]
+    fn api_real_mode_rejected_before_root_or_lease() {
+        let f = F::new();
+        let mut r = request();
+        r.mode = "REAL_API".into();
+        assert_eq!(
+            Store::api_init(&f.workspace, &f.run, &serde_json::to_vec(&r).unwrap()).err(),
+            Some("REAL_API_NOT_AUTHORIZED")
+        );
+        assert!(!f.run.exists())
+    }
+    #[test]
+    fn api_request_binds_after_guard_and_differs_across_roots() {
+        let a = F::new();
+        let b = F::new();
+        let sa = a.init();
+        let sb = b.init();
+        let (ia, pa, _, _) = sa.api_plan().unwrap();
+        let (ib, pb, _, _) = sb.api_plan().unwrap();
+        assert_ne!(ia, ib);
+        assert_ne!(pa.input_delivery_identity, pb.input_delivery_identity);
+        assert_eq!(pa.plan_request_sha256, pb.plan_request_sha256);
+        assert_eq!(pa.plan_request_sha256, hash(&a.raw))
+    }
+    #[test]
+    fn api_complete_two_stage_fixture_unchanged_and_restart_no_send() {
+        let f = F::new();
+        let s = f.init();
+        let (v, n) = execute(&s, "ok");
+        assert_eq!(n, 2);
+        assert_eq!(v["next_action"], "PM_REVIEW");
+        assert_eq!(v["execution_authorized"], false);
+        assert_eq!(s.api_attempts().unwrap().len(), 2);
+        assert_eq!(
+            fs::read(f.run.join("fixture").join(API_TARGET)).unwrap(),
+            API_FIXTURE
+        );
+        drop(s);
+        let s = Store::api_open(&f.workspace).unwrap();
+        let (v2, n2) = execute(&s, "ok");
+        assert_eq!(n2, 0);
+        assert_eq!(v2, v);
+    }
+    #[test]
+    fn api_failed_develop_exact_codes_never_review() {
+        for (kind, code) in [
+            ("auth", "AUTH_REJECTED"),
+            ("billing", "BILLING_REJECTED"),
+            ("rate", "RATE_LIMITED"),
+            ("redirect", "REDIRECT_REJECTED"),
+            ("unknown", "TRANSPORT_UNKNOWN"),
+            ("late", "DEADLINE"),
+            ("cancel", "CANCELLED"),
+            ("usage", "USAGE_UNKNOWN"),
+            ("model", "API_PROTOCOL_REJECTED"),
+            ("truncated", "OUTPUT_TRUNCATED"),
+            ("tool", "TOOL_OUTPUT_REJECTED"),
+            ("secret", "SECRET_ECHO"),
+            ("unicode-secret", "SECRET_ECHO"),
+            ("output-tokens", "TOKEN_BOUND"),
+            ("usage-sum", "TOKEN_BOUND"),
+            ("extra-choice", "API_PROTOCOL_REJECTED"),
+            ("duplicate", "SCHEMA_REJECTED"),
+            ("malformed", "SCHEMA_REJECTED"),
+            ("overflow", "BOUND"),
+        ] {
+            let f = F::new();
+            let s = f.init();
+            let (v, n) = execute(&s, kind);
+            assert_eq!(n, 1, "{kind}");
+            let a = s.api_attempts().unwrap();
+            assert_eq!(a.len(), 1, "{kind}");
+            assert_eq!(a[0].facts.as_ref().unwrap().error_code, code, "{kind}");
+            assert_ne!(v["next_action"], "PM_REVIEW", "{kind}");
+            if kind == "auth" {
+                assert_eq!(a[0].state, "RESPONSE_RECEIVED")
+            };
+            if kind == "secret" {
+                assert!(a[0].facts.as_ref().unwrap().response_sha256.is_none());
+                assert!(!f.run.join("DEVELOP-response.json").exists())
+            }
+        }
+    }
+    #[test]
+    fn api_review_claims_are_not_acceptance_or_auto_repair() {
+        for (kind, next) in [
+            ("review-blocked", "PM_REQUIRED"),
+            ("review-conflict", "PM_REQUIRED"),
+            ("review-changes", "REPAIR_AUTH_REQUIRED"),
+        ] {
+            let f = F::new();
+            let (v, n) = execute(&f.init(), kind);
+            assert_eq!(n, 2);
+            assert_eq!(v["next_action"], next);
+            assert_eq!(v["next_execution_authorized"], false);
+        }
+    }
+    #[test]
+    fn api_v3_ddl_golden_and_old_open_zero_writes() {
+        assert_eq!(
+            hash(super::super::store::API_SCHEMA.as_bytes()),
+            "fc87ee02cab39949927702acea06d06cf1deea79fc16b1a633aef500d927cfd3"
+        );
+        let f = F::new();
+        let s = f.init();
+        let before = fs::read(f.workspace.join("handoff.sqlite3")).unwrap();
+        assert_eq!(
+            Store::open(&f.workspace).err(),
+            Some("API_STORE_COMMAND_REQUIRED")
+        );
+        assert_eq!(
+            fs::read(f.workspace.join("handoff.sqlite3")).unwrap(),
+            before
+        );
+        assert!(Source::base("INJECTED_TEST").is_err());
+        assert_eq!(s.snapshot().unwrap().base_source, "INJECTED_TEST")
+    }
+    #[test]
+    fn api_existing_workspace_init_rejects_without_writing() {
+        let f = F::new();
+        let _s = f.init();
+        let b = fs::read(f.workspace.join("handoff.sqlite3")).unwrap();
+        assert_eq!(
+            Store::api_init(&f.workspace, &f.root.join("second-run"), &f.raw).err(),
+            Some("CREATE_NEW_REJECTED")
+        );
+        assert_eq!(fs::read(f.workspace.join("handoff.sqlite3")).unwrap(), b);
+        assert!(!f.root.join("second-run").exists())
+    }
+    fn meta(s: &Store) -> ApiRequestMeta {
+        let (id, p, _, _) = s.api_plan().unwrap();
+        let base = s.api_base().unwrap();
+        let input = relay::api_develop_input(&p, &base).unwrap();
+        let secret = InjectedSecrets.acquire(RelayRole::Develop, &id).unwrap();
+        make_request(RelayRole::Develop, &p, &id, &input, None, &secret)
+            .unwrap()
+            .meta
+    }
+    #[test]
+    fn api_stale_states_read_only_no_permit_or_replay() {
+        for stage in 0..3 {
+            let f = F::new();
+            let s = f.init();
+            let r = s.api_reserve(meta(&s)).unwrap();
+            if stage > 0 {
+                let p = s.api_dispatching(r).unwrap();
+                if stage > 1 {
+                    let mut a = p.attempt().clone();
+                    s.api_cas(&mut a, "IN_FLIGHT").unwrap()
+                }
+            }
+            let b = fs::read(f.workspace.join("handoff.sqlite3")).unwrap();
+            let (v, n) = execute(&s, "ok");
+            assert_eq!(n, 0);
+            assert_eq!(v["next_action"], "PM_REQUIRED");
+            assert!(v["unknowns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x == "STALE_NONTERMINAL"));
+            assert_eq!(fs::read(f.workspace.join("handoff.sqlite3")).unwrap(), b);
+        }
+    }
+    #[test]
+    fn api_double_connection_reservation_and_cas_conflict() {
+        let f = F::new();
+        let s = f.init();
+        let other = Store::api_open(&f.workspace).unwrap();
+        let r = s.api_reserve(meta(&s)).unwrap();
+        assert_eq!(
+            other.api_reserve(meta(&other)).err().map(|e| e.to_string()),
+            Some("LEASE_EXISTS".into())
+        );
+        let p = s.api_dispatching(r).unwrap();
+        let mut a = p.attempt().clone();
+        let mut b = a.clone();
+        s.api_cas(&mut a, "IN_FLIGHT").unwrap();
+        assert_eq!(
+            other.api_cas(&mut b, "IN_FLIGHT"),
+            Err("ATTEMPT_CAS_CONFLICT")
+        );
+        assert!(p.claim_once());
+        assert!(!p.claim_once())
+    }
+    #[test]
+    fn api_tampered_delivery_or_ddl_rejected() {
+        for ddl in [false, true] {
+            let f = F::new();
+            let s = f.init();
+            let (id, mut p, _, _) = s.api_plan().unwrap();
+            let c = rusqlite::Connection::open(f.workspace.join("handoff.sqlite3")).unwrap();
+            if ddl {
+                c.execute_batch("ALTER TABLE relay_attempts ADD COLUMN unexpected TEXT")
+                    .unwrap()
+            } else {
+                p.input_delivery_identity = "0".repeat(64);
+                c.execute(
+                    "UPDATE relay_plans SET plan_json=?1 WHERE plan_id=?2",
+                    rusqlite::params![serde_json::to_string(&p).unwrap(), id],
+                )
+                .unwrap();
+            }
+            drop(c);
+            drop(s);
+            assert!(Store::api_open(&f.workspace).is_err());
+        }
+    }
+    #[test]
+    fn api_file_drift_preserves_historical_facts_and_blocks_next() {
+        let f = F::new();
+        let s = f.init();
+        let (_, n) = execute(&s, "ok");
+        assert_eq!(n, 2);
+        fs::write(f.run.join("fixture").join(API_TARGET), b"changed").unwrap();
+        let v = relay::api_status(&s).unwrap();
+        assert_eq!(v["next_action"], "PM_REQUIRED");
+        assert_eq!(s.api_attempts().unwrap().len(), 2);
+        assert_eq!(execute(&s, "ok").1, 0)
+    }
+    #[test]
+    fn api_evidence_failure_survives_reopen_no_review() {
+        let f = F::new();
+        let s = f.init();
+        fs::write(f.run.join("DEVELOP-response.json"), b"do not overwrite").unwrap();
+        let (v, n) = execute(&s, "ok");
+        assert_eq!(n, 1);
+        assert_eq!(v["next_action"], "PM_REQUIRED");
+        let a = s.api_attempts().unwrap();
+        assert_eq!(a[0].state, "RESPONSE_RECEIVED");
+        assert_eq!(a[0].evidence.as_ref().unwrap()["state"], "FAILED");
+        assert_eq!(
+            fs::read(f.run.join("DEVELOP-response.json")).unwrap(),
+            b"do not overwrite"
+        );
+        drop(s);
+        assert_eq!(
+            relay::api_status(&Store::api_open(&f.workspace).unwrap()).unwrap()["next_action"],
+            "PM_REQUIRED"
+        )
+    }
+    #[test]
+    fn api_secret_unicode_all_decoded_and_raw_paths_reject() {
+        let secret = InjectedSecrets.acquire(RelayRole::Develop, "test").unwrap();
+        let sentinel = "NOVA_INJECTED_ONLY_SECRET_SENTINEL";
+        let escaped: String = sentinel
+            .chars()
+            .map(|c| format!("\\u{:04x}", c as u32))
+            .collect();
+        for b in [
+            format!("{{\"id\":\"{sentinel}\"}}"),
+            format!("{{\"id\":\"{escaped}\"}}"),
+            format!("{{\"usage\":{{\"bad\":\"{escaped}\"}}}}"),
+            format!("{{\"{escaped}\":0}}"),
+            format!(
+                "{{\"content\":{}}}",
+                serde_json::to_string(&format!("{{\"rationale\":\"{escaped}\"}}")).unwrap()
+            ),
+        ] {
+            assert_eq!(
+                secret.scan_json(b.as_bytes(), 131072).err(),
+                Some("SECRET_ECHO")
+            );
+        }
+        assert_eq!(
+            secret.scan_text(format!("prefix{sentinel}suffix").as_bytes()),
+            Err("SECRET_ECHO")
+        );
+    }
+    #[test]
+    fn api_limits_depth_duplicate_and_unknown_request() {
+        assert!(api_json::<Value>(b"{\"a\":1,\"a\":2}", 1024).is_err());
+        assert!(api_json::<Value>(
+            format!("{}0{}", "[".repeat(18), "]".repeat(18)).as_bytes(),
+            1024
+        )
+        .is_err());
+        let mut r = request();
+        r.limits.total_ms = 120001;
+        assert!(r.validate().is_err());
+        r = request();
+        r.registration_revision = 1;
+        assert!(r.validate().is_err())
+    }
+    struct MissingSecret;
+    impl SecretProvider for MissingSecret {
+        fn acquire(&mut self, _: RelayRole, _: &str) -> Result<SecretLease> {
+            Err("SECRET_UNAVAILABLE")
+        }
+    }
+    #[test]
+    fn api_secret_failure_and_pre_cancel_zero_reservation() {
+        for cancelled in [false, true] {
+            let f = F::new();
+            let s = f.init();
+            let mut t = InjectedTransport { calls: 0 };
+            let result = relay::run_api_with(
+                &s,
+                &mut t,
+                &mut MissingSecret,
+                &mut InjectedCounter,
+                &FakeClock(Cell::new(0)),
+                &AtomicBool::new(cancelled),
+            );
+            assert_eq!(
+                result.err(),
+                Some(if cancelled {
+                    "CANCELLED"
+                } else {
+                    "SECRET_UNAVAILABLE"
+                })
+            );
+            assert!(s.api_attempts().unwrap().is_empty());
+            assert_eq!(t.calls, 0)
+        }
+    }
+    struct UnknownCounter;
+    impl TokenCounter for UnknownCounter {
+        fn count(&mut self, _: &str, _: &[u8]) -> Result<CountReceipt> {
+            Err("TOKEN_BUDGET_UNKNOWN")
+        }
+    }
+    #[test]
+    fn api_unknown_tokens_zero_send() {
+        let f = F::new();
+        let s = f.init();
+        let mut t = InjectedTransport { calls: 0 };
+        assert_eq!(
+            relay::run_api_with(
+                &s,
+                &mut t,
+                &mut InjectedSecrets,
+                &mut UnknownCounter,
+                &FakeClock(Cell::new(0)),
+                &AtomicBool::new(false)
+            )
+            .err(),
+            Some("TOKEN_BUDGET_UNKNOWN")
+        );
+        assert_eq!(t.calls, 0);
+        assert!(s.api_attempts().unwrap().is_empty())
+    }
+    #[test]
+    fn api_simultaneous_connections_only_one_reservation() {
+        let f = F::new();
+        let s = f.init();
+        let m = meta(&s);
+        drop(s);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut threads = vec![];
+        for _ in 0..2 {
+            let path = f.workspace.clone();
+            let meta = m.clone();
+            let b = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                let s = Store::api_open(&path).unwrap();
+                b.wait();
+                s.api_reserve(meta).map(|_| ()).map_err(|e| e.to_string())
+            }));
+        }
+        let results: Vec<_> = threads.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| r.as_ref().err().is_some_and(|e| e == "LEASE_EXISTS"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            Store::api_open(&f.workspace)
+                .unwrap()
+                .api_attempts()
+                .unwrap()
+                .len(),
+            1
+        )
+    }
+    #[test]
+    fn api_request_meta_forgery_rejected_before_lease() {
+        for field in ["input", "body", "model", "protocol", "source", "parent"] {
+            let f = F::new();
+            let s = f.init();
+            let mut m = meta(&s);
+            match field {
+                "input" => m.input_sha256 = "0".repeat(64),
+                "body" => m.body_sha256 = "0".repeat(64),
+                "model" => m.requested_model = "unknown".into(),
+                "protocol" => m.protocol = "unknown".into(),
+                "source" => m.source = "NATIVE".into(),
+                _ => m.parent_attempt_id = Some("unknown".into()),
+            };
+            assert_eq!(s.api_reserve(m).err(), Some("BINDING_MISMATCH"));
+            assert!(s.api_attempts().unwrap().is_empty())
+        }
+    }
+    #[test]
+    fn api_partial_init_preserved_and_not_auto_repaired() {
+        for fault in 1..=4 {
+            let f = F::new();
+            assert_eq!(
+                Store::api_init_fault(&f.workspace, &f.run, &f.raw, fault).err(),
+                Some("INJECTED_INIT_FAILURE")
+            );
+            assert!(f.workspace.exists() && f.run.exists());
+            assert!(Store::api_open(&f.workspace).is_err());
+            assert_eq!(
+                Store::api_init(&f.workspace, &f.root.join("other-run"), &f.raw).err(),
+                Some("CREATE_NEW_REJECTED")
+            );
+            assert!(!f.root.join("other-run").exists())
+        }
+    }
+    #[test]
+    fn api_v1_and_v2_api_open_refuse_no_write() {
+        let f = super::Fixture::new();
+        let v1 = f.store();
+        let root = f.root.join("owned");
+        let b = fs::read(root.join("handoff.sqlite3")).unwrap();
+        assert_eq!(
+            Store::api_open(&root).err(),
+            Some("API_STORE_VERSION_REQUIRED")
+        );
+        assert_eq!(fs::read(root.join("handoff.sqlite3")).unwrap(), b);
+        drop(v1);
+        let r = f.root.join("v2");
+        let _v2 = Store::relay_init(&r, &f.m, &f.e).unwrap();
+        let b = fs::read(r.join("handoff.sqlite3")).unwrap();
+        assert_eq!(
+            Store::api_open(&r).err(),
+            Some("API_STORE_VERSION_REQUIRED")
+        );
+        assert_eq!(fs::read(r.join("handoff.sqlite3")).unwrap(), b)
     }
 }

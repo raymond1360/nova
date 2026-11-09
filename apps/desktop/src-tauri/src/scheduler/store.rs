@@ -413,7 +413,9 @@ impl Store {
         }
         sql(db.conn().execute_batch("BEGIN IMMEDIATE;"))?;
         let result = (|| {
-            let ddl = if version == 2 {
+            let ddl = if version == 3 {
+                API_SCHEMA.into()
+            } else if version == 2 {
                 SCHEMA.replace("CHECK(schema_version=1)", "CHECK(schema_version=2)")
                     + RELAY_PLANS_DDL
                     + ";"
@@ -467,9 +469,16 @@ impl Store {
         drop(db);
         drop(dg);
         drop(rg);
-        Self::open(root)
+        if version == 3 {
+            Self::open_kind(root, true)
+        } else {
+            Self::open(root)
+        }
     }
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_kind(root, false)
+    }
+    fn open_kind(root: &Path, api: bool) -> Result<Self> {
         safe_location(root)?;
         let rg = Guard::open(root, true)?;
         let (b, _) =
@@ -512,7 +521,13 @@ impl Store {
         {
             return Err("STORE_VERSION_REJECTED");
         }
-        if ![1, 2].contains(&mark.2) {
+        if !api && mark.2 == 3 {
+            return Err("API_STORE_COMMAND_REQUIRED");
+        }
+        if api && mark.2 != 3 {
+            return Err("API_STORE_VERSION_REQUIRED");
+        }
+        if ![1, 2, 3].contains(&mark.2) {
             return Err("STORE_VERSION_REJECTED");
         }
         if mark.2 == 2 {
@@ -520,6 +535,27 @@ impl Store {
                 ("relay_plans", RELAY_PLANS_DDL),
                 ("relay_attempts", RELAY_ATTEMPTS_DDL),
             ] {
+                let actual: String = sql(c.query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    [name],
+                    |r| r.get(0),
+                ))?;
+                if actual != expected {
+                    return Err("STORE_VERSION_REJECTED");
+                }
+            }
+        }
+        if api {
+            for expected in API_SCHEMA
+                .split(';')
+                .map(str::trim)
+                .filter(|x| !x.is_empty())
+            {
+                let name = expected
+                    .strip_prefix("CREATE TABLE ")
+                    .and_then(|x| x.split('(').next())
+                    .ok_or("STORE_VERSION_REJECTED")?
+                    .trim();
                 let actual: String = sql(c.query_row(
                     "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
                     [name],
@@ -1794,5 +1830,550 @@ impl Store {
             Path::new(&record.approval.roots.run_root),
             Some(created),
         )
+    }
+}
+
+/// Frozen API v3 DDL, LF text including final newline. Old SCHEMA remains unchanged.
+pub const API_SCHEMA: &str = r#"CREATE TABLE scheduler_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),magic TEXT NOT NULL CHECK(magic='NOVA_SH1_OWNED_V1'),purpose TEXT NOT NULL CHECK(purpose='INTERNAL_HANDOFF_ONLY'),schema_version INTEGER NOT NULL CHECK(schema_version=3),db_id TEXT NOT NULL UNIQUE,owner_root TEXT NOT NULL,product_user_version_at_init INTEGER NOT NULL,ready INTEGER NOT NULL CHECK(ready=1));
+CREATE TABLE scheduler_packages(package_id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES nova_projects(id),task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),manifest_json TEXT NOT NULL,manifest_sha256 TEXT NOT NULL,policy_id TEXT NOT NULL CHECK(policy_id='INTERNAL_MANUAL_V1'),phase TEXT NOT NULL,revision INTEGER NOT NULL CHECK(revision>=0),current_envelope_id TEXT,base_sha TEXT NOT NULL CHECK(length(base_sha)=40),base_source TEXT NOT NULL CHECK(base_source='INJECTED_TEST'),current_delivery_identity TEXT NOT NULL CHECK(length(current_delivery_identity)=64),auto_repair_count INTEGER NOT NULL DEFAULT 0 CHECK(auto_repair_count=0),manual_rounds_recorded INTEGER NOT NULL DEFAULT 0 CHECK(manual_rounds_recorded>=0),readiness_invalidated INTEGER NOT NULL DEFAULT 0 CHECK(readiness_invalidated IN (0,1)),registration_closed INTEGER NOT NULL DEFAULT 0 CHECK(registration_closed IN (0,1)),closure_receipt_id TEXT);
+CREATE TABLE scheduler_envelopes(envelope_id TEXT PRIMARY KEY,package_id TEXT NOT NULL REFERENCES scheduler_packages(package_id),envelope_json TEXT NOT NULL,observed_head_sha TEXT NOT NULL CHECK(length(observed_head_sha)=40),observed_utc TEXT NOT NULL,delivery_identity TEXT NOT NULL CHECK(length(delivery_identity)=64));
+CREATE TABLE scheduler_receipts(receipt_id TEXT PRIMARY KEY,package_id TEXT NOT NULL REFERENCES scheduler_packages(package_id),envelope_id TEXT REFERENCES scheduler_envelopes(envelope_id),mode TEXT NOT NULL CHECK(mode IN ('CURRENT','INDEX_ONLY')),report_type TEXT CHECK(report_type IN ('DEVELOPMENT','REVIEW','CI','PM_DECISION')),file_path TEXT NOT NULL,file_bytes INTEGER NOT NULL CHECK(file_bytes>=0 AND file_bytes<=2097152),file_sha256 TEXT NOT NULL CHECK(length(file_sha256)=64),metadata_json TEXT,delivery_identity TEXT,source_receipt_id TEXT REFERENCES scheduler_receipts(receipt_id),transcribed_by_json TEXT,CHECK(mode!='CURRENT' OR (delivery_identity IS NOT NULL AND length(delivery_identity)=64)),CHECK((source_receipt_id IS NULL AND transcribed_by_json IS NULL) OR (source_receipt_id IS NOT NULL AND transcribed_by_json IS NOT NULL AND source_receipt_id!=receipt_id)),UNIQUE(package_id,file_sha256,mode));
+CREATE TABLE scheduler_issue_snapshots(receipt_id TEXT NOT NULL REFERENCES scheduler_receipts(receipt_id),issue_id TEXT NOT NULL,severity TEXT NOT NULL CHECK(severity IN ('BLOCKER','HIGH','MEDIUM','LOW','INFO')),blocking INTEGER NOT NULL CHECK(blocking IN (0,1)),status TEXT NOT NULL CHECK(status IN ('OPEN','CLOSED')),first_seen_sha TEXT NOT NULL CHECK(length(first_seen_sha)=40),closed_sha TEXT,CHECK((status='OPEN' AND closed_sha IS NULL) OR (status='CLOSED' AND closed_sha IS NOT NULL AND length(closed_sha)=40)),PRIMARY KEY(receipt_id,issue_id));
+CREATE TABLE scheduler_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,package_id TEXT NOT NULL REFERENCES scheduler_packages(package_id),revision INTEGER NOT NULL,idempotency_key TEXT NOT NULL,kind TEXT NOT NULL,actor TEXT NOT NULL CHECK(actor IN ('user','nova','system')),payload_json TEXT NOT NULL,UNIQUE(package_id,revision),UNIQUE(package_id,idempotency_key));
+CREATE TABLE relay_plans(
+ plan_id TEXT PRIMARY KEY,
+ package_id TEXT NOT NULL UNIQUE REFERENCES scheduler_packages(package_id),
+ plan_json TEXT NOT NULL CHECK(length(plan_json)<=65536),
+ plan_sha256 TEXT NOT NULL CHECK(length(plan_sha256)=64),
+ registration_revision INTEGER NOT NULL,
+ run_root TEXT NOT NULL, run_root_identity TEXT NOT NULL,
+ backend_kind TEXT NOT NULL CHECK(backend_kind='API_INJECTED'),
+ protocol TEXT NOT NULL CHECK(protocol='API_JSON_INJECTED_V1'),
+ created_utc TEXT NOT NULL);
+CREATE TABLE relay_attempts(
+ attempt_id TEXT PRIMARY KEY,
+ plan_id TEXT NOT NULL REFERENCES relay_plans(plan_id),
+ role TEXT NOT NULL CHECK(role IN ('DEVELOP','REVIEW')),
+ round INTEGER NOT NULL CHECK(round=1),
+ input_identity TEXT NOT NULL CHECK(length(input_identity)=64),
+ parent_attempt_id TEXT REFERENCES relay_attempts(attempt_id),
+ request_meta_json TEXT NOT NULL CHECK(length(request_meta_json)<=8192),
+ request_sha256 TEXT NOT NULL CHECK(length(request_sha256)=64),
+ state TEXT NOT NULL CHECK(state IN
+ ('RESERVED','DISPATCHING','IN_FLIGHT','RESPONSE_RECEIVED','STOPPED','UNKNOWN')),
+ state_version INTEGER NOT NULL CHECK(state_version>=0),
+ started_utc TEXT, ended_utc TEXT,
+ facts_json TEXT CHECK(facts_json IS NULL OR length(facts_json)<=16384),
+ model_claim_json TEXT CHECK(model_claim_json IS NULL OR length(model_claim_json)<=65536),
+ binding_json TEXT CHECK(binding_json IS NULL OR length(binding_json)<=4096),
+ evidence_json TEXT CHECK(evidence_json IS NULL OR length(evidence_json)<=16384),
+ UNIQUE(plan_id,role,round),
+ CHECK((role='DEVELOP' AND parent_attempt_id IS NULL) OR
+       (role='REVIEW' AND parent_attempt_id IS NOT NULL)));
+"#;
+
+pub struct ApiReservation {
+    attempt: ApiAttempt,
+}
+pub struct ApiDispatchPermit {
+    attempt: ApiAttempt,
+    claimed: std::sync::atomic::AtomicBool,
+}
+impl ApiDispatchPermit {
+    pub fn claim_once(&self) -> bool {
+        self.claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+    pub fn attempt(&self) -> &ApiAttempt {
+        &self.attempt
+    }
+}
+impl Store {
+    pub fn api_init(root: &Path, run: &Path, raw: &[u8]) -> Result<Self> {
+        Self::api_init_stage(root, run, raw, 0)
+    }
+    #[cfg(test)]
+    pub(crate) fn api_init_fault(root: &Path, run: &Path, raw: &[u8], fault: u8) -> Result<Self> {
+        Self::api_init_stage(root, run, raw, fault)
+    }
+    fn api_init_stage(root: &Path, run: &Path, raw: &[u8], fault: u8) -> Result<Self> {
+        let req: ApiPlanRequest = api_json(raw, 65536)?;
+        req.validate()?;
+        // Existing workspace is rejected without opening or mutating it.
+        if root.try_exists().map_err(|_| "PATH_REJECTED")? {
+            return Err("CREATE_NEW_REJECTED");
+        }
+        absolute(root)?;
+        absolute(run)?;
+        safe_location(root)?;
+        safe_location(run)?;
+        let rp = Guard::open(root.parent().ok_or("PATH_REJECTED")?, true)?;
+        let rr = Guard::open(run.parent().ok_or("PATH_REJECTED")?, true)?;
+        let root = rp.path.join(root.file_name().ok_or("PATH_REJECTED")?);
+        let run = rr.path.join(run.file_name().ok_or("PATH_REJECTED")?);
+        if inside(&root, &run) || inside(&run, &root) {
+            return Err("STORE_ROOT_REJECTED");
+        }
+        fs::create_dir(&run).map_err(|_| "CREATE_NEW_REJECTED")?;
+        let fixture = run.join("fixture");
+        fs::create_dir(&fixture).map_err(|_| "CREATE_NEW_REJECTED")?;
+        fs::create_dir(fixture.join("pilot")).map_err(|_| "CREATE_NEW_REJECTED")?;
+        fs::create_dir(fixture.join("pilot/src")).map_err(|_| "CREATE_NEW_REJECTED")?;
+        new_file(&fixture.join(API_TARGET), API_FIXTURE)?;
+        let reports = run.join("reports");
+        fs::create_dir(&reports).map_err(|_| "CREATE_NEW_REJECTED")?;
+        let rg = Guard::open(&fixture, true)?;
+        let mut fg = Guard::open(&fixture.join(API_TARGET), false)?;
+        let b = fg.bytes(65536)?;
+        if b != API_FIXTURE {
+            return Err("BASE_CHANGED");
+        }
+        let m = Manifest {
+            schema: "nova.sh1.package/1".into(),
+            package_id: req.package_id.clone(),
+            repo_path: rg.path.to_string_lossy().into(),
+            title: "API injected fixture".into(),
+            goal: "Bounded patch proposal only".into(),
+            allowed_paths: vec![API_TARGET.into()],
+            acceptance_items: vec!["Injected two-stage receipts only".into()],
+            pm_decision_ref: req.pm_decision_ref.clone(),
+            report_roots: vec![reports.to_string_lossy().into()],
+            required_reports: vec![ReportType::Development, ReportType::Review, ReportType::Ci],
+            baseline: Baseline {
+                mode: "DECLARED".into(),
+                base_sha: Some(API_B.into()),
+            },
+            eol_policy: "false".into(),
+        };
+        let mut e = Envelope {
+            head: API_H.into(),
+            parent: "2".repeat(40),
+            base: API_B.into(),
+            base_source: ApiSource::InjectedTest.as_str().into(),
+            root_identity: rg.identity.clone(),
+            git_dir: rg.path.join(".injected-git").to_string_lossy().into(),
+            tree: vec![TreeEntry {
+                path: API_TARGET.into(),
+                mode: "100644".into(),
+                object: "4".repeat(40),
+            }],
+            files: vec![FileFact {
+                path: API_TARGET.into(),
+                bytes: b.len() as u64,
+                sha256: hash(&b),
+                identity: fg.identity.clone(),
+            }],
+            ancestors: vec![API_H.into(), "2".repeat(40), API_B.into()],
+            attributes: json!({"filter":"unspecified","text":"set","eol":"lf"}),
+            outside_scope_notice: "INJECTED_TEST_NOT_A_GIT_SAMPLE".into(),
+            observed_utc: chrono::Utc::now().to_rfc3339(),
+            delivery_identity: String::new(),
+            envelope_id: String::new(),
+        };
+        e.bind(&m)?;
+        let store = Self::init_version(&root, &m, &e, fault, 3, None)?;
+        let plan = ApiPlan::bind(req, e.delivery_identity.clone(), hash(raw));
+        let text = encoded(&plan)?;
+        let id = hash(text.as_bytes());
+        let run_guard = Guard::open(&run, true)?;
+        let db = store.write_connection()?;
+        sql(db.conn().execute("INSERT INTO relay_plans VALUES(?1,?2,?3,?1,0,?4,?5,'API_INJECTED','API_JSON_INJECTED_V1',?6)",params![id,m.package_id,text,run_guard.path.to_string_lossy(),run_guard.identity,chrono::Utc::now().to_rfc3339()]))?;
+        drop(db);
+        drop(store);
+        Self::api_open(&root)
+    }
+    pub fn api_open(root: &Path) -> Result<Self> {
+        let s = Self::open_kind(root, true)?;
+        s.api_plan()?;
+        s.api_attempts()?;
+        Ok(s)
+    }
+    pub fn api_plan(&self) -> Result<(String, ApiPlan, PathBuf, String)> {
+        let c = self.read_connection()?;
+        let snap = snapshot(&c)?;
+        let version: i64 = sql(c.query_row(
+            "SELECT schema_version FROM scheduler_meta",
+            [],
+            |r| r.get(0),
+        ))?;
+        if version != 3 {
+            return Err("API_STORE_VERSION_REQUIRED");
+        }
+        let row=sql(c.query_row("SELECT plan_id,plan_json,plan_sha256,package_id,registration_revision,run_root,run_root_identity,backend_kind,protocol FROM relay_plans",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?))))?;
+        let p: ApiPlan = api_json(row.1.as_bytes(), 65536)?;
+        p.validate()?;
+        if row.0 != hash(row.1.as_bytes())
+            || row.0 != row.2
+            || encoded(&p)? != row.1
+            || p.package_id != snap.manifest.package_id
+            || row.3 != p.package_id
+            || row.4 != p.registration_revision
+            || p.input_delivery_identity != snap.delivery
+            || snap.base_source != "INJECTED_TEST"
+            || row.7 != "API_INJECTED"
+            || row.8 != p.protocol
+        {
+            return Err("BINDING_MISMATCH");
+        }
+        Ok((row.0, p, PathBuf::from(row.5), row.6))
+    }
+    /// File-only check: never probes .git or invokes Git.
+    pub fn api_base(&self) -> Result<Vec<u8>> {
+        let (_, p, run, run_id) = self.api_plan()?;
+        let s = self.snapshot()?;
+        let e = self.audit_envelope()?;
+        let rr = Guard::open(&run, true)?;
+        if rr.identity != run_id {
+            return Err("EVIDENCE_ROOT_CHANGED");
+        }
+        let root = Guard::open(Path::new(&s.manifest.repo_path), true)?;
+        if root.identity != e.root_identity
+            || s.delivery != p.input_delivery_identity
+            || s.revision != 0
+            || s.invalidated
+            || s.closed
+            || e.head != API_H
+            || e.parent != "2".repeat(40)
+            || e.base != API_B
+            || e.base_source != "INJECTED_TEST"
+            || e.tree
+                != vec![TreeEntry {
+                    path: API_TARGET.into(),
+                    mode: "100644".into(),
+                    object: "4".repeat(40),
+                }]
+            || Path::new(&e.git_dir) != root.path.join(".injected-git")
+            || Path::new(&e.git_dir)
+                .try_exists()
+                .map_err(|_| "PATH_REJECTED")?
+        {
+            return Err("BINDING_MISMATCH");
+        }
+        let mut rebound = e.clone();
+        rebound.bind(&s.manifest)?;
+        if rebound.envelope_id != e.envelope_id || rebound.delivery_identity != e.delivery_identity
+        {
+            return Err("BINDING_MISMATCH");
+        }
+        let mut f = Guard::open(&root.path.join(API_TARGET), false)?;
+        let b = f.bytes(65536)?;
+        if b != API_FIXTURE
+            || hash(&b) != p.base_sha256
+            || e.files
+                != vec![FileFact {
+                    path: API_TARGET.into(),
+                    bytes: b.len() as u64,
+                    sha256: hash(&b),
+                    identity: f.identity.clone(),
+                }]
+        {
+            return Err("BASE_CHANGED");
+        }
+        Ok(b)
+    }
+    pub fn api_attempts(&self) -> Result<Vec<ApiAttempt>> {
+        let (id, p, _, _) = self.api_plan()?;
+        let c = self.read_connection()?;
+        let mut q=sql(c.prepare("SELECT attempt_id,role,state,state_version,input_identity,parent_attempt_id,request_meta_json,request_sha256,facts_json,model_claim_json,binding_json,evidence_json FROM relay_attempts WHERE plan_id=?1 ORDER BY rowid"))?;
+        let rows = sql(q.query_map([&id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, Option<String>>(10)?,
+                r.get::<_, Option<String>>(11)?,
+            ))
+        }))?;
+        let mut out: Vec<ApiAttempt> = vec![];
+        for r in rows {
+            let r = sql(r)?;
+            let role = match r.1.as_str() {
+                "DEVELOP" => RelayRole::Develop,
+                "REVIEW" => RelayRole::Review,
+                _ => return Err("BINDING_MISMATCH"),
+            };
+            let meta: ApiRequestMeta = api_json(r.6.as_bytes(), 8192)?;
+            if meta.plan_id != id
+                || meta.role != role
+                || meta.input_sha256 != r.4
+                || meta.body_sha256 != r.7
+                || meta.source != "INJECTED"
+                || meta.logical_endpoint != "INJECTED_CHAT_ENDPOINT"
+                || meta.protocol != p.protocol
+                || meta.schema != "nova.scheduler.api-request/1"
+                || &meta.requested_model
+                    != if role == RelayRole::Develop {
+                        &p.model_develop
+                    } else {
+                        &p.model_review
+                    }
+                || meta.parent_attempt_id != r.5
+            {
+                return Err("BINDING_MISMATCH");
+            }
+            let a = ApiAttempt {
+                attempt_id: r.0,
+                role,
+                state: r.2,
+                state_version: r.3,
+                input_identity: r.4,
+                parent_attempt_id: r.5,
+                meta,
+                request_sha256: r.7,
+                facts: r.8.map(|x| api_json(x.as_bytes(), 16384)).transpose()?,
+                model_claim: r.9.map(|x| api_json(x.as_bytes(), 65536)).transpose()?,
+                binding: r.10.map(|x| api_json(x.as_bytes(), 4096)).transpose()?,
+                evidence: r.11.map(|x| api_json(x.as_bytes(), 16384)).transpose()?,
+            };
+            if role == RelayRole::Review {
+                let parent = out
+                    .iter()
+                    .find(|x| {
+                        Some(&x.attempt_id) == a.parent_attempt_id.as_ref()
+                            && x.role == RelayRole::Develop
+                    })
+                    .ok_or("BINDING_MISMATCH")?;
+                if parent
+                    .binding
+                    .as_ref()
+                    .and_then(|b| b["review_input_sha256"].as_str())
+                    != Some(a.input_identity.as_str())
+                {
+                    return Err("BINDING_MISMATCH");
+                }
+            }
+            if let Some(f) = &a.facts {
+                if f.schema != "nova.scheduler.api-facts/1"
+                    || f.source != "INJECTED"
+                    || f.request_bytes != a.meta.body_bytes
+                    || f.transport_state != a.state
+                {
+                    return Err("BINDING_MISMATCH");
+                }
+            }
+            if let Some(e) = &a.evidence {
+                if !["PENDING", "COMPLETE", "FAILED"].contains(&e["state"].as_str().unwrap_or("")) {
+                    return Err("BINDING_MISMATCH");
+                }
+            }
+            if let Some(claim) = &a.model_claim {
+                if a.facts
+                    .as_ref()
+                    .is_none_or(|f| f.error_code != "NONE" || f.response_sha256.is_none())
+                {
+                    return Err("BINDING_MISMATCH");
+                }
+                if a.role == RelayRole::Develop {
+                    let raw = serde_json::to_vec(claim).map_err(|_| "ENCODING")?;
+                    let (c, review) = super::relay::api_review_input(&p, &id, API_FIXTURE, &raw)?;
+                    let binding = a.binding.as_ref().ok_or("BINDING_MISMATCH")?;
+                    if binding["plan_id"] != id
+                        || binding["candidate_sha256"] != c.candidate_sha256
+                        || binding["review_input_sha256"] != hash(&review)
+                    {
+                        return Err("BINDING_MISMATCH");
+                    }
+                } else {
+                    let parent = out
+                        .iter()
+                        .find(|x| Some(&x.attempt_id) == a.parent_attempt_id.as_ref())
+                        .ok_or("BINDING_MISMATCH")?;
+                    let c: ReviewClaim =
+                        serde_json::from_value(claim.clone()).map_err(|_| "SCHEMA_REJECTED")?;
+                    c.validate(
+                        &p.base_sha256,
+                        parent
+                            .binding
+                            .as_ref()
+                            .and_then(|b| b["candidate_sha256"].as_str())
+                            .ok_or("BINDING_MISMATCH")?,
+                    )?;
+                }
+            }
+            out.push(a);
+        }
+        Ok(out)
+    }
+    pub fn api_reserve(&self, meta: ApiRequestMeta) -> Result<ApiReservation> {
+        self.api_base()?;
+        let (id, p, _, _) = self.api_plan()?;
+        let existing = self.api_attempts()?;
+        if existing.iter().any(|a| a.role == meta.role) {
+            return Err("LEASE_EXISTS");
+        }
+        if meta.role == RelayRole::Review {
+            let a = existing
+                .iter()
+                .find(|a| Some(&a.attempt_id) == meta.parent_attempt_id.as_ref())
+                .ok_or("BINDING_MISMATCH")?;
+            if a.state != "RESPONSE_RECEIVED"
+                || a.facts.as_ref().is_none_or(|f| {
+                    f.error_code != "NONE" || !f.unknowns.is_empty() || !f.local_resources_released
+                })
+                || a.evidence.as_ref().and_then(|e| e["state"].as_str()) != Some("COMPLETE")
+                || a.binding
+                    .as_ref()
+                    .and_then(|b| b["review_input_sha256"].as_str())
+                    != Some(meta.input_sha256.as_str())
+            {
+                return Err("BINDING_MISMATCH");
+            }
+        } else if meta.parent_attempt_id.is_some() {
+            return Err("BINDING_MISMATCH");
+        }
+        if meta.plan_id != id || !hex(&meta.body_sha256, 64) || !hex(&meta.input_sha256, 64) {
+            return Err("BINDING_MISMATCH");
+        }
+        // Reconstruct inputs from tool-bound immutable material; callers cannot reserve arbitrary body hashes.
+        let base = self.api_base()?;
+        let expected_input = if meta.role == RelayRole::Develop {
+            super::relay::api_develop_input(&p, &base)?
+        } else {
+            let parent = existing
+                .iter()
+                .find(|a| Some(&a.attempt_id) == meta.parent_attempt_id.as_ref())
+                .ok_or("BINDING_MISMATCH")?;
+            let raw = serde_json::to_vec(parent.model_claim.as_ref().ok_or("BINDING_MISMATCH")?)
+                .map_err(|_| "ENCODING")?;
+            super::relay::api_review_input(&p, &id, &base, &raw)?.1
+        };
+        let mut secrets = super::api_adapter::InjectedSecrets;
+        let secret = super::api_adapter::SecretProvider::acquire(&mut secrets, meta.role, &id)?;
+        let expected = super::api_adapter::make_request(
+            meta.role,
+            &p,
+            &id,
+            &expected_input,
+            meta.parent_attempt_id.clone(),
+            &secret,
+        )?;
+        if encoded(&expected.meta)? != encoded(&meta)? {
+            return Err("BINDING_MISMATCH");
+        }
+
+        let a = ApiAttempt {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            role: meta.role,
+            state: "RESERVED".into(),
+            state_version: 0,
+            input_identity: meta.input_sha256.clone(),
+            parent_attempt_id: meta.parent_attempt_id.clone(),
+            request_sha256: meta.body_sha256.clone(),
+            meta,
+            facts: None,
+            model_claim: None,
+            binding: None,
+            evidence: None,
+        };
+        let db = self.write_connection()?;
+        sql(db.conn().execute_batch("BEGIN IMMEDIATE"))?;
+        let result = (|| {
+            let s = snapshot(db.conn())?;
+            if s.revision != p.registration_revision
+                || s.invalidated
+                || s.closed
+                || s.delivery != p.input_delivery_identity
+            {
+                return Err("REGISTRATION_CHANGED");
+            }
+            db.conn().execute("INSERT INTO relay_attempts(attempt_id,plan_id,role,round,input_identity,parent_attempt_id,request_meta_json,request_sha256,state,state_version) VALUES(?1,?2,?3,1,?4,?5,?6,?7,'RESERVED',0)",params![a.attempt_id,id,a.role.name(),a.input_identity,a.parent_attempt_id,encoded(&a.meta)?,a.request_sha256]).map_err(|_|"LEASE_EXISTS")?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => sql(db.conn().execute_batch("COMMIT"))?,
+            Err(e) => {
+                let _ = db.conn().execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
+        Ok(ApiReservation { attempt: a })
+    }
+    pub fn api_dispatching(&self, r: ApiReservation) -> Result<ApiDispatchPermit> {
+        self.api_base()?;
+        let mut a = r.attempt;
+        self.api_cas(&mut a, "DISPATCHING")?;
+        Ok(ApiDispatchPermit {
+            attempt: a,
+            claimed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+    pub fn api_cas(&self, a: &mut ApiAttempt, to: &str) -> Result<()> {
+        let (id, _, _, _) = self.api_plan()?;
+        let actual = self
+            .api_attempts()?
+            .into_iter()
+            .find(|x| x.attempt_id == a.attempt_id)
+            .ok_or("BINDING_MISMATCH")?;
+        if actual.input_identity != a.input_identity
+            || actual.parent_attempt_id != a.parent_attempt_id
+            || encoded(&actual.meta)? != encoded(&a.meta)?
+            || actual.request_sha256 != a.request_sha256
+            || actual.role != a.role
+        {
+            return Err("BINDING_MISMATCH");
+        }
+        let edge = matches!(
+            (a.state.as_str(), to),
+            ("RESERVED", "DISPATCHING")
+                | ("RESERVED", "UNKNOWN")
+                | ("DISPATCHING", "IN_FLIGHT")
+                | ("DISPATCHING", "STOPPED")
+                | ("DISPATCHING", "UNKNOWN")
+                | ("IN_FLIGHT", "RESPONSE_RECEIVED")
+                | ("IN_FLIGHT", "STOPPED")
+                | ("IN_FLIGHT", "UNKNOWN")
+        );
+        if !edge {
+            return Err("ATTEMPT_EDGE_REJECTED");
+        }
+        let db = self.write_connection()?;
+        let n=sql(db.conn().execute("UPDATE relay_attempts SET state=?1,state_version=state_version+1,facts_json=?2,model_claim_json=?3,binding_json=?4,evidence_json=?5,started_utc=CASE WHEN ?1='IN_FLIGHT' THEN ?10 ELSE started_utc END,ended_utc=CASE WHEN ?1 IN ('RESPONSE_RECEIVED','STOPPED','UNKNOWN') THEN ?10 ELSE ended_utc END WHERE attempt_id=?6 AND plan_id=?7 AND state=?8 AND state_version=?9",params![to,a.facts.as_ref().map(encoded).transpose()?,a.model_claim.as_ref().map(encoded).transpose()?,a.binding.as_ref().map(encoded).transpose()?,a.evidence.as_ref().map(encoded).transpose()?,a.attempt_id,id,a.state,a.state_version,chrono::Utc::now().to_rfc3339()]))?;
+        if n != 1 {
+            return Err("ATTEMPT_CAS_CONFLICT");
+        };
+        a.state = to.into();
+        a.state_version += 1;
+        Ok(())
+    }
+    pub fn api_evidence(&self, a: &mut ApiAttempt, state: &str) -> Result<()> {
+        if !["COMPLETE", "FAILED"].contains(&state)
+            || a.evidence.as_ref().and_then(|v| v["state"].as_str()) != Some("PENDING")
+        {
+            return Err("EVIDENCE_STATE_CONFLICT");
+        }
+        let (id, _, _, _) = self.api_plan()?;
+        let e = json!({"state":state});
+        let db = self.write_connection()?;
+        let n=sql(db.conn().execute("UPDATE relay_attempts SET evidence_json=?1,state_version=state_version+1 WHERE attempt_id=?2 AND plan_id=?3 AND state=?4 AND state_version=?5 AND state IN ('RESPONSE_RECEIVED','STOPPED','UNKNOWN')",params![encoded(&e)?,a.attempt_id,id,a.state,a.state_version]))?;
+        if n != 1 {
+            return Err("ATTEMPT_CAS_CONFLICT");
+        };
+        a.evidence = Some(e);
+        a.state_version += 1;
+        Ok(())
+    }
+    pub fn api_save(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        if bytes.len() > 262144 || name.contains(['\\', '/']) || !name.ends_with(".json") {
+            return Err("BOUND");
+        }
+        let (_, _, run, identity) = self.api_plan()?;
+        let g = Guard::open(&run, true)?;
+        if g.identity != identity {
+            return Err("EVIDENCE_ROOT_CHANGED");
+        };
+        new_file(&g.path.join(name), bytes)
     }
 }

@@ -77,8 +77,23 @@ fn unified(a: &str, b: &str, path: &str) -> String {
     }
     d
 }
+/// Minimal shared material view; contains no backend profile or authorization.
+pub struct TaskMaterial<'a> {
+    pub target_path: &'a str,
+    pub base_sha256: &'a str,
+}
 pub fn candidate(p: &RelayPlan, base: &[u8], raw: &[u8]) -> Result<Candidate> {
     p.validate()?;
+    candidate_material(
+        &TaskMaterial {
+            target_path: &p.target_path,
+            base_sha256: &p.base_sha256,
+        },
+        base,
+        raw,
+    )
+}
+pub fn candidate_material(p: &TaskMaterial<'_>, base: &[u8], raw: &[u8]) -> Result<Candidate> {
     if base.len() > 65536 || hash(base) != p.base_sha256 {
         return Err("BASE_CHANGED");
     }
@@ -87,7 +102,7 @@ pub fn candidate(p: &RelayPlan, base: &[u8], raw: &[u8]) -> Result<Candidate> {
         return Err("BASE_SIGNATURE");
     }
     let proposal: Proposal = relay_json(raw, 32768)?;
-    proposal.validate(p)?;
+    proposal.validate_target(p.target_path)?;
     let matches: Vec<_> = base
         .windows(proposal.old_text.len())
         .enumerate()
@@ -1218,4 +1233,337 @@ pub fn finish_run(store: &Store, outcome: Result<Value>, close: Result<()>) -> R
             },
         ))
     }
+}
+
+/// Separate API summary. CLI wire paths above remain unchanged.
+pub fn api_status(store: &Store) -> Result<Value> {
+    let (id, p, _, _) = store.api_plan()?;
+    let attempts = store.api_attempts()?;
+    let mut unknowns: Vec<String> = vec![];
+    if attempts
+        .iter()
+        .any(|a| ["RESERVED", "DISPATCHING", "IN_FLIGHT"].contains(&a.state.as_str()))
+    {
+        unknowns.push("STALE_NONTERMINAL".into())
+    }
+    if store.api_base().is_err() {
+        unknowns.push("FIXTURE_CHANGED".into())
+    }
+    for a in &attempts {
+        if a.state == "UNKNOWN" {
+            unknowns.push("TRANSPORT_UNKNOWN".into())
+        }
+        if let Some(f) = &a.facts {
+            unknowns.extend(f.unknowns.clone())
+        }
+        if a.evidence
+            .as_ref()
+            .is_some_and(|e| e["state"] != "COMPLETE")
+        {
+            unknowns.push("EVIDENCE_NOT_CONFIRMED".into())
+        }
+    }
+    let mut next = if attempts.is_empty() {
+        "DELIVER_TO_DEVELOPER"
+    } else {
+        "STOPPED"
+    };
+    if let Some(a) = attempts.iter().find(|a| a.role == RelayRole::Review) {
+        if a.state == "RESPONSE_RECEIVED"
+            && a.facts.as_ref().is_some_and(|f| f.error_code == "NONE")
+            && a.evidence
+                .as_ref()
+                .is_some_and(|e| e["state"] == "COMPLETE")
+        {
+            let claim: ReviewClaim =
+                serde_json::from_value(a.model_claim.clone().ok_or("SCHEMA_REJECTED")?)
+                    .map_err(|_| "SCHEMA_REJECTED")?;
+            unknowns.extend(claim.unknowns.clone());
+            if claim.verdict == "BLOCKED" {
+                unknowns.push("REVIEW_BLOCKED".into())
+            }
+            if claim.verdict == "PASS" && claim.issues.iter().any(|i| i.blocking) {
+                unknowns.push("CLAIM_CONFLICT".into())
+            }
+            next = if claim.verdict == "CHANGES_REQUIRED" || claim.issues.iter().any(|i| i.blocking)
+            {
+                "REPAIR_AUTH_REQUIRED"
+            } else if claim.verdict == "PASS" {
+                "PM_REVIEW"
+            } else {
+                "PM_REQUIRED"
+            };
+        }
+    }
+    unknowns.sort();
+    unknowns.dedup();
+    if !unknowns.is_empty() {
+        next = "PM_REQUIRED"
+    }
+    let e = store.audit_envelope()?;
+    let value = json!({"schema":"nova.scheduler.api-summary/1","mode":"API_INJECTED_ONLY","source":"INJECTED","native_executed":false,"network_executed":false,"execution_authorized":false,"next_execution_authorized":false,"delivery_sha":null,"package_id":p.package_id,"plan_id":id,"plan_request_sha256":p.plan_request_sha256,"input_base_sha":{"value":p.input_base_sha,"source":"INJECTED_TEST"},"input_delivery_identity":{"value":p.input_delivery_identity,"source":"TOOL_COMPUTED_FROM_INJECTED_TEMPLATE_AND_GUARD"},"git_identity_source":ApiSource::InjectedTest,"file_facts":{"source":"TOOL_FILE_HASH","files":e.files},"store_facts_source":"LOCAL_STORE_READ","facts":attempts,"unknowns":unknowns,"next_action":next,"suggestion_only":true});
+    if serde_json::to_vec(&value).map_err(|_| "ENCODING")?.len() > 65536 {
+        return Err("BOUND");
+    }
+    Ok(value)
+}
+pub(crate) fn api_develop_input(p: &ApiPlan, base: &[u8]) -> Result<Vec<u8>> {
+    serde_json::to_vec(&json!({"schema":"nova.scheduler.api-develop-input/1","plan":p,"base":std::str::from_utf8(base).map_err(|_|"BASE_ENCODING")?,"data_is_untrusted":true})).map_err(|_|"ENCODING")
+}
+pub(crate) fn api_review_input(
+    p: &ApiPlan,
+    id: &str,
+    base: &[u8],
+    raw: &[u8],
+) -> Result<(Candidate, Vec<u8>)> {
+    let c = candidate_material(
+        &TaskMaterial {
+            target_path: &p.target_path,
+            base_sha256: &p.base_sha256,
+        },
+        base,
+        raw,
+    )?;
+    let v = json!({"schema":"nova.scheduler.api-review-package/1","plan_id":id,"input_base_sha":p.input_base_sha,"input_delivery_identity":p.input_delivery_identity,"base_sha256":p.base_sha256,"proposal_sha256":c.proposal_sha256,"candidate_sha256":c.candidate_sha256,"diff_sha256":c.diff_sha256,"base":std::str::from_utf8(base).map_err(|_|"BASE_ENCODING")?,"candidate":c.text,"diff":c.diff,"developer_claim":api_json::<Value>(raw,32768)?,"data_is_untrusted":true});
+    let b = serde_json::to_vec(&v).map_err(|_| "ENCODING")?;
+    if b.len() > 65536 {
+        return Err("MATERIAL_BOUND");
+    }
+    Ok((c, b))
+}
+pub fn run_api(store: &Store) -> Result<Value> {
+    let mut t = super::api_adapter::InjectedTransport { calls: 0 };
+    let mut secrets = super::api_adapter::InjectedSecrets;
+    let mut counter = super::api_adapter::InjectedCounter;
+    let clock = super::api_adapter::MonotonicClock::default();
+    run_api_with(
+        store,
+        &mut t,
+        &mut secrets,
+        &mut counter,
+        &clock,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+pub(crate) fn run_api_with(
+    store: &Store,
+    transport: &mut dyn super::api_adapter::ApiTransport,
+    secrets: &mut dyn super::api_adapter::SecretProvider,
+    counter: &mut dyn super::api_adapter::TokenCounter,
+    clock: &dyn super::api_adapter::Clock,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Value> {
+    use super::api_adapter::*;
+    use std::sync::atomic::Ordering;
+    if !store.api_attempts()?.is_empty() {
+        return api_status(store);
+    }
+    let origin = clock.now_ms();
+    let (id, p, _, _) = store.api_plan()?;
+    let total = origin.checked_add(p.limits.total_ms).ok_or("DEADLINE")?;
+    let base = store.api_base()?;
+    let mut input = api_develop_input(&p, &base)?;
+    let mut parent = None;
+    let mut used = 0u64;
+    for role in [RelayRole::Develop, RelayRole::Review] {
+        let now = clock.now_ms();
+        if cancel.load(Ordering::Acquire) {
+            return Err("CANCELLED");
+        }
+        let end = now
+            .checked_add(p.limits.stage_ms)
+            .ok_or("DEADLINE")?
+            .min(total.saturating_sub(10000));
+        if now >= end || end - now < 15000 {
+            return Err("BUDGET_EXHAUSTED");
+        }
+        let secret = secrets.acquire(role, &id)?;
+        // Safety scan occurs before hashes or reservation. Request hash excludes all authentication.
+        secret.scan_json(&input, 131072)?;
+        let req = make_request(role, &p, &id, &input, parent.clone(), &secret)?;
+        let count = checked_count(
+            counter,
+            &req.meta.requested_model,
+            &req.body,
+            p.limits.input_tokens,
+        )?;
+        used = used.checked_add(count).ok_or("TOKEN_BOUND")?;
+        if used
+            .checked_add(p.limits.output_tokens)
+            .is_none_or(|n| n > 24576)
+        {
+            return Err("TOKEN_BOUND");
+        }
+        if cancel.load(Ordering::Acquire) || clock.now_ms() >= end {
+            return Err("DEADLINE");
+        }
+        store.api_base()?;
+        let reserved = store.api_reserve(req.meta.clone())?;
+        let permit = store.api_dispatching(reserved)?;
+        let mut a = permit.attempt().clone();
+        if cancel.load(Ordering::Acquire) || clock.now_ms() >= end {
+            a.facts = Some(ApiFacts {
+                schema: "nova.scheduler.api-facts/1".into(),
+                source: "INJECTED".into(),
+                dispatch_invoked: false,
+                response_status: None,
+                request_bytes: req.body.len() as u64,
+                response_bytes: 0,
+                response_sha256: None,
+                transport_state: "STOPPED".into(),
+                local_cancel_requested: cancel.load(Ordering::Acquire),
+                local_resources_released: true,
+                error_code: "DEADLINE".into(),
+                unknowns: vec![],
+            });
+            store.api_cas(&mut a, "STOPPED")?;
+            return api_status(store);
+        }
+        // Write-ahead admission is not proof that a request was sent.
+        store.api_cas(&mut a, "IN_FLIGHT")?;
+        let result = transport.send(&req, &secret, &permit, end, clock, cancel);
+        let mut facts = ApiFacts {
+            schema: "nova.scheduler.api-facts/1".into(),
+            source: "INJECTED".into(),
+            dispatch_invoked: true,
+            response_status: result.status,
+            request_bytes: req.body.len() as u64,
+            response_bytes: result.body.len() as u64,
+            response_sha256: None,
+            transport_state: "RESPONSE_RECEIVED".into(),
+            local_cancel_requested: cancel.load(Ordering::Acquire),
+            local_resources_released: result.resources_released,
+            error_code: "NONE".into(),
+            unknowns: vec![],
+        };
+        let parsed = (|| -> Result<(Vec<u8>, u64)> {
+            if !result.resources_released {
+                return Err("TRANSPORT_UNKNOWN");
+            }
+            if cancel.load(Ordering::Acquire) {
+                return Err("CANCELLED");
+            }
+            if clock.now_ms() >= end {
+                return Err("DEADLINE");
+            }
+            if let Some(e) = result.error {
+                return Err(match e {
+                    "CANCELLED" => "CANCELLED",
+                    "DEADLINE" => "DEADLINE",
+                    _ => "TRANSPORT_ERROR",
+                });
+            }
+            parse_response(&result, &req, &secret, counter, &p.limits)
+        })();
+        let mut response_artifact: Option<Vec<u8>> = None;
+        let mut review_input = None;
+        match parsed {
+            Ok((raw, output_usage)) => {
+                // Complete scans precede every response/claim/derived hash and evidence write.
+                let checked = (|| -> Result<()> {
+                    secret.scan_json(&result.body, 131072)?;
+                    if role == RelayRole::Develop {
+                        let canonical = serde_json::to_vec(&api_json::<Value>(&raw, 32768)?)
+                            .map_err(|_| "ENCODING")?;
+                        let (c, review) = api_review_input(&p, &id, &base, &canonical)?;
+                        secret.scan_text(c.text.as_bytes())?;
+                        secret.scan_text(c.diff.as_bytes())?;
+                        secret.scan_json(&review, 65536)?;
+                        // Scan the actual REVIEW body again before allowing its hash/registration.
+                        let _ = make_request(
+                            RelayRole::Review,
+                            &p,
+                            &id,
+                            &review,
+                            Some(a.attempt_id.clone()),
+                            &secret,
+                        )?;
+                        a.binding = Some(
+                            json!({"plan_id":id,"candidate_sha256":c.candidate_sha256,"review_input_sha256":hash(&review)}),
+                        );
+                        review_input = Some(review);
+                    } else {
+                        let claim: ReviewClaim = api_json(&raw, 65536)?;
+                        let prev = store
+                            .api_attempts()?
+                            .into_iter()
+                            .find(|x| x.role == RelayRole::Develop)
+                            .ok_or("BINDING_MISMATCH")?;
+                        let binding = prev.binding.ok_or("BINDING_MISMATCH")?;
+                        claim.validate(
+                            &p.base_sha256,
+                            binding["candidate_sha256"]
+                                .as_str()
+                                .ok_or("BINDING_MISMATCH")?,
+                        )?;
+                    }
+                    a.model_claim = Some(api_json(&raw, 65536)?);
+                    facts.response_sha256 = Some(hash(&result.body));
+                    response_artifact = Some(result.body.clone());
+                    Ok(())
+                })();
+                if let Err(e) = checked {
+                    facts.error_code = e.into();
+                    a.model_claim = None;
+                    a.binding = None;
+                    review_input = None;
+                    response_artifact = None;
+                    facts.response_sha256 = None;
+                }
+                // Provider usage is a claim, not a second exact input count. Count local output separately.
+                let completion = output_usage;
+                used = used.checked_add(completion).ok_or("TOKEN_BOUND")?;
+                if used > 24576 {
+                    facts.error_code = "TOKEN_BOUND".into();
+                    review_input = None;
+                }
+            }
+            Err(e) => {
+                facts.error_code = e.into();
+                if ["TRANSPORT_UNKNOWN", "USAGE_UNKNOWN"].contains(&e) {
+                    facts.unknowns.push(e.into())
+                }
+            }
+        }
+        if store.api_base().is_err() {
+            facts.unknowns.push("FIXTURE_CHANGED".into())
+        }
+        if clock.now_ms() >= total {
+            facts.unknowns.push("PARTIAL_DEADLINE".into());
+            review_input = None;
+        }
+        let to = if !facts.local_resources_released {
+            "UNKNOWN"
+        } else if result.status.is_some() {
+            "RESPONSE_RECEIVED"
+        } else {
+            "STOPPED"
+        };
+        facts.transport_state = to.into();
+        let success = facts.error_code == "NONE" && facts.unknowns.is_empty();
+        a.facts = Some(facts);
+        a.evidence = Some(json!({"state":"PENDING"}));
+        store.api_cas(&mut a, to)?;
+        let saved = (|| -> Result<()> {
+            if clock.now_ms() >= total {
+                return Err("DEADLINE");
+            }
+            if let Some(bytes) = response_artifact {
+                store.api_save(&format!("{}-response.json", role.name()), &bytes)?;
+            }
+            if let Some(bytes) = &review_input {
+                store.api_save("review-package.json", bytes)?;
+            }
+            Ok(())
+        })();
+        store.api_evidence(&mut a, if saved.is_ok() { "COMPLETE" } else { "FAILED" })?;
+        if !success || saved.is_err() {
+            return api_status(store);
+        }
+        if role == RelayRole::Develop {
+            parent = Some(a.attempt_id.clone());
+            input = review_input.ok_or("BINDING_MISMATCH")?;
+        }
+    }
+    api_status(store)
 }

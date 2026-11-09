@@ -321,12 +321,13 @@ pub fn bridge<P: CasPort, J: JsVerifier>(
         verified = true;
         Ok(())
     })();
-    let code = match operation {
+    let mut code = match operation {
         Ok(()) => "NONE",
         Err(e) => match e.as_str() {
             "CAS_LATE_PARTIAL_NO_JS" => "CAS_LATE_PARTIAL_NO_JS",
             "CAS_RESERVATION_MISMATCH" => "CAS_RESERVATION_MISMATCH",
             "CAS_RESERVE" => "CAS_RESERVE",
+            "CAS_RECEIPT_MISMATCH" => "CAS_RECEIPT_MISMATCH",
             "CAS_APPLY" => "CAS_APPLY",
             "CAS_NOT_COMMITTED" => "CAS_NOT_COMMITTED",
             "JS_LATE" => "JS_LATE",
@@ -335,6 +336,12 @@ pub fn bridge<P: CasPort, J: JsVerifier>(
         },
     };
     let state = journal_state(port.status());
+    if state != JournalState::CommittedHistorical {
+        verified = false;
+        if code == "NONE" {
+            code = "CAS_FINAL_STATUS_NOT_COMMITTED";
+        }
+    }
     if port.now_ms() > end || port.now_ms() < start {
         partial = true;
         verified = false;

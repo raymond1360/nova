@@ -184,6 +184,7 @@ struct MemoryCas {
     apply_calls: usize,
     trees: usize,
     clock_calls: Cell<usize>,
+    status_calls: usize,
 }
 impl MemoryCas {
     fn new() -> Self {
@@ -195,6 +196,7 @@ impl MemoryCas {
             apply_calls: 0,
             trees: 0,
             clock_calls: Cell::new(0),
+            status_calls: 0,
         }
     }
 }
@@ -257,13 +259,27 @@ impl CasPort for MemoryCas {
         Ok(())
     }
     fn status(&mut self) -> super::Result<String> {
+        self.status_calls += 1;
+        if self.status_calls == 2 {
+            match self.point {
+                "final-status-error" => return Err("INJECTED final read".into()),
+                "final-status-prepared" => return Ok("PREPARED".into()),
+                "final-status-recovered" => return Ok("RECOVERED_HISTORICAL".into()),
+                "final-status-unknown" => return Ok("UNKNOWN".into()),
+                _ => (),
+            }
+        }
         if self.point == "status" {
             return Err("INJECTED".into());
         }
         Ok(self.state.into())
     }
     fn receipt(&mut self) -> super::Result<super::journal::Receipt> {
-        Ok(receipt())
+        let mut receipt = receipt();
+        if self.point == "receipt-mismatch" {
+            receipt.post_sha256 = hash(b"INJECTED wrong receipt");
+        }
+        Ok(receipt)
     }
     fn after_tree(&mut self) -> super::Result<TreeSnapshot> {
         self.trees += 1;
@@ -930,6 +946,7 @@ fn nb3_js_output_exact_contract() {
 // Full production run with the actual observation adapter, Agent capability and bridge ports.
 struct Full {
     tick: u64,
+    export_bytes: Option<Vec<u8>>,
     observed: ObservationReview,
     port: MemoryCas,
     cas_calls: usize,
@@ -982,6 +999,9 @@ impl Ops for Full {
         Ok(())
     }
     fn export_and_review(&mut self) -> super::Result<ObservationReview> {
+        if let Some(bytes) = &self.export_bytes {
+            self.observed = parsed(bytes)?.review;
+        }
         Ok(self.observed.clone())
     }
     fn cas_and_verify(&mut self, p: &Patch) -> super::Result<CasReview> {
@@ -1020,6 +1040,7 @@ fn nb3_complete_synthetic_adapter_bridge_run_success() {
     let observed = parsed(&encode(finish(events()))).unwrap().review;
     let mut f = Full {
         tick: 0,
+        export_bytes: None,
         observed,
         port: MemoryCas::new(),
         cas_calls: 0,
@@ -1039,6 +1060,7 @@ fn nb3_run_observation_source_mismatch_stops_before_cas() {
     observed.source = None;
     let mut f = Full {
         tick: 0,
+        export_bytes: None,
         observed,
         port: MemoryCas::new(),
         cas_calls: 0,
@@ -1119,6 +1141,7 @@ fn nb3_run_logo_restored_stops_with_zero_cas() {
     }));
     let mut f = Full {
         tick: 0,
+        export_bytes: None,
         observed: parsed(&encode(finish(es))).unwrap().review,
         port: MemoryCas::new(),
         cas_calls: 0,
@@ -1133,6 +1156,7 @@ fn nb3_run_logo_restored_stops_with_zero_cas() {
 fn nb3_run_recovered_historical_not_success() {
     let mut f = Full {
         tick: 0,
+        export_bytes: None,
         observed: parsed(&encode(finish(events()))).unwrap().review,
         port: MemoryCas::new(),
         cas_calls: 0,
@@ -1218,5 +1242,249 @@ fn nb3_observation_typed_ownership_missing_duplicate_wrong_source_time() {
             parse(&encode(finish(events())), &b, &r, t.clone()).is_err(),
             "{mode}"
         )
+    }
+}
+// B-1: exports are parsed inside the real run; rejection must never reach the CAS port.
+fn assert_export_rejected_before_cas(es: Vec<Event>, code: &str) {
+    let bytes = encode(finish(es));
+    assert_eq!(parsed(&bytes).err().unwrap(), code);
+    let mut full = Full {
+        tick: 0,
+        export_bytes: Some(bytes),
+        observed: parsed(&encode(finish(events()))).unwrap().review,
+        port: MemoryCas::new(),
+        cas_calls: 0,
+    };
+    let state = super::opencode_gate::RunState::new().unwrap();
+    let out = run(&mut full, state.clone(), "INJECTED_NB3_REMEDIATION");
+    assert!(!out.success);
+    assert!(!out.cas_started);
+    assert_eq!(out.error.as_deref(), Some(code));
+    assert_eq!(state.state(), super::opencode_gate::State::Stopped);
+    assert_eq!(full.cas_calls, 0);
+    assert!(!full.port.prepared);
+}
+fn foreign_write(path: &str) -> Vec<Event> {
+    let mut es = events();
+    es.push(Event::Write(Write {
+        at: 30,
+        process: ProcessIdentity {
+            pid: 99,
+            created: 3,
+        },
+        path: path.into(),
+        kind: WriteKind::Overwrite,
+        open_access: None,
+    }));
+    es
+}
+#[test]
+fn nb3_b1_foreign_aliases_and_fixture_paths_run_reject_zero_cas() {
+    let paths = [
+        r"C:/NovaM0B/run/project/Logo.tsx".to_string(),
+        r"\??\C:\NovaM0B\run\project\Logo.tsx".to_string(),
+        r"C:\NOVAM0~1\run\project\Logo.tsx".to_string(),
+        r"\\.\C:\NovaM0B\run\project\Logo.tsx".to_string(),
+        r"\Device\HarddiskVolume3\NovaM0B\run\project\Logo.tsx".to_string(),
+        r"\\localhost\C$\NovaM0B\run\project\Logo.tsx".to_string(),
+        TARGET.to_string(),
+        TARGET.to_lowercase(),
+        format!(r"\\?\{}", TARGET),
+    ];
+    for path in paths {
+        assert_export_rejected_before_cas(foreign_write(&path), "OBS_FOREIGN_FIXTURE_WRITE");
+    }
+}
+#[test]
+fn nb3_b1_foreign_abnormal_components_and_ads_reject() {
+    for path in [
+        r"E:\..\Logo.tsx",
+        r"E:\foo\.\Logo.tsx",
+        r"E:\foo.\Logo.tsx",
+        r"E:\foo \Logo.tsx",
+        r"E:\foo\\Logo.tsx",
+        r"E:\foo\Logo.tsx:ads",
+        r"E:Logo.tsx",
+        r"E:\NUL\Logo.tsx",
+        r"E:\foo\a?b",
+        r"E:\foo\CON.txt",
+        r"E:\foo\a~1",
+    ] {
+        assert_export_rejected_before_cas(foreign_write(path), "OBS_FOREIGN_FIXTURE_WRITE");
+    }
+}
+#[test]
+fn nb3_b1_confirmed_foreign_write_kept_and_success_chain_retained() {
+    for path in [
+        r"E:\other\file",
+        r"e:\Other\File",
+        r"C:\NovaM0B\run\project-other\Logo.tsx",
+    ] {
+        let bytes = encode(finish(foreign_write(path)));
+        let p = parsed(&bytes).unwrap();
+        assert_eq!(p.retained_events.len(), 7);
+        assert_eq!(p.review.tree.writes.len(), 1);
+        let mut f = Full {
+            tick: 0,
+            export_bytes: Some(bytes),
+            observed: p.review,
+            port: MemoryCas::new(),
+            cas_calls: 0,
+        };
+        let out = run(
+            &mut f,
+            super::opencode_gate::RunState::new().unwrap(),
+            "INJECTED_NB3_REMEDIATION",
+        );
+        assert!(out.success, "{out:?}");
+        assert_eq!(f.cas_calls, 1);
+    }
+}
+#[test]
+fn nb3_b1_undeclared_network_and_pid_creation_mismatch_run_reject() {
+    for process in [
+        ProcessIdentity {
+            pid: 99,
+            created: 3,
+        },
+        ProcessIdentity {
+            pid: 17,
+            created: 2,
+        },
+    ] {
+        let mut es = events();
+        es.push(Event::Network(Network {
+            at: 30,
+            process,
+            protocol: "TCP".into(),
+            address: "8.8.8.8".into(),
+            port: 443,
+        }));
+        assert_export_rejected_before_cas(es, "OBS_NETWORK_PROCESS_UNDECLARED");
+    }
+    let mut es = events();
+    es.push(Event::Process(Process {
+        at: 5,
+        process: ProcessIdentity {
+            pid: 99,
+            created: 3,
+        },
+        parent: None,
+    }));
+    es.push(Event::Network(Network {
+        at: 30,
+        process: ProcessIdentity {
+            pid: 99,
+            created: 4,
+        },
+        protocol: "TCP".into(),
+        address: "127.0.0.1".into(),
+        port: 1234,
+    }));
+    assert_export_rejected_before_cas(es, "OBS_NETWORK_PROCESS_UNDECLARED");
+}
+#[test]
+fn nb3_b1_declared_outside_network_retained() {
+    let mut es = events();
+    es.push(Event::Process(Process {
+        at: 5,
+        process: ProcessIdentity {
+            pid: 99,
+            created: 3,
+        },
+        parent: None,
+    }));
+    es.push(Event::Network(Network {
+        at: 30,
+        process: ProcessIdentity {
+            pid: 99,
+            created: 3,
+        },
+        protocol: "TCP".into(),
+        address: "8.8.8.8".into(),
+        port: 443,
+    }));
+    let p = parsed(&encode(finish(es))).unwrap();
+    assert_eq!(p.retained_events.len(), 8);
+    assert_eq!(p.review.tree.descendants.len(), 0);
+}
+#[test]
+fn nb3_n1_final_status_error_and_drift_revoke_verified_preserve_facts() {
+    for (point, expected) in [
+        ("final-status-error", JournalState::Uncertain),
+        ("final-status-prepared", JournalState::Prepared),
+        ("final-status-recovered", JournalState::RecoveredHistorical),
+        ("final-status-unknown", JournalState::Uncertain),
+    ] {
+        let mut p = MemoryCas::new();
+        p.point = point;
+        let (o, c) = invoke(&mut p);
+        let o = o.unwrap();
+        assert_eq!(p.status_calls, 2, "{point}");
+        assert_eq!(p.apply_calls, 1);
+        assert_eq!(p.trees, 1);
+        assert_eq!(c, 1);
+        assert_eq!(o.review.state, expected);
+        assert!(o.review.receipt);
+        assert!(!o.review.independently_verified);
+        assert_eq!(o.code, "CAS_FINAL_STATUS_NOT_COMMITTED");
+        assert!(!o.partial);
+    }
+}
+#[test]
+fn nb3_n6_committed_receipt_mismatch_hits_receipt_check() {
+    let mut p = MemoryCas::new();
+    p.point = "receipt-mismatch";
+    let (o, c) = invoke(&mut p);
+    let o = o.unwrap();
+    assert_eq!(p.apply_calls, 1);
+    assert_eq!(p.state, "COMMITTED_HISTORICAL");
+    assert_eq!(p.status_calls, 2);
+    assert_eq!(o.review.state, JournalState::CommittedHistorical);
+    assert_eq!(o.code, "CAS_RECEIPT_MISMATCH");
+    assert!(!o.review.receipt);
+    assert!(!o.review.independently_verified);
+    assert_eq!(c, 0);
+    assert_eq!(p.trees, 0);
+}
+#[test]
+fn nb3_n6_only_old_logo_indistinguishable_time_is_rejected() {
+    let low = 800000;
+    for field in ["write", "change"] {
+        for old_time in [low - 1, low] {
+            let (r, mut before) = fixture();
+            let logo = before
+                .files
+                .iter_mut()
+                .find(|f| f.path == "Logo.tsx")
+                .unwrap();
+            if field == "write" {
+                logo.write = old_time;
+            } else {
+                logo.change = old_time;
+            }
+            let fact = AgentTreeReceipt {
+                after: before.clone(),
+                descendants: vec![],
+                writes: vec![],
+            };
+            let reviewed =
+                ReviewedAgentTree::review(&before, &fact, &r, &target(), FactSource::Injected)
+                    .unwrap();
+            // Nova timestamps remain valid in the same [800000,1100000] window. All other facts unchanged.
+            let result = review_nova_tree(
+                &reviewed,
+                &nova(),
+                &receipt(),
+                &oracle(PRE).unwrap(),
+                1_000_000,
+                1_100_000,
+            );
+            if old_time < low {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err(), "NOVA_TIME_INDISCERNIBLE", "{field}");
+            }
+        }
     }
 }

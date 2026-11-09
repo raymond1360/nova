@@ -164,6 +164,40 @@ fn event_time(e: &Event) -> u64 {
         Event::End(x) => x.at,
     }
 }
+/// Lexical Win32 drive-absolute path only; do not classify aliases as outside the fixture.
+/// This is SYNTHETIC attribution, not a native reparse/namespace proof.
+fn confirmed_foreign_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if !path.is_ascii()
+        || bytes.len() <= 3
+        || !bytes[0].is_ascii_alphabetic()
+        || &bytes[1..3] != b":\\"
+        || path.contains(['/', '~'])
+        || path.chars().any(|c| c.is_control())
+    {
+        return false;
+    }
+    if !path[3..].split('\\').all(|part| {
+        if part.is_empty()
+            || part == "."
+            || part == ".."
+            || part.ends_with([' ', '.'])
+            || part.contains([':', '<', '>', '"', '|', '?', '*'])
+        {
+            return false;
+        }
+        let stem = part.split('.').next().unwrap().to_ascii_uppercase();
+        !["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&stem.trim_end())
+            && !(stem.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && matches!(stem.as_bytes()[3], b'0'..=b'9'))
+    }) {
+        return false;
+    }
+    let folded = path.to_ascii_lowercase();
+    let root = ROOT.to_ascii_lowercase();
+    folded != root && !folded.starts_with(&(root + "\\"))
+}
 /// Every body byte (including each LF) is covered by the header and terminator hash.
 pub fn parse(
     bytes: &[u8],
@@ -363,13 +397,6 @@ pub fn parse(
                     .path
                     .strip_prefix(&format!("{}\\", ROOT))
                     .map(|p| p.replace('\\', "/"));
-                let looks_inside = w
-                    .path
-                    .to_ascii_lowercase()
-                    .starts_with(&ROOT.to_ascii_lowercase())
-                    || w.path
-                        .to_ascii_lowercase()
-                        .starts_with(&format!(r"\\?\{}", ROOT).to_ascii_lowercase());
                 if members.contains(&w.process) {
                     if writes.len() >= 64 {
                         return Err("OBS_WRITE_BOUND".into());
@@ -387,12 +414,17 @@ pub fn parse(
                         process: w.process.clone(),
                         kind,
                     });
-                } else if looks_inside {
+                } else if !confirmed_foreign_path(&w.path) {
                     return Err("OBS_FOREIGN_FIXTURE_WRITE".into());
                 }
             }
-            Event::Network(n) if members.contains(&n.process) => {
-                if n.protocol != "TCP" || n.address != "127.0.0.1" || n.port != b.model_port {
+            Event::Network(n) => {
+                if !processes.contains_key(&n.process) {
+                    return Err("OBS_NETWORK_PROCESS_UNDECLARED".into());
+                }
+                if members.contains(&n.process)
+                    && (n.protocol != "TCP" || n.address != "127.0.0.1" || n.port != b.model_port)
+                {
                     return Err("OBS_NETWORK_DENIED".into());
                 }
             }

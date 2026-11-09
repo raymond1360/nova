@@ -902,3 +902,124 @@ jobs:
             ${{ steps.ar0_paths.outputs.root }}/public/checks.json
             ${{ steps.ar0_paths.outputs.root }}/public/logs.json
             ${{ steps.ar0_paths.outputs.root }}/public/files.json
+
+  scheduler-api-validation:
+    runs-on: windows-2022
+    timeout-minutes: 110
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.0-x86_64-pc-windows-msvc
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Checkout API injection candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Prepare isolated API paths and standard Git launcher
+        id: api_paths
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$true
+          if($PSVersionTable.PSVersion.Major -ne 7){throw 'API_PWSH'}
+          if((git rev-parse HEAD).Trim() -cne $env:GITHUB_SHA){throw 'API_SHA'}
+          git diff --exit-code 295abceab5989982415c5464746a48835ea3508f HEAD -- apps/desktop/src-tauri
+          $git=Join-Path $env:ProgramFiles 'Git/cmd/git.exe'
+          if(-not(Test-Path -LiteralPath $git)){throw 'API_GIT_LAUNCHER_MISSING'}
+          $env:PATH=(Split-Path $git)+';'+$env:PATH
+          if((Get-Command git -CommandType Application|Select-Object -First 1).Source -cne $git){throw 'API_GIT_RESOLUTION'}
+          $version=(& $git --version);if($LASTEXITCODE -ne 0){throw 'API_GIT_VERSION'}
+          Write-Output "Git launcher=$git version=$version bytes=$((Get-Item $git).Length) SHA256=$((Get-FileHash $git -Algorithm SHA256).Hash) pwsh=$($PSVersionTable.PSVersion)"
+          Get-PSDrive C | Select-Object Name,Free,Used | Format-Table
+          $root=[IO.Path]::GetFullPath("C:\sapi-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)")
+          if(Test-Path $root){throw 'API_ROOT_EXISTS'}
+          New-Item -ItemType Directory $root|Out-Null
+          foreach($n in @('tmp','public')){New-Item -ItemType Directory (Join-Path $root $n)|Out-Null}
+          $item=Get-Item $root;for($q=$item;$null -ne $q;$q=$q.Parent){if($q.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'API_ROOT_LINK'}}
+          if($item.FullName -cne $root -or $root.Contains('~')){throw 'API_ROOT_CANONICAL'}
+          "root=$root" >> $env:GITHUB_OUTPUT
+          "PATH=$env:PATH" >> $env:GITHUB_ENV
+          "TEMP=$root\tmp" >> $env:GITHUB_ENV
+          "TMP=$root\tmp" >> $env:GITHUB_ENV
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+          if((rustc --version) -notmatch '^rustc 1\.98\.0 '){throw 'API_RUST_VERSION'}
+          cargo fetch --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+      - name: Run API injected validation only
+        id: api_run
+        timeout-minutes: 93
+        env:
+          API_ROOT: ${{ steps.api_paths.outputs.root }}
+        run: |
+          $ErrorActionPreference='Stop'
+          & ./scripts/test_scheduler_api_injected.ps1 -EvidenceDirectory "$env:API_ROOT/ev" -TargetDirectory "$env:API_ROOT/t"
+          if($LASTEXITCODE -ne 0){throw 'API_SCRIPT_EXIT'}
+      - name: Verify four API summaries
+        if: ${{ always() && steps.api_paths.outputs.root != '' }}
+        env:
+          API_ROOT: ${{ steps.api_paths.outputs.root }}
+          API_SCRIPT_OUTCOME: ${{ steps.api_run.outcome }}
+        run: |
+          function Read-BoundedJson([string]$Path,[long]$Cap){
+           if(-not(Test-Path -LiteralPath $Path)){throw 'API_FILE_MISSING'}
+           if((Get-Item $Path).Length -gt $Cap){throw 'API_FILE_BOUND'}
+           $raw=[IO.File]::ReadAllText($Path)
+           $doc=[Text.Json.JsonDocument]::Parse($raw)
+           function Unique($e){if($e.ValueKind -eq 'Object'){$seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal);foreach($p in $e.EnumerateObject()){if(-not $seen.Add($p.Name)){throw 'API_JSON_DUPLICATE'};Unique $p.Value}}elseif($e.ValueKind -eq 'Array'){foreach($v in $e.EnumerateArray()){Unique $v}}}
+           try{Unique $doc.RootElement}finally{$doc.Dispose()}
+           return ($raw|ConvertFrom-Json -AsHashtable)
+          }
+          function Require-Ledger($Rows,$Expected,[string]$Code){
+           if(@($Rows).Count -ne $Expected.Count){throw $Code}
+           $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+           foreach($r in $Rows){if(-not $seen.Add($r.name) -or -not $Expected.Contains($r.name) -or $r.state -cne 'COMPLETE' -or $r.exit_code -isnot [long] -and $r.exit_code -isnot [int] -or $r.exit_code -ne $Expected[$r.name]){throw $Code}}
+          }
+          function SetHash($Items){$a=[string[]]@($Items);[Array]::Sort($a,[StringComparer]::Ordinal);$b=[Text.Encoding]::UTF8.GetBytes(($a -join "`n")+"`n");return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($b)).ToLowerInvariant()}
+          function Assert-ApiBundle([string]$Root,$Identity){
+           $caps=@{'result.json'=65536;'checks.json'=131072;'tests.json'=262144;'files.json'=16384};$data=@{}
+           foreach($n in $caps.Keys){$data[$n]=Read-BoundedJson (Join-Path $Root $n) $caps[$n];$i=$data[$n].identity;if($i.sha -cne $Identity.sha -or $i.run_id -cne $Identity.run_id -or $i.attempt -cne $Identity.attempt){throw 'API_IDENTITY'}}
+           $result=$data['result.json'];$c=$data['checks.json'];$t=$data['tests.json'];$m=$data['files.json']
+           if($result.schema -cne 'nova.scheduler.api-validation/1' -or $c.schema -cne 'nova.scheduler.api-checks/1' -or $t.schema -cne 'nova.scheduler.api-tests/1' -or $m.schema -cne 'nova.scheduler.api-files/1'){throw 'API_SCHEMA'}
+           if($result.source -cne 'ACTUAL_LOCAL_INJECTED_VALIDATION' -or $t.source -cne 'ACTUAL_LOCAL_TEST_OUTPUT'){throw 'API_SOURCE'}
+          if($result.source_sha -cne $Identity.sha -or $result.verdict -cne 'PASS' -or $result.failure_code -cne 'NONE' -or $result.mode -cne 'API_INJECTED_ONLY'){throw 'API_RESULT'}
+           foreach($k in @('network_executed','real_execution_authorized','github_verified')){if($result[$k] -isnot [bool] -or $result[$k]){throw 'API_REAL_EXECUTION'}}
+           Require-Ledger $c.commands @{'old-relay-regression'=0;'api-debug-build'=0;'api-default-guard'=101;'api-release-guard'=101;'api-init'=0;'api-run'=0;'api-reopen-status'=0;'api-no-replay'=0;'legacy-status-v3'=2;'legacy-handoff-v3'=2;'legacy-import-v3'=2;'legacy-index-only-v3'=2;'legacy-relay-status-v3'=2;'legacy-relay-run-v3'=2;'legacy-relay-init-v3'=2;'legacy-current-head'=0;'legacy-init-existing-v3'=2} 'API_COMMAND_LEDGER'
+           Require-Ledger $c.old_commands @{'sh1-wrapper'=0;'relay-debug-build'=0;'ignored-list'=0;'explicit-0'=0;'explicit-1'=0;'explicit-2'=0;'explicit-3'=0;'explicit-4'=0;'explicit-5'=0;'explicit-6'=0;'explicit-7'=0;'explicit-8'=0;'explicit-9'=0;'explicit-10'=0;'explicit-11'=0;'explicit-12'=0;'explicit-13'=0;'explicit-14'=0;'explicit-15'=0;'explicit-16'=0;'explicit-17'=0;'explicit-18'=0;'reject-hash-missing'=101;'reject-hash-mismatch'=101;'default-nova_scheduler_relay'=101;'release-nova_scheduler_relay'=101;'default-nova_scheduler_relay_fake_cli'=101;'release-nova_scheduler_relay_fake_cli'=101;'fixture-init'=0;'fixture-add'=0;'fixture-base-commit'=0;'fixture-base'=0;'fixture-second-commit'=0;'source-init'=0;'real-false-rejected'=2;'relay-init'=0;'relay-run'=0;'relay-status'=0;'relay-no-replay'=0;'v2-history-not-cloned'=2;'pilot-approval-missing'=2;'pilot-approval-expired'=2} 'API_OLD_LEDGER'
+           Require-Ledger $c.sh1_commands @{'debug-build'=0;'scheduler-list'=0;'scheduler-tests'=0;'adapter-tests'=0;'default-required-features'=101;'release-guard'=101;'fixture-init'=0;'fixture-add-base'=0;'fixture-commit-base'=0;'fixture-base-sha'=0;'root-commit-rejected'=2;'fixture-add-change'=0;'fixture-commit-change'=0;'bin-init'=0;'absent-nested-init'=0;'handoff-missing-slots'=2;'legacy-index-only'=0;'bin-import-REVIEW'=0;'bin-import-CI'=0;'bin-import-DEVELOPMENT'=0;'bin-status'=0;'bin-handoff'=0;'bin-repeat'=0;'outside-untracked'=0;'outside-filter'=0;'scope-filter'=2;'scope-filter-set'=2;'scope-dirty-repeat'=2;'crlf-false-dirty'=2;'crlf-init-true'=0;'crlf-status-true'=0;'crlf-init-input'=0;'crlf-status-input'=0;'explicit-eol-crlf'=0;'contradictory-attributes'=2;'junction-rejected'=2;'unknown-command'=2;'fixture-add-staged'=0;'staged-scope'=2;'fixture-add-extra'=0;'fixture-commit-extra'=0;'cumulative-scope-rejected'=2;'default-list'=0;'default-tests'=0;'default-build'=0} 'API_SH1_LEDGER'
+           foreach($k in @('default_executed','reopen_equal','db_unchanged','legacy_roots_absent','gate_checks_verified')){if($c[$k] -isnot [bool] -or -not $c[$k]){throw "API_CHECK_$k"}}
+           foreach($k in @('listed','passed','ignored')){if($t[$k] -isnot [array] -or @($t[$k]|Sort-Object -Unique).Count -ne $t[$k].Count -or (SetHash $t[$k]) -cne @{'listed'='e5c993a728e976912f750d97229274a650b0fb12cae9adc5a0870ad346c76352';'passed'='e95362e815a73078c62fb6ba19dee1754951d3e0d4211998ea3d0a037e8f9d6b';'ignored'='a39bbead332b9d661508d9a4d3a81dbf78a7473b535e6e470c0d76e3738d9611'}[$k]){throw 'API_TEST_SET'}}
+           foreach($n in @('scheduler::tests::api_injected::api_complete_two_stage_fixture_unchanged_and_restart_no_send','scheduler::tests::api_injected::api_double_connection_reservation_and_cas_conflict','scheduler::tests::api_injected::api_evidence_failure_survives_reopen_no_review','scheduler::tests::api_injected::api_existing_workspace_init_rejects_without_writing','scheduler::tests::api_injected::api_failed_develop_exact_codes_never_review','scheduler::tests::api_injected::api_file_drift_preserves_historical_facts_and_blocks_next','scheduler::tests::api_injected::api_limits_depth_duplicate_and_unknown_request','scheduler::tests::api_injected::api_partial_init_preserved_and_not_auto_repaired','scheduler::tests::api_injected::api_real_mode_rejected_before_root_or_lease','scheduler::tests::api_injected::api_request_binds_after_guard_and_differs_across_roots','scheduler::tests::api_injected::api_request_meta_forgery_rejected_before_lease','scheduler::tests::api_injected::api_request_rejects_final_delivery_and_plan_id_before_roots','scheduler::tests::api_injected::api_review_claims_are_not_acceptance_or_auto_repair','scheduler::tests::api_injected::api_secret_failure_and_pre_cancel_zero_reservation','scheduler::tests::api_injected::api_secret_unicode_all_decoded_and_raw_paths_reject','scheduler::tests::api_injected::api_simultaneous_connections_only_one_reservation','scheduler::tests::api_injected::api_stale_states_read_only_no_permit_or_replay','scheduler::tests::api_injected::api_tampered_delivery_or_ddl_rejected','scheduler::tests::api_injected::api_unknown_tokens_zero_send','scheduler::tests::api_injected::api_v1_and_v2_api_open_refuse_no_write','scheduler::tests::api_injected::api_v3_ddl_golden_and_old_open_zero_writes','scheduler::tests::ar0::api_ea7_behavior_byte_goldens')){if($n -cnotin $t.passed -or $n -cnotin $c.scheduler.passed -or $n -cnotin $c.required_api_tests){throw 'API_REQUIRED_TEST'}}
+           if((SetHash $c.explicit.passed) -cne (SetHash $t.ignored) -or @($c.explicit.passed|Sort-Object -Unique).Count -ne 19){throw 'API_EXPLICIT_TESTS'}
+           if(Compare-Object (@($c.scheduler.listed)|Sort-Object) (@(@($c.scheduler.passed)+@($c.scheduler.ignored))|Sort-Object)){throw 'API_SCHEDULER_SET'}
+           if($c.fake_identity.sha256 -cnotmatch '^[0-9a-f]{64}$' -or $c.fake_identity.bytes -le 0 -or $c.cli_roles.Count -ne 2 -or @($c.cli_roles.role|Sort-Object -Unique).Count -ne 2){throw 'API_FAKE_IDENTITY'}
+          foreach($r in $c.cli_roles){if($r.role -cnotin @('DEVELOP','REVIEW') -or $r.exe_sha256 -cne $c.fake_identity.sha256 -or $r.state -cne 'EXITED' -or $r.reclaim -cne 'CONFIRMED'){throw 'API_FAKE_BINDING'}}
+          if(@($m.files).Count -ne 3 -or @($m.files.name|Sort-Object -Unique).Count -ne 3){throw 'API_MANIFEST'}
+           foreach($n in @('result.json','checks.json','tests.json')){$entry=@($m.files|Where-Object name -CEQ $n);$p=Join-Path $Root $n;if($entry.Count -ne 1 -or $entry[0].bytes -ne (Get-Item $p).Length -or $entry[0].sha256 -cne (Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant()){throw 'API_MANIFEST'}}
+          }
+          $ErrorActionPreference='Stop'
+          $identity=@{sha=$env:GITHUB_SHA;run_id=$env:GITHUB_RUN_ID;attempt=$env:GITHUB_RUN_ATTEMPT}
+          $root="$env:API_ROOT/ev"
+          try {
+            Assert-ApiBundle $root $identity
+            if($env:API_SCRIPT_OUTCOME -cne 'success'){throw 'API_SCRIPT_NOT_SUCCESS'}
+          } finally {
+            # Preserve only existing bounded fixed summaries, including honest FAIL/PARTIAL.
+            foreach($n in @('result.json','checks.json','tests.json','files.json')){
+              $cap=@{'result.json'=65536;'checks.json'=131072;'tests.json'=262144;'files.json'=16384}[$n]
+              $p=Join-Path $root $n
+              if((Test-Path $p) -and (Get-Item $p).Length -le $cap){Copy-Item -LiteralPath $p -Destination "$env:API_ROOT/public/$n" -ErrorAction Stop}
+            }
+          }
+      - name: Upload only API injected summaries
+        if: ${{ always() && steps.api_paths.outputs.root != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: scheduler-api-injected-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            ${{ steps.api_paths.outputs.root }}/public/result.json
+            ${{ steps.api_paths.outputs.root }}/public/checks.json
+            ${{ steps.api_paths.outputs.root }}/public/tests.json
+            ${{ steps.api_paths.outputs.root }}/public/files.json

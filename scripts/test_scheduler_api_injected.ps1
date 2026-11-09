@@ -14,7 +14,7 @@ $commandTemp=Join-Path $EvidenceDirectory 'command-temp';New-Item -ItemType Dire
 $clock=[Diagnostics.Stopwatch]::StartNew();$deadline=5400000
 $rows=[Collections.Generic.List[object]]::new();$verdict='FAIL';$stage='BUILD'
 $gitElapsedMs=0L
-function Invoke-Fixed([string]$Name,[string]$Exe,[string[]]$Vector,[string]$Cwd=$crate,[switch]$FixtureGit,[string]$FakeHash) {
+function Invoke-Fixed([string]$Name,[string]$Exe,[string[]]$Vector,[string]$Cwd=$crate,[string]$FakeHash) {
  if($clock.ElapsedMilliseconds -ge $deadline){throw 'TOTAL_DEADLINE'}
  $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$Exe;$info.WorkingDirectory=$Cwd
  $info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
@@ -22,16 +22,6 @@ function Invoke-Fixed([string]$Name,[string]$Exe,[string[]]$Vector,[string]$Cwd=
  $info.Environment['TEMP']=$commandTemp;$info.Environment['TMP']=$commandTemp
  [void]$info.Environment.Remove('NOVA_AR0_TEST_FAKE_SHA256');if($FakeHash){$info.Environment['NOVA_AR0_TEST_FAKE_SHA256']=$FakeHash};
  $info.Environment['RUSTUP_AUTO_INSTALL']='0';$info.Environment['NOVA_SH1_TEST_ROOT']=$EvidenceDirectory
- if($FixtureGit){
-  $info.Environment.Clear();$info.Environment['SystemRoot']=$env:SystemRoot
-  $info.Environment['PATH']=(Split-Path $git)+';'+$env:SystemRoot+'\System32'
-  foreach($key in @('TEMP','TMP','HOME','USERPROFILE')){$info.Environment[$key]=$EvidenceDirectory}
-  $info.Environment['GIT_CONFIG_NOSYSTEM']='1';$info.Environment['GIT_CONFIG_GLOBAL']=$empty
-  $info.Environment['GIT_TERMINAL_PROMPT']='0'
-  foreach($key in @('GIT_AUTHOR_NAME','GIT_COMMITTER_NAME')){$info.Environment[$key]='Nova Fixture'}
-  foreach($key in @('GIT_AUTHOR_EMAIL','GIT_COMMITTER_EMAIL')){$info.Environment[$key]='fixture@invalid.example'}
-  foreach($key in @('GIT_AUTHOR_DATE','GIT_COMMITTER_DATE')){$info.Environment[$key]='2026-01-01T00:00:00+00:00'}
- }
  foreach($a in $Vector){$info.ArgumentList.Add($a)}
  $beforeTemps=@(Get-ChildItem -LiteralPath $commandTemp -Directory -Filter 'nova-sh1-*' | ForEach-Object Name)
  $local=[Diagnostics.Stopwatch]::StartNew()
@@ -45,7 +35,6 @@ function Invoke-Fixed([string]$Name,[string]$Exe,[string[]]$Vector,[string]$Cwd=
   for($i=0;$i -lt 2;$i++){$tasks+= $readers[$i].ReadAsync($buffers[$i],0,4096)}
   while(-not ($done[0] -and $done[1] -and $p.HasExited)){
    if($clock.ElapsedMilliseconds -ge $deadline){throw 'TOTAL_DEADLINE'}
-   if($FixtureGit -and ($local.ElapsedMilliseconds -ge 5000 -or $script:gitElapsedMs+$local.ElapsedMilliseconds -ge 30000)){throw 'FIXTURE_GIT_DEADLINE'}
    for($i=0;$i -lt 2;$i++){
     if(-not $done[$i] -and $tasks[$i].IsCompleted){$n=$tasks[$i].GetAwaiter().GetResult();if($n -eq 0){$done[$i]=$true;continue}
      $b=[Text.Encoding]::UTF8.GetBytes($buffers[$i],0,$n);$sizes[$i]+=$b.Length
@@ -58,12 +47,11 @@ function Invoke-Fixed([string]$Name,[string]$Exe,[string[]]$Vector,[string]$Cwd=
   if($Exe -ceq $bin -and @(Get-ChildItem -LiteralPath $commandTemp -Directory -Filter 'nova-sh1-*' | Where-Object {$_.Name -cnotin $beforeTemps}).Count -ne 0){throw 'BIN_TEMP_NOT_CLEANED'}
  } finally {
   if($row.state -eq 'PARTIAL' -and -not $p.HasExited){$p.Kill($true);[void]$p.WaitForExit(5000);if($p.HasExited){$row.exit_code=$p.ExitCode}}
-  if($FixtureGit){$script:gitElapsedMs+=$local.ElapsedMilliseconds}
   foreach($w in $writers){$w.Flush($true);$w.Dispose()};$row.ended_utc=[DateTime]::UtcNow.ToString('o');$p.Dispose()
  }
  return $row.exit_code
 }
-function Require-Zero([string]$Name,[string]$Exe,[string[]]$Vector,[string]$Cwd=$crate,[switch]$FixtureGit,[string]$FakeHash){if((Invoke-Fixed $Name $Exe $Vector $Cwd -FixtureGit:$FixtureGit -FakeHash:$FakeHash) -ne 0){throw "Fixed stage failed: $Name"}}
+function Require-Zero([string]$Name,[string]$Exe,[string[]]$Vector,[string]$Cwd=$crate,[string]$FakeHash){if((Invoke-Fixed $Name $Exe $Vector $Cwd -FakeHash:$FakeHash) -ne 0){throw "Fixed stage failed: $Name"}}
 function Output-Json([string]$Name){Get-Content -LiteralPath (Join-Path $EvidenceDirectory "$Name.stdout.log") -Raw | ConvertFrom-Json -AsHashtable}
 function Write-Json([string]$Path,$Value){[IO.File]::WriteAllText($Path,($Value|ConvertTo-Json -Depth 30),[Text.UTF8Encoding]::new($false))}
 # Serial libtest output may contain inherited child stdout between the test header and its `ok`.
@@ -86,10 +74,30 @@ function Read-ActualPassed([string[]]$Lines,[string[]]$Declared) {
 }
 
 
+
+function SetHash($Items){$a=[string[]]@($Items);[Array]::Sort($a,[StringComparer]::Ordinal);$b=[Text.Encoding]::UTF8.GetBytes(($a -join "`n")+"`n");return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($b)).ToLowerInvariant()}
+function Assert-Set($Listed,$Passed,$Ignored) {
+ foreach($a in @(@($Listed),@($Passed),@($Ignored))){if($a.Count -eq 0 -or @($a|Sort-Object -Unique).Count -ne $a.Count){throw 'API_SET_DUPLICATE_OR_EMPTY'}}
+ if(Compare-Object (@($Listed)|Sort-Object) (@(@($Passed)+@($Ignored))|Sort-Object)){throw 'API_SET_PARTITION'}
+ if(@($Passed|Where-Object {$_ -cin $Ignored}).Count){throw 'API_IGNORED_EXECUTED'}
+}
+function Get-DbIdentity([string]$Workspace) {
+ $out=@();foreach($n in @('handoff.sqlite3','handoff.sqlite3-wal','handoff.sqlite3-shm')){
+  $p=Join-Path $Workspace $n
+  if(Test-Path -LiteralPath $p){$i=Get-Item -LiteralPath $p -Force;if($i.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'DB_LINK_REJECTED'};$out+=@{name=$n;exists=$true;bytes=$i.Length;sha256=(Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant()}}
+  else{$out+=@{name=$n;exists=$false;bytes=$null;sha256=$null}}
+ };return ($out|ConvertTo-Json -Depth 5 -Compress)
+}
+function Assert-Reopened($First,$Reopened,$Again){
+ if(($First|ConvertTo-Json -Depth 50 -Compress) -cne ($Reopened|ConvertTo-Json -Depth 50 -Compress) -or ($First|ConvertTo-Json -Depth 50 -Compress) -cne ($Again|ConvertTo-Json -Depth 50 -Compress)){throw 'API_REOPEN_MISMATCH'}
+ if($First.facts.Count -ne 2 -or @($First.facts.attempt_id|Sort-Object -Unique).Count -ne 2 -or @($First.facts|Where-Object {$_.facts.dispatch_invoked -isnot [bool] -or -not $_.facts.dispatch_invoked}).Count){throw 'API_ATTEMPT_SET'}
+}
+
+$RequiredApiTests=@('scheduler::tests::api_injected::api_complete_two_stage_fixture_unchanged_and_restart_no_send','scheduler::tests::api_injected::api_double_connection_reservation_and_cas_conflict','scheduler::tests::api_injected::api_evidence_failure_survives_reopen_no_review','scheduler::tests::api_injected::api_existing_workspace_init_rejects_without_writing','scheduler::tests::api_injected::api_failed_develop_exact_codes_never_review','scheduler::tests::api_injected::api_file_drift_preserves_historical_facts_and_blocks_next','scheduler::tests::api_injected::api_limits_depth_duplicate_and_unknown_request','scheduler::tests::api_injected::api_partial_init_preserved_and_not_auto_repaired','scheduler::tests::api_injected::api_real_mode_rejected_before_root_or_lease','scheduler::tests::api_injected::api_request_binds_after_guard_and_differs_across_roots','scheduler::tests::api_injected::api_request_meta_forgery_rejected_before_lease','scheduler::tests::api_injected::api_request_rejects_final_delivery_and_plan_id_before_roots','scheduler::tests::api_injected::api_review_claims_are_not_acceptance_or_auto_repair','scheduler::tests::api_injected::api_secret_failure_and_pre_cancel_zero_reservation','scheduler::tests::api_injected::api_secret_unicode_all_decoded_and_raw_paths_reject','scheduler::tests::api_injected::api_simultaneous_connections_only_one_reservation','scheduler::tests::api_injected::api_stale_states_read_only_no_permit_or_replay','scheduler::tests::api_injected::api_tampered_delivery_or_ddl_rejected','scheduler::tests::api_injected::api_unknown_tokens_zero_send','scheduler::tests::api_injected::api_v1_and_v2_api_open_refuse_no_write','scheduler::tests::api_injected::api_v3_ddl_golden_and_old_open_zero_writes','scheduler::tests::ar0::api_ea7_behavior_byte_goldens')
 $bin=Join-Path $TargetDirectory 'debug/nova_scheduler_api_injected.exe'
 $pwsh=(Get-Command pwsh -CommandType Application|Select-Object -First 1).Source
 if(-not $pwsh){throw 'PWSH_MISSING'}
-$tests=$null;$failure='INCOMPLETE';$verdict='FAIL'
+$tests=$null;$scheduler=$null;$explicit=$null;$prior=$null;$sh1=$null;$v=$null;$again=$null;$before=$null;$failure='INCOMPLETE';$verdict='FAIL'
 try {
  Require-Zero 'old-relay-regression' $pwsh @('-NoProfile','-File',(Join-Path $PSScriptRoot 'test_scheduler_relay.ps1'),'-EvidenceDirectory',(Join-Path $EvidenceDirectory 'old-relay'),'-TargetDirectory',$TargetDirectory) $repo
  $prior=Get-Content (Join-Path $EvidenceDirectory 'old-relay/result.json') -Raw|ConvertFrom-Json -AsHashtable
@@ -99,6 +107,17 @@ try {
  $tests=Get-Content (Join-Path $EvidenceDirectory 'old-relay/default-names.json') -Raw|ConvertFrom-Json -AsHashtable
  $scheduler=Get-Content (Join-Path $EvidenceDirectory 'old-relay/scheduler-names.json') -Raw|ConvertFrom-Json -AsHashtable
  $explicit=Get-Content (Join-Path $EvidenceDirectory 'old-relay/explicit-names.json') -Raw|ConvertFrom-Json -AsHashtable
+ if((SetHash $tests.listed) -cne 'e5c993a728e976912f750d97229274a650b0fb12cae9adc5a0870ad346c76352'){throw 'API_FROZEN_DEFAULT_LISTED'}
+ if((SetHash $tests.passed) -cne 'e95362e815a73078c62fb6ba19dee1754951d3e0d4211998ea3d0a037e8f9d6b'){throw 'API_FROZEN_DEFAULT_PASSED'}
+ if((SetHash $tests.ignored) -cne 'a39bbead332b9d661508d9a4d3a81dbf78a7473b535e6e470c0d76e3738d9611'){throw 'API_FROZEN_DEFAULT_IGNORED'}
+ if((SetHash $scheduler.listed) -cne 'fd838f5e743c8e6d2ed5800b39f7cff603e6a1f9c63f05552defccc3527ed337'){throw 'API_FROZEN_SCHEDULER_LISTED'}
+ if((SetHash $scheduler.passed) -cne 'e2990fcab05fe889a5dfea31568ba529b7a82c2f3a31c017cf2b70312a771c5f'){throw 'API_FROZEN_SCHEDULER_PASSED'}
+ if((SetHash $scheduler.ignored) -cne 'a39bbead332b9d661508d9a4d3a81dbf78a7473b535e6e470c0d76e3738d9611'){throw 'API_FROZEN_SCHEDULER_IGNORED'}
+ Assert-Set $tests.listed $tests.passed $tests.ignored
+ Assert-Set $scheduler.listed $scheduler.passed $scheduler.ignored
+ foreach($name in $RequiredApiTests){if($name -cnotin $tests.passed -or $name -cnotin $scheduler.passed){throw 'API_REQUIRED_TEST_MISSING'}}
+ if(Compare-Object (@($tests.ignored)|Sort-Object) (@($explicit.passed)|Sort-Object)){throw 'API_EXPLICIT_SET'}
+ if(@($explicit.passed|Sort-Object -Unique).Count -ne 19){throw 'API_EXPLICIT_DUPLICATE'}
  if(@($tests.ignored).Count -ne 19 -or @($scheduler.ignored).Count -ne 19){throw 'IGNORED_SET_REJECTED'}
  # The unchanged relay script binds each exact ignored invocation to its freshly built fake hash.
  Require-Zero 'api-debug-build' $cargo @('build','--offline','--locked','--features','scheduler-validation','--bin','nova_scheduler_api_injected')
@@ -120,10 +139,11 @@ try {
  Require-Zero 'api-reopen-status' $bin @('api-status','--workspace',$workspace)
  Require-Zero 'api-no-replay' $bin @('api-run','--workspace',$workspace)
  $again=Output-Json 'api-no-replay'
+ Assert-Reopened $v (Output-Json 'api-reopen-status') $again
  if(($again.facts|ConvertTo-Json -Depth 30 -Compress) -cne ($v.facts|ConvertTo-Json -Depth 30 -Compress)){throw 'API_REPLAY'}
  if((Get-FileHash (Join-Path $run 'fixture/pilot/src/normalize_label.rs') -Algorithm SHA256).Hash.ToLowerInvariant() -cne $baseHash){throw 'CANDIDATE_APPLIED'}
  $handoff=Join-Path $TargetDirectory 'debug/nova_scheduler_handoff.exe';$relay=Join-Path $TargetDirectory 'debug/nova_scheduler_relay.exe'
- $before=(Get-FileHash (Join-Path $workspace 'handoff.sqlite3')).Hash
+ $before=Get-DbIdentity $workspace
  foreach($verb in @('status','handoff','import','index-only')){
   $vector=if($verb -eq 'index-only'){@('import','--workspace',$workspace,'--report',$plan,'--index-only')}elseif($verb -eq 'import'){@('import','--workspace',$workspace,'--report',$plan)}else{@($verb,'--workspace',$workspace)}
   $name="legacy-$verb-v3";$exit=Invoke-Fixed $name $handoff $vector
@@ -141,17 +161,21 @@ try {
  $oldManifest=Join-Path $EvidenceDirectory 'legacy-existing-root-manifest.json';Write-Json $oldManifest $legacyManifest
  $exit=Invoke-Fixed 'legacy-init-existing-v3' $handoff @('init','--workspace',$workspace,'--manifest',$oldManifest)
  if($exit -ne 2 -or (Output-Json 'legacy-init-existing-v3').error_code -cne 'CREATE_NEW_REJECTED'){throw 'LEGACY_INIT_EXISTING_NOT_REJECTED'}
- if((Get-FileHash (Join-Path $workspace 'handoff.sqlite3')).Hash -cne $before){throw 'LEGACY_V3_WROTE'}
+ if((Get-DbIdentity $workspace) -cne $before){throw 'LEGACY_V3_WROTE'}
+ if((Test-Path (Join-Path $EvidenceDirectory 'never-relay')) -or (Test-Path (Join-Path $EvidenceDirectory 'never-run'))){throw 'LEGACY_ROOT_CREATED'}
  $verdict='PASS';$failure='NONE'
 } catch { $failure=if($_.Exception.Message -cmatch '^[A-Z0-9_]+$'){$_.Exception.Message}else{'LOCAL_CHECK_FAILED'};throw
 } finally {
  # Reconstruct only closed fields. Raw logs stay private, never in the upload manifest.
- $fixed=@{schema='nova.scheduler.api-validation/1';mode='API_INJECTED_ONLY';source='ACTUAL_LOCAL_INJECTED_VALIDATION';source_sha=(& $git -C $repo rev-parse HEAD);verdict=$verdict;failure_code=$failure;network_executed=$false;real_execution_authorized=$false;github_verified=$false}
- $checks=@{schema='nova.scheduler.api-checks/1';commands=@($rows|ForEach-Object {@{name=$_.name;state=$_.state;exit_code=$_.exit_code}});old_default_regression_required=$true}
- $names=@{schema='nova.scheduler.api-tests/1';source='ACTUAL_LOCAL_TEST_OUTPUT';listed=$tests.listed;passed=$tests.passed;ignored=$tests.ignored}
+ $identity=@{sha=(& $git -C $repo rev-parse HEAD).Trim();run_id=[string]$env:GITHUB_RUN_ID;attempt=[string]$env:GITHUB_RUN_ATTEMPT}
+ $fixed=@{identity=$identity;schema='nova.scheduler.api-validation/1';mode='API_INJECTED_ONLY';source='ACTUAL_LOCAL_INJECTED_VALIDATION';source_sha=(& $git -C $repo rev-parse HEAD);verdict=$verdict;failure_code=$failure;network_executed=$false;real_execution_authorized=$false;github_verified=$false}
+ $fakeIdentity=if(Test-Path (Join-Path $EvidenceDirectory 'old-relay/fake-cli-identity.json')){Get-Content (Join-Path $EvidenceDirectory 'old-relay/fake-cli-identity.json') -Raw|ConvertFrom-Json -AsHashtable}else{$null}
+ $oldRun=if(Test-Path (Join-Path $EvidenceDirectory 'old-relay/relay-run.stdout.log')){Get-Content (Join-Path $EvidenceDirectory 'old-relay/relay-run.stdout.log') -Raw|ConvertFrom-Json -AsHashtable}else{$null}
+ $checks=@{identity=$identity;schema='nova.scheduler.api-checks/1';commands=@($rows|ForEach-Object {@{name=$_.name;state=$_.state;exit_code=$_.exit_code}});old_default_regression_required=$true;old_commands=$prior.commands;default_executed=$sh1.default_regression_executed;scheduler=$scheduler;explicit=$explicit;required_api_tests=$RequiredApiTests;reopen_equal=($verdict -ceq 'PASS');db_unchanged=($verdict -ceq 'PASS');legacy_roots_absent=($verdict -ceq 'PASS');gate_checks_verified=($verdict -ceq 'PASS');sh1_commands=$sh1.commands;fake_identity=@{sha256=$fakeIdentity.sha256;bytes=$fakeIdentity.bytes};cli_roles=@($oldRun.facts|ForEach-Object {@{role=$_.role;exe_sha256=$_.exe_sha256;state=$_.state;reclaim=$_.reclaim}})}
+ $names=@{identity=$identity;schema='nova.scheduler.api-tests/1';source='ACTUAL_LOCAL_TEST_OUTPUT';listed=$tests.listed;passed=$tests.passed;ignored=$tests.ignored}
  foreach($pair in @(@('result.json',$fixed,65536),@('checks.json',$checks,131072),@('tests.json',$names,262144))){$path=Join-Path $EvidenceDirectory $pair[0];Write-Json $path $pair[1];if((Get-Item $path).Length -gt $pair[2]){throw 'SUMMARY_BOUND'}}
  $files=@('result.json','checks.json','tests.json')|ForEach-Object {$p=Join-Path $EvidenceDirectory $_;@{name=$_;bytes=(Get-Item $p).Length;sha256=(Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant()}}
- Write-Json (Join-Path $EvidenceDirectory 'files.json') @{schema='nova.scheduler.api-files/1';files=@($files)}
+ Write-Json (Join-Path $EvidenceDirectory 'files.json') @{schema='nova.scheduler.api-files/1';identity=$identity;files=@($files)}
  if((Get-Item (Join-Path $EvidenceDirectory 'files.json')).Length -gt 16384){throw 'MANIFEST_BOUND'}
 }
 if($verdict -cne 'PASS'){exit 1}

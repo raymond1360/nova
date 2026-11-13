@@ -21,6 +21,13 @@ function Invoke-Fixed([string]$Name,[string]$Exe,[string[]]$Vector,[string]$Cwd=
  $info.Environment['CARGO_TARGET_DIR']=$TargetDirectory;$info.Environment['CARGO_NET_OFFLINE']='true'
  $info.Environment['TEMP']=$commandTemp;$info.Environment['TMP']=$commandTemp
  $info.Environment['RUSTUP_AUTO_INSTALL']='0';$info.Environment['NOVA_SH1_TEST_ROOT']=$EvidenceDirectory
+ # These two libtest runs include a create-new fixed-name approval fixture; never share its parent.
+ if($Name -cin @('scheduler-tests','default-tests')){
+  $testRoot=Join-Path $EvidenceDirectory "$Name-test-root"
+  New-Item -ItemType Directory -Path $testRoot -ErrorAction Stop | Out-Null
+  $info.Environment['NOVA_SH1_TEST_ROOT']=$testRoot
+ }
+
  if($FixtureGit){
   $info.Environment.Clear();$info.Environment['SystemRoot']=$env:SystemRoot
   $info.Environment['PATH']=(Split-Path $git)+';'+$env:SystemRoot+'\System32'

@@ -905,4 +905,79 @@ mod tests {
         configure_key_with(&r, "offline-fake-secret-only").unwrap();
         assert!(r.0.load(Ordering::SeqCst));
     }
+    #[test]
+    fn deepseek_secret_echo_never_persists_body_or_body_hash() {
+        struct Echo {
+            bytes: Vec<u8>,
+            calls: usize,
+        }
+        impl HttpPort for Echo {
+            fn execute(
+                &mut self,
+                _: &ApiRequest,
+                _: &SecretLease,
+                _: u64,
+                _: &dyn Clock,
+                _: &AtomicBool,
+            ) -> TransportResult {
+                self.calls += 1;
+                TransportResult {
+                    status: Some(200),
+                    body: self.bytes.clone(),
+                    resources_released: true,
+                    error: None,
+                }
+            }
+        }
+        for unicode in [false, true] {
+            let (root, _) = fixture();
+            let mut value: Value = serde_json::from_slice(&wire("{}")).unwrap();
+            if unicode {
+                value["choices"][0]["message"]["content"] =
+                    json!(r#"{"new_text":"\u006fffline-fake-secret-only"}"#);
+            } else {
+                value["extra"] = json!("offline-fake-secret-only");
+            }
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let unsafe_hash = hash(&bytes);
+            let mut t = Transport {
+                port: Echo { bytes, calls: 0 },
+            };
+            let c = Cred {
+                reads: AtomicUsize::new(0),
+            };
+            let v = run_ports(
+                &root.join("workspace"),
+                true,
+                &mut t,
+                &c,
+                &MonotonicClock::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(t.port.calls, 1);
+            assert_eq!(v["facts"][0]["facts"]["error_code"], "SECRET_ECHO");
+            assert!(v["facts"][0]["facts"]["response_sha256"].is_null());
+            assert!(v["facts"][0]["model_claim"].is_null());
+            assert!(!root.join("run/DEVELOP-response.json").exists());
+            assert!(!root.join("run/review-package.json").exists());
+            let db = std::fs::read(root.join("workspace/handoff.sqlite3")).unwrap();
+            assert!(!db
+                .windows(unsafe_hash.len())
+                .any(|w| w == unsafe_hash.as_bytes()));
+            assert!(!db
+                .windows(b"offline-fake-secret-only".len())
+                .any(|w| w == b"offline-fake-secret-only"));
+            run_ports(
+                &root.join("workspace"),
+                true,
+                &mut t,
+                &c,
+                &MonotonicClock::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(t.port.calls, 1);
+        }
+    }
 }

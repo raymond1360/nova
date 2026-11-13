@@ -1338,6 +1338,25 @@ pub(crate) fn api_review_input(
     }
     Ok((c, b))
 }
+/// Version is persisted in the parent binding; absence means byte-for-byte legacy material.
+pub(crate) const REVIEW_GOAL_V2: &str = "DEEPSEEK_REVIEW_GOAL_V2";
+pub(crate) fn api_review_input_versioned(
+    p: &ApiPlan, id: &str, base: &[u8], raw: &[u8], version: Option<&Value>,
+) -> Result<(Candidate, Vec<u8>)> {
+    let (candidate, legacy) = api_review_input(p, id, base, raw)?;
+    match version {
+        None => Ok((candidate, legacy)),
+        Some(Value::String(v)) if v == REVIEW_GOAL_V2 && p.mode == "REAL_API" => {
+            let mut material: Value = api_json(&legacy, 65536)?;
+            material["review_material_version"] = json!(REVIEW_GOAL_V2);
+            material["goal"] = json!(p.goal);
+            let bytes = serde_json::to_vec(&material).map_err(|_| "ENCODING")?;
+            if bytes.len() > 65536 { return Err("MATERIAL_BOUND"); }
+            Ok((candidate, bytes))
+        }
+        _ => Err("REVIEW_VERSION_REJECTED"),
+    }
+}
 pub fn run_api(store: &Store) -> Result<Value> {
     if store.api_plan()?.1.mode != "API_INJECTED_ONLY" {return Err("REAL_API_NOT_AUTHORIZED");}
     let mut t = super::api_adapter::InjectedTransport { calls: 0 };
@@ -1415,6 +1434,7 @@ pub(crate) fn run_api_with(
         if cancel.load(Ordering::Acquire) || clock.now_ms() >= end {
             a.facts = Some(ApiFacts {
                 schema: "nova.scheduler.api-facts/1".into(),
+                diagnostic: None,
                 source: if real {"REAL_API"}else{"INJECTED"}.into(),
                 dispatch_invoked: false,
                 response_status: None,
@@ -1435,6 +1455,7 @@ pub(crate) fn run_api_with(
         let result = transport.send(&req, &secret, &permit, end, clock, cancel);
         let mut facts = ApiFacts {
             schema: "nova.scheduler.api-facts/1".into(),
+                diagnostic: None,
             source: if real {"REAL_API"}else{"INJECTED"}.into(),
             dispatch_invoked: true,
             response_status: result.status,
@@ -1447,6 +1468,7 @@ pub(crate) fn run_api_with(
             error_code: "NONE".into(),
             unknowns: vec![],
         };
+        let mut diagnostic = None;
         let parsed = (|| -> Result<(Vec<u8>, u64)> {
             if !result.resources_released {
                 return Err("TRANSPORT_UNKNOWN");
@@ -1464,7 +1486,10 @@ pub(crate) fn run_api_with(
                     _ => "TRANSPORT_ERROR",
                 });
             }
-            parse_response(&result, &req, &secret, counter, &p.limits)
+            if real {
+                super::deepseek_transport::parse_response_diagnosed(&result, &req, &secret)
+                    .map_err(|(error, code)| { diagnostic = Some(code); error })
+            } else { parse_response(&result, &req, &secret, counter, &p.limits) }
         })();
         let mut response_artifact: Option<Vec<u8>> = None;
         let mut review_input = None;
@@ -1476,7 +1501,8 @@ pub(crate) fn run_api_with(
                     if role == RelayRole::Develop {
                         let canonical = serde_json::to_vec(&api_json::<Value>(&raw, 32768)?)
                             .map_err(|_| "ENCODING")?;
-                        let (c, review) = api_review_input(&p, &id, &base, &canonical)?;
+                        let version = real.then(|| json!(REVIEW_GOAL_V2));
+                        let (c, review) = api_review_input_versioned(&p, &id, &base, &canonical, version.as_ref())?;
                         secret.scan_text(c.text.as_bytes())?;
                         secret.scan_text(c.diff.as_bytes())?;
                         secret.scan_json(&review, 65536)?;
@@ -1492,9 +1518,12 @@ pub(crate) fn run_api_with(
                         a.binding = Some(
                             if real {json!({"plan_id":id,"candidate_sha256":c.candidate_sha256,"review_input_sha256":hash(&review),"proposal_sha256":c.proposal_sha256,"diff_sha256":c.diff_sha256})} else {json!({"plan_id":id,"candidate_sha256":c.candidate_sha256,"review_input_sha256":hash(&review)})},
                         );
+                        if real { a.binding.as_mut().ok_or("BINDING_MISMATCH")?["review_material_version"] = json!(REVIEW_GOAL_V2); }
                         review_input = Some(review);
                     } else {
-                        let claim: ReviewClaim = api_json(&raw, 65536)?;
+                        let claim: ReviewClaim = api_json(&raw, 65536).map_err(|e| {
+                            if real { diagnostic = Some(ApiDiagnostic::ReviewClaimDecode); } e
+                        })?;
                         let prev = store
                             .api_attempts()?
                             .into_iter()
@@ -1506,7 +1535,7 @@ pub(crate) fn run_api_with(
                             binding["candidate_sha256"]
                                 .as_str()
                                 .ok_or("BINDING_MISMATCH")?,
-                        )?;
+                        ).map_err(|e| { if real { diagnostic = Some(ApiDiagnostic::ReviewClaimValidation); } e })?;
                     }
                     if real {
                         let reported=secret.scan_response(&result.body)?;
@@ -1562,6 +1591,7 @@ pub(crate) fn run_api_with(
         };
         facts.transport_state = to.into();
         let success = facts.error_code == "NONE" && facts.unknowns.is_empty();
+        facts.diagnostic = diagnostic;
         a.facts = Some(facts);
         a.evidence = Some(json!({"state":"PENDING"}));
         store.api_cas(&mut a, to)?;

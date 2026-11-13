@@ -1304,9 +1304,18 @@ pub struct ApiRequestMeta {
     pub source: String,
     pub parent_attempt_id: Option<String>,
 }
+/// Safe fixed codes only: never derived from provider field values or exception text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ApiDiagnostic {
+    ScanSecret, ScanJson, ContentSecret, ContentJson, OuterProtocol, Usage,
+    ReviewClaimDecode, ReviewClaimValidation,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiFacts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<ApiDiagnostic>,
     pub schema: String,
     pub source: String,
     pub dispatch_invoked: bool,

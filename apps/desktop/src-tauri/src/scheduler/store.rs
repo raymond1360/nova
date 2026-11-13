@@ -2222,8 +2222,9 @@ impl Store {
                         let text:String=sql(c.query_row("SELECT plan_json FROM relay_plans WHERE plan_id=?1",[&id],|r|r.get(0)))?;
                         let record:DeepSeekRecord=api_json(text.as_bytes(),65536)?;record.validate()?;record.plan.snapshot.into_bytes()
                     }else{API_FIXTURE.to_vec()};
-                    let (c, review) = super::relay::api_review_input(&p, &id, &historic, &raw)?;
                     let binding = a.binding.as_ref().ok_or("BINDING_MISMATCH")?;
+                    let (c, review) = super::relay::api_review_input_versioned(
+                        &p, &id, &historic, &raw, binding.get("review_material_version"))?;
                     if binding["plan_id"] != id
                         || binding["candidate_sha256"] != c.candidate_sha256
                         || binding["review_input_sha256"] != hash(&review)
@@ -2292,7 +2293,8 @@ impl Store {
                 .ok_or("BINDING_MISMATCH")?;
             let raw = serde_json::to_vec(parent.model_claim.as_ref().ok_or("BINDING_MISMATCH")?)
                 .map_err(|_| "ENCODING")?;
-            super::relay::api_review_input(&p, &id, &base, &raw)?.1
+            super::relay::api_review_input_versioned(&p, &id, &base, &raw,
+                parent.binding.as_ref().and_then(|b| b.get("review_material_version")))?.1
         };
         let expected = if p.mode=="REAL_API" {
             super::deepseek_transport::reconstruct_request(meta.role,&p,&id,&expected_input,meta.parent_attempt_id.clone())?

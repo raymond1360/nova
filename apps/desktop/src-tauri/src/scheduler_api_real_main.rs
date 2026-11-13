@@ -89,10 +89,15 @@ fn execute() -> Result<serde_json::Value, &'static str> {
             }
             let mut f = Guard::open(Path::new(&a[3]), false)?;
             let raw = f.bytes(32768)?;
-            let digest = api::plan_digest(&raw)?;
-            eprintln!("Approve snapshot/goal in the plan, DeepSeek direct, two requests, no monetary cap, candidate/diff/proposal review export. Type plan digest {digest}:");
-            let confirmation = line()?;
-            api::approve_and_init(Path::new(&a[1]), Path::new(&a[2]), &raw, &confirmation)
+            let stdin = io::stdin();
+            let stderr = io::stderr();
+            api::approve_init_dialog(
+                Path::new(&a[1]),
+                Path::new(&a[2]),
+                &raw,
+                &mut stdin.lock(),
+                &mut stderr.lock(),
+            )
         }
         _ => Err("REAL_API_NOT_AUTHORIZED"),
     }

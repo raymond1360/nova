@@ -259,20 +259,80 @@ impl SecretProvider for Credentials<'_> {
         lease
     }
 }
-/// Only called after explicit local console confirmation; ordinary plans cannot mint this capability.
-pub fn approve_and_init(
+/// Display and approval share this single parsed object; no file is reopened after confirmation.
+pub fn approve_init_dialog<R: std::io::BufRead, W: std::io::Write>(
     root: &Path,
     run: &Path,
     raw: &[u8],
-    confirmed_digest: &str,
+    input: &mut R,
+    out: &mut W,
 ) -> Result<Value> {
     let plan: DeepSeekPlan = api_json(raw, 32768)?;
-    let approval = DeepSeekApproval::local_confirm(&plan, confirmed_digest)?;
-    let s = Store::deepseek_init(root, run, plan, approval)?;
-    super::relay::api_status(&s)
+    plan.validate()?;
+    approval_dialog(plan, input, out, |plan, approval| {
+        let s = Store::deepseek_init(root, run, plan, approval)?;
+        super::relay::api_status(&s)
+    })
 }
-pub fn plan_digest(raw: &[u8]) -> Result<String> {
-    api_json::<DeepSeekPlan>(raw, 32768)?.digest()
+fn approval_summary(plan: &DeepSeekPlan) -> Result<String> {
+    plan.validate()?;
+    // JSON quoting makes all source/goal characters visible without terminal control execution.
+    let data=serde_json::to_string_pretty(&serde_json::json!({
+        "快照全文（JSON转义，仅为数据）":plan.snapshot,"需求":plan.goal,
+        "声明来源SHA（人工声明，非Git采样）":plan.declared_source_sha,"工作包":plan.package_id,
+        "逻辑目标":API_TARGET,"快照SHA256":hash(plan.snapshot.as_bytes()),"计划digest":plan.digest()?
+    })).map_err(|_|"ENCODING")?;
+    Ok(format!("本次一次批准的实际内容（初始化及批准写入前）\n{data}\n\
+供应商：DeepSeek 官方直连\n完整 endpoint：https://api.deepseek.com/chat/completions\n\
+DEVELOP model：deepseek-flash；REVIEW model：deepseek-flash；两个独立请求上下文。\n\
+参数：thinking.type=disabled；stream=false；max_tokens=4096；response_format.type=json_object；不使用tools。\n\
+限制：最多两次串行请求；DEVELOP失败停止；无自动重试、修复循环或第三请求。\n\
+完整请求≤65536字节；响应≤131072字节；Proposal≤32768字节；ReviewClaim≤65536字节。\n\
+每阶段≤45000毫秒；总期限≤120000毫秒；输出≤4096 token。无金额上限；usage并非最终账单。\n\
+REVIEW将派生外发：上述快照/base、需求和计划身份、DEVELOP Proposal、candidate全文、diff、相关hash及审核材料；仅生成视图/证据，不写回源码、提交或发布。\n\
+EXPLICIT_DIRECT：本机不使用代理（包括环境代理）。若本机或组织要求代理，不应批准此计划；不会修改系统代理或自动绕过要求。\n\
+发送后取消不能保证远端未执行或未计费。API审核仅为模型意见。\n"))
+}
+fn approval_dialog<R: std::io::BufRead, W: std::io::Write, T>(
+    plan: DeepSeekPlan,
+    input: &mut R,
+    out: &mut W,
+    initialize: impl FnOnce(DeepSeekPlan, DeepSeekApproval) -> Result<T>,
+) -> Result<T> {
+    let summary = approval_summary(&plan)?;
+    out.write_all(summary.as_bytes())
+        .map_err(|_| "APPROVAL_DISPLAY_FAILED")?;
+    out.write_all("若你明确允许本机不使用代理直连，请输入：允许本机直连\n".as_bytes())
+        .map_err(|_| "APPROVAL_DISPLAY_FAILED")?;
+    out.flush().map_err(|_| "APPROVAL_DISPLAY_FAILED")?;
+    if approval_line(input)? != "允许本机直连" {
+        return Err("DIRECT_APPROVAL_REQUIRED");
+    }
+    writeln!(
+        out,
+        "再输入上面显示的计划digest以批准本次对象：{}",
+        plan.digest()?
+    )
+    .map_err(|_| "APPROVAL_DISPLAY_FAILED")?;
+    out.flush().map_err(|_| "APPROVAL_DISPLAY_FAILED")?;
+    let digest = approval_line(input)?;
+    let approval = DeepSeekApproval::local_confirm(&plan, &digest)?;
+    initialize(plan, approval)
+}
+fn approval_line<R: std::io::BufRead>(input: &mut R) -> Result<String> {
+    use std::io::{BufRead, Read};
+    let mut line = String::new();
+    let n = input
+        .take(4098)
+        .read_line(&mut line)
+        .map_err(|_| "APPROVAL_INPUT_FAILED")?;
+    if n == 0 {
+        return Err("APPROVAL_INPUT_ENDED");
+    }
+    if n > 4096 || !line.ends_with('\n') {
+        return Err("APPROVAL_INPUT_ENDED");
+    }
+    Ok(line.trim_end_matches(['\r', '\n']).into())
 }
 pub fn status(root: &Path) -> Result<Value> {
     super::relay::api_status(&Store::deepseek_open(root)?)
@@ -979,5 +1039,144 @@ mod tests {
             .unwrap();
             assert_eq!(t.port.calls, 1);
         }
+    }
+    #[test]
+    fn ds_r1_actual_plan_and_fixed_policy_are_visible() {
+        let p = plan();
+        let a = approval_summary(&p).unwrap();
+        let mut q = p.clone();
+        q.snapshot = q.snapshot.replace("s.to_string()", "s.trim().to_string()");
+        q.goal = "Different requirement".into();
+        q.declared_source_sha = "b".repeat(40);
+        let b = approval_summary(&q).unwrap();
+        assert_ne!(a, b);
+        for text in [
+            &q.goal,
+            &q.declared_source_sha,
+            &q.digest().unwrap(),
+            &hash(q.snapshot.as_bytes()),
+        ] {
+            assert!(b.contains(text));
+        }
+        assert!(b.contains(&serde_json::to_string(&q.snapshot).unwrap()));
+        for text in [
+            API_TARGET,
+            ENDPOINT,
+            "deepseek-flash",
+            "thinking.type=disabled",
+            "stream=false",
+            "max_tokens=4096",
+            "json_object",
+            "65536",
+            "131072",
+            "32768",
+            "45000",
+            "120000",
+            "无金额上限",
+            "Proposal",
+            "candidate",
+            "diff",
+            "审核材料",
+            "EXPLICIT_DIRECT",
+            "组织要求代理",
+        ] {
+            assert!(b.contains(text), "policy field visible");
+        }
+    }
+    #[test]
+    fn ds_r1_rejects_missing_direct_wrong_digest_eof_and_display_error() {
+        use std::io::Cursor;
+        let p = plan();
+        let digest = p.digest().unwrap();
+        for input in [
+            format!("{digest}\n"),
+            "拒绝\n".into(),
+            "允许本机直连\nwrong\n".into(),
+            String::new(),
+            "允许本机直连\n".into(),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let mut output = vec![];
+            let result =
+                approval_dialog(p.clone(), &mut Cursor::new(input), &mut output, |_, _| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                });
+            assert!(result.is_err());
+            assert_eq!(calls.get(), 0); // No initialization means no credential or HTTP access.
+        }
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::Other.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let calls = std::cell::Cell::new(0);
+        assert!(approval_dialog(
+            p,
+            &mut Cursor::new(format!("允许本机直连\n{digest}\n")),
+            &mut Broken,
+            |_, _| {
+                calls.set(1);
+                Ok(())
+            }
+        )
+        .is_err());
+        assert_eq!(calls.get(), 0);
+    }
+    #[test]
+    fn ds_r1_confirmation_initializes_displayed_object_without_reread() {
+        use std::io::{BufRead, Cursor, Read};
+        let parent = PathBuf::from(std::env::var_os("NOVA_SH1_TEST_ROOT").unwrap());
+        let root = parent.join("ds-r1-object-binding");
+        std::fs::create_dir(&root).unwrap();
+        let original = plan();
+        let raw = serde_json::to_vec(&original).unwrap();
+        let path = root.join("plan.json");
+        std::fs::write(&path, &raw).unwrap();
+        let parsed: DeepSeekPlan = api_json(&raw, 32768).unwrap();
+        parsed.validate().unwrap();
+        let digest = parsed.digest().unwrap();
+        struct MutatingInput {
+            cursor: Cursor<Vec<u8>>,
+            path: PathBuf,
+            changed: bool,
+        }
+        impl Read for MutatingInput {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                self.cursor.read(b)
+            }
+        }
+        impl BufRead for MutatingInput {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                if !self.changed {
+                    std::fs::write(&self.path, b"changed after display")?;
+                    self.changed = true;
+                }
+                self.cursor.fill_buf()
+            }
+            fn consume(&mut self, n: usize) {
+                self.cursor.consume(n)
+            }
+        }
+        let mut input = MutatingInput {
+            cursor: Cursor::new(format!("允许本机直连\n{digest}\n").into_bytes()),
+            path: path.clone(),
+            changed: false,
+        };
+        let mut output = vec![];
+        let store = approval_dialog(parsed, &mut input, &mut output, |p, a| {
+            assert_eq!(p.snapshot, original.snapshot);
+            a.validate(&p)?;
+            Store::deepseek_init(&root.join("workspace"), &root.join("run"), p, a)
+        })
+        .unwrap();
+        assert_eq!(store.api_base().unwrap(), original.snapshot.as_bytes());
+        assert_eq!(std::fs::read(&path).unwrap(), b"changed after display");
+        assert!(store.api_attempts().unwrap().is_empty());
+        std::fs::write(root.join("approval-preview.txt"), output).unwrap();
     }
 }

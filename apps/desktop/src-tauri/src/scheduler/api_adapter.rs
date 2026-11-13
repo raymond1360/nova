@@ -25,6 +25,19 @@ impl SecretLease {
         self.walk(&v, 0)?;
         Ok(v)
     }
+    // Only the response envelope defines JSON-encoded assistant content.
+    // A field named content inside a proposal remains ordinary code/text.
+    pub(super) fn scan_response(&self, b: &[u8]) -> Result<Value> {
+        let value = self.scan_json(b, 131072)?;
+        if let Some(choices) = value["choices"].as_array() {
+            for choice in choices {
+                if let Some(content) = choice["message"]["content"].as_str() {
+                    self.scan_json(content.as_bytes(), 65536)?;
+                }
+            }
+        }
+        Ok(value)
+    }
     fn walk(&self, v: &Value, depth: usize) -> Result<()> {
         if depth > 16 {
             return Err("BOUND");
@@ -32,10 +45,6 @@ impl SecretLease {
         match v {
             Value::String(s) => {
                 self.scan_text(s.as_bytes())?;
-                if s.trim_start().starts_with(['{', '[']) {
-                    let inner: Value = api_json(s.as_bytes(), 131072)?;
-                    self.walk(&inner, depth + 1)?
-                }
             }
             Value::Array(a) => {
                 for x in a {
@@ -219,7 +228,7 @@ pub fn parse_response(
         return Err("BOUND");
     }
     // Never hash or preserve an unscanned body, including non-200 error bodies.
-    let value = secret.scan_json(&r.body, 131072)?;
+    let value = secret.scan_response(&r.body)?;
     if r.status != Some(200) {
         return Err(match r.status {
             Some(401 | 403) => "AUTH_REJECTED",

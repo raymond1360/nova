@@ -3895,12 +3895,12 @@ mod api_injected {
             format!("{{\"usage\":{{\"bad\":\"{escaped}\"}}}}"),
             format!("{{\"{escaped}\":0}}"),
             format!(
-                "{{\"content\":{}}}",
+                "{{\"choices\":[{{\"message\":{{\"content\":{}}}}}]}}",
                 serde_json::to_string(&format!("{{\"rationale\":\"{escaped}\"}}")).unwrap()
             ),
         ] {
             assert_eq!(
-                secret.scan_json(b.as_bytes(), 131072).err(),
+                secret.scan_response(b.as_bytes()).err(),
                 Some("SECRET_ECHO")
             );
         }
@@ -3908,6 +3908,29 @@ mod api_injected {
             secret.scan_text(format!("prefix{sentinel}suffix").as_bytes()),
             Err("SECRET_ECHO")
         );
+    }
+    #[test]
+    fn api_f1_code_text_and_protocol_content_boundaries() {
+        let secret = InjectedSecrets.acquire(RelayRole::Develop, "test").unwrap();
+        let envelope = |text: &str| serde_json::to_vec(&json!({"choices":[{"message":{"content":text}}]})).unwrap();
+        for code in ["{\n    s.trim()\n}", "[item; count]", "{not json}"] {
+            let proposal = json!({"old_text":code,"new_text":code,"content":code});
+            let raw = serde_json::to_vec(&proposal).unwrap();
+            assert!(secret.scan_json(&raw, 32768).is_ok());
+            assert!(secret.scan_response(&envelope(&proposal.to_string())).is_ok());
+        }
+        for text in ["{bad", r#"{"a":1,"a":2}"#] {
+            assert!(secret.scan_response(&envelope(text)).is_err());
+        }
+        let deep = format!("{}0{}", "[".repeat(18), "]".repeat(18));
+        assert!(secret.scan_response(&envelope(&deep)).is_err());
+        let large = serde_json::to_string(&"x".repeat(65537)).unwrap();
+        assert!(secret.scan_response(&envelope(&large)).is_err());
+        let escaped: String = "NOVA_INJECTED_ONLY_SECRET_SENTINEL".chars().map(|c| format!("\\u{:04x}", c as u32)).collect();
+        for field in ["new_text", "rationale", "summary", "content"] {
+            let payload = format!("{{\"{field}\":\"{escaped}\"}}");
+            assert_eq!(secret.scan_response(&envelope(&payload)).err(), Some("SECRET_ECHO"));
+        }
     }
     #[test]
     fn api_limits_depth_duplicate_and_unknown_request() {

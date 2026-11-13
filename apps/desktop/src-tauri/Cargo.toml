@@ -93,3 +93,8 @@ required-features = ["scheduler-validation"]
 name = "nova_scheduler_api_injected"
 path = "tests/fixtures/scheduler_api_injected_main.rs"
 required-features = ["scheduler-validation"]
+
+[[bin]]
+name = 'nova_scheduler_api_real'
+path = 'src/scheduler_api_real_main.rs'
+required-features = ['scheduler-validation']

@@ -11,3 +11,5 @@ pub mod relay;
 pub mod cli_adapter;
 
 pub mod api_adapter;
+
+pub mod deepseek_transport;

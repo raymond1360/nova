@@ -413,7 +413,7 @@ impl Store {
         }
         sql(db.conn().execute_batch("BEGIN IMMEDIATE;"))?;
         let result = (|| {
-            let ddl = if version == 3 {
+            let ddl = if version == 4 { deepseek_schema() } else if version == 3 {
                 API_SCHEMA.into()
             } else if version == 2 {
                 SCHEMA.replace("CHECK(schema_version=1)", "CHECK(schema_version=2)")
@@ -469,8 +469,8 @@ impl Store {
         drop(db);
         drop(dg);
         drop(rg);
-        if version == 3 {
-            Self::open_kind(root, true)
+        if version == 3 || version == 4 {
+            Self::open_version(root, version)
         } else {
             Self::open(root)
         }
@@ -479,6 +479,10 @@ impl Store {
         Self::open_kind(root, false)
     }
     fn open_kind(root: &Path, api: bool) -> Result<Self> {
+        Self::open_version(root, if api {3} else {0})
+    }
+    fn open_version(root: &Path, kind: i64) -> Result<Self> {
+        let api = kind >= 3;
         safe_location(root)?;
         let rg = Guard::open(root, true)?;
         let (b, _) =
@@ -521,13 +525,13 @@ impl Store {
         {
             return Err("STORE_VERSION_REJECTED");
         }
-        if !api && mark.2 == 3 {
+        if !api && [3, 4].contains(&mark.2) {
             return Err("API_STORE_COMMAND_REQUIRED");
         }
-        if api && mark.2 != 3 {
+        if api && mark.2 != kind {
             return Err("API_STORE_VERSION_REQUIRED");
         }
-        if ![1, 2, 3].contains(&mark.2) {
+        if ![1, 2, 3, 4].contains(&mark.2) {
             return Err("STORE_VERSION_REJECTED");
         }
         if mark.2 == 2 {
@@ -546,7 +550,8 @@ impl Store {
             }
         }
         if api {
-            for expected in API_SCHEMA
+            let ddl = if kind == 4 { deepseek_schema() } else { API_SCHEMA.into() };
+            for expected in ddl
                 .split(';')
                 .map(str::trim)
                 .filter(|x| !x.is_empty())
@@ -1905,6 +1910,17 @@ impl Store {
     fn api_init_stage(root: &Path, run: &Path, raw: &[u8], fault: u8) -> Result<Self> {
         let req: ApiPlanRequest = api_json(raw, 65536)?;
         req.validate()?;
+        Self::api_init_material(root, run, raw, fault, req, None)
+    }
+    pub(crate) fn deepseek_init(root: &Path, run: &Path, plan: DeepSeekPlan, approval: DeepSeekApproval) -> Result<Self> {
+        approval.validate(&plan)?;
+        let core = plan.core(String::new())?;
+        let req = core.request();
+        let raw = serde_json::to_vec(&plan).map_err(|_|"ENCODING")?;
+        Self::api_init_material(root, run, &raw, 0, req, Some((plan, approval)))
+    }
+    fn api_init_material(root: &Path, run: &Path, raw: &[u8], fault: u8, req: ApiPlanRequest,
+        real: Option<(DeepSeekPlan, DeepSeekApproval)>) -> Result<Self> {
         // Existing workspace is rejected without opening or mutating it.
         if root.try_exists().map_err(|_| "PATH_REJECTED")? {
             return Err("CREATE_NEW_REJECTED");
@@ -1925,13 +1941,13 @@ impl Store {
         fs::create_dir(&fixture).map_err(|_| "CREATE_NEW_REJECTED")?;
         fs::create_dir(fixture.join("pilot")).map_err(|_| "CREATE_NEW_REJECTED")?;
         fs::create_dir(fixture.join("pilot/src")).map_err(|_| "CREATE_NEW_REJECTED")?;
-        new_file(&fixture.join(API_TARGET), API_FIXTURE)?;
+        new_file(&fixture.join(API_TARGET), real.as_ref().map(|r|r.0.snapshot.as_bytes()).unwrap_or(API_FIXTURE))?;
         let reports = run.join("reports");
         fs::create_dir(&reports).map_err(|_| "CREATE_NEW_REJECTED")?;
         let rg = Guard::open(&fixture, true)?;
         let mut fg = Guard::open(&fixture.join(API_TARGET), false)?;
         let b = fg.bytes(65536)?;
-        if b != API_FIXTURE {
+        if hash(&b) != req.base_sha256 {
             return Err("BASE_CHANGED");
         }
         let m = Manifest {
@@ -1947,7 +1963,7 @@ impl Store {
             required_reports: vec![ReportType::Development, ReportType::Review, ReportType::Ci],
             baseline: Baseline {
                 mode: "DECLARED".into(),
-                base_sha: Some(API_B.into()),
+                base_sha: Some(real.as_ref().map(|r|r.0.declared_source_sha.clone()).unwrap_or_else(||API_B.into())),
             },
             eol_policy: "false".into(),
         };
@@ -1976,17 +1992,30 @@ impl Store {
             delivery_identity: String::new(),
             envelope_id: String::new(),
         };
-        e.bind(&m)?;
-        let store = Self::init_version(&root, &m, &e, fault, 3, None)?;
+        if let Some((p, _)) = &real {
+            e.head=p.declared_source_sha.clone(); e.base=e.head.clone(); e.parent.clear();e.git_dir=rg.path.join(".human-snapshot-no-git").to_string_lossy().into();
+            e.base_source="HUMAN_ATTESTED".into();e.tree.clear();e.ancestors.clear();
+            e.outside_scope_notice="HUMAN_SNAPSHOT_NOT_GIT_SAMPLE".into();
+        }
+        if real.is_some(){e.bind_human_snapshot(&m)?;}else{e.bind(&m)?;}
+        let store = Self::init_version(&root, &m, &e, fault, if real.is_some(){4}else{3}, None)?;
         let plan = ApiPlan::bind(req, e.delivery_identity.clone(), hash(raw));
-        let text = encoded(&plan)?;
+        let text = if let Some((plan, approval)) = real {
+            {let core=plan.core(e.delivery_identity.clone())?;
+            let develop_input_sha256=hash(&super::relay::api_develop_input(&core,plan.snapshot.as_bytes())?);
+            encoded(&DeepSeekRecord{core,plan,approval,develop_input_sha256})?}
+        } else { encoded(&plan)? };
         let id = hash(text.as_bytes());
         let run_guard = Guard::open(&run, true)?;
         let db = store.write_connection()?;
-        sql(db.conn().execute("INSERT INTO relay_plans VALUES(?1,?2,?3,?1,0,?4,?5,'API_INJECTED','API_JSON_INJECTED_V1',?6)",params![id,m.package_id,text,run_guard.path.to_string_lossy(),run_guard.identity,chrono::Utc::now().to_rfc3339()]))?;
+        let is_real = e.base_source == "HUMAN_ATTESTED";
+        sql(db.conn().execute("INSERT INTO relay_plans VALUES(?1,?2,?3,?1,0,?4,?5,?7,?8,?6)",params![id,m.package_id,text,run_guard.path.to_string_lossy(),run_guard.identity,chrono::Utc::now().to_rfc3339(),if is_real {"DEEPSEEK_DIRECT"}else{"API_INJECTED"},if is_real {"DEEPSEEK_CHAT_JSON_V1"}else{"API_JSON_INJECTED_V1"}]))?;
         drop(db);
         drop(store);
-        Self::api_open(&root)
+        if is_real {Self::deepseek_open(&root)} else {Self::api_open(&root)}
+    }
+    pub fn deepseek_open(root: &Path) -> Result<Self> {
+        let s=Self::open_version(root,4)?;s.api_plan()?;s.api_attempts()?;Ok(s)
     }
     pub fn api_open(root: &Path) -> Result<Self> {
         let s = Self::open_kind(root, true)?;
@@ -2002,21 +2031,20 @@ impl Store {
             [],
             |r| r.get(0),
         ))?;
-        if version != 3 {
-            return Err("API_STORE_VERSION_REQUIRED");
-        }
+        if version != 3 && version != 4 { return Err("API_STORE_VERSION_REQUIRED"); }
         let row=sql(c.query_row("SELECT plan_id,plan_json,plan_sha256,package_id,registration_revision,run_root,run_root_identity,backend_kind,protocol FROM relay_plans",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?))))?;
-        let p: ApiPlan = api_json(row.1.as_bytes(), 65536)?;
-        p.validate()?;
+        let p: ApiPlan = if version == 4 {
+            let r:DeepSeekRecord=api_json(row.1.as_bytes(),65536)?;r.validate()?;r.core
+        } else {let p:ApiPlan=api_json(row.1.as_bytes(),65536)?;p.validate()?;p};
         if row.0 != hash(row.1.as_bytes())
             || row.0 != row.2
-            || encoded(&p)? != row.1
+            || (version == 3 && encoded(&p)? != row.1)
             || p.package_id != snap.manifest.package_id
             || row.3 != p.package_id
             || row.4 != p.registration_revision
             || p.input_delivery_identity != snap.delivery
-            || snap.base_source != "INJECTED_TEST"
-            || row.7 != "API_INJECTED"
+            || snap.base_source != if version==4 {"HUMAN_ATTESTED"} else {"INJECTED_TEST"}
+            || row.7 != if version==4 {"DEEPSEEK_DIRECT"}else{"API_INJECTED"}
             || row.8 != p.protocol
         {
             return Err("BINDING_MISMATCH");
@@ -2033,6 +2061,18 @@ impl Store {
             return Err("EVIDENCE_ROOT_CHANGED");
         }
         let root = Guard::open(Path::new(&s.manifest.repo_path), true)?;
+        if p.mode == "REAL_API" {
+            let mut file=Guard::open(&root.path.join(API_TARGET),false)?;let b=file.bytes(8192)?;
+            let mut rebound=e.clone();rebound.bind_human_snapshot(&s.manifest)?;
+            if root.identity!=e.root_identity || s.delivery!=p.input_delivery_identity || s.revision!=0
+                || s.invalidated || s.closed || hash(&b)!=p.base_sha256 || e.base_source!="HUMAN_ATTESTED"
+                || e.head!=p.input_base_sha || !e.parent.is_empty() || !e.tree.is_empty() || !e.ancestors.is_empty()
+                || Path::new(&e.git_dir)!=root.path.join(".human-snapshot-no-git") || Path::new(&e.git_dir).try_exists().map_err(|_|"PATH_REJECTED")?
+                || rebound.envelope_id!=e.envelope_id
+                || e.files!=vec![FileFact{path:API_TARGET.into(),bytes:b.len() as u64,sha256:hash(&b),identity:file.identity.clone()}]
+                {return Err("BASE_CHANGED");}
+            return Ok(b);
+        }
         if root.identity != e.root_identity
             || s.delivery != p.input_delivery_identity
             || s.revision != 0
@@ -2110,8 +2150,8 @@ impl Store {
                 || meta.role != role
                 || meta.input_sha256 != r.4
                 || meta.body_sha256 != r.7
-                || meta.source != "INJECTED"
-                || meta.logical_endpoint != "INJECTED_CHAT_ENDPOINT"
+                || meta.source != if p.mode=="REAL_API" {"REAL_API"}else{"INJECTED"}
+                || meta.logical_endpoint != if p.mode=="REAL_API" {"https://api.deepseek.com/chat/completions"}else{"INJECTED_CHAT_ENDPOINT"}
                 || meta.protocol != p.protocol
                 || meta.schema != "nova.scheduler.api-request/1"
                 || &meta.requested_model
@@ -2157,7 +2197,7 @@ impl Store {
             }
             if let Some(f) = &a.facts {
                 if f.schema != "nova.scheduler.api-facts/1"
-                    || f.source != "INJECTED"
+                    || f.source != if p.mode=="REAL_API" {"REAL_API"}else{"INJECTED"}
                     || f.request_bytes != a.meta.body_bytes
                     || f.transport_state != a.state
                 {
@@ -2178,7 +2218,11 @@ impl Store {
                 }
                 if a.role == RelayRole::Develop {
                     let raw = serde_json::to_vec(claim).map_err(|_| "ENCODING")?;
-                    let (c, review) = super::relay::api_review_input(&p, &id, API_FIXTURE, &raw)?;
+                    let historic = if p.mode=="REAL_API" {
+                        let text:String=sql(c.query_row("SELECT plan_json FROM relay_plans WHERE plan_id=?1",[&id],|r|r.get(0)))?;
+                        let record:DeepSeekRecord=api_json(text.as_bytes(),65536)?;record.validate()?;record.plan.snapshot.into_bytes()
+                    }else{API_FIXTURE.to_vec()};
+                    let (c, review) = super::relay::api_review_input(&p, &id, &historic, &raw)?;
                     let binding = a.binding.as_ref().ok_or("BINDING_MISMATCH")?;
                     if binding["plan_id"] != id
                         || binding["candidate_sha256"] != c.candidate_sha256
@@ -2250,16 +2294,13 @@ impl Store {
                 .map_err(|_| "ENCODING")?;
             super::relay::api_review_input(&p, &id, &base, &raw)?.1
         };
-        let mut secrets = super::api_adapter::InjectedSecrets;
-        let secret = super::api_adapter::SecretProvider::acquire(&mut secrets, meta.role, &id)?;
-        let expected = super::api_adapter::make_request(
-            meta.role,
-            &p,
-            &id,
-            &expected_input,
-            meta.parent_attempt_id.clone(),
-            &secret,
-        )?;
+        let expected = if p.mode=="REAL_API" {
+            super::deepseek_transport::reconstruct_request(meta.role,&p,&id,&expected_input,meta.parent_attempt_id.clone())?
+        } else {
+            let mut secrets=super::api_adapter::InjectedSecrets;
+            let secret=super::api_adapter::SecretProvider::acquire(&mut secrets,meta.role,&id)?;
+            super::api_adapter::make_request(meta.role,&p,&id,&expected_input,meta.parent_attempt_id.clone(),&secret)?
+        };
         if encoded(&expected.meta)? != encoded(&meta)? {
             return Err("BINDING_MISMATCH");
         }
@@ -2376,4 +2417,11 @@ impl Store {
         };
         new_file(&g.path.join(name), bytes)
     }
+}
+
+fn deepseek_schema() -> String {
+    API_SCHEMA.replace("schema_version=3", "schema_version=4")
+        .replace("base_source='INJECTED_TEST'", "base_source='HUMAN_ATTESTED'")
+        .replace("backend_kind='API_INJECTED'", "backend_kind='DEEPSEEK_DIRECT'")
+        .replace("protocol='API_JSON_INJECTED_V1'", "protocol='DEEPSEEK_CHAT_JSON_V1'")
 }

@@ -1301,7 +1301,14 @@ pub fn api_status(store: &Store) -> Result<Value> {
         next = "PM_REQUIRED"
     }
     let e = store.audit_envelope()?;
-    let value = json!({"schema":"nova.scheduler.api-summary/1","mode":"API_INJECTED_ONLY","source":"INJECTED","native_executed":false,"network_executed":false,"execution_authorized":false,"next_execution_authorized":false,"delivery_sha":null,"package_id":p.package_id,"plan_id":id,"plan_request_sha256":p.plan_request_sha256,"input_base_sha":{"value":p.input_base_sha,"source":"INJECTED_TEST"},"input_delivery_identity":{"value":p.input_delivery_identity,"source":"TOOL_COMPUTED_FROM_INJECTED_TEMPLATE_AND_GUARD"},"git_identity_source":ApiSource::InjectedTest,"file_facts":{"source":"TOOL_FILE_HASH","files":e.files},"store_facts_source":"LOCAL_STORE_READ","facts":attempts,"unknowns":unknowns,"next_action":next,"suggestion_only":true});
+    let mut value = json!({"schema":"nova.scheduler.api-summary/1","mode":"API_INJECTED_ONLY","source":"INJECTED","native_executed":false,"network_executed":false,"execution_authorized":false,"next_execution_authorized":false,"delivery_sha":null,"package_id":p.package_id,"plan_id":id,"plan_request_sha256":p.plan_request_sha256,"input_base_sha":{"value":p.input_base_sha,"source":"INJECTED_TEST"},"input_delivery_identity":{"value":p.input_delivery_identity,"source":"TOOL_COMPUTED_FROM_INJECTED_TEMPLATE_AND_GUARD"},"git_identity_source":ApiSource::InjectedTest,"file_facts":{"source":"TOOL_FILE_HASH","files":e.files},"store_facts_source":"LOCAL_STORE_READ","facts":attempts,"unknowns":unknowns,"next_action":next,"suggestion_only":true});
+    if p.mode=="REAL_API" {
+        value["mode"]=json!("REAL_API");value["source"]=json!("DEEPSEEK_DIRECT");
+        value["network_executed"]=if attempts.iter().any(|a|a.facts.as_ref().is_some_and(|f|f.response_status.is_some())) {json!(true)} else if attempts.iter().any(|a|a.facts.as_ref().is_some_and(|f|f.dispatch_invoked)) {Value::Null}else{json!(false)};
+        value["input_base_sha"]=json!({"value":p.input_base_sha,"source":"HUMAN_ATTESTED"});
+        value["git_identity_source"]=json!("HUMAN_ATTESTED");
+        value["input_delivery_identity"]=json!({"value":p.input_delivery_identity,"source":"TOOL_BOUND_HUMAN_SNAPSHOT"});
+    }
     if serde_json::to_vec(&value).map_err(|_| "ENCODING")?.len() > 65536 {
         return Err("BOUND");
     }
@@ -1332,6 +1339,7 @@ pub(crate) fn api_review_input(
     Ok((c, b))
 }
 pub fn run_api(store: &Store) -> Result<Value> {
+    if store.api_plan()?.1.mode != "API_INJECTED_ONLY" {return Err("REAL_API_NOT_AUTHORIZED");}
     let mut t = super::api_adapter::InjectedTransport { calls: 0 };
     let mut secrets = super::api_adapter::InjectedSecrets;
     let mut counter = super::api_adapter::InjectedCounter;
@@ -1364,6 +1372,7 @@ pub(crate) fn run_api_with(
     let base = store.api_base()?;
     let mut input = api_develop_input(&p, &base)?;
     let mut parent = None;
+    let real = p.mode == "REAL_API";
     let mut used = 0u64;
     for role in [RelayRole::Develop, RelayRole::Review] {
         let now = clock.now_ms();
@@ -1381,6 +1390,7 @@ pub(crate) fn run_api_with(
         // Safety scan occurs before hashes or reservation. Request hash excludes all authentication.
         secret.scan_json(&input, 131072)?;
         let req = make_request(role, &p, &id, &input, parent.clone(), &secret)?;
+        if !real {
         let count = checked_count(
             counter,
             &req.meta.requested_model,
@@ -1394,6 +1404,7 @@ pub(crate) fn run_api_with(
         {
             return Err("TOKEN_BOUND");
         }
+        }
         if cancel.load(Ordering::Acquire) || clock.now_ms() >= end {
             return Err("DEADLINE");
         }
@@ -1404,7 +1415,7 @@ pub(crate) fn run_api_with(
         if cancel.load(Ordering::Acquire) || clock.now_ms() >= end {
             a.facts = Some(ApiFacts {
                 schema: "nova.scheduler.api-facts/1".into(),
-                source: "INJECTED".into(),
+                source: if real {"REAL_API"}else{"INJECTED"}.into(),
                 dispatch_invoked: false,
                 response_status: None,
                 request_bytes: req.body.len() as u64,
@@ -1424,7 +1435,7 @@ pub(crate) fn run_api_with(
         let result = transport.send(&req, &secret, &permit, end, clock, cancel);
         let mut facts = ApiFacts {
             schema: "nova.scheduler.api-facts/1".into(),
-            source: "INJECTED".into(),
+            source: if real {"REAL_API"}else{"INJECTED"}.into(),
             dispatch_invoked: true,
             response_status: result.status,
             request_bytes: req.body.len() as u64,
@@ -1479,7 +1490,7 @@ pub(crate) fn run_api_with(
                             &secret,
                         )?;
                         a.binding = Some(
-                            json!({"plan_id":id,"candidate_sha256":c.candidate_sha256,"review_input_sha256":hash(&review)}),
+                            if real {json!({"plan_id":id,"candidate_sha256":c.candidate_sha256,"review_input_sha256":hash(&review),"proposal_sha256":c.proposal_sha256,"diff_sha256":c.diff_sha256})} else {json!({"plan_id":id,"candidate_sha256":c.candidate_sha256,"review_input_sha256":hash(&review)})},
                         );
                         review_input = Some(review);
                     } else {
@@ -1497,6 +1508,15 @@ pub(crate) fn run_api_with(
                                 .ok_or("BINDING_MISMATCH")?,
                         )?;
                     }
+                    if real {
+                        let reported=secret.scan_response(&result.body)?;
+                        let mut usage=json!({});
+                        for field in ["prompt_tokens","completion_tokens","total_tokens","prompt_cache_hit_tokens","prompt_cache_miss_tokens"] {
+                            usage[field]=reported["usage"][field].clone();
+                        }
+                        let binding=a.binding.get_or_insert_with(||json!({}));
+                        binding["usage"]=usage;binding["usage_source"]=json!("UPSTREAM_REPORTED");
+                    }
                     a.model_claim = Some(api_json(&raw, 65536)?);
                     facts.response_sha256 = Some(hash(&result.body));
                     response_artifact = Some(result.body.clone());
@@ -1513,7 +1533,7 @@ pub(crate) fn run_api_with(
                 // Provider usage is a claim, not a second exact input count. Count local output separately.
                 let completion = output_usage;
                 used = used.checked_add(completion).ok_or("TOKEN_BOUND")?;
-                if used > 24576 {
+                if !real && used > 24576 {
                     facts.error_code = "TOKEN_BOUND".into();
                     review_input = None;
                 }
@@ -1532,7 +1552,8 @@ pub(crate) fn run_api_with(
             facts.unknowns.push("PARTIAL_DEADLINE".into());
             review_input = None;
         }
-        let to = if !facts.local_resources_released {
+        if real && (result.status.is_none() || result.error.is_some() || cancel.load(Ordering::Acquire) || clock.now_ms()>=end) { facts.unknowns.push("REMOTE_EFFECT_UNKNOWN".into()); }
+        let to = if !facts.local_resources_released || (real && result.status.is_none()) {
             "UNKNOWN"
         } else if result.status.is_some() {
             "RESPONSE_RECEIVED"

@@ -1370,3 +1370,103 @@ pub fn api_json<T: serde::de::DeserializeOwned>(b: &[u8], cap: usize) -> Result<
     walk(&v, 0, &mut 0)?;
     serde_json::from_value(v).map_err(|_| "SCHEMA_REJECTED")
 }
+
+// A real request is never accepted by the injected initializer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeepSeekPlan {
+    pub schema: String,
+    pub package_id: String,
+    pub declared_source_sha: String,
+    pub snapshot: String,
+    pub goal: String,
+    pub proxy_policy: String,
+    pub review_rule: String,
+}
+impl DeepSeekPlan {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != "nova.deepseek.plan/1" || !id(&self.package_id)
+            || !hex(&self.declared_source_sha, 40) || self.snapshot.is_empty()
+            || self.snapshot.len() > 8192 || self.snapshot.contains(['\0','\r'])
+            || !self.snapshot.lines().any(|l|l==RELAY_SIGNATURE)
+            || self.goal.trim().is_empty() || self.goal.len() > 4096
+            || self.proxy_policy != "EXPLICIT_DIRECT" || self.review_rule != "CANDIDATE_DIFF_PROPOSAL_V1"
+        { return Err("REAL_PLAN_REJECTED"); }
+        Ok(())
+    }
+    pub fn digest(&self) -> Result<String> {
+        self.validate()?;
+        Ok(hash(&serde_json::to_vec(self).map_err(|_| "ENCODING")?))
+    }
+}
+/// Created only by the local explicit approval operation, never from model output or a plan bool.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeepSeekApproval {
+    plan_sha256: String,
+    snapshot_sha256: String,
+    approval_id: String,
+    endpoint: String,
+    model: String,
+    max_requests: u8,
+    no_money_limit: bool,
+    wire_policy_sha256: String,
+}
+fn deepseek_policy_hash()->String {hash(b"DEEPSEEK_CHAT_JSON_V1|deepseek-flash|thinking=disabled|stream=false|max_tokens=4096|json_object|requests=2|request=65536|response=131072|stage=45000|total=120000|CANDIDATE_DIFF_PROPOSAL_V1|NO_MONEY_LIMIT")}
+impl DeepSeekApproval {
+    pub(crate) fn local_confirm(plan: &DeepSeekPlan, confirmed_digest: &str) -> Result<Self> {
+        let digest = plan.digest()?;
+        if digest != confirmed_digest { return Err("APPROVAL_REQUIRED"); }
+        Ok(Self { plan_sha256: digest, snapshot_sha256: hash(plan.snapshot.as_bytes()),
+            approval_id: uuid::Uuid::new_v4().to_string(),
+            endpoint: "https://api.deepseek.com/chat/completions".into(), model: "deepseek-flash".into(),
+            max_requests: 2, no_money_limit: true,wire_policy_sha256:deepseek_policy_hash() })
+    }
+    pub fn validate(&self, plan: &DeepSeekPlan) -> Result<()> {
+        if self.plan_sha256 != plan.digest()? || self.snapshot_sha256 != hash(plan.snapshot.as_bytes())
+            || uuid::Uuid::parse_str(&self.approval_id).is_err()
+            || self.endpoint != "https://api.deepseek.com/chat/completions" || self.model != "deepseek-flash"
+            || self.max_requests != 2 || !self.no_money_limit || self.wire_policy_sha256!=deepseek_policy_hash() { return Err("APPROVAL_REQUIRED"); }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeepSeekRecord {
+    pub plan: DeepSeekPlan,
+    pub approval: DeepSeekApproval,
+    pub core: ApiPlan,
+    pub develop_input_sha256: String,
+}
+impl DeepSeekRecord {
+    pub fn validate(&self) -> Result<()> {
+        self.approval.validate(&self.plan)?;
+        let expected = self.plan.core(self.core.input_delivery_identity.clone())?;
+        if self.develop_input_sha256 != hash(&super::relay::api_develop_input(&self.core,self.plan.snapshot.as_bytes())?) || relay_encoded(&expected)? != relay_encoded(&self.core)? { return Err("BINDING_MISMATCH"); }
+        Ok(())
+    }
+}
+impl DeepSeekPlan {
+    pub fn core(&self, delivery: String) -> Result<ApiPlan> {
+        self.validate()?;
+        Ok(ApiPlan { schema:"nova.scheduler.api-plan/1".into(), mode:"REAL_API".into(),
+            package_id:self.package_id.clone(), registration_revision:0,
+            input_base_sha:self.declared_source_sha.clone(),input_delivery_identity:delivery,
+            target_path:API_TARGET.into(),base_sha256:hash(self.snapshot.as_bytes()),goal:self.goal.clone(),
+            constraints:vec!["Proposal only; never execute tools or write source".into()],examples:vec![],
+            protocol:"DEEPSEEK_CHAT_JSON_V1".into(),model_develop:"deepseek-flash".into(),model_review:"deepseek-flash".into(),
+            limits:ApiLimits{stage_ms:45000,total_ms:120000,input_tokens:8192,output_tokens:4096},
+            pm_decision_ref:"LOCAL_EXPLICIT_APPROVAL".into(),plan_request_sha256:self.digest()? })
+    }
+}
+
+impl Envelope {
+    pub(crate) fn bind_human_snapshot(&mut self,m:&Manifest)->Result<()> {
+        if self.base_source!="HUMAN_ATTESTED" || self.outside_scope_notice!="HUMAN_SNAPSHOT_NOT_GIT_SAMPLE"
+            || !hex(&self.head,40) || self.base!=self.head || !self.parent.is_empty()
+            || !self.tree.is_empty() || !self.ancestors.is_empty() {return Err("VERSION_UNKNOWN");}
+        self.delivery_identity=hash(&serde_json::to_vec(&("HUMAN_SNAPSHOT_V1",&m.package_id,&self.root_identity,&self.head,&m.allowed_paths,&self.files)).map_err(|_|"ENCODING")?);
+        self.envelope_id.clear();self.envelope_id=hash(&serde_json::to_vec(self).map_err(|_|"ENCODING")?);Ok(())
+    }
+}

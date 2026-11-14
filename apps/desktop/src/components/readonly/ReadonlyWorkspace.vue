@@ -2,11 +2,14 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useReadonlyWorkspace } from '../../stores/readonlyWorkspace'
+import RequirementDraftEditor from './RequirementDraftEditor.vue'
 import ReadonlyEvidenceDrawer from './ReadonlyEvidenceDrawer.vue'
 import { copy, tokens, stage, type Language } from './text'
 const emit = defineEmits<{ close: [] }>()
 const store = useReadonlyWorkspace()
 const language = ref<Language>('zh'), theme = ref<'green' | 'paper'>('green')
+const editing = ref(false), draftEditor = ref<InstanceType<typeof RequirementDraftEditor>>()
+function returnToLegacy() { if (editing.value) draftEditor.value?.requestLeave(() => emit('close')); else emit('close') }
 const drawer = ref(false), sidebar = ref(true), notificationError = ref(false)
 const t = computed(() => copy[language.value])
 const selectedTask = computed(() => store.tasks.find(task => task.id === store.taskId))
@@ -35,10 +38,11 @@ onUnmounted(() => { disposed = true; if (timer) clearInterval(timer); unlisten?.
   <div class="ro" :style="tokens[theme]" :lang="language === 'zh' ? 'zh-CN' : 'en'" @keydown.esc="drawer = false">
     <header class="ro-header">
       <div class="ro-brand"><span class="ro-mark">N</span><div><strong>Nova</strong><small>{{ t.preview }}</small></div></div>
-      <span class="ro-badge">{{ t.readonly }}</span>
-      <div class="ro-tools"><button type="button" data-language @click="language = language === 'zh' ? 'en' : 'zh'">{{ t.language }}</button><button type="button" @click="theme = theme === 'green' ? 'paper' : 'green'">{{ theme === 'green' ? t.theme : t.green }}</button><button type="button" data-return @click="emit('close')">{{ t.back }}</button></div>
+      <span class="ro-badge">{{ editing ? t.formalDraft : t.readonly }}</span>
+      <div class="ro-tools"><button type="button" data-language @click="language = language === 'zh' ? 'en' : 'zh'">{{ t.language }}</button><button type="button" @click="theme = theme === 'green' ? 'paper' : 'green'">{{ theme === 'green' ? t.theme : t.green }}</button><button type="button" data-return @click="returnToLegacy">{{ t.back }}</button></div>
     </header>
-    <div class="ro-body" :class="{ 'drawer-open': drawer }">
+    <RequirementDraftEditor v-if="editing" ref="draftEditor" :project-id="store.projectId" :project-name="store.projects.find(p => p.id === store.projectId)?.name ?? store.projectId" :task-id="store.taskId || undefined" :language="language" @close="editing = false" />
+    <div v-else class="ro-body" :class="{ 'drawer-open': drawer }">
       <aside v-if="sidebar" class="ro-projects" :aria-label="t.projects">
         <h2>{{ t.projects }}</h2><p v-if="store.projectsLoading" role="status">{{ t.loading }}</p>
         <p v-if="store.projectsError" role="alert">{{ t.readError }} <button @click="store.loadProjects()">{{ t.refresh }}</button></p>
@@ -51,7 +55,7 @@ onUnmounted(() => { disposed = true; if (timer) clearInterval(timer); unlisten?.
         <button v-for="task in store.tasks" :key="task.id" type="button" class="ro-choice" :class="{ selected: store.taskId === task.id }" :data-task="task.id" :aria-pressed="store.taskId === task.id" @click="store.selectTask(task.id)"><strong>{{ task.title }}</strong><small>{{ stage(task.state, language) }}</small></button>
       </aside>
       <main class="ro-main">
-        <div class="ro-context"><button type="button" :aria-expanded="sidebar" @click="sidebar = !sidebar">{{ t.showSidebar }}</button><span>{{ selectedTask?.title ?? t.title }}</span><button type="button" data-evidence-toggle :aria-expanded="drawer" @click="drawer = !drawer">{{ drawer ? t.close : t.evidence }}</button></div>
+        <div class="ro-context"><button type="button" data-formal-entry :disabled="!store.projectId" @click="editing = true">{{ t.formalDraft }}</button><button type="button" :aria-expanded="sidebar" @click="sidebar = !sidebar">{{ t.showSidebar }}</button><span>{{ selectedTask?.title ?? t.title }}</span><button type="button" data-evidence-toggle :aria-expanded="drawer" @click="drawer = !drawer">{{ drawer ? t.close : t.evidence }}</button></div>
         <div class="ro-feed">
           <div class="ro-kicker">NOVA · {{ t.readonly }}</div><h1>{{ selectedTask?.title ?? t.title }}</h1><p class="ro-intro">{{ t.intro }}</p>
           <div v-if="!store.taskId" class="ro-empty"><span aria-hidden="true">◌</span><h2>{{ store.projectId ? t.chooseTask : t.chooseProject }}</h2></div>

@@ -1,7 +1,7 @@
 export type Language = 'zh' | 'en'
 export const copy = {
   zh: {
-    title: '任务只读工作台', preview: '新版只读预览', back: '返回原界面', projects: '项目', tasks: '任务记录',
+    formalDraft: '正式需求草稿…', title: '任务只读工作台', preview: '新版只读预览', back: '返回原界面', projects: '项目', tasks: '任务记录',
     chooseProject: '选择现有项目', chooseTask: '选择任务查看记录', emptyProjects: '暂无已登记项目', emptyTasks: '此项目暂无任务记录',
     intro: '查看已有工作与证据。这里不发送请求、不启动任务，也不确认完成。',
     recorded: '记录阶段', unknown: '尚无可确认的记录', liveUnknown: '记录不证明进程当前存活',
@@ -17,7 +17,7 @@ export const copy = {
     exit: '退出码', approved: '已接受', rejected: '未接受', showSidebar: '项目与任务', needsAction: '需要用户处理',
   },
   en: {
-    title: 'Task record workspace', preview: 'Read-only preview', back: 'Back to original UI', projects: 'Projects', tasks: 'Task records',
+    formalDraft: 'Persistent requirement draft…', title: 'Task record workspace', preview: 'Read-only preview', back: 'Back to original UI', projects: 'Projects', tasks: 'Task records',
     chooseProject: 'Select an existing project', chooseTask: 'Choose a task to read', emptyProjects: 'No registered projects', emptyTasks: 'No task records in this project',
     intro: 'Read existing work and evidence. This view cannot send, start tasks or accept completion.',
     recorded: 'Recorded stage', unknown: 'No confirmed record yet', liveUnknown: 'A record does not prove the process is alive',

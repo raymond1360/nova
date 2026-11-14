@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, defineAsyncComponent, onMounted, onUnmounted, ref } from 'vue'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useNovaStore } from './stores/nova'
 import { applyStreamChunk, applyStreamError } from './chatEvents'
 import type { ChatMessage, DirectoryStatus, ToolStatus } from './types'
 import CoreLoopView from './components/CoreLoopView.vue'
 
+const ReadonlyWorkspace = defineAsyncComponent(() => import('./components/readonly/ReadonlyWorkspace.vue'))
+const readonlyPreview = ref(false)
 const store = useNovaStore()
 const providerName = ref('SDKMAX')
 const baseUrl = ref('https://api.sdkmax.com')
@@ -198,7 +200,8 @@ const environmentDiagnostics = computed(() => {
 </script>
 
 <template>
-  <main class="shell">
+  <ReadonlyWorkspace v-if="readonlyPreview" @close="readonlyPreview = false" />
+  <main v-else class="shell">
     <aside class="sidebar">
       <div class="brand">
         <span class="brand-mark">N</span>
@@ -208,6 +211,7 @@ const environmentDiagnostics = computed(() => {
         </div>
       </div>
       <nav class="nav">
+        <button data-readonly-entry @click="readonlyPreview = true">新版只读预览 / Read-only preview</button>
         <button :class="{ active: store.activeTab === 'chat' }" @click="store.activeTab = 'chat'">聊天</button>
         <button :class="{ active: store.activeTab === 'providers' }" @click="store.activeTab = 'providers'">
           供应商

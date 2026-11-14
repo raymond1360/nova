@@ -61,9 +61,9 @@ onUnmounted(() => { if (e.value) e.value.composing = false; if (store.activeKey 
   <section class="rd-editor" data-draft-editor :aria-label="t('正式需求草稿编辑', 'Persistent requirement draft editor')">
     <header><h1>{{ t('正式持久草稿；未确认、未创建任务', 'Persistent draft; not confirmed, no task created here') }}</h1>
       <p>{{ t('项目', 'Project') }}: {{ projectName }} · {{ project }}</p>
-      <p>{{ t('未保存输入只保留在本窗口内存；刷新或关闭可能丢失。只点击保存按钮才保存。', 'Unsaved input stays in window memory only and may be lost on reload or close. Only Save writes your edits.') }}</p>
       <button type="button" data-draft-back :disabled="pending" @click="requestLeave()">{{ t('返回只读预览', 'Back to read-only preview') }}</button>
     </header>
+    <p class="rd-warning" data-reload-warning>{{ t('未保存输入只保留在本窗口内存；刷新或关闭可能丢失。保存中关闭可能使结果未知，请勿另建请求重复保存。只点击保存按钮才保存。', 'Unsaved input stays in window memory only and may be lost on reload or close. Closing during a save may leave its result unknown; do not create a duplicate save request. Only Save writes your edits.') }}</p>
     <div v-if="!opened" data-open-notice>
       <p>{{ t('明确打开后会访问产品库，必要时创建会话和空草稿；不会确认需求或创建任务。不会导入本窗口草稿。', 'Opening accesses the product database and may create a conversation and empty draft. It does not confirm requirements, create a task or import your window draft.') }}</p>
       <p>{{ t('来源任务', 'Source task') }}: {{ task ?? t('无（项目草稿）', 'None (project draft)') }}</p>
@@ -101,6 +101,7 @@ onUnmounted(() => { if (e.value) e.value.composing = false; if (store.activeKey 
 </template>
 <style scoped>
 .rd-editor { flex: 1; overflow: auto; padding: 24px; max-width: 100%; min-height: 0; }
+.rd-warning { position: sticky; top: 0; z-index: 2; background: var(--ro-bg); border: 1px solid var(--ro-border); padding: 10px; }
 h1 { font-size: 22px; } label { display: block; margin: 14px 0; }
 textarea { display: block; box-sizing: border-box; width: 100%; min-height: 75px; resize: vertical; }
 button, select, textarea { font: inherit; color: inherit; border: 1px solid var(--ro-border); border-radius: 7px; padding: 9px; background: var(--ro-bg); }

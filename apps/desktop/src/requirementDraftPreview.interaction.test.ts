@@ -3,6 +3,7 @@ import { createPinia, setActivePinia } from 'pinia'
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }))
 import { invoke } from '@tauri-apps/api/core'
+import App from './App.vue'
 import Workspace from './components/readonly/ReadonlyWorkspace.vue'
 import { useWorkspaceStore, type Draft } from './stores/workspace'
 import { useReadonlyWorkspace } from './stores/readonlyWorkspace'
@@ -19,6 +20,9 @@ beforeEach(() => {
   vi.useFakeTimers(); setActivePinia(createPinia()); ipc.mockReset(); calls = []; drafts = {}; intercept = undefined
   const cache = new Map<string, string>(); vi.stubGlobal('sessionStorage', { getItem: (k: string) => cache.get(k) ?? null, setItem: (k: string, v: string) => cache.set(k, v) })
   ipc.mockImplementation(async (cmd, args: any) => {
+    if (cmd === 'initialize_app') return undefined
+    if (cmd === 'get_provider' || cmd === 'get_setting') return null as any
+    if (cmd === 'list_conversations') return [] as any
     if (cmd === 'list_projects') return [{ id: 'p', name: 'Fixture', local_path: 'fixture' }, { id: 'q', name: 'Other', local_path: 'other' }] as any
     if (cmd === 'list_tasks_for_project') return ['a','b'].map(id => ({ id, project_id: args.projectId, title: id, state: 'draft' })) as any
     if (cmd === 'get_task_evidence_overview') return { timeline: [], commands: [], tests: [], builds: [], file_changes: [], git_events: [], acceptance_history: [] } as any
@@ -75,5 +79,52 @@ describe('manual persistent draft actual preview integration', () => {
     await vi.advanceTimersByTimeAsync(5000); expect(ops()).toEqual(['open']); intercept = undefined; await click(node('data-retry-open')); await edit('retain')
     await click(node('data-return')); await click(node('data-leave-stay')); expect(node('data-formal-field','goal_raw').value).toBe('retain')
     mounted!.unmount(); mounted = undefined; expect(ops()).not.toContain('save')
+  })
+})
+
+// Exercise the actual production App v-if/close path, not an artificial parent unmount.
+async function appPreview() {
+  mounted = renderComponent(App, createPinia()); await settle()
+  await click(node('data-readonly-entry')); await vi.dynamicImportSettled(); await settle()
+  await click(node('data-project', 'p')); await click(node('data-task', 'a'))
+}
+async function reenterAppDraft() {
+  await click(node('data-readonly-entry')); await vi.dynamicImportSettled(); await settle()
+  await click(node('data-project', 'p')); await click(node('data-task', 'a'))
+  await click(node('data-formal-entry')); await click(node('data-open-project'))
+}
+describe('actual App leave path and request retention', () => {
+  it('guards parent removal for dirty input, retains it through App return/reentry, and never autosaves', async () => {
+    await appPreview(); await open(); await edit('  keep\nexact\n')
+    await click(node('data-return')); expect(node('data-leave-prompt')).toBeTruthy()
+    await click(node('data-leave-stay')); expect(node('data-draft-editor')).toBeTruthy()
+    await click(node('data-return')); await click(node('data-leave-keep'))
+    expect(all(mounted!.root,n=>n.props['data-draft-editor']!==undefined)).toHaveLength(0)
+    expect(useWorkspaceStore().entries['p:initial'].fields.goal_raw).toBe('  keep\nexact\n')
+    await reenterAppDraft(); expect(node('data-formal-field','goal_raw').value).toBe('  keep\nexact\n')
+    expect(ops()).not.toContain('save'); mounted!.unmount(); mounted=undefined; expect(ops()).not.toContain('save')
+  })
+  it('requires a choice for IME even without dirty fields on both controlled return paths', async () => {
+    await appPreview(); await open(); node('data-formal-field','goal_raw').props.onCompositionstart(); await settle()
+    expect(useWorkspaceStore().current?.dirty).toBe(false)
+    await click(node('data-return')); expect(node('data-leave-prompt')).toBeTruthy(); await click(node('data-leave-stay'))
+    await click(node('data-draft-back')); expect(node('data-leave-prompt')).toBeTruthy(); await click(node('data-leave-keep'))
+    expect(ops()).not.toContain('save'); await click(node('data-task','b')); expect(useWorkspaceStore().entries['p:initial']).toBeTruthy()
+  })
+  it('blocks App parent removal while saving; unknown payload/key survive explicit leave and reentry', async () => {
+    await appPreview(); await open(); await edit('original\n')
+    let reject!: (reason: any)=>void
+    intercept=r=>r.op==='save'?new Promise((_resolve,b)=>{reject=b}):undefined
+    const saving=click(node('data-save')); await settle()
+    const entry=useWorkspaceStore().entries['p:initial']; const original=clone(entry.saveRetry)
+    await click(node('data-return')); expect(node('data-draft-editor')).toBeTruthy(); expect(node('data-draft-back').props.disabled).toBe(true)
+    expect(entry.saveRetry).toEqual(original); expect(all(mounted!.root,n=>n.props['data-leave-prompt']!==undefined)).toHaveLength(0)
+    reject({code:'REQUEST_FAILED'}); await saving
+    await click(node('data-return')); expect(node('data-leave-prompt')).toBeTruthy(); await click(node('data-leave-keep'))
+    expect(entry.saveRetry).toEqual(original); expect(useWorkspaceStore().activeKey).toBe('')
+    await reenterAppDraft(); expect(useWorkspaceStore().current?.saveRetry).toEqual(original)
+    const savesBefore=ops().filter(op=>op==='save').length; expect(savesBefore).toBe(1)
+    intercept=undefined; await click(node('data-save')); const saves=calls.filter(c=>c.op==='save'); expect(saves[1]).toEqual(saves[0])
+    expect(node('data-reload-warning').textContent).toContain('刷新或关闭可能丢失')
   })
 })

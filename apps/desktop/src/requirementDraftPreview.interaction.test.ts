@@ -10,6 +10,7 @@ import { useReadonlyWorkspace } from './stores/readonlyWorkspace'
 import { all, click, renderComponent, settle, type TestNode } from './testSupport/interactionRenderer'
 const ipc = vi.mocked(invoke), clone = <T>(v: T): T => JSON.parse(JSON.stringify(v))
 let mounted: ReturnType<typeof renderComponent> | undefined
+let bindings: Record<string, any>
 let calls: any[], drafts: Record<string, Draft>, intercept: ((r: any) => Promise<any> | undefined) | undefined
 function node(attr: string, value?: string) { const found = all(mounted!.root, n => value === undefined ? n.props[attr] !== undefined : n.props[attr] === value); expect(found).toHaveLength(1); return found[0] }
 const ops = () => calls.map(c => c.op)
@@ -17,14 +18,14 @@ async function edit(text: string) { const n = node('data-formal-field', 'goal_ra
 async function mount() { mounted = renderComponent(Workspace, createPinia()); await settle(); await click(node('data-project', 'p')); await click(node('data-task', 'a')) }
 async function open(next = false) { await click(node('data-formal-entry')); expect(calls).toHaveLength(0); await click(node(next ? 'data-open-next' : 'data-open-project')) }
 beforeEach(() => {
-  vi.useFakeTimers(); setActivePinia(createPinia()); ipc.mockReset(); calls = []; drafts = {}; intercept = undefined
+  vi.useFakeTimers(); setActivePinia(createPinia()); ipc.mockReset(); calls = []; drafts = {}; bindings = {}; intercept = undefined
   const cache = new Map<string, string>(); vi.stubGlobal('sessionStorage', { getItem: (k: string) => cache.get(k) ?? null, setItem: (k: string, v: string) => cache.set(k, v) })
   ipc.mockImplementation(async (cmd, args: any) => {
     if (cmd === 'initialize_app') return undefined
     if (cmd === 'get_provider' || cmd === 'get_setting') return null as any
     if (cmd === 'list_conversations') return [] as any
     if (cmd === 'list_projects') return [{ id: 'p', name: 'Fixture', local_path: 'fixture' }, { id: 'q', name: 'Other', local_path: 'other' }] as any
-    if (cmd === 'list_tasks_for_project') return ['a','b'].map(id => ({ id, project_id: args.projectId, title: id, state: 'draft' })) as any
+    if (cmd === 'list_tasks_for_project') return [...['a','b'], ...Object.values(bindings).map(b => b.task_id)].map(id => ({ id, project_id: args.projectId, title: id, state: 'draft' })) as any
     if (cmd === 'get_task_evidence_overview') return { timeline: [], commands: [], tests: [], builds: [], file_changes: [], git_events: [], acceptance_history: [] } as any
     if (cmd !== 'requirement_workspace') throw Error('Forbidden IPC: ' + cmd)
     const r = { ...args.request.operation, project: args.request.project_id, key: args.request.client_request_id }; calls.push(clone(r))
@@ -33,12 +34,13 @@ beforeEach(() => {
     if (r.op === 'list') return { drafts: Object.values(drafts).filter(d => d.draft_id.startsWith(r.project + ':')), messages: [] } as any
     if (r.op === 'create') { const id = r.project + ':' + (r.origin_task_id ?? 'initial'); drafts[id] ??= { draft_id: id, revision: 1, status: 'editable', content_hash: 'h', origin_task_id: r.origin_task_id, fields: { title_raw: '', selected_ai: null, goal_raw: '', in_scope_raw: '', not_in_scope_raw: '', done_criteria_raw: '' } }; return clone(drafts[id]) as any }
     if (r.op === 'get') return clone(drafts[r.draft_id]) as any
-    if (r.op === 'binding') return { task_id: 'existing', draft_id: r.draft_id } as any
+    if (r.op === 'binding') return clone(bindings[r.draft_id] ?? (drafts[r.draft_id]?.status === 'bound' ? { task_id: 'existing', draft_id: r.draft_id, revision: drafts[r.draft_id].revision, content_hash: drafts[r.draft_id].content_hash, selected_ai: drafts[r.draft_id].fields.selected_ai } : null)) as any
+    if (r.op === 'confirm') { const d = drafts[r.draft_id]; if (d.revision !== r.expected_revision || d.content_hash !== r.content_hash) throw { code: 'REVISION_CONFLICT' }; bindings[r.draft_id] ??= { task_id: 'bound-' + r.draft_id, draft_id: r.draft_id, revision: r.expected_revision, content_hash: r.content_hash, selected_ai: r.selected_ai }; d.status = 'bound'; return clone(bindings[r.draft_id]) as any }
     if (r.op === 'save') { const d = drafts[r.draft_id]; if (d.revision !== r.expected_revision) throw { code: 'REVISION_CONFLICT' }; d.fields = clone(r.fields); d.revision++; return clone(d) as any }
     throw Error('Forbidden workspace op: ' + r.op)
   })
 })
-afterEach(() => { mounted?.unmount(); mounted = undefined; expect(ops().every(op => ['open','list','create','get','save','binding'].includes(op))).toBe(true); vi.useRealTimers(); vi.unstubAllGlobals() })
+afterEach(() => { mounted?.unmount(); mounted = undefined; expect(ops().every(op => ['open','list','create','get','save','binding','confirm'].includes(op))).toBe(true); vi.useRealTimers(); vi.unstubAllGlobals() })
 describe('manual persistent draft actual preview integration', () => {
   it('requires explicit open, keeps preview cache separate and saves incomplete exact text only on click', async () => {
     await mount(); const ro = useReadonlyWorkspace(); ro.editDraft('window\nonly'); await open(); expect(ops()).toEqual(['open','list','create'])
@@ -67,7 +69,7 @@ describe('manual persistent draft actual preview integration', () => {
     await mount(); await open(); await edit('local\n'); drafts['p:initial'].revision = 2; drafts['p:initial'].fields.goal_raw = 'server'
     await click(node('data-save')); expect(node('data-conflict').textContent).toContain('server'); expect(node('data-formal-field','goal_raw').value).toBe('local\n')
     expect(node('data-save').props.disabled).toBe(true); const count = calls.length; await click(node('data-keep-local')); expect(calls).toHaveLength(count); await click(node('data-save')); expect(drafts['p:initial'].revision).toBe(3)
-    await click(node('data-refresh-draft')); expect(ops().at(-1)).toBe('get')
+    await click(node('data-refresh-draft')); expect(ops().slice(-2)).toEqual(['get','binding'])
   })
   it('restores existing/bound drafts without create and provides no confirm or replacement action', async () => {
     await mount(); await open(); await edit('saved'); await click(node('data-save')); await click(node('data-draft-back'))
@@ -126,5 +128,60 @@ describe('actual App leave path and request retention', () => {
     const savesBefore=ops().filter(op=>op==='save').length; expect(savesBefore).toBe(1)
     intercept=undefined; await click(node('data-save')); const saves=calls.filter(c=>c.op==='save'); expect(saves[1]).toEqual(saves[0])
     expect(node('data-reload-warning').textContent).toContain('刷新或关闭可能丢失')
+  })
+})
+
+async function completeDraft(next = false) {
+  await mount(); await open(next)
+  for (const field of ['title_raw','goal_raw','in_scope_raw','not_in_scope_raw','done_criteria_raw']) {
+    const n = node('data-formal-field',field); n.value = '  '+field+'\nexact\n'; await n.props.onInput({ target:n })
+  }
+  await node('data-formal-ai').props.onChange({target:{value:'codex_cli'}}); await settle(); await click(node('data-save'))
+}
+describe('saved-revision confirmation without execution', () => {
+  it('shows exact saved fields and binding identity only after explicit review, then creates once and views read-only records', async () => {
+    await completeDraft(true); const e=useWorkspaceStore().current!; const saved=clone(e.draft)
+    expect(ops()).not.toContain('confirm'); await click(node('data-review-saved'))
+    const card=node('data-confirm-card'); expect(card.textContent).toContain(saved!.draft_id); expect(card.textContent).toContain(saved!.content_hash); expect(card.textContent).toContain('p / a')
+    for(const value of Object.values(saved!.fields)) expect(card.textContent).toContain(value!)
+    await click(node('data-language')); expect(node('data-confirm-card').textContent).toContain('no execution')
+    const preventDefault=vi.fn(); node('data-confirm-reviewed').props.onKeydown({key:'Enter',isComposing:true,preventDefault}); expect(preventDefault).toHaveBeenCalled(); expect(ops()).not.toContain('confirm')
+    await click(node('data-confirm-reviewed')); expect(ops().filter(op=>op==='confirm')).toHaveLength(1)
+    const sent=calls.find(r=>r.op==='confirm'); expect(sent).toMatchObject({draft_id:saved!.draft_id,expected_revision:saved!.revision,content_hash:saved!.content_hash,selected_ai:'codex_cli'})
+    expect(all(mounted!.root,n=>n.props['data-confirm-reviewed']!==undefined)).toHaveLength(0)
+    await click(node('data-view-bound')); expect(useReadonlyWorkspace().taskId).toBe(e.binding!.task_id); expect(ops().filter(op=>op==='confirm')).toHaveLength(1)
+  })
+  it('invalidates review on edits, IME, refresh, and refuses dirty, pending, conflict, empty AI or fields', async () => {
+    await completeDraft(); const e=useWorkspaceStore().current!
+    await click(node('data-review-saved')); await edit('changed'); expect(all(mounted!.root,n=>n.props['data-confirm-card']!==undefined)).toHaveLength(0); expect(node('data-review-saved').props.disabled).toBe(true)
+    await click(node('data-save')); await click(node('data-review-saved')); node('data-formal-field','goal_raw').props.onCompositionstart(); await settle(); expect(node('data-review-saved').props.disabled).toBe(true)
+    node('data-formal-field','goal_raw').props.onCompositionend({target:node('data-formal-field','goal_raw')}); await settle(); await click(node('data-save'))
+    await click(node('data-review-saved')); await click(node('data-refresh-draft')); expect(all(mounted!.root,n=>n.props['data-confirm-card']!==undefined)).toHaveLength(0)
+    e.conflict=clone(e.draft); await settle(); expect(node('data-review-saved').props.disabled).toBe(true); e.conflict=null
+    await node('data-formal-ai').props.onChange({target:{value:''}}); await settle(); await click(node('data-save')); expect(node('data-review-saved').props.disabled).toBe(true)
+    expect(ops()).not.toContain('confirm')
+  })
+  it('locks App leave and duplicate clicks during confirm, preserves unknown request across leave/reentry and retries only that request', async () => {
+    await completeDraft(); await click(node('data-review-saved')); let reject!: (e:any)=>void
+    intercept=r=>r.op==='confirm'?new Promise((_a,b)=>{reject=b}):undefined
+    const oldButton=node('data-confirm-reviewed'); const first=click(oldButton); await settle(); await oldButton.props.onClick(); await settle()
+    expect(ops().filter(op=>op==='confirm')).toHaveLength(1); await click(node('data-return')); expect(node('data-draft-editor')).toBeTruthy(); expect(node('data-draft-back').props.disabled).toBe(true)
+    reject({code:'REQUEST_FAILED'}); await first; const original=clone(useWorkspaceStore().current!.confirmRetry)
+    expect(node('data-formal-field','goal_raw').props.readonly).toBe(true); await click(node('data-check-confirm')); expect(useWorkspaceStore().current!.confirmRetry).toEqual(original); expect(mounted!.root.textContent).toContain('CONFIRM_RESULT_UNKNOWN')
+    await click(node('data-draft-back')); await click(node('data-leave-keep')); await click(node('data-formal-entry')); await click(node('data-open-project')); expect(useWorkspaceStore().current!.confirmRetry).toEqual(original)
+    intercept=undefined; await click(node('data-retry-confirm')); const confirms=calls.filter(r=>r.op==='confirm'); expect(confirms).toHaveLength(2); expect(confirms[1]).toEqual(confirms[0])
+  })
+  it('accepts only matching get/binding after a lost confirmation response and restores same task on cold open', async () => {
+    await completeDraft(); await click(node('data-review-saved'))
+    intercept=r=>{if(r.op!=='confirm')return; const d=drafts[r.draft_id];d.status='bound';bindings[r.draft_id]={task_id:'already-created',draft_id:d.draft_id,revision:d.revision,content_hash:d.content_hash,selected_ai:d.fields.selected_ai};return Promise.reject({code:'DATABASE_ERROR'})}
+    await click(node('data-confirm-reviewed')); intercept=undefined; const before=calls.length; await click(node('data-check-confirm')); expect(ops().slice(before)).toEqual(['get','binding']); expect(useWorkspaceStore().current!.confirmRetry).toBe(null); expect(node('data-view-bound').textContent).toContain('already-created')
+    await click(node('data-draft-back')); useWorkspaceStore().$reset(); calls=[]; await click(node('data-formal-entry')); await click(node('data-open-project')); expect(ops()).toEqual(['open','list','binding']); expect(node('data-view-bound').textContent).toContain('already-created'); expect(ops()).not.toContain('create')
+  })
+  it('keeps uncertain identity on a mismatched binding and stops on definitive gate rejection without automatic retry', async () => {
+    await completeDraft(); await click(node('data-review-saved')); intercept=r=>r.op==='confirm'?Promise.reject({code:'REQUEST_FAILED'}):undefined
+    await click(node('data-confirm-reviewed')); const e=useWorkspaceStore().current!, original=clone(e.confirmRetry); const d=drafts[e.draft!.draft_id];d.status='bound';bindings[d.draft_id]={task_id:'wrong',draft_id:d.draft_id,revision:d.revision,content_hash:'wrong-hash',selected_ai:d.fields.selected_ai}
+    intercept=undefined; await click(node('data-check-confirm')); expect(e.confirmRetry).toEqual(original); expect(e.binding).toBe(null); expect(e.error).toBe('CONFIRM_BINDING_MISMATCH')
+    intercept=r=>r.op==='confirm'?Promise.reject({code:'EXECUTION_IN_PROGRESS'}):undefined; await click(node('data-retry-confirm')); expect(e.confirmRetry).toBe(null); expect(e.error).toBe('EXECUTION_IN_PROGRESS'); expect(node('data-review-saved').props.disabled).toBe(true)
+    await vi.advanceTimersByTimeAsync(5000); expect(ops().filter(op=>op==='confirm')).toHaveLength(2)
   })
 })

@@ -170,3 +170,32 @@ describe('non-AI workspace', () => {
     wait.resolve({ task_id: 't', draft_id: 'p:initial', revision: 2 }); await pending; await settle(); expect(mounted.root.textContent).toContain('未自动启动')
   })
 })
+
+describe('read-only confirmation reconciliation', () => {
+  it('rejects wrong draft, revision, hash, AI, origin or request scope without replacing the uncertain request', async () => {
+    for (const variant of ['draft','revision','hash','ai','origin','scope']) {
+      handler=undefined; const s=useWorkspaceStore(); const project='check-'+variant; await s.open(project)
+      Object.assign(s.current!.fields,fields());s.current!.dirty=true;s.current!.edits++;await s.save()
+      handler=r=>r.op==='confirm'?Promise.reject({code:'REQUEST_FAILED'}):undefined;await s.confirm()
+      const e=s.current!, id=e.draft!.draft_id;drafts[id].status='bound';const value=clone(drafts[id]);
+      const binding={task_id:'existing',draft_id:id,revision:value.revision,content_hash:value.content_hash,selected_ai:value.fields.selected_ai}
+      if(variant==='draft')binding.draft_id='another'
+      if(variant==='revision')binding.revision++
+      if(variant==='hash')binding.content_hash='another'
+      if(variant==='ai')binding.selected_ai='claude_cli'
+      if(variant==='origin')value.origin_task_id='another-task'
+      if(variant==='scope')e.confirmRetry!.project_id='another-project'
+      const original=clone(e.confirmRetry)
+      handler=r=>r.op==='get'?Promise.resolve(value):r.op==='binding'?Promise.resolve(binding):undefined
+      expect(await s.inspectBinding(s.activeKey)).toBe(false);expect(e.confirmRetry).toEqual(original);expect(e.binding).toBe(null);expect(e.draft!.status).toBe('editable')
+      expect(e.error).toBe('CONFIRM_BINDING_MISMATCH')
+    }
+  })
+  it('keeps late reconciliation in its original entry when another scope becomes active', async () => {
+    const s=useWorkspaceStore();await s.open('p');Object.assign(s.current!.fields,fields());s.current!.dirty=true;s.current!.edits++;await s.save()
+    handler=r=>r.op==='confirm'?Promise.reject({code:'REQUEST_FAILED'}):undefined;await s.confirm();const entry=s.current!, original=clone(entry.confirmRetry);const wait=deferred<any>()
+    handler=r=>r.op==='get'?wait.promise:r.op==='binding'?Promise.resolve(null):undefined
+    const checking=s.inspectBinding('p:initial');await s.open('q');s.edit('goal_raw','other untouched')
+    wait.resolve(clone(drafts['p:initial']));await checking;expect(s.current!.project).toBe('q');expect(s.current!.fields.goal_raw).toBe('other untouched');expect(s.current!.error).toBe('');expect(entry.confirmRetry).toEqual(original);expect(entry.error).toBe('CONFIRM_RESULT_UNKNOWN')
+  })
+})

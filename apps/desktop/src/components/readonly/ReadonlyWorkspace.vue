@@ -10,6 +10,13 @@ const store = useReadonlyWorkspace()
 const language = ref<Language>('zh'), theme = ref<'green' | 'paper'>('green')
 const editing = ref(false), draftEditor = ref<InstanceType<typeof RequirementDraftEditor>>()
 function returnToLegacy() { if (editing.value) draftEditor.value?.requestLeave(() => emit('close')); else emit('close') }
+async function viewBoundTask(taskId: string) {
+  const project = store.projectId
+  editing.value = false
+  const loading = store.selectProject(project), epoch = store.epoch
+  await loading
+  if (store.epoch === epoch && store.projectId === project && store.tasks.some(task => task.id === taskId)) await store.selectTask(taskId)
+}
 const drawer = ref(false), sidebar = ref(true), notificationError = ref(false)
 const t = computed(() => copy[language.value])
 const selectedTask = computed(() => store.tasks.find(task => task.id === store.taskId))
@@ -41,7 +48,7 @@ onUnmounted(() => { disposed = true; if (timer) clearInterval(timer); unlisten?.
       <span class="ro-badge">{{ editing ? t.formalDraft : t.readonly }}</span>
       <div class="ro-tools"><button type="button" data-language @click="language = language === 'zh' ? 'en' : 'zh'">{{ t.language }}</button><button type="button" @click="theme = theme === 'green' ? 'paper' : 'green'">{{ theme === 'green' ? t.theme : t.green }}</button><button type="button" data-return @click="returnToLegacy">{{ t.back }}</button></div>
     </header>
-    <RequirementDraftEditor v-if="editing" ref="draftEditor" :project-id="store.projectId" :project-name="store.projects.find(p => p.id === store.projectId)?.name ?? store.projectId" :task-id="store.taskId || undefined" :language="language" @close="editing = false" />
+    <RequirementDraftEditor v-if="editing" ref="draftEditor" :project-id="store.projectId" :project-name="store.projects.find(p => p.id === store.projectId)?.name ?? store.projectId" :task-id="store.taskId || undefined" :language="language" @close="editing = false" @view-task="viewBoundTask" />
     <div v-else class="ro-body" :class="{ 'drawer-open': drawer }">
       <aside v-if="sidebar" class="ro-projects" :aria-label="t.projects">
         <h2>{{ t.projects }}</h2><p v-if="store.projectsLoading" role="status">{{ t.loading }}</p>

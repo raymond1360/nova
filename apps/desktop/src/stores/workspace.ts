@@ -13,7 +13,7 @@ export interface Draft {
   draft_id: string; revision: number; status: 'editable' | 'bound' | 'archived'
   fields: RequirementFields; content_hash: string; origin_task_id: string | null
 }
-export interface Binding { task_id: string; draft_id: string; revision: number; content_hash: string }
+export interface Binding { task_id: string; draft_id: string; revision: number; content_hash: string; selected_ai: string }
 export interface RequirementMessage { id: string; seq: number; kind: string; body_raw: string | null; draft_id: string; revision: number }
 interface Entry {
   project: string; origin: string | null; conversation: string; draft: Draft | null
@@ -81,6 +81,29 @@ export const useWorkspaceStore = defineStore('workspace', {
       const value = await call<Draft>(request(e.project, { op: 'get', conversation_id: e.conversation, draft_id: e.draft.draft_id }, false))
       if (e.dirty || e.composing || e.saveRetry) e.conflict = value
       else { e.draft = value; e.fields = copy(value.fields) }
+    },
+    // Explicit, read-only reconciliation. Never replace an uncertain confirmation request.
+    async inspectBinding(key: string) {
+      const e = this.entries[key]
+      if (!e?.draft || e.loading || e.saving || e.confirming || e.dirty || e.composing || e.saveRetry || e.conflict) return false
+      const pending = e.confirmRetry, draftId = e.draft.draft_id
+      e.loading = true
+      try {
+        const value = await call<Draft>(request(e.project, { op: 'get', conversation_id: e.conversation, draft_id: draftId }, false))
+        const binding = await call<Binding | null>(request(e.project, { op: 'binding', conversation_id: e.conversation, draft_id: draftId }, false))
+        if (this.entries[key] !== e || e.confirmRetry !== pending) return false
+        const identity = value.draft_id === draftId && value.origin_task_id === e.origin
+        const matches = !pending || (pending.project_id === e.project && pending.conversation_id === e.conversation && pending.draft_id === draftId &&
+          value.revision === pending.expected_revision && value.content_hash === pending.content_hash && value.fields.selected_ai === pending.selected_ai)
+        const bound = value.status === 'bound' && !!binding?.task_id && binding.draft_id === draftId &&
+          binding.revision === value.revision && binding.content_hash === value.content_hash && binding.selected_ai === value.fields.selected_ai
+        if (!identity || !matches || (value.status === 'bound' ? !bound : !!binding)) { e.error = 'CONFIRM_BINDING_MISMATCH'; return false }
+        if (pending && !bound) { e.error = 'CONFIRM_RESULT_UNKNOWN'; return false }
+        e.draft = value; e.fields = copy(value.fields); e.binding = binding
+        if (bound) { e.confirmRetry = null; e.message = 'BOUND_NOT_STARTED' }
+        e.error = ''; return true
+      } catch { e.error = 'CONFIRM_CHECK_FAILED'; return false }
+      finally { e.loading = false }
     },
     async save(key?: string) {
       key ??= this.activeKey

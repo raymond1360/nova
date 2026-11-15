@@ -1342,11 +1342,15 @@ mod tests {
                     error: Some("DEADLINE"),
                 };
             }
-            let content = if req.meta.role == RelayRole::Develop {
+            let mut content = if req.meta.role == RelayRole::Develop {
                 json!({"schema":"nova.relay.proposal/1","target_path":"note.txt","old_text":"Alpha","new_text":if self.mode==1 {"wrong"}else{"beta"},"rationale":if self.mode==3 {"fake-s1-credential-only"}else{"one replacement"}})
             } else {
                 json!({"schema":"nova.relay.review/1","base_sha256":input["base_sha256"],"candidate_sha256":input["candidate_sha256"],"verdict":if self.mode==2 {"CHANGES_REQUIRED"}else{"PASS"},"issues":[],"unknowns":[]})
             };
+            if req.meta.role==RelayRole::Develop {
+                if self.mode==6 {content.as_object_mut().unwrap().remove("new_text");}
+                if self.mode==7 {content["target_path"]=json!("wrong.txt");}
+            }
             let mut envelope = json!({"id":"synthetic-s1-response","created":1794730000u64,"object":"chat.completion","model":"deepseek-flash","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":content.to_string()}}],"usage":{"prompt_tokens":64,"completion_tokens":32,"total_tokens":96,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":64}});
             if self.mode == 5 {
                 envelope.as_object_mut().unwrap().remove("usage");
@@ -1546,7 +1550,7 @@ mod tests {
     }
     #[test]
     fn task_execution_failure_cancel_secrets_and_usage_stop_without_review() {
-        for mode in 1..=5 {
+        for mode in 1..=7 {
             let r = setup();
             let p = accept(&r);
             let (mut http, mut keys, clock, stop) = ports();
@@ -1562,6 +1566,13 @@ mod tests {
             )
             .unwrap();
             assert_ne!(out["execution_state"], "TECHNICALLY_VERIFIED_AWAITING_USER");
+            if [1,6,7].contains(&mode) {
+                let expected=match mode {1=>"PROPOSAL_DERIVED_MATERIAL",6=>"PROPOSAL_DECODE",_=>"PROPOSAL_VALIDATION"};
+                assert_eq!(out["facts"][0]["facts"]["diagnostic"],expected);
+                assert!(out["facts"][0]["facts"]["response_sha256"].is_null());
+                assert!(out["facts"][0]["model_claim"].is_null());
+            }
+
             assert_eq!(http.calls, if mode == 2 { 2 } else { 1 });
             assert_eq!(fs::read(p.target()).unwrap(), p.snapshot.as_bytes());
             for entry in

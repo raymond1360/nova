@@ -1310,6 +1310,7 @@ pub struct ApiRequestMeta {
 pub enum ApiDiagnostic {
     ScanSecret, ScanJson, ContentSecret, ContentJson, OuterProtocol, Usage,
     ReviewClaimDecode, ReviewClaimValidation,
+    ProposalDecode, ProposalValidation, ProposalDerivedMaterial, ProposalDerivedSafety, ProposalDerivedRequest,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

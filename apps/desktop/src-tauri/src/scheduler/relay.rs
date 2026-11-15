@@ -1512,11 +1512,17 @@ pub(crate) fn run_api_with(
                     if role == RelayRole::Develop {
                         let canonical = serde_json::to_vec(&api_json::<Value>(&raw, 32768)?)
                             .map_err(|_| "ENCODING")?;
+                        if real {
+                            let proposal: Proposal=api_json(&canonical,32768).map_err(|e|{diagnostic=Some(ApiDiagnostic::ProposalDecode);e})?;
+                            proposal.validate_target(&p.target_path).map_err(|e|{diagnostic=Some(ApiDiagnostic::ProposalValidation);e})?;
+                        }
                         let version = real.then(|| json!(if super::task_execution::is_task(&p) {super::task_execution::MATERIAL}else{REVIEW_GOAL_V2}));
-                        let (c, review) = api_review_input_versioned(&p, &id, &base, &canonical, version.as_ref())?;
-                        secret.scan_text(c.text.as_bytes())?;
-                        secret.scan_text(c.diff.as_bytes())?;
-                        secret.scan_json(&review, 65536)?;
+                        let (c, review) = api_review_input_versioned(&p, &id, &base, &canonical, version.as_ref()).map_err(|e|{if real {diagnostic=Some(ApiDiagnostic::ProposalDerivedMaterial);}e})?;
+                        (|| -> Result<()> {
+                            secret.scan_text(c.text.as_bytes())?;
+                            secret.scan_text(c.diff.as_bytes())?;
+                            secret.scan_json(&review, 65536)?;Ok(())
+                        })().map_err(|e|{if real {diagnostic=Some(ApiDiagnostic::ProposalDerivedSafety);}e})?;
                         // Scan the actual REVIEW body again before allowing its hash/registration.
                         let _ = make_request(
                             RelayRole::Review,
@@ -1525,7 +1531,7 @@ pub(crate) fn run_api_with(
                             &review,
                             Some(a.attempt_id.clone()),
                             &secret,
-                        )?;
+                        ).map_err(|e|{if real {diagnostic=Some(ApiDiagnostic::ProposalDerivedRequest);}e})?;
                         a.binding = Some(
                             if real {json!({"plan_id":id,"candidate_sha256":c.candidate_sha256,"review_input_sha256":hash(&review),"proposal_sha256":c.proposal_sha256,"diff_sha256":c.diff_sha256})} else {json!({"plan_id":id,"candidate_sha256":c.candidate_sha256,"review_input_sha256":hash(&review)})},
                         );

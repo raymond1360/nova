@@ -9,6 +9,23 @@ if(-not [IO.Path]::IsPathRooted($TargetDirectory)){throw 'Absolute target requir
 $cargo=(Get-Command cargo -CommandType Application | Select-Object -First 1).Source
 $git=(Get-Command git -CommandType Application | Select-Object -First 1).Source
 if(-not $cargo -or -not $git){throw 'Tool missing'}
+# Bind the actual workspace, including staged/unstaged and buildable ignored files.
+function Assert-ReviewedSource([string]$GitExe,[string]$Root) {
+ $baseline='12771639274fa86bac74fb9a6ad3eb670819cfe3'
+ & $GitExe -C $Root merge-base --is-ancestor $baseline HEAD
+ $code=$LASTEXITCODE
+ if($code -ne 0){throw "SOURCE_ANCESTRY_REJECTED:$code"}
+ & $GitExe -C $Root diff --exit-code $baseline -- apps/desktop/src-tauri
+ $code=$LASTEXITCODE
+ if($code -ne 0){throw "SOURCE_TREE_REJECTED:$code"}
+ # Do not use --exclude-standard: ignored Rust/build inputs can also affect compilation.
+ # Cargo output is not a source input; it is isolated through CARGO_TARGET_DIR below.
+ $extra=@(& $GitExe -C $Root ls-files --others -- apps/desktop/src-tauri ':!apps/desktop/src-tauri/target')
+ $code=$LASTEXITCODE
+ if($code -ne 0){throw "SOURCE_ENUMERATION_REJECTED:$code"}
+ if($extra.Count -ne 0){throw 'SOURCE_UNTRACKED_REJECTED'}
+}
+Assert-ReviewedSource $git $repo
 $crate=Join-Path $repo 'apps/desktop/src-tauri'
 $commandTemp=Join-Path $EvidenceDirectory 'command-temp';New-Item -ItemType Directory -Path $commandTemp | Out-Null
 $clock=[Diagnostics.Stopwatch]::StartNew();$deadline=5400000

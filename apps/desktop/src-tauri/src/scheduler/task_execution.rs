@@ -450,12 +450,45 @@ fn static_scan(v: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Fixed argv only; no shell, hooks, fsmonitor, external diff, textconv, ambient Git env or network.
+/// Deliberately narrow fixture config grammar, not a general Git config parser.
+/// Reject includes without following them. Keep the inspected file pinned until Git exits.
+fn git_config_guard(root: &Path) -> Result<Guard> {
+    let reject = "TASK_GIT_CONFIG_UNSUPPORTED";
+    if root.join(".git/config.worktree").exists() {
+        return Err(reject);
+    }
+    let mut g = Guard::open(&root.join(".git/config"), false).map_err(|_| reject)?;
+    let raw = g.bytes(16384).map_err(|_| reject)?;
+    let text = std::str::from_utf8(&raw).map_err(|_| reject)?;
+    let mut core = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line == "[core]" {
+            core = true;
+            continue;
+        }
+        let (key, value) = line.split_once('=').ok_or(reject)?;
+        if !core || !matches!((key.trim(), value.trim()),
+            ("repositoryformatversion", "0") | ("bare", "false")
+            | ("filemode", "false" | "true") | ("logallrefupdates", "true")
+            | ("symlinks", "false") | ("ignorecase", "true" | "false")
+            | ("autocrlf", "false")) {
+            return Err(reject);
+        }
+    }
+    Ok(g)
+}
+
+/// Fixed argv plus pinned allowlisted local config; no repository-derived commands.
 fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     use std::{
         process::{Command, Stdio},
         time::{Duration, Instant},
     };
+    let _config = git_config_guard(root)?;
     let tool = Path::new(r"C:\Program Files\Git\cmd\git.exe");
     let _pin = Guard::tool(tool)?;
     let mut c = Command::new(tool);
@@ -464,6 +497,7 @@ fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
         c.env("SystemRoot", v);
     }
     c.env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "NUL")
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_NO_REPLACE_OBJECTS", "1")
@@ -1182,6 +1216,52 @@ mod tests {
         let f = Fixture::open(&r.fixture_root).unwrap();
         initialize(&f, p.clone()).unwrap();
         p
+    }
+    #[test]
+    fn task_git_config_commands_rejected_at_all_sampling_boundaries() {
+        for extra in [
+            "[filter \"probe\"]\n clean = echo SIDE_EFFECT > ../effect.txt; cat\n",
+            "[filter \"probe\"]\n process = echo SIDE_EFFECT > ../effect.txt\n",
+            "[include]\n path = ../included.config\n",
+            "[includeIf \"gitdir:**\"]\n path = ../included.config\n",
+            "[core]\n fsmonitor = echo SIDE_EFFECT > ../effect.txt\n",
+        ] {
+            let r = setup();
+            let p = accept(&r);
+            let repo = p.repo();
+            fs::write(repo.join(".git/info/attributes"), b"note.txt filter=probe\n").unwrap();
+            fs::write(repo.join("included.config"), b"[filter \"probe\"]\n clean = echo SIDE_EFFECT > ../effect.txt; cat\n").unwrap();
+            let config = repo.join(".git/config");
+            let mut f = OpenOptions::new().append(true).open(config).unwrap();
+            f.write_all(extra.as_bytes()).unwrap();
+            drop(f);
+            let before = fs::read(p.target()).unwrap();
+            let dirty = p.snapshot.replace("Alpha", "Bravo");
+            assert_eq!(dirty.len(), p.snapshot.len());
+            fs::write(p.target(), dirty).unwrap();
+            assert_eq!(git_facts(&repo, "note.txt", false).unwrap_err(), "TASK_GIT_CONFIG_UNSUPPORTED");
+            assert_eq!(git_facts(&repo, "note.txt", true).unwrap_err(), "TASK_GIT_CONFIG_UNSUPPORTED");
+            assert_eq!(verify_after(&p).unwrap_err(), "TASK_GIT_CONFIG_UNSUPPORTED");
+            let mut scans = 0;
+            assert!(approve_with(r.clone(), &mut Cursor::new("NO\n"), &mut vec![], |_| { scans += 1; Ok(()) }).is_err());
+            assert_eq!(scans, 0);
+            let (mut h, mut k, c, stop) = ports();
+            assert!(run_with(&r.fixture_root, &r.task_id, true, &mut h, &mut k, &c, &stop).is_err());
+            assert_eq!((h.calls, k.reads), (0, 0));
+            assert_eq!(fs::read(p.target()).unwrap(), p.snapshot.replace("Alpha", "Bravo").as_bytes());
+            assert!(!r.fixture_root.join("effect.txt").exists());
+            assert_ne!(before, fs::read(p.target()).unwrap());
+        }
+    }
+    #[test]
+    fn task_git_config_guard_pins_and_rejects_unsupported_sources() {
+        let r = setup();
+        let repo = r.fixture_root.join("project");
+        let pin = git_config_guard(&repo).unwrap();
+        assert!(OpenOptions::new().write(true).open(repo.join(".git/config")).is_err());
+        drop(pin);
+        fs::write(repo.join(".git/config.worktree"), b"[filter \"probe\"]\n process = forbidden\n").unwrap();
+        assert_eq!(git(&repo, &["rev-parse", "HEAD"]).unwrap_err(), "TASK_GIT_CONFIG_UNSUPPORTED");
     }
     struct Keys {
         reads: usize,

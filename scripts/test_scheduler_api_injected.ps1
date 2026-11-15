@@ -11,7 +11,7 @@ $git=(Get-Command git -CommandType Application | Select-Object -First 1).Source
 if(-not $cargo -or -not $git){throw 'Tool missing'}
 # Bind the actual workspace, including staged/unstaged and buildable ignored files.
 function Assert-ReviewedSource([string]$GitExe,[string]$Root) {
- $baseline='12771639274fa86bac74fb9a6ad3eb670819cfe3'
+ $baseline='5f5587a477a996e62ae5e600eadfddc38370667a'
  & $GitExe -C $Root merge-base --is-ancestor $baseline HEAD
  $code=$LASTEXITCODE
  if($code -ne 0){throw "SOURCE_ANCESTRY_REJECTED:$code"}

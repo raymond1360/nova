@@ -452,8 +452,20 @@ fn static_scan(v: &Value) -> Result<()> {
 
 /// Deliberately narrow fixture config grammar, not a general Git config parser.
 /// Reject includes without following them. Keep the inspected file pinned until Git exits.
+fn fs_metadata(p:&Path)->std::io::Result<std::fs::Metadata>{std::fs::symlink_metadata(p)}
 fn git_config_guard(root: &Path) -> Result<Guard> {
     let reject = "TASK_GIT_CONFIG_UNSUPPORTED";
+    // No Git discovery/indirection: this entry only accepts a standalone .git directory.
+    let metadata=root.join(".git");
+    let directory=Guard::open(&metadata,true).map_err(|_|reject)?;
+    if !directory.path.is_dir() {return Err(reject);}
+    for name in ["commondir", "gitdir", "config.worktree"] {
+        match fs_metadata(&metadata.join(name)) {
+            Ok(_) => return Err(reject),
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound => (),
+            Err(_) => return Err(reject),
+        }
+    }
     if root.join(".git/config.worktree").exists() {
         return Err(reject);
     }
@@ -1216,6 +1228,32 @@ mod tests {
         let f = Fixture::open(&r.fixture_root).unwrap();
         initialize(&f, p.clone()).unwrap();
         p
+    }
+    #[test]
+    fn task_git_commondir_clean_process_rejected_before_any_sampling() {
+        for driver in ["clean","process"] {
+            let r=setup();let p=accept(&r);let repo=p.repo();
+            let common=r.fixture_root.join("common.git");
+            fn copy_tree(from:&Path,to:&Path){
+                fs::create_dir(to).unwrap();
+                for entry in fs::read_dir(from).unwrap(){let entry=entry.unwrap();let path=entry.path();let dest=to.join(entry.file_name());if path.is_dir(){copy_tree(&path,&dest);}else{fs::copy(path,dest).unwrap();}}
+            }
+            copy_tree(&repo.join(".git"),&common);
+            let marker=r.fixture_root.join("effect.txt");
+            let command=format!("[filter \"probe\"]\n {driver} = echo SIDE_EFFECT > {}; cat\n",marker.to_string_lossy().replace('\\',"/"));
+            fs::write(common.join("config"),command).unwrap();
+            fs::write(repo.join(".git/commondir"),common.to_string_lossy().as_bytes()).unwrap();
+            fs::write(repo.join(".git/info/attributes"),b"note.txt filter=probe\n").unwrap();
+            fs::write(p.target(),p.snapshot.replace("Alpha","Bravo")).unwrap();
+            assert_eq!(git_config_guard(&repo).err(),Some("TASK_GIT_CONFIG_UNSUPPORTED"));
+            assert_eq!(git_facts(&repo,"note.txt",false).unwrap_err(),"TASK_GIT_CONFIG_UNSUPPORTED");
+            assert_eq!(verify_after(&p).unwrap_err(),"TASK_GIT_CONFIG_UNSUPPORTED");
+            let mut scans=0;
+            assert!(approve_with(r.clone(),&mut Cursor::new("NO\n"),&mut vec![],|_|{scans+=1;Ok(())}).is_err());
+            assert_eq!(scans,0);
+            assert!(!marker.exists());
+            assert_eq!(fs::read(p.target()).unwrap(),p.snapshot.replace("Alpha","Bravo").as_bytes());
+        }
     }
     #[test]
     fn task_git_config_commands_rejected_at_all_sampling_boundaries() {

@@ -413,7 +413,7 @@ impl Store {
         }
         sql(db.conn().execute_batch("BEGIN IMMEDIATE;"))?;
         let result = (|| {
-            let ddl = if version == 4 { deepseek_schema() } else if version == 3 {
+            let ddl = if version == 5 { task_schema() } else if version == 4 { deepseek_schema() } else if version == 3 {
                 API_SCHEMA.into()
             } else if version == 2 {
                 SCHEMA.replace("CHECK(schema_version=1)", "CHECK(schema_version=2)")
@@ -469,7 +469,7 @@ impl Store {
         drop(db);
         drop(dg);
         drop(rg);
-        if version == 3 || version == 4 {
+        if version == 3 || version == 4 || version == 5 {
             Self::open_version(root, version)
         } else {
             Self::open(root)
@@ -525,13 +525,13 @@ impl Store {
         {
             return Err("STORE_VERSION_REJECTED");
         }
-        if !api && [3, 4].contains(&mark.2) {
+        if !api && [3, 4, 5].contains(&mark.2) {
             return Err("API_STORE_COMMAND_REQUIRED");
         }
         if api && mark.2 != kind {
             return Err("API_STORE_VERSION_REQUIRED");
         }
-        if ![1, 2, 3, 4].contains(&mark.2) {
+        if ![1, 2, 3, 4, 5].contains(&mark.2) {
             return Err("STORE_VERSION_REJECTED");
         }
         if mark.2 == 2 {
@@ -550,7 +550,7 @@ impl Store {
             }
         }
         if api {
-            let ddl = if kind == 4 { deepseek_schema() } else { API_SCHEMA.into() };
+            let ddl = if kind == 5 { task_schema() } else if kind == 4 { deepseek_schema() } else { API_SCHEMA.into() };
             for expected in ddl
                 .split(';')
                 .map(str::trim)
@@ -2031,9 +2031,11 @@ impl Store {
             [],
             |r| r.get(0),
         ))?;
-        if version != 3 && version != 4 { return Err("API_STORE_VERSION_REQUIRED"); }
+        if version != 3 && version != 4 && version != 5 { return Err("API_STORE_VERSION_REQUIRED"); }
         let row=sql(c.query_row("SELECT plan_id,plan_json,plan_sha256,package_id,registration_revision,run_root,run_root_identity,backend_kind,protocol FROM relay_plans",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?))))?;
-        let p: ApiPlan = if version == 4 {
+        let p: ApiPlan = if version == 5 {
+            let r:super::task_execution::TaskRecord=api_json(row.1.as_bytes(),65536)?;r.validate()?;r.core
+        } else if version == 4 {
             let r:DeepSeekRecord=api_json(row.1.as_bytes(),65536)?;r.validate()?;r.core
         } else {let p:ApiPlan=api_json(row.1.as_bytes(),65536)?;p.validate()?;p};
         if row.0 != hash(row.1.as_bytes())
@@ -2043,17 +2045,29 @@ impl Store {
             || row.3 != p.package_id
             || row.4 != p.registration_revision
             || p.input_delivery_identity != snap.delivery
-            || snap.base_source != if version==4 {"HUMAN_ATTESTED"} else {"INJECTED_TEST"}
-            || row.7 != if version==4 {"DEEPSEEK_DIRECT"}else{"API_INJECTED"}
+            || snap.base_source != if version==5 {"TOOL_GIT_READ"} else if version==4 {"HUMAN_ATTESTED"} else {"INJECTED_TEST"}
+            || row.7 != if version>=4 {"DEEPSEEK_DIRECT"}else{"API_INJECTED"}
             || row.8 != p.protocol
         {
             return Err("BINDING_MISMATCH");
         }
         Ok((row.0, p, PathBuf::from(row.5), row.6))
     }
-    /// File-only check: never probes .git or invokes Git.
+    /// Legacy fixtures are file-only; task mode revalidates fixed, read-only Git facts.
     pub fn api_base(&self) -> Result<Vec<u8>> {
         let (_, p, run, run_id) = self.api_plan()?;
+        if let Some(record)=self.task_record()? {
+            let snap=self.snapshot()?;
+            if snap.invalidated || snap.closed || snap.revision!=0 || snap.delivery!=p.input_delivery_identity
+                || snap.manifest.repo_path!=record.plan.request.fixture_root.join("project").to_string_lossy()
+                || snap.manifest.allowed_paths!=vec![record.plan.request.target.clone()] {
+                return Err("REGISTRATION_CHANGED");
+            }
+            super::task_execution::verify_plan(&record.plan)?;
+            let rr=Guard::open(&run,true)?;
+            if rr.identity!=run_id {return Err("EVIDENCE_ROOT_CHANGED");}
+            return Ok(record.plan.snapshot.into_bytes());
+        }
         let s = self.snapshot()?;
         let e = self.audit_envelope()?;
         let rr = Guard::open(&run, true)?;
@@ -2220,7 +2234,8 @@ impl Store {
                     let raw = serde_json::to_vec(claim).map_err(|_| "ENCODING")?;
                     let historic = if p.mode=="REAL_API" {
                         let text:String=sql(c.query_row("SELECT plan_json FROM relay_plans WHERE plan_id=?1",[&id],|r|r.get(0)))?;
-                        let record:DeepSeekRecord=api_json(text.as_bytes(),65536)?;record.validate()?;record.plan.snapshot.into_bytes()
+                        if let Some(record)=self.task_record()? {record.plan.snapshot.into_bytes()}
+                        else {let record:DeepSeekRecord=api_json(text.as_bytes(),65536)?;record.validate()?;record.plan.snapshot.into_bytes()}
                     }else{API_FIXTURE.to_vec()};
                     let binding = a.binding.as_ref().ok_or("BINDING_MISMATCH")?;
                     let (c, review) = super::relay::api_review_input_versioned(
@@ -2426,4 +2441,56 @@ fn deepseek_schema() -> String {
         .replace("base_source='INJECTED_TEST'", "base_source='HUMAN_ATTESTED'")
         .replace("backend_kind='API_INJECTED'", "backend_kind='DEEPSEEK_DIRECT'")
         .replace("protocol='API_JSON_INJECTED_V1'", "protocol='DEEPSEEK_CHAT_JSON_V1'")
+}
+
+fn task_schema() -> String {
+    deepseek_schema().replace("schema_version=4", "schema_version=5")
+        .replace("base_source='HUMAN_ATTESTED'", "base_source='TOOL_GIT_READ'") + TASK_WRITE_DDL
+}
+const TASK_WRITE_DDL:&str="CREATE TABLE task_write(singleton INTEGER PRIMARY KEY CHECK(singleton=1),intent_json TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('INTENT','VERIFIED','UNKNOWN')),receipt_json TEXT);";
+impl Store {
+    pub(crate) fn task_init(root:&Path,plan:&super::task_execution::TaskPlan)->Result<Self> {
+        let run=root.parent().ok_or("PATH_REJECTED")?.join(format!("task-evidence-{}",plan.request.task_id));
+        fs::create_dir(&run).map_err(|_|"CREATE_NEW_REJECTED")?;
+        let rg=Guard::open(&plan.request.fixture_root.join("project"),true)?;
+        let target=plan.request.target.clone();
+        let m=Manifest{schema:"nova.sh1.package/1".into(),package_id:format!("task-{}",plan.request.task_id),repo_path:rg.path.to_string_lossy().into(),title:"S1 isolated task execution".into(),
+            goal:"Approved one-file replacement".into(),allowed_paths:vec![target.clone()],acceptance_items:vec!["Exact approved candidate bytes".into()],pm_decision_ref:"LOCAL_TASK_APPROVAL".into(),report_roots:vec![run.to_string_lossy().into()],
+            required_reports:vec![ReportType::Development,ReportType::Review,ReportType::Ci],baseline:Baseline{mode:"DECLARED".into(),base_sha:Some(plan.head.clone())},eol_policy:"false".into()};
+        let digest=plan.digest()?;
+        let mut e=Envelope{head:plan.head.clone(),base:plan.head.clone(),parent:String::new(),base_source:"TOOL_GIT_READ".into(),root_identity:rg.identity.clone(),git_dir:rg.path.join(".git").to_string_lossy().into(),tree:vec![],files:vec![FileFact{path:target,bytes:plan.snapshot.len() as u64,sha256:hash(plan.snapshot.as_bytes()),identity:plan.target_identity.clone()}],ancestors:vec![],attributes:json!({"task_plan":digest}),outside_scope_notice:"TOOL_SAMPLED_ISOLATED_TASK_SINGLE_FILE".into(),observed_utc:chrono::Utc::now().to_rfc3339(),delivery_identity:digest.clone(),envelope_id:String::new()};
+        e.envelope_id=hash(encoded(&e)?.as_bytes());
+        let store=Self::init_version(root,&m,&e,0,5,None)?;
+        let record=super::task_execution::TaskRecord{plan:plan.clone(),digest,core:plan.core(e.delivery_identity)?,approval_id:uuid::Uuid::new_v4().to_string(),expires_utc:(chrono::Utc::now()+chrono::Duration::minutes(15)).to_rfc3339()};
+        record.validate()?;
+        let text=encoded(&record)?;let id=hash(text.as_bytes());let run_guard=Guard::open(&run,true)?;
+        let db=store.write_connection()?;
+        sql(db.conn().execute("INSERT INTO relay_plans VALUES(?1,?2,?3,?1,0,?4,?5,'DEEPSEEK_DIRECT','DEEPSEEK_CHAT_JSON_V1',?6)",params![id,m.package_id,text,run_guard.path.to_string_lossy(),run_guard.identity,chrono::Utc::now().to_rfc3339()]))?;
+        drop(db);drop(store);Self::task_open(root)
+    }
+    pub(crate) fn task_open(root:&Path)->Result<Self> {let s=Self::open_version(root,5)?;s.api_plan()?;s.api_attempts()?;Ok(s)}
+    pub(crate) fn task_record(&self)->Result<Option<super::task_execution::TaskRecord>> {
+        let c=self.read_connection()?;
+        let version:i64=sql(c.query_row("SELECT schema_version FROM scheduler_meta",[],|r|r.get(0)))?;
+        if version!=5 {return Ok(None);}
+        let text:String=sql(c.query_row("SELECT plan_json FROM relay_plans",[],|r|r.get(0)))?;
+        let record:super::task_execution::TaskRecord=api_json(text.as_bytes(),65536)?;record.validate()?;Ok(Some(record))
+    }
+    pub(crate) fn task_intent(&self,intent:&Value)->Result<()> {
+        if self.task_record()?.is_none() {return Err("TASK_STORE_REQUIRED");}
+        let db=self.write_connection()?;
+        sql(db.conn().execute("INSERT INTO task_write(singleton,intent_json,state) VALUES(1,?1,'INTENT')",[encoded(intent)?]))?;Ok(())
+    }
+    pub(crate) fn task_write_state(&self)->Result<Option<(Value,String,Option<Value>)>> {
+        if self.task_record()?.is_none(){return Err("TASK_STORE_REQUIRED");}
+        let c=self.read_connection()?;
+        let row:Option<(String,String,Option<String>)>=sql(c.query_row("SELECT intent_json,state,receipt_json FROM task_write WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional())?;
+        row.map(|(i,s,r)|Ok((api_json(i.as_bytes(),16384)?,s,r.map(|x|api_json(x.as_bytes(),16384)).transpose()?))).transpose()
+    }
+    pub(crate) fn task_write_finish(&self,state:&str,receipt:&Value)->Result<()> {
+        if !["VERIFIED","UNKNOWN"].contains(&state){return Err("TASK_WRITE_STATE_REJECTED");}
+        let db=self.write_connection()?;
+        let n=sql(db.conn().execute("UPDATE task_write SET state=?1,receipt_json=?2 WHERE singleton=1 AND state='INTENT'",params![state,encoded(receipt)?]))?;
+        if n!=1{return Err("TASK_WRITE_CAS_CONFLICT");}Ok(())
+    }
 }

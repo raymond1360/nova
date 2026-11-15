@@ -94,15 +94,18 @@ pub fn candidate(p: &RelayPlan, base: &[u8], raw: &[u8]) -> Result<Candidate> {
     )
 }
 pub fn candidate_material(p: &TaskMaterial<'_>, base: &[u8], raw: &[u8]) -> Result<Candidate> {
-    if base.len() > 65536 || hash(base) != p.base_sha256 {
+    candidate_text(p.target_path,p.base_sha256,base,raw,true)
+}
+pub(crate) fn candidate_text(target:&str,base_sha256:&str,base:&[u8],raw:&[u8],sample_signature:bool)->Result<Candidate> {
+    if base.len() > 65536 || hash(base) != base_sha256 {
         return Err("BASE_CHANGED");
     }
     let b = std::str::from_utf8(base).map_err(|_| "BASE_ENCODING")?;
-    if b.contains(['\0', '\r']) || !b.lines().any(|l| l == RELAY_SIGNATURE) {
+    if (b.contains('\0') || (sample_signature && b.contains('\r'))) || (sample_signature && !b.lines().any(|l| l == RELAY_SIGNATURE)) {
         return Err("BASE_SIGNATURE");
     }
     let proposal: Proposal = relay_json(raw, 32768)?;
-    proposal.validate_target(p.target_path)?;
+    proposal.validate_target(target)?;
     let matches: Vec<_> = base
         .windows(proposal.old_text.len())
         .enumerate()
@@ -130,10 +133,10 @@ pub fn candidate_material(p: &TaskMaterial<'_>, base: &[u8], raw: &[u8]) -> Resu
     }
     let signature_preserved = text.lines().filter(|l| *l == RELAY_SIGNATURE).count() == 1
         && b.lines().filter(|l| *l == RELAY_SIGNATURE).count() == 1;
-    if !signature_preserved {
+    if sample_signature && !signature_preserved {
         return Err("SIGNATURE_CHANGED");
     }
-    let diff = unified(b, &text, &p.target_path);
+    let diff = unified(b, &text, target);
     Ok(Candidate {
         candidate_sha256: hash(text.as_bytes()),
         text,
@@ -1308,6 +1311,11 @@ pub fn api_status(store: &Store) -> Result<Value> {
         value["input_base_sha"]=json!({"value":p.input_base_sha,"source":"HUMAN_ATTESTED"});
         value["git_identity_source"]=json!("HUMAN_ATTESTED");
         value["input_delivery_identity"]=json!({"value":p.input_delivery_identity,"source":"TOOL_BOUND_HUMAN_SNAPSHOT"});
+        if super::task_execution::is_task(&p) {
+            value["input_base_sha"]=json!({"value":p.input_base_sha,"source":"TOOL_GIT_READ"});
+            value["git_identity_source"]=json!("TOOL_GIT_READ");
+            value["input_delivery_identity"]=json!({"value":p.input_delivery_identity,"source":"TOOL_BOUND_ISOLATED_TASK"});
+        }
     }
     if serde_json::to_vec(&value).map_err(|_| "ENCODING")?.len() > 65536 {
         return Err("BOUND");
@@ -1343,6 +1351,9 @@ pub(crate) const REVIEW_GOAL_V2: &str = "DEEPSEEK_REVIEW_GOAL_V2";
 pub(crate) fn api_review_input_versioned(
     p: &ApiPlan, id: &str, base: &[u8], raw: &[u8], version: Option<&Value>,
 ) -> Result<(Candidate, Vec<u8>)> {
+    if version.and_then(Value::as_str)==Some(super::task_execution::MATERIAL) && super::task_execution::is_task(p) {
+        return super::task_execution::review_input(p,id,base,raw);
+    }
     let (candidate, legacy) = api_review_input(p, id, base, raw)?;
     match version {
         None => Ok((candidate, legacy)),
@@ -1501,7 +1512,7 @@ pub(crate) fn run_api_with(
                     if role == RelayRole::Develop {
                         let canonical = serde_json::to_vec(&api_json::<Value>(&raw, 32768)?)
                             .map_err(|_| "ENCODING")?;
-                        let version = real.then(|| json!(REVIEW_GOAL_V2));
+                        let version = real.then(|| json!(if super::task_execution::is_task(&p) {super::task_execution::MATERIAL}else{REVIEW_GOAL_V2}));
                         let (c, review) = api_review_input_versioned(&p, &id, &base, &canonical, version.as_ref())?;
                         secret.scan_text(c.text.as_bytes())?;
                         secret.scan_text(c.diff.as_bytes())?;
@@ -1518,7 +1529,7 @@ pub(crate) fn run_api_with(
                         a.binding = Some(
                             if real {json!({"plan_id":id,"candidate_sha256":c.candidate_sha256,"review_input_sha256":hash(&review),"proposal_sha256":c.proposal_sha256,"diff_sha256":c.diff_sha256})} else {json!({"plan_id":id,"candidate_sha256":c.candidate_sha256,"review_input_sha256":hash(&review)})},
                         );
-                        if real { a.binding.as_mut().ok_or("BINDING_MISMATCH")?["review_material_version"] = json!(REVIEW_GOAL_V2); }
+                        if real { a.binding.as_mut().ok_or("BINDING_MISMATCH")?["review_material_version"] = json!(if super::task_execution::is_task(&p) {super::task_execution::MATERIAL}else{REVIEW_GOAL_V2}); }
                         review_input = Some(review);
                     } else {
                         let claim: ReviewClaim = api_json(&raw, 65536).map_err(|e| {

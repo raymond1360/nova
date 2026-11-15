@@ -52,6 +52,21 @@ unsafe extern "system" fn cancel_handler(code: u32) -> i32 {
 fn execute() -> Result<serde_json::Value, &'static str> {
     let a: Vec<String> = std::env::args().skip(1).collect();
     match a.first().map(String::as_str) {
+        Some("task-status") if a.len()==3 => nova_lib::scheduler::task_execution::status(Path::new(&a[1]),&a[2]),
+        Some("task-approve-init") if a.len()==2 => {
+            if !io::stdin().is_terminal(){return Err("CONSOLE_REQUIRED");}
+            let mut file=Guard::open(Path::new(&a[1]),false)?;
+            let request=nova_lib::scheduler::contract::api_json(&file.bytes(32768)?,32768)?;
+            nova_lib::scheduler::task_execution::approve_dialog(request,&mut io::stdin().lock(),&mut io::stderr().lock())
+        }
+        Some("task-run") if a.len()==4 && a[3]=="--enable-real" => {
+            #[cfg(windows)] unsafe {
+                if windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(cancel_handler),1)==0{return Err("CONSOLE_HANDLER_REJECTED");}
+            }
+            let result=nova_lib::scheduler::task_execution::run(Path::new(&a[1]),&a[2],true,&CANCEL);
+            #[cfg(windows)] unsafe {windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(cancel_handler),0);}
+            result
+        }
         Some("status") if a.len() == 2 => api::status(Path::new(&a[1])),
         Some("run") if a.len() == 3 && a[2] == "--enable-real" => {
             #[cfg(windows)]

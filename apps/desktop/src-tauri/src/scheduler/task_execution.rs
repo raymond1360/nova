@@ -236,7 +236,7 @@ impl TaskPlan {
             target_path: self.request.target.clone(),
             base_sha256: hash(self.snapshot.as_bytes()),
             goal: String::from_utf8(bytes(&self.task)?).map_err(|_| "ENCODING")?,
-            constraints: vec![String::from_utf8(bytes(self)?).map_err(|_| "ENCODING")?],
+            constraints: vec![String::from_utf8(bytes(self)?).map_err(|_| "ENCODING")?, "DEVELOP_PROPOSAL_EXPLICIT_V1".into()],
             examples: vec![],
             protocol: "DEEPSEEK_CHAT_JSON_V1".into(),
             model_develop: "deepseek-flash".into(),
@@ -250,6 +250,12 @@ impl TaskPlan {
             pm_decision_ref: "TASK_LOCAL_EXPLICIT_APPROVAL".into(),
             plan_request_sha256: self.digest()?,
         })
+    }
+    // Absence retains the frozen legacy request encoding; new plans carry an explicit prompt version.
+    fn historical_core(&self,stored:&ApiPlan)->Result<ApiPlan>{
+        let mut expected=self.core(stored.input_delivery_identity.clone())?;
+        if stored.constraints.len()==1 {expected.constraints.pop();}
+        Ok(expected)
     }
     fn repo(&self) -> PathBuf {
         self.request.fixture_root.join("project")
@@ -678,7 +684,7 @@ impl TaskRecord {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.plan.digest()? != self.digest
             || uuid::Uuid::parse_str(&self.approval_id).is_err()
-            || bytes(&self.plan.core(self.core.input_delivery_identity.clone())?)?
+            || bytes(&self.plan.historical_core(&self.core)?)?
                 != bytes(&self.core)?
             || chrono::DateTime::parse_from_rfc3339(&self.expires_utc).is_err()
         {
@@ -773,7 +779,7 @@ pub(crate) fn candidate(p: &ApiPlan, base: &[u8], raw: &[u8]) -> Result<super::r
         65536,
     )?;
     plan.validate()?;
-    if bytes(&plan.core(p.input_delivery_identity.clone())?)? != bytes(p)?
+    if bytes(&plan.historical_core(p)?)? != bytes(p)?
         || base != plan.snapshot.as_bytes()
     {
         return Err("TASK_BINDING_REJECTED");
@@ -1656,6 +1662,27 @@ mod tests {
         let r = setup();
         let p = prepare(r.clone()).unwrap();
         let core = p.core(p.digest().unwrap()).unwrap();
+        // Serialization-only synthetic approved values, including quotes, slash, LF and Unicode.
+        let mut quoted=p.clone();
+        quoted.request.target="text/dynamic.txt".into();
+        quoted.snapshot="before \"x\"\\tail\n after".into();
+        quoted.request.old_text="\"x\"\\tail\n".into();
+        quoted.request.new_text="\"Ä\"\\next\n".into();
+        let explicit=quoted.core(quoted.digest().unwrap()).unwrap();
+        let input=super::super::relay::api_develop_input(&explicit,quoted.snapshot.as_bytes()).unwrap();
+        let req=super::super::deepseek_transport::reconstruct_request(RelayRole::Develop,&explicit,"synthetic",&input,None).unwrap();
+        let wire:Value=serde_json::from_slice(&req.body).unwrap();
+        let system=wire["messages"][0]["content"].as_str().unwrap();
+        for rule in ["six required String fields","no additional fields","nova.relay.proposal/1","8192","16384","2048","nonempty","U+000D","U+0000","not the whole file","CRLF"] {assert!(system.contains(rule));}
+        let example:Proposal=serde_json::from_str(system.split_once("Example: ").unwrap().1).unwrap();
+        assert_eq!(example.target_path,quoted.request.target);assert_eq!(example.old_text,quoted.request.old_text);assert_eq!(example.new_text,quoted.request.new_text);
+        example.validate_target(&quoted.request.target).unwrap();assert!(!system.contains(API_TARGET));
+        let mut legacy=explicit.clone();legacy.constraints.pop();
+        assert_eq!(bytes(&quoted.historical_core(&legacy).unwrap()).unwrap(),bytes(&legacy).unwrap());
+        let old_input=super::super::relay::api_develop_input(&legacy,quoted.snapshot.as_bytes()).unwrap();
+        let old_req=super::super::deepseek_transport::reconstruct_request(RelayRole::Develop,&legacy,"synthetic",&old_input,None).unwrap();
+        let old:Value=serde_json::from_slice(&old_req.body).unwrap();assert!(old["messages"][0]["content"].as_str().unwrap().contains("exact source"));
+
         let proposal = json!({"schema":"nova.relay.proposal/1","target_path":"note.txt","old_text":"Alpha","new_text":"beta","rationale":"ok"});
         let (_, material) = review_input(
             &core,

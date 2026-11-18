@@ -124,11 +124,11 @@ try {
  $tests=Get-Content (Join-Path $EvidenceDirectory 'old-relay/default-names.json') -Raw|ConvertFrom-Json -AsHashtable
  $scheduler=Get-Content (Join-Path $EvidenceDirectory 'old-relay/scheduler-names.json') -Raw|ConvertFrom-Json -AsHashtable
  $explicit=Get-Content (Join-Path $EvidenceDirectory 'old-relay/explicit-names.json') -Raw|ConvertFrom-Json -AsHashtable
- if((SetHash $tests.listed) -cne 'b8742b8fccbc8008645cc0e4e6bf1ff78f185deef3b8375cbd2fb3ea0e8f2064'){throw 'API_FROZEN_DEFAULT_LISTED'}
- if((SetHash $tests.passed) -cne 'b10f7172b04c9880f8aad11bb5737bf55885f3a7d21a7d152db1d026dd48f404'){throw 'API_FROZEN_DEFAULT_PASSED'}
+ if((SetHash $tests.listed) -cne 'b08cce8d9ff6c530fa57629a5e05b44b9d7e0e30ab293a01cf941d48071f8234'){throw 'API_FROZEN_DEFAULT_LISTED'}
+ if((SetHash $tests.passed) -cne 'd5cdfc3a584d6268a9874368cf71ea55eba930030878234e59adcc05275a8199'){throw 'API_FROZEN_DEFAULT_PASSED'}
  if((SetHash $tests.ignored) -cne 'a39bbead332b9d661508d9a4d3a81dbf78a7473b535e6e470c0d76e3738d9611'){throw 'API_FROZEN_DEFAULT_IGNORED'}
- if((SetHash $scheduler.listed) -cne 'fa383ac71ae9278d648015105cf27e2a85366413a93aa217a8f31ddb89d6c6b1'){throw 'API_FROZEN_SCHEDULER_LISTED'}
- if((SetHash $scheduler.passed) -cne 'b8bb34f5d67b481fb394c5576bdf281f3d67c1d5c9191b35e8d1cadae8ce560f'){throw 'API_FROZEN_SCHEDULER_PASSED'}
+ if((SetHash $scheduler.listed) -cne 'f5ed22827996fd0d26a2299b8124a9148f100fd34816ef34b0851dd74bd0c852'){throw 'API_FROZEN_SCHEDULER_LISTED'}
+ if((SetHash $scheduler.passed) -cne '8ae2695bfc37299ce4d91565909ddc600e818a4e3c8c06144b9bce1d8dd7769b'){throw 'API_FROZEN_SCHEDULER_PASSED'}
  if((SetHash $scheduler.ignored) -cne 'a39bbead332b9d661508d9a4d3a81dbf78a7473b535e6e470c0d76e3738d9611'){throw 'API_FROZEN_SCHEDULER_IGNORED'}
  Assert-Set $tests.listed $tests.passed $tests.ignored
  Assert-Set $scheduler.listed $scheduler.passed $scheduler.ignored
@@ -137,7 +137,7 @@ try {
  if(@($explicit.passed|Sort-Object -Unique).Count -ne 19){throw 'API_EXPLICIT_DUPLICATE'}
  if(@($tests.ignored).Count -ne 19 -or @($scheduler.ignored).Count -ne 19){throw 'IGNORED_SET_REJECTED'}
  # Test coverage is reused from the actual default/scheduler passed sets above; do not rerun subsets.
- Require-Zero 'deepseek-debug-build' $cargo @('build','--offline','--locked','--features','scheduler-validation','--bin','nova_scheduler_api_real')
+ Require-Zero 'deepseek-debug-build' $cargo @('build','--offline','--locked','--features','scheduler-validation','--bin','nova_scheduler_api_real','--bin','nova_scheduler_self_handoff')
  $exit=Invoke-Fixed 'deepseek-default-guard' $cargo @('build','--offline','--locked','--bin','nova_scheduler_api_real')
  $err=[string](Get-Content (Join-Path $EvidenceDirectory 'deepseek-default-guard.stderr.log') -Raw)
  if($exit -ne 101 -or $err -cnotmatch '(?m)^error: target `nova_scheduler_api_real` in package `nova` requires the features: `scheduler-validation`\r?$' -or $err -match 'could not compile|error\[E[0-9]+\]'){throw 'DEEPSEEK_DEFAULT_GUARD'}
@@ -150,6 +150,7 @@ try {
   $output=Output-Json $case[0]
   if($exit -ne 2 -or $output.Count -ne 2 -or $output.error_code -cne 'REAL_API_NOT_AUTHORIZED' -or $output.mode -cne 'REAL_API'){throw 'DEEPSEEK_DEFAULT_OFF'}
  }
+ Require-Zero 'self1-entry-guards' $pwsh @('-NoProfile','-NonInteractive','-File',(Join-Path $repo 'scripts/test_scheduler_self_handoff.ps1'),'-EvidenceDirectory',(Join-Path $EvidenceDirectory 'self1-entry'),'-TargetDirectory',$TargetDirectory,'-SkipTests','-UseBuiltBinary')
  $deepseekEntry=@{debug_built=$true;default_guard='REQUIRED_FEATURES';release_guard='scheduler-validation is debug-only and must never ship';default_off_error='REAL_API_NOT_AUTHORIZED';no_enable_error='REAL_API_NOT_AUTHORIZED';network_executed=$false;real_execution_authorized=$false}
  # The unchanged relay script binds each exact ignored invocation to its freshly built fake hash.
  Require-Zero 'api-debug-build' $cargo @('build','--offline','--locked','--features','scheduler-validation','--bin','nova_scheduler_api_injected')

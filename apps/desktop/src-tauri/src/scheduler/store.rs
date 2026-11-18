@@ -413,7 +413,7 @@ impl Store {
         }
         sql(db.conn().execute_batch("BEGIN IMMEDIATE;"))?;
         let result = (|| {
-            let ddl = if version == 5 { task_schema() } else if version == 4 { deepseek_schema() } else if version == 3 {
+            let ddl = if version == 6 { self_schema() } else if version == 5 { task_schema() } else if version == 4 { deepseek_schema() } else if version == 3 {
                 API_SCHEMA.into()
             } else if version == 2 {
                 SCHEMA.replace("CHECK(schema_version=1)", "CHECK(schema_version=2)")
@@ -469,7 +469,7 @@ impl Store {
         drop(db);
         drop(dg);
         drop(rg);
-        if version == 3 || version == 4 || version == 5 {
+        if version == 3 || version == 4 || version == 5 || version == 6 {
             Self::open_version(root, version)
         } else {
             Self::open(root)
@@ -525,13 +525,13 @@ impl Store {
         {
             return Err("STORE_VERSION_REJECTED");
         }
-        if !api && [3, 4, 5].contains(&mark.2) {
+        if !api && [3, 4, 5, 6].contains(&mark.2) {
             return Err("API_STORE_COMMAND_REQUIRED");
         }
         if api && mark.2 != kind {
             return Err("API_STORE_VERSION_REQUIRED");
         }
-        if ![1, 2, 3, 4, 5].contains(&mark.2) {
+        if ![1, 2, 3, 4, 5, 6].contains(&mark.2) {
             return Err("STORE_VERSION_REJECTED");
         }
         if mark.2 == 2 {
@@ -550,7 +550,7 @@ impl Store {
             }
         }
         if api {
-            let ddl = if kind == 5 { task_schema() } else if kind == 4 { deepseek_schema() } else { API_SCHEMA.into() };
+            let ddl = if kind == 6 { self_schema() } else if kind == 5 { task_schema() } else if kind == 4 { deepseek_schema() } else { API_SCHEMA.into() };
             for expected in ddl
                 .split(';')
                 .map(str::trim)
@@ -2492,5 +2492,40 @@ impl Store {
         let db=self.write_connection()?;
         let n=sql(db.conn().execute("UPDATE task_write SET state=?1,receipt_json=?2 WHERE singleton=1 AND state='INTENT'",params![state,encoded(receipt)?]))?;
         if n!=1{return Err("TASK_WRITE_CAS_CONFLICT");}Ok(())
+    }
+}
+
+// SELF-1 is an explicitly created owned Store version. No migration of old stores.
+const SELF_DDL: &str = "CREATE TABLE self_handoff(singleton INTEGER PRIMARY KEY CHECK(singleton=1),revision INTEGER NOT NULL,state_json TEXT NOT NULL);";
+fn self_schema() -> String {
+    SCHEMA.replace("CHECK(schema_version=1)", "CHECK(schema_version=6)") + SELF_DDL
+}
+impl Store {
+    pub fn self_init(root: &Path, manifest: &Manifest, envelope: &Envelope) -> Result<Self> {
+        if root != super::self_handoff::store_path(Path::new(&manifest.repo_path))? {return Err("SELF_CANONICAL_STORE_REQUIRED");}
+        Self::init_version(root, manifest, envelope, 0, 6, None)
+    }
+    pub fn self_open(root: &Path) -> Result<Self> {
+        let s=Self::open_version(root,6)?;
+        if root!=super::self_handoff::store_path(Path::new(&s.snapshot()?.manifest.repo_path))? {return Err("SELF_CANONICAL_STORE_REQUIRED");}
+        Ok(s)
+    }
+    pub(crate) fn self_read(&self) -> Result<(i64, Option<Value>)> {
+        let c=self.read_connection()?;
+        let row:Option<(i64,String)>=sql(c.query_row("SELECT revision,state_json FROM self_handoff WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?))).optional())?;
+        match row { Some((rev,raw))=>Ok((rev,Some(serde_json::from_str(&raw).map_err(|_|"SELF_STATE_REJECTED")?))),None=>Ok((0,None)) }
+    }
+    pub(crate) fn self_cas(&self, expected:i64, state:&Value) -> Result<()> {
+        let raw=serde_json::to_string(state).map_err(|_|"ENCODING")?;
+        if raw.len()>2*1024*1024 {return Err("INPUT_BOUND");}
+        let db=self.write_connection()?; let c=db.conn(); sql(c.execute_batch("BEGIN IMMEDIATE"))?;
+        let result=(|| {
+            let current:Option<i64>=sql(c.query_row("SELECT revision FROM self_handoff WHERE singleton=1",[],|r|r.get(0)).optional())?;
+            if current.unwrap_or(0)!=expected {return Err("CAS_CONFLICT");}
+            if current.is_none() {sql(c.execute("INSERT INTO self_handoff VALUES(1,1,?1)",[raw]))?;}
+            else if sql(c.execute("UPDATE self_handoff SET revision=revision+1,state_json=?1 WHERE singleton=1 AND revision=?2",params![raw,expected]))?!=1 {return Err("CAS_CONFLICT");}
+            Ok(())
+        })();
+        match result {Ok(())=>sql(c.execute_batch("COMMIT")),Err(e)=>{let _=c.execute_batch("ROLLBACK");Err(e)}}
     }
 }

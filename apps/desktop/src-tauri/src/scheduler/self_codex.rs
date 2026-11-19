@@ -142,7 +142,66 @@ fn check(s: &Store, p: &Plan) -> Result<()> {
 /// Help output cannot authorize model usage or establish Windows sandbox enforcement.
 /// This offline package deliberately exposes no live enable flag or permissive fallback.
 pub fn live_admission() -> Result<()> {
-    Err("SELF2_NATIVE_PERMISSION_AND_UUID_ADMISSION_REQUIRED")
+    #[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+    { finish_admission(None, None, "") }
+    #[cfg(not(any(test, all(feature = "scheduler-validation", debug_assertions))))]
+    { Err("SELF2_NATIVE_PERMISSION_AND_UUID_ADMISSION_REQUIRED") }
+}
+/// Opaque future model authorization: no public constructor, JSON import, PASS field or env switch.
+/// This package issues none. Permission success alone cannot construct this independent authority.
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+pub struct ModelAuthorization {
+    plan_sha256: String,
+    permission_fingerprint: String,
+    expires_utc: i64,
+}
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+pub(super) fn finish_admission(
+    permission: Option<&super::admission_probe::PermissionBinding>,
+    model: Option<&ModelAuthorization>,
+    plan_sha256: &str,
+) -> Result<()> {
+    let permission=permission.ok_or("SELF2_NATIVE_PERMISSION_AND_UUID_ADMISSION_REQUIRED")?;
+    let model=model.ok_or("SELF2_MODEL_AUTHORIZATION_REQUIRED")?;
+    if model.plan_sha256!=plan_sha256 || model.permission_fingerprint!=permission.fingerprint() {
+        return Err("SELF2_MODEL_AUTHORIZATION_BINDING_MISMATCH");
+    }
+    if model.expires_utc<=chrono::Utc::now().timestamp() {return Err("SELF2_MODEL_AUTHORIZATION_EXPIRED")}
+    // Non-model W/R does not establish exec/resume/model-session or UUID enforcement.
+    // A later specifically authorized canary must supply that admission; never launch here.
+    Err("SELF2_MODEL_SESSION_AND_UUID_ADMISSION_REQUIRED")
+}
+#[cfg(test)]
+pub(super) fn test_model_authorization_binding(permission: &super::admission_probe::PermissionBinding) {
+    let mut model=ModelAuthorization { plan_sha256: "synthetic-plan".into(),
+        permission_fingerprint: permission.fingerprint().into(), expires_utc: chrono::Utc::now().timestamp()+60 };
+    assert_eq!(finish_admission(Some(permission),Some(&model),"wrong-plan"),Err("SELF2_MODEL_AUTHORIZATION_BINDING_MISMATCH"));
+    model.permission_fingerprint="0".repeat(64);
+    assert_eq!(finish_admission(Some(permission),Some(&model),"synthetic-plan"),Err("SELF2_MODEL_AUTHORIZATION_BINDING_MISMATCH"));
+    model.permission_fingerprint=permission.fingerprint().into();model.expires_utc=0;
+    assert_eq!(finish_admission(Some(permission),Some(&model),"synthetic-plan"),Err("SELF2_MODEL_AUTHORIZATION_EXPIRED"));
+    model.expires_utc=chrono::Utc::now().timestamp()+60;
+    assert_eq!(finish_admission(Some(permission),Some(&model),"synthetic-plan"),Err("SELF2_MODEL_SESSION_AND_UUID_ADMISSION_REQUIRED"));
+}
+/// Read-only Store-scoped admission check. No CAS, permit acquisition or transport construction.
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+pub fn admission_for(
+    s: &Store,
+    scope: &super::admission_probe::PermissionScope,
+    model: Option<&ModelAuthorization>,
+) -> Result<()> {
+    let j=journal(s)?;
+    if j.records.iter().any(|r| r.outcome!="COMPLETE") {return Err("SELF2_RECONCILE_REQUIRED")}
+    let stage=h::load(s)?.1.stage;
+    if [&stage.developer,&stage.reviewer].iter().any(|v|v.as_ref().is_some_and(|v|v.source=="SYNTHETIC_CLI_RECEIPT")) {
+        return Err("SELF2_SYNTHETIC_IDENTITY_NOT_ADMISSION");
+    }
+    if !matches!(j.plan.mode,Mode::RealPendingAdmission) || j.plan.project_root!=scope.project_root
+        || j.plan.cli!=scope.cli || j.plan.cli_sha256!=scope.cli_sha256 {
+        return Err("SELF2_PERMISSION_SCOPE_MISMATCH");
+    }
+    let binding=super::admission_probe::bind_permission(scope)?;
+    finish_admission(Some(&binding),model,&j.plan_sha256)
 }
 pub fn attach(s: &Store, p: Plan) -> Result<()> {
     check(s, &p)?;
@@ -1211,6 +1270,12 @@ mod tests {
             "SELF2_NATIVE_PERMISSION_AND_UUID_ADMISSION_REQUIRED"
         );
         assert!(FakeCli::new(Path::new("C:/real/codex.exe"), CLI_SHA).is_err());
+        let (_,s,_)=fixture();let before=h::load(&s).unwrap().0;
+        let scope=super::super::admission_probe::permission_scope_1119e();
+        assert_eq!(admission_for(&s,&scope,None),Err("SELF2_PERMISSION_SCOPE_MISMATCH"));
+        assert!(run_native(&s).is_err());
+        assert_eq!(h::load(&s).unwrap().0,before);assert!(journal(&s).unwrap().records.is_empty());
+
     }
     #[test]
     fn self2_unbound_uuid_captured_only_from_receipt() {

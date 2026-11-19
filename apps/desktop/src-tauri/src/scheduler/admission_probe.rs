@@ -41,6 +41,88 @@ struct Plan {
     controls: BTreeMap<String, Fact>,
     targets: BTreeMap<String, Fact>,
 }
+/// Exact scope of the accepted non-model fixture, not a transferable sandbox certificate.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionScope {
+    pub project_root: PathBuf,
+    pub cli: PathBuf,
+    pub cli_sha256: String,
+    pub controller: PathBuf,
+    pub controller_sha256: String,
+    pub permission_plan_sha256: String,
+}
+pub(super) struct PermissionBinding {
+    pub(super) scope: PermissionScope,
+    fingerprint: String,
+}
+impl PermissionBinding {
+    pub(super) fn fingerprint(&self) -> &str { &self.fingerprint }
+}
+struct AcceptedPermission {
+    scope: PermissionScope,
+    receipts: BTreeMap<String, String>,
+}
+pub fn permission_scope_1119e() -> PermissionScope {
+    PermissionScope {
+        project_root: PathBuf::from(r"D:\nova-self2-permission-probe-1119e\workspace"),
+        cli: CLI.into(), cli_sha256: self_codex::CLI_SHA.into(),
+        controller: PathBuf::from(r"D:\nova\audit\self2-permission-ready-1119e\target\debug\nova_scheduler_self_codex.exe"),
+        controller_sha256: "e999703a84c517e46981e4d30da777b2675729627ba8f95d237eaf223402f7f8".into(),
+        permission_plan_sha256: "5c1239902fe69b5c4198f0d5bda65e18ac7570d57e43ae2b70645a2aae05f6cc".into(),
+    }
+}
+fn accepted_1119e() -> AcceptedPermission {
+    // Raw tool receipts from the accepted object, not a report PASS or caller-supplied digest.
+    AcceptedPermission { scope: permission_scope_1119e(), receipts: [
+        ("W.started.json", "a7cbbb3f6325f950cd36c3f9e8f22b0cc1210c257e90be577f50055c6afc58bf"),
+        ("W.process.json", "ba71cbbddb475f4a8ab72cdfe0259c54c10e2476a4cfe65f6ed5a50fa90df15b"),
+        ("W.exit.json", "9a6e6022927fb12cbcd145c511c67f0f44bf0d9708604a0b6167c76c22e4e5e3"),
+        ("R.started.json", "7ccf2e1880787bedc9465caaf2369d48f162b2af134b9aac105cc08491083017"),
+        ("R.process.json", "1c88c0916ff256fd092a8f2bf1e55f1d7de3ddda3a4ad3f523428067929aebc8"),
+        ("R.exit.json", "0fe64f27cee49154edd56a24a95e685697c77fc65b3979ad034da0b82d18217f"),
+    ].into_iter().map(|(n,h)|(n.into(),h.into())).collect() }
+}
+fn receipt_hashes(root: &Path) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for entry in fs::read_dir(root.join("evidence")).map_err(|_| "SELF2_PERMISSION_EVIDENCE_REQUIRED")?.take(7) {
+        let entry=entry.map_err(|_| "SELF2_PERMISSION_EVIDENCE_REQUIRED")?;
+        let n=entry.file_name().into_string().map_err(|_| "SELF2_PERMISSION_EVIDENCE_REJECTED")?;
+        if !["W.started.json","W.process.json","W.exit.json","R.started.json","R.process.json","R.exit.json"].contains(&n.as_str()) {
+            return Err("SELF2_PERMISSION_EVIDENCE_REJECTED");
+        }
+        out.insert(n, fact(&entry.path())?.sha256);
+    }
+    if out.len()!=6 {return Err("SELF2_PERMISSION_EVIDENCE_REQUIRED")}
+    Ok(out)
+}
+fn permission_at(root: &Path, scope: &PermissionScope, accepted: &AcceptedPermission, actual_cli_hash: &str) -> Result<PermissionBinding> {
+    if scope!=&accepted.scope || scope.project_root!=root.join("workspace") || actual_cli_hash!=scope.cli_sha256 {
+        return Err("SELF2_PERMISSION_SCOPE_MISMATCH");
+    }
+    let _pins=pinned(root)?;
+    if fact(&root.join("plan.json"))?.sha256!=scope.permission_plan_sha256 || receipt_hashes(root)?!=accepted.receipts {
+        return Err("SELF2_PERMISSION_EVIDENCE_REJECTED");
+    }
+    // Reuse the original environment/config/control, program, process, tool, cleanup and NOW-file guards.
+    let p=validate_environment_for(root, None, &scope.controller)?;
+    if p.helper_hash!=scope.controller_sha256 || p.cli_hash!=scope.cli_sha256 {
+        return Err("SELF2_PERMISSION_SCOPE_MISMATCH");
+    }
+    check_for(root,"R",&scope.controller)?; // recursively rechecks W; no run/evaluate executable invoked.
+    if receipt_hashes(root)?!=accepted.receipts {return Err("SELF2_PERMISSION_EVIDENCE_REJECTED")}
+    Ok(PermissionBinding { scope: scope.clone(), fingerprint: hash(&bytes(&json!({"scope":scope,"receipts":accepted.receipts}))?) })
+}
+pub(super) fn bind_permission(scope: &PermissionScope) -> Result<PermissionBinding> {
+    let accepted=accepted_1119e();
+    if scope!=&accepted.scope {return Err("SELF2_PERMISSION_SCOPE_MISMATCH")}
+    permission_at(Path::new(r"D:\nova-self2-permission-probe-1119e"),scope,&accepted,&tool_hash(&scope.cli)?)
+}
+/// Read-only preparation interface. A binding is rechecked on each call and is never a launch permit.
+pub fn permission_preflight(scope: &PermissionScope) -> Result<Value> {
+    let binding=bind_permission(scope)?;
+    Ok(json!({"schema":"nova.self2.permission-binding/1","scope":binding.scope,"permission_fingerprint":binding.fingerprint(),"permission_verified":true,"model_authorization":"REQUIRED_SEPARATELY","model_admission":false,"real_codex_started":false}))
+}
 fn bytes<T: Serialize>(v: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(v).map_err(|_| "ENCODING")
 }
@@ -104,6 +186,9 @@ fn validate(root: &Path) -> Result<Plan> {
     validate_environment(root, None)
 }
 fn validate_environment(root: &Path, helper: Option<&BTreeMap<String, String>>) -> Result<Plan> {
+    validate_environment_for(root, helper, &std::env::current_exe().map_err(|_| "SELF_PATH")?)
+}
+fn validate_environment_for(root: &Path, helper: Option<&BTreeMap<String, String>>, expected_helper: &Path) -> Result<Plan> {
     let p: Plan = load(&root.join("plan.json"))?;
     if root.join("home/config.toml").exists()
         || root.join("home/AGENTS.md").exists()
@@ -115,7 +200,7 @@ fn validate_environment(root: &Path, helper: Option<&BTreeMap<String, String>>) 
     {
         return Err("PROBE_ENVIRONMENT_DRIFT");
     }
-    if p.helper != std::env::current_exe().map_err(|_| "SELF_PATH")?
+    if p.helper != expected_helper
         || uuid::Uuid::parse_str(&p.nonce).is_err()
     {
         return Err("PROBE_BINDING_REJECTED");
@@ -453,9 +538,12 @@ pub fn failure(operation: &str, step: &str, code: &str) -> Value {
     failure_at(Path::new(ROOT), operation, step, code)
 }
 fn check(root: &Path, step: &str) -> Result<Value> {
+    check_for(root, step, &std::env::current_exe().map_err(|_| "SELF_PATH")?)
+}
+fn check_for(root: &Path, step: &str, expected_helper: &Path) -> Result<Value> {
     phase(step)?;
     let _guards = pinned(root)?;
-    let p = validate(root)?;
+    let p = validate_environment_for(root, None, expected_helper)?;
     let s: Start = load(&root.join("evidence").join(format!("{step}.started.json")))?;
     let x: Exit = load(&root.join("evidence").join(format!("{step}.exit.json")))?;
     let e = &x.execution;
@@ -498,7 +586,7 @@ fn check(root: &Path, step: &str) -> Result<Value> {
         return Err("PROBE_CURRENT_FILE_DRIFT");
     }
     if step == "R" {
-        check(root, "W")?;
+        check_for(root, "W", expected_helper)?;
     }
     Ok(
         json!({"schema":"nova.self2.permission-verdict/1","phase":step,"tool_verified":true,"cli_process_started":true,"sandbox_helper_execution":"VERIFIED_FIXED_TOOL_RECEIPT","model_started":false,"model_admission":false,"plan_digest":s.digest,"command_exit":e.exit_code,"pid":e.pid,"creation":e.process_creation_utc,"reclaim":e.reclaim,"tool_receipt":r,"current_files":current(root)?,"stdout_hash":hash(&e.stdout),"stderr_hash":hash(&e.stderr)}),

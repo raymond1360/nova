@@ -95,6 +95,13 @@ impl F {
         )
         .unwrap();
     }
+    fn accepted(&self) -> AcceptedPermission {
+        AcceptedPermission { scope: PermissionScope {
+            project_root: self.root.join("workspace"), cli: PathBuf::from(r"C:\SYNTHETIC\codex.exe"),
+            cli_sha256: self.p.cli_hash.clone(), controller: self.p.helper.clone(),
+            controller_sha256: self.p.helper_hash.clone(), permission_plan_sha256: hash(&bytes(&self.p).unwrap()),
+        }, receipts: receipt_hashes(&self.root).unwrap() }
+    }
     fn driver(&self, case: &str) -> (NativeDriver, Command) {
         let exe = std::env::current_exe().unwrap();
         let sha = tool_hash(&exe).unwrap();
@@ -233,7 +240,7 @@ fn probe_fixed_surface_and_live_gate_closed() {
     let mut serialization = f.p.clone();
     serialization.environment = BTreeMap::from([
         ("SystemRoot".into(), r"C:\SYNTHETIC_WINDOWS".into()),
-        ("COMPUTERNAME".into(), "SYNTHETIC \"Ä\" \\ line\nnext".into()),
+        ("COMPUTERNAME".into(), "SYNTHETIC \"脛\" \\ line\nnext".into()),
     ]);
     let material = f.root.join("evidence/synthetic-shell-contract.json");
     fs::write(&material, bytes(&json!({
@@ -244,6 +251,33 @@ fn probe_fixed_surface_and_live_gate_closed() {
 }
 #[test]
 fn probe_current_bytes_identity_controls_and_receipts_rechecked() {
+    // Test-only accepted anchors; production accepts only the pinned 1119e raw receipts.
+    let a=F::new();a.synthetic("W");a.synthetic("R");let accepted=a.accepted();
+    let binding=permission_at(&a.root,&accepted.scope,&accepted,self_codex::CLI_SHA).unwrap();
+    assert_eq!(self_codex::finish_admission(Some(&binding),None,"synthetic-plan"),Err("SELF2_MODEL_AUTHORIZATION_REQUIRED"));
+    self_codex::test_model_authorization_binding(&binding);
+    for key in ["root","cli","controller","cli_hash","controller_hash","configuration"] {
+        let mut scope=accepted.scope.clone();
+        match key { "root"=>scope.project_root=a.root.join("other"),"cli"=>scope.cli=a.root.join("other.exe"),
+            "controller"=>scope.controller=a.root.join("other.exe"),"cli_hash"=>scope.cli_sha256="0".repeat(64),
+            "controller_hash"=>scope.controller_sha256="0".repeat(64),_=>scope.permission_plan_sha256="0".repeat(64) }
+        assert!(permission_at(&a.root,&scope,&accepted,self_codex::CLI_SHA).is_err());
+        assert!(bind_permission(&scope).is_err()); // rejected before touching the real fixed fixture.
+    }
+    assert!(permission_at(&a.root,&accepted.scope,&accepted,&"0".repeat(64)).is_err());
+    let receipt=a.root.join("evidence/R.exit.json");let original=fs::read(&receipt).unwrap();
+    let mut bad: Exit=load(&receipt).unwrap();bad.execution.reclaim="UNKNOWN".into();
+    fs::write(&receipt,bytes(&bad).unwrap()).unwrap();
+    assert!(permission_at(&a.root,&accepted.scope,&accepted,self_codex::CLI_SHA).is_err());
+    let recomputed=a.accepted(); // even self-consistent edited hashes cannot turn UNKNOWN into success.
+    assert!(permission_at(&a.root,&recomputed.scope,&recomputed,self_codex::CLI_SHA).is_err());
+    fs::write(&receipt,&original).unwrap();
+    fs::write(a.root.join("workspace/write.txt"),b"EXPIRED_APPLICABILITY").unwrap();
+    assert!(permission_at(&a.root,&accepted.scope,&accepted,self_codex::CLI_SHA).is_err());
+    fs::write(a.root.join("workspace/write.txt"),AFTER).unwrap();
+    assert!(permission_at(&a.root,&accepted.scope,&accepted,self_codex::CLI_SHA).is_ok());
+    fs::remove_file(&receipt).unwrap();
+    assert!(permission_at(&a.root,&accepted.scope,&accepted,self_codex::CLI_SHA).is_err());
     let f = F::new();
     f.synthetic("W");
     assert!(check(&f.root, "W").is_ok());

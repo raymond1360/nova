@@ -33,6 +33,7 @@ impl F {
                 fact(&root.join("control/instructions.txt")).unwrap(),
             )]),
             targets: current(&root).unwrap(),
+            project: None,
         };
         fresh(&root.join("plan.json"), &p).unwrap();
         Self { root, p }
@@ -50,7 +51,7 @@ impl F {
         let s = self.start(step);
         reserve(&self.root, step, &s).unwrap();
         if step == "W" {
-            fs::write(self.root.join("workspace/write.txt"), AFTER).unwrap();
+            fs::write(target_directory(&self.root,&self.p).join("write.txt"), AFTER).unwrap();
         }
         let mut e = Execution::failed(if step == "W" {
             "SUCCESS"
@@ -251,6 +252,70 @@ fn probe_fixed_surface_and_live_gate_closed() {
 }
 #[test]
 fn probe_current_bytes_identity_controls_and_receipts_rechecked() {
+    // Full public admission path, ordinary .git directory and declared editable source.
+    {
+        use super::super::{self_handoff as h, self_codex as c, contract::{Conclusion,ReportType}, store::Store};
+        let mut f=F::new();let workspace=f.root.join("workspace");
+        fs::create_dir(workspace.join(PROJECT_TARGETS)).unwrap();
+        for n in ["write.txt","readonly.txt"] {fs::rename(workspace.join(n),workspace.join(PROJECT_TARGETS).join(n)).unwrap()}
+        fs::write(workspace.join(".gitignore"),b"/.nova-permission/\n").unwrap();
+        fs::write(workspace.join("a.txt"),b"before\n").unwrap();
+        let git=|args:&[&str]| -> String {
+            let out=std::process::Command::new(r"C:\Program Files\Git\cmd\git.exe")
+                .env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","NUL")
+                .arg("-C").arg(&workspace).args(args).output().unwrap();
+            assert!(out.status.success(),"synthetic Git failed");String::from_utf8(out.stdout).unwrap().trim().into()
+        };
+        git(&["init","-q"]);git(&["add","--","a.txt",".gitignore"]);
+        git(&["-c","user.name=synthetic","-c","user.email=synthetic@invalid","-c","core.hooksPath=NUL","-c","commit.gpgsign=false","commit","-qm","base"]);
+        let base=git(&["rev-parse","HEAD"]);fs::write(workspace.join("a.txt"),b"after\n").unwrap();git(&["add","--","a.txt"]);
+        git(&["-c","user.name=synthetic","-c","user.email=synthetic@invalid","-c","core.hooksPath=NUL","-c","commit.gpgsign=false","commit","-qm","candidate"]);
+        let head=git(&["rev-parse","HEAD"]);
+        f.p.schema="nova.self2.permission-probe/3".into();f.p.project=Some(project_layout(&f.root).unwrap());
+        f.p.cli_hash=tool_hash(&f.p.helper).unwrap();fs::write(f.root.join("plan.json"),bytes(&f.p).unwrap()).unwrap();
+        f.synthetic("W");f.synthetic("R");let mut accepted=f.accepted();accepted.scope.cli=f.p.helper.clone();
+        SYNTHETIC_ACCEPTED.with(|v|*v.borrow_mut()=Some(accepted.clone()));
+        struct ClearTrust;impl Drop for ClearTrust {fn drop(&mut self){SYNTHETIC_ACCEPTED.with(|v|*v.borrow_mut()=None)}}
+        let _clear=ClearTrust;
+        let report=h::tests::report("project-package",&head,ReportType::Development,Conclusion::NotRun);
+        let input:h::DeliveryInput=serde_json::from_value(json!({"stage":"project-stage","package":"project-package","base_sha":base,"head_sha":head,
+            "goal":"Only edit a.txt","acceptance":["declared source only"],"allowed_paths":["a.txt"],"required_commands":[],"logs":[],"developer_report":report})).unwrap();
+        let reports=f.root.join("reports");fs::create_dir(&reports).unwrap();
+        let stage=h::Stage {stage:"project-stage".into(),developer:None,reviewer:None};
+        let store=h::init_work(&h::store_path(&workspace).unwrap(),&workspace,&reports,stage,input.clone()).unwrap();
+        c::attach(&store,c::Plan {mode:c::Mode::RealPendingAdmission,schema:"nova.self2.plan/1".into(),input,
+            project_root:workspace.clone(),cli:accepted.scope.cli.clone(),cli_sha256:accepted.scope.cli_sha256.clone(),
+            cli_version:c::CLI_VERSION.into(),model:"SYNTHETIC_NOT_RUN".into(),commands:vec![]}).unwrap();
+        let observed=std::cell::RefCell::new(vec![]);
+        let admission=|store:&Store| {
+            let before=h::load(store).unwrap();let r=c::admission_for(store,&accepted.scope,None);
+            let after=h::load(store).unwrap();assert_eq!(before.0,after.0);
+            assert_eq!(serde_json::to_value(&before.1).unwrap(),serde_json::to_value(&after.1).unwrap());
+            observed.borrow_mut().push(json!({"result":format!("{r:?}"),"revision_before":before.0,"revision_after":after.0,"records":after.1.self2.as_ref().unwrap().records.len(),"state_unchanged":true}));r
+        };
+        assert_eq!(admission(&store),Err("SELF2_MODEL_AUTHORIZATION_REQUIRED"));
+        // A legitimate in-scope source edit is independent of immutable permission sentinels.
+        fs::write(workspace.join("a.txt"),b"legal uncommitted model edit\n").unwrap();
+        assert_eq!(admission(&store),Err("SELF2_MODEL_AUTHORIZATION_REQUIRED"));
+        fs::write(workspace.join("outside.txt"),b"unapproved").unwrap();assert_eq!(admission(&store),Err("SCOPE_REJECTED"));fs::remove_file(workspace.join("outside.txt")).unwrap();
+        let config=workspace.join(".git/config");let original=fs::read(&config).unwrap();fs::write(&config,b"[core]\n bare = false\n# drift\n").unwrap();
+        assert!(admission(&store).is_err());fs::write(&config,original).unwrap();
+        let marker=workspace.join(PROJECT_TARGETS).join("readonly.txt");fs::write(&marker,b"drift").unwrap();assert!(admission(&store).is_err());fs::write(&marker,BEFORE).unwrap();
+        let receipt=f.root.join("evidence/R.exit.json");let raw=fs::read(&receipt).unwrap();let mut unknown:Exit=load(&receipt).unwrap();unknown.execution.reclaim="UNKNOWN".into();fs::write(&receipt,bytes(&unknown).unwrap()).unwrap();assert!(admission(&store).is_err());
+        // Even test authority accepting the edited hashes cannot bypass original cleanup/UNKNOWN checks.
+        let mut updated=f.accepted();updated.scope.cli=accepted.scope.cli.clone();SYNTHETIC_ACCEPTED.with(|v|*v.borrow_mut()=Some(updated));assert!(admission(&store).is_err());
+        fs::write(&receipt,raw).unwrap();SYNTHETIC_ACCEPTED.with(|v|*v.borrow_mut()=Some(accepted.clone()));assert_eq!(admission(&store),Err("SELF2_MODEL_AUTHORIZATION_REQUIRED"));
+        // Existing Store record state blocks admission without clearing or replaying it.
+        for outcome in ["STARTED","UNKNOWN"] {
+            let (rev,mut state)=h::load(&store).unwrap();state.self2.as_mut().unwrap().records=vec![c::Record {key:"synthetic-reserved".into(),
+                attempt:serde_json::from_value(json!({"attempt_id":uuid::Uuid::new_v4().to_string(),"role":"DEVELOP","state":"LAUNCHING","state_version":0,"input_identity":"0".repeat(64),"profile_id":"SELF2_DEVELOP","exe_sha256":"0".repeat(64),"argv_sha256":"0".repeat(64),"env_names_sha256":"0".repeat(64)})).unwrap(),
+                spec_sha256:"0".repeat(64),expected_uuid:None,outcome:outcome.into(),execution:None,stdout_path:None,stderr_path:None}];h::save(&store,rev,&state).unwrap();
+            assert_eq!(admission(&store),Err("SELF2_RECONCILE_REQUIRED"));
+        }
+        let trace=f.root.join("reports/public-admission-evidence.json");
+        fs::write(&trace,bytes(&json!({"synthetic_only":true,"entry":"self_codex::admission_for","mode":"RealPendingAdmission","project":workspace,"permission_schema":f.p.schema,"git_is_local_directory":workspace.join(".git").is_dir(),"observations":observed.into_inner()})).unwrap()).unwrap();
+        println!("SYNTHETIC_PUBLIC_ADMISSION_EVIDENCE={}",trace.display());
+    }
     // Test-only accepted anchors; production accepts only the pinned 1119e raw receipts.
     let a=F::new();a.synthetic("W");a.synthetic("R");let accepted=a.accepted();
     let binding=permission_at(&a.root,&accepted.scope,&accepted,self_codex::CLI_SHA).unwrap();

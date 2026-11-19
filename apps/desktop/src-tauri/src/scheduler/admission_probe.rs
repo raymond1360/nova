@@ -40,6 +40,51 @@ struct Plan {
     helper_hash: String,
     controls: BTreeMap<String, Fact>,
     targets: BTreeMap<String, Fact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<ProjectLayout>,
+}
+/// V3: ordinary standalone Git workspace plus ignored, immutable permission sentinels.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ProjectLayout {
+    workspace_identity: String,
+    git_identity: String,
+    targets_identity: String,
+    git_config: Fact,
+    git_exclude: Fact,
+    git_ignore: Fact,
+}
+const PROJECT_TARGETS: &str = ".nova-permission";
+fn project_layout(root: &Path) -> Result<ProjectLayout> {
+    let workspace=root.join("workspace");let git=workspace.join(".git");
+    // No ancestor discovery, gitdir pointers, worktrees or common config indirection.
+    for name in ["commondir","config.worktree","worktrees","info/attributes"] {
+        match fs::symlink_metadata(git.join(name)) {
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound => {},
+            _ => return Err("PROBE_PROJECT_LAYOUT_REJECTED"),
+        }
+    }
+    let ignore=fact(&workspace.join(".gitignore"))?;
+    if fs::read(workspace.join(".gitignore")).map_err(|_|"PROBE_READ")? != b"/.nova-permission/\n" {
+        return Err("PROBE_PROJECT_LAYOUT_REJECTED");
+    }
+    Ok(ProjectLayout { workspace_identity: Guard::open(&workspace,true)?.identity,
+        git_identity: Guard::open(&git,true)?.identity,
+        targets_identity: Guard::open(&workspace.join(PROJECT_TARGETS),true)?.identity,
+        git_config: fact(&git.join("config"))?,git_exclude:fact(&git.join("info/exclude"))?,git_ignore:ignore })
+}
+fn target_directory(root: &Path, p: &Plan) -> PathBuf {
+    let workspace=root.join("workspace");
+    if p.project.is_some() {workspace.join(PROJECT_TARGETS)} else {workspace}
+}
+fn current_for(root: &Path, p: &Plan) -> Result<BTreeMap<String,Fact>> {
+    let mut out=BTreeMap::new();
+    for entry in fs::read_dir(target_directory(root,p)).map_err(|_|"PROBE_READ")? {
+        let entry=entry.map_err(|_|"PROBE_READ")?;
+        let name=entry.file_name().into_string().map_err(|_|"PROBE_PATH")?;
+        out.insert(name,fact(&entry.path())?);
+    }
+    Ok(out)
 }
 /// Exact scope of the accepted non-model fixture, not a transferable sandbox certificate.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,6 +104,7 @@ pub(super) struct PermissionBinding {
 impl PermissionBinding {
     pub(super) fn fingerprint(&self) -> &str { &self.fingerprint }
 }
+#[derive(Clone)]
 struct AcceptedPermission {
     scope: PermissionScope,
     receipts: BTreeMap<String, String>,
@@ -105,18 +151,29 @@ fn permission_at(root: &Path, scope: &PermissionScope, accepted: &AcceptedPermis
         return Err("SELF2_PERMISSION_EVIDENCE_REJECTED");
     }
     // Reuse the original environment/config/control, program, process, tool, cleanup and NOW-file guards.
-    let p=validate_environment_for(root, None, &scope.controller)?;
+    let p=validate_bound(root, None, &scope.controller,&scope.cli_sha256)?;
     if p.helper_hash!=scope.controller_sha256 || p.cli_hash!=scope.cli_sha256 {
         return Err("SELF2_PERMISSION_SCOPE_MISMATCH");
     }
-    check_for(root,"R",&scope.controller)?; // recursively rechecks W; no run/evaluate executable invoked.
+    check_bound(root,"R",&scope.controller,&scope.cli_sha256)?; // recursively rechecks W; no run/evaluate executable invoked.
     if receipt_hashes(root)?!=accepted.receipts {return Err("SELF2_PERMISSION_EVIDENCE_REJECTED")}
     Ok(PermissionBinding { scope: scope.clone(), fingerprint: hash(&bytes(&json!({"scope":scope,"receipts":accepted.receipts}))?) })
 }
 pub(super) fn bind_permission(scope: &PermissionScope) -> Result<PermissionBinding> {
+    #[cfg(test)]
+    if let Some(accepted)=SYNTHETIC_ACCEPTED.with(|v|v.borrow().clone()).filter(|v|v.scope==*scope) {
+        return permission_at(scope.project_root.parent().ok_or("PROBE_PATH")?,scope,&accepted,&tool_hash(&scope.cli)?);
+    }
+
     let accepted=accepted_1119e();
     if scope!=&accepted.scope {return Err("SELF2_PERMISSION_SCOPE_MISMATCH")}
     permission_at(Path::new(r"D:\nova-self2-permission-probe-1119e"),scope,&accepted,&tool_hash(&scope.cli)?)
+}
+#[cfg(test)]
+thread_local! { static SYNTHETIC_ACCEPTED: std::cell::RefCell<Option<AcceptedPermission>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+pub(super) fn synthetic_cli_binding(root: &Path, cli: &Path, sha: &str) -> bool {
+    SYNTHETIC_ACCEPTED.with(|v|v.borrow().as_ref().is_some_and(|a|a.scope.project_root==root && a.scope.cli==cli && a.scope.cli_sha256==sha))
 }
 /// Read-only preparation interface. A binding is rechecked on each call and is never a launch permit.
 pub fn permission_preflight(scope: &PermissionScope) -> Result<Value> {
@@ -189,6 +246,9 @@ fn validate_environment(root: &Path, helper: Option<&BTreeMap<String, String>>) 
     validate_environment_for(root, helper, &std::env::current_exe().map_err(|_| "SELF_PATH")?)
 }
 fn validate_environment_for(root: &Path, helper: Option<&BTreeMap<String, String>>, expected_helper: &Path) -> Result<Plan> {
+    validate_bound(root,helper,expected_helper,self_codex::CLI_SHA)
+}
+fn validate_bound(root: &Path, helper: Option<&BTreeMap<String,String>>, expected_helper: &Path, expected_cli: &str) -> Result<Plan> {
     let p: Plan = load(&root.join("plan.json"))?;
     if root.join("home/config.toml").exists()
         || root.join("home/AGENTS.md").exists()
@@ -205,12 +265,15 @@ fn validate_environment_for(root: &Path, helper: Option<&BTreeMap<String, String
     {
         return Err("PROBE_BINDING_REJECTED");
     }
-    if p.schema != "nova.self2.permission-probe/2"
-        || p.cli_hash != self_codex::CLI_SHA
+    if !matches!((&*p.schema,&p.project),("nova.self2.permission-probe/2",None)|("nova.self2.permission-probe/3",Some(_)))
+        || p.cli_hash != expected_cli
         || p.root_identity != Guard::open(root, true)?.identity
         || tool_hash(&p.helper)? != p.helper_hash
     {
         return Err("PROBE_BINDING_REJECTED");
+    }
+    if let Some(expected)=&p.project {
+        if &project_layout(root)?!=expected {return Err("PROBE_PROJECT_DRIFT")}
     }
     for (n, f) in &p.controls {
         if !["instructions.txt"].contains(&n.as_str()) || fact(&root.join("control").join(n))? != *f
@@ -541,9 +604,12 @@ fn check(root: &Path, step: &str) -> Result<Value> {
     check_for(root, step, &std::env::current_exe().map_err(|_| "SELF_PATH")?)
 }
 fn check_for(root: &Path, step: &str, expected_helper: &Path) -> Result<Value> {
+    check_bound(root,step,expected_helper,self_codex::CLI_SHA)
+}
+fn check_bound(root: &Path, step: &str, expected_helper: &Path, expected_cli: &str) -> Result<Value> {
     phase(step)?;
     let _guards = pinned(root)?;
-    let p = validate_environment_for(root, None, expected_helper)?;
+    let p = validate_bound(root, None, expected_helper, expected_cli)?;
     let s: Start = load(&root.join("evidence").join(format!("{step}.started.json")))?;
     let x: Exit = load(&root.join("evidence").join(format!("{step}.exit.json")))?;
     let e = &x.execution;
@@ -582,14 +648,14 @@ fn check_for(root: &Path, step: &str, expected_helper: &Path) -> Result<Value> {
         return Err("PROBE_TOOL_RECEIPT_REJECTED");
     }
     // Re-read NOW: neither the exited process nor a stored snapshot can attest current bytes/identity.
-    if current(root)? != expected(&p, step, true) {
+    if current_for(root,&p)? != expected(&p, step, true) {
         return Err("PROBE_CURRENT_FILE_DRIFT");
     }
     if step == "R" {
-        check_for(root, "W", expected_helper)?;
+        check_bound(root, "W", expected_helper, expected_cli)?;
     }
     Ok(
-        json!({"schema":"nova.self2.permission-verdict/1","phase":step,"tool_verified":true,"cli_process_started":true,"sandbox_helper_execution":"VERIFIED_FIXED_TOOL_RECEIPT","model_started":false,"model_admission":false,"plan_digest":s.digest,"command_exit":e.exit_code,"pid":e.pid,"creation":e.process_creation_utc,"reclaim":e.reclaim,"tool_receipt":r,"current_files":current(root)?,"stdout_hash":hash(&e.stdout),"stderr_hash":hash(&e.stderr)}),
+        json!({"schema":"nova.self2.permission-verdict/1","phase":step,"tool_verified":true,"cli_process_started":true,"sandbox_helper_execution":"VERIFIED_FIXED_TOOL_RECEIPT","model_started":false,"model_admission":false,"plan_digest":s.digest,"command_exit":e.exit_code,"pid":e.pid,"creation":e.process_creation_utc,"reclaim":e.reclaim,"tool_receipt":r,"current_files":current_for(root,&p)?,"stdout_hash":hash(&e.stdout),"stderr_hash":hash(&e.stderr)}),
     )
 }
 pub fn prepare() -> Result<Value> {
@@ -626,6 +692,7 @@ pub fn prepare() -> Result<Value> {
             fact(&root.join("control/instructions.txt"))?,
         )]),
         targets: current(root)?,
+        project: None,
     };
     fresh(&root.join("plan.json"), &p)?;
     Ok(
@@ -650,7 +717,7 @@ pub fn run(step: &str, digest: &str, confirmation: &str) -> Result<Value> {
     if step == "R" {
         check(root, "W")?;
     }
-    if current(root)? != expected(&p, step, false) {
+    if current_for(root,&p)? != expected(&p, step, false) {
         return Err("PROBE_CURRENT_FILE_DRIFT");
     }
     if tool_hash(Path::new(CLI))? != self_codex::CLI_SHA
@@ -661,7 +728,7 @@ pub fn run(step: &str, digest: &str, confirmation: &str) -> Result<Value> {
     // Host open-only check distinguishes native sandbox denial from an unwritable host fixture.
     let host = OpenOptions::new()
         .write(true)
-        .open(root.join("workspace").join(target(step)))
+        .open(target_directory(root,&p).join(target(step)))
         .map_err(|_| "PROBE_HOST_NOT_WRITABLE")?;
     drop(host);
     let spec = Spec {
@@ -678,7 +745,7 @@ pub fn run(step: &str, digest: &str, confirmation: &str) -> Result<Value> {
         digest: actual,
         phase: step.into(),
         command_hash: hash(&bytes(&spec.argv)?),
-        before: current(root)?,
+        before: current_for(root,&p)?,
         host_write_allowed: true,
     };
     let mut d = NativeDriver::self2_transport(Path::new(CLI), self_codex::CLI_SHA)?;
@@ -713,10 +780,10 @@ fn helper_at(root: &Path, step: &str, nonce: &str, environment: &BTreeMap<String
     if s.digest != hash(&bytes(&p)?) || s.phase != step {
         return Err("PROBE_HELPER_PERMIT_REJECTED");
     }
-    if current(root)? != expected(&p, step, false) {
+    if current_for(root,&p)? != expected(&p, step, false) {
         return Err("PROBE_CURRENT_FILE_DRIFT");
     }
-    let path = root.join("workspace").join(target(step));
+    let path = target_directory(root,&p).join(target(step));
     let mut options = OpenOptions::new();
     options.read(true).write(true);
     #[cfg(windows)]

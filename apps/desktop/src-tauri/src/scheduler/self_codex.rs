@@ -91,11 +91,18 @@ fn bytes<T: Serialize>(v: &T) -> Result<Vec<u8>> {
 fn uuid_ok(s: &str) -> bool {
     uuid::Uuid::parse_str(s).is_ok_and(|u| u.to_string() == s)
 }
+fn plan_cli_pin(p: &Plan) -> bool {
+    if p.cli_sha256==CLI_SHA {return true}
+    #[cfg(test)]
+    { return super::admission_probe::synthetic_cli_binding(&p.project_root,&p.cli,&p.cli_sha256); }
+    #[cfg(not(test))]
+    { false }
+}
 fn check(s: &Store, p: &Plan) -> Result<()> {
     let st = h::load(s)?.1;
     if p.schema != "nova.self2.plan/1"
         || p.input.stage != st.stage.stage
-        || p.cli_sha256 != CLI_SHA
+        || !plan_cli_pin(p)
         || p.cli_version != CLI_VERSION
         || !p.cli.is_absolute()
         || p.model.is_empty()
@@ -200,7 +207,12 @@ pub fn admission_for(
         || j.plan.cli!=scope.cli || j.plan.cli_sha256!=scope.cli_sha256 {
         return Err("SELF2_PERMISSION_SCOPE_MISMATCH");
     }
+    if j.plan.input.allowed_paths.iter().any(|p|p==".gitignore" || p==".git" || p.starts_with(".git/") || p==".nova-permission" || p.starts_with(".nova-permission/")) {
+        return Err("SELF2_PERMISSION_RESERVED_SCOPE");
+    }
+    // Existing material contract allows declared source edits but rejects outside-scope drift.
     let binding=super::admission_probe::bind_permission(scope)?;
+    h::material_for(&j.plan.project_root,&j.plan.input,false)?;
     finish_admission(Some(&binding),model,&j.plan_sha256)
 }
 pub fn attach(s: &Store, p: Plan) -> Result<()> {

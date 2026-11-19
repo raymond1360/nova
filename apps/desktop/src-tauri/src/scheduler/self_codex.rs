@@ -434,7 +434,22 @@ fn invoke(
         state: "LAUNCHING".into(),
         state_version: 0,
         input_identity: hash(&b),
-        parent_attempt_id: None,
+        parent_attempt_id: if role == Role::Develop {
+            None
+        } else {
+            Some(
+                j.records
+                    .iter()
+                    .rev()
+                    .find(|r| {
+                        r.attempt.profile_id == Role::Develop.profile() && r.outcome == "COMPLETE"
+                    })
+                    .ok_or("SELF2_DEVELOPER_RECEIPT_REQUIRED")?
+                    .attempt
+                    .attempt_id
+                    .clone(),
+            )
+        },
         profile_id: role.profile(),
         exe_sha256: spec.exe_sha256.clone(),
         argv_sha256: spec.argv_sha256(),
@@ -544,7 +559,12 @@ fn invoke(
         "UNKNOWN"
     }
     .into();
-    r.attempt.state = r.outcome.clone();
+    r.attempt.state = if r.outcome == "COMPLETE" {
+        "EXITED"
+    } else {
+        &r.outcome
+    }
+    .into();
     r.attempt.session_id = e.session_id.clone();
     r.attempt.usage_json = e.usage.as_ref().map(|v| v.to_string());
     r.attempt.exit_code = e.exit_code;
@@ -1051,6 +1071,12 @@ mod tests {
         let mut d = fake("ok");
         let v = run_memory(&s, &mut d).unwrap();
         assert_eq!(d.calls.len(), 3);
+        let receipts = journal(&s).unwrap().records;
+        assert!(receipts.iter().all(|r| r.attempt.state == "EXITED"));
+        assert_eq!(
+            receipts[2].attempt.parent_attempt_id.as_deref(),
+            Some(receipts[0].attempt.attempt_id.as_str())
+        );
         assert_eq!(v["self1"]["active"]["status"], "AWAITING_PM_AND_USER");
         assert_eq!(v["real_codex_started"], false);
         h::export(&s, &f.dir.join("self2-export")).unwrap();

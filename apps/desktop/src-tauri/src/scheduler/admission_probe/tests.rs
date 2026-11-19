@@ -140,7 +140,7 @@ fn probe_fixed_surface_and_live_gate_closed() {
     assert_eq!(phase("exec"), Err("PROBE_PHASE_REJECTED"));
     let f = F::new();
     let a = argv(&f.root, &f.p, "R");
-    assert_eq!(&a[0..2], &["--ignore-user-config", "sandbox"]);
+    assert_eq!(a[0], "sandbox");
     assert!(a.contains(&"windows.sandbox=\"unelevated\"".into()));
     assert!(a.contains(&"sandbox_mode=\"read-only\"".into()));
     assert!(!a

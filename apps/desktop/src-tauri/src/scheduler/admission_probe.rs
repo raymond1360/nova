@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-pub const ROOT: &str = r"D:\nova-self2-permission-probe-1119";
+pub const ROOT: &str = r"D:\nova-self2-permission-probe-1119b";
 pub const CLI: &str = r"C:\Users\Lenovo\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe";
 const BEFORE: &[u8] = b"CANARY_INITIAL\r\n";
 const AFTER: &[u8] = b"CANARY_DEVELOPED\r\n";
@@ -147,7 +147,6 @@ fn expected(p: &Plan, step: &str, after: bool) -> BTreeMap<String, Fact> {
 }
 fn argv(root: &Path, p: &Plan, step: &str) -> Vec<String> {
     vec![
-        "--ignore-user-config".into(),
         "sandbox".into(),
         "-C".into(),
         root.join("workspace").to_string_lossy().into_owned(),

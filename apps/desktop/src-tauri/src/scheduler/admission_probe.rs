@@ -35,6 +35,7 @@ struct Plan {
     nonce: String,
     cli_hash: String,
     environment: BTreeMap<String, String>,
+    helper_environment: BTreeMap<String, String>,
     helper: PathBuf,
     helper_hash: String,
     controls: BTreeMap<String, Fact>,
@@ -100,10 +101,17 @@ fn pinned(root: &Path) -> Result<Vec<Guard>> {
     .collect()
 }
 fn validate(root: &Path) -> Result<Plan> {
+    validate_environment(root, None)
+}
+fn validate_environment(root: &Path, helper: Option<&BTreeMap<String, String>>) -> Result<Plan> {
     let p: Plan = load(&root.join("plan.json"))?;
-    if p.environment != env(root)?
-        || root.join("home/config.toml").exists()
+    if root.join("home/config.toml").exists()
         || root.join("home/AGENTS.md").exists()
+        || p.helper_environment != helper_environment(root, &p.environment)?
+        || match helper {
+            None => p.environment != env(root)?,
+            Some(actual) => canonical_environment(actual)? != canonical_environment(&p.helper_environment)?,
+        }
     {
         return Err("PROBE_ENVIRONMENT_DRIFT");
     }
@@ -112,7 +120,7 @@ fn validate(root: &Path) -> Result<Plan> {
     {
         return Err("PROBE_BINDING_REJECTED");
     }
-    if p.schema != "nova.self2.permission-probe/1"
+    if p.schema != "nova.self2.permission-probe/2"
         || p.cli_hash != self_codex::CLI_SHA
         || p.root_identity != Guard::open(root, true)?.identity
         || tool_hash(&p.helper)? != p.helper_hash
@@ -169,6 +177,14 @@ fn argv(root: &Path, p: &Plan, step: &str) -> Vec<String> {
         "windows.sandbox=\"unelevated\"".into(),
         "-c".into(),
         "sandbox_workspace_write.network_access=false".into(),
+        "-c".into(),
+        "shell_environment_policy.inherit=\"none\"".into(),
+        "-c".into(),
+        format!("shell_environment_policy.set={{{}}}", p.environment.iter()
+            .map(|(k, v)| format!("{}={}", json!(k), json!(v)))
+            .collect::<Vec<_>>().join(",")),
+        "-c".into(),
+        format!("shell_environment_policy.include_only={}", json!(p.environment.keys().collect::<Vec<_>>())),
         "--".into(),
         p.helper.to_string_lossy().into_owned(),
         "permission-helper".into(),
@@ -187,6 +203,85 @@ fn env(root: &Path) -> Result<BTreeMap<String, String>> {
         root.join("home").to_string_lossy().into_owned(),
     );
     Ok(e)
+}
+// rust-v0.162.1 create_env: inherit=none, explicit safe set, exact include_only,
+// no thread ID. Legacy then normalizes null values, adds pager/offline entries,
+// prepends the known-folder denybin and reorders PATHEXT. No tools run here.
+fn canonical_environment(input: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for (k, v) in input {
+        if !k.is_ascii() || k.contains('=') || k.contains('\0') || v.contains('\0')
+            || out.insert(k.to_ascii_uppercase(), v.clone()).is_some() {
+            return Err("PROBE_ENVIRONMENT_DRIFT");
+        }
+    }
+    Ok(out)
+}
+#[cfg(windows)]
+fn legacy_profile_dir() -> Result<PathBuf> {
+    use std::ffi::c_void;
+    use windows_sys::core::GUID;
+    // dirs-next 2.0.0 / dirs-sys-next 0.1.2 use this exact read-only API,
+    // not USERPROFILE or CODEX_HOME. Avoid enabling any new dependency feature.
+    #[link(name = "shell32")]
+    extern "system" { fn SHGetKnownFolderPath(id: *const GUID, flags: u32, token: *mut c_void, path: *mut *mut u16) -> i32; }
+    #[link(name = "ole32")]
+    extern "system" { fn CoTaskMemFree(memory: *mut c_void); }
+    let id = GUID::from_u128(0x5e6c858f_0e22_4760_9afe_ea3317b67173);
+    let mut ptr = std::ptr::null_mut();
+    let status = unsafe { SHGetKnownFolderPath(&id, 0, std::ptr::null_mut(), &mut ptr) };
+    if status < 0 || ptr.is_null() { return Err("PROBE_HELPER_HOME_UNKNOWN"); }
+    let value = (|| {
+        let mut len = 0;
+        while len < 32768 && unsafe { *ptr.add(len) } != 0 { len += 1; }
+        if len == 32768 { return Err("PROBE_HELPER_HOME_UNKNOWN"); }
+        let s = String::from_utf16(unsafe { std::slice::from_raw_parts(ptr, len) })
+            .map_err(|_| "PROBE_HELPER_HOME_UNKNOWN")?;
+        let p = PathBuf::from(s);
+        if !p.is_absolute() { return Err("PROBE_HELPER_HOME_UNKNOWN"); }
+        Ok(p)
+    })();
+    unsafe { CoTaskMemFree(ptr.cast()); }
+    value
+}
+#[cfg(not(windows))]
+fn legacy_profile_dir() -> Result<PathBuf> { Err("WINDOWS_REQUIRED") }
+fn helper_environment(root: &Path, host: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
+    helper_environment_for_profile(root, host, &legacy_profile_dir()?)
+}
+fn helper_environment_for_profile(root: &Path, host: &BTreeMap<String, String>, profile: &Path) -> Result<BTreeMap<String, String>> {
+    let mut safe = cli_adapter::environment(host, root)?;
+    safe.insert("CODEX_HOME".into(), root.join("home").to_string_lossy().into_owned());
+    if safe != *host || !profile.is_absolute() { return Err("PROBE_ENVIRONMENT_DRIFT"); }
+    let mut child = host.clone();
+    child.entry("PATHEXT".into()).or_insert_with(|| ".COM;.EXE;.BAT;.CMD".into());
+    for value in child.values_mut() {
+        let normalized = value.trim().to_ascii_lowercase();
+        if normalized == "/dev/null" || normalized == "\\\\\\\\dev\\\\\\\\null" { *value = "NUL".into(); }
+    }
+    for (k, v) in [
+        ("GIT_PAGER", "more.com"), ("PAGER", "more.com"), ("LESS", ""),
+        ("SBX_NONET_ACTIVE", "1"), ("HTTP_PROXY", "http://127.0.0.1:9"),
+        ("HTTPS_PROXY", "http://127.0.0.1:9"), ("ALL_PROXY", "http://127.0.0.1:9"),
+        ("NO_PROXY", "localhost,127.0.0.1,::1"), ("PIP_NO_INDEX", "1"),
+        ("PIP_DISABLE_PIP_VERSION_CHECK", "1"), ("NPM_CONFIG_OFFLINE", "true"),
+        ("CARGO_NET_OFFLINE", "true"), ("GIT_HTTP_PROXY", "http://127.0.0.1:9"),
+        ("GIT_HTTPS_PROXY", "http://127.0.0.1:9"), ("GIT_SSH_COMMAND", "cmd /c exit 1"),
+        ("GIT_ALLOW_PROTOCOLS", ""),
+    ] { child.insert(k.into(), v.into()); }
+    let base = profile.join(".sbx-denybin").to_string_lossy().into_owned();
+    let path = child.get("PATH").cloned().unwrap_or_default();
+    if !path.split(';').next().unwrap_or_default().eq_ignore_ascii_case(&base) {
+        child.insert("PATH".into(), if path.is_empty() { base } else { format!("{base};{path}") });
+    }
+    let exts: Vec<_> = child["PATHEXT"].split(';').filter(|v| !v.is_empty()).collect();
+    let mut ordered = Vec::new();
+    for want in [".BAT", ".CMD"] {
+        if let Some(value) = exts.iter().find(|v| v.eq_ignore_ascii_case(want)) { ordered.push(*value); }
+    }
+    ordered.extend(exts.iter().copied().filter(|v| !v.eq_ignore_ascii_case(".BAT") && !v.eq_ignore_ascii_case(".CMD")));
+    child.insert("PATHEXT".into(), ordered.join(";"));
+    Ok(child)
 }
 /// Only this module constructs the capability; no arbitrary Spec crosses the public boundary.
 pub(super) struct Command {
@@ -430,11 +525,12 @@ pub fn prepare() -> Result<Value> {
         fs::write(root.join("workspace").join(n), BEFORE).map_err(|_| "PROBE_CREATE")?;
     }
     let p = Plan {
-        schema: "nova.self2.permission-probe/1".into(),
+        schema: "nova.self2.permission-probe/2".into(),
         root_identity: Guard::open(root, true)?.identity,
         nonce: uuid::Uuid::new_v4().to_string(),
         cli_hash: self_codex::CLI_SHA.into(),
         environment: env(root)?,
+        helper_environment: helper_environment(root, &env(root)?)?,
         helper: helper.clone(),
         helper_hash: tool_hash(&helper)?,
         controls: BTreeMap::from([(
@@ -516,12 +612,12 @@ pub fn evaluate(step: &str) -> Result<Value> {
 }
 /// Fixed helper, no shell/path/program argument. Only two existing synthetic target files.
 pub fn helper(step: &str, nonce: &str) -> Result<(Value, i32)> {
-    helper_at(Path::new(ROOT), step, nonce)
+    helper_at(Path::new(ROOT), step, nonce, &std::env::vars().collect())
 }
-fn helper_at(root: &Path, step: &str, nonce: &str) -> Result<(Value, i32)> {
+fn helper_at(root: &Path, step: &str, nonce: &str, environment: &BTreeMap<String, String>) -> Result<(Value, i32)> {
     phase(step)?;
     let _guards = pinned(root)?;
-    let p = validate(root)?;
+    let p = validate_environment(root, Some(environment))?;
     if nonce != p.nonce {
         return Err("PROBE_NONCE_REJECTED");
     }

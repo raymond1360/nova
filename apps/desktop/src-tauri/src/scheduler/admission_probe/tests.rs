@@ -20,11 +20,12 @@ impl F {
         fs::write(root.join("control/instructions.txt"), b"SYNTHETIC ONLY").unwrap();
         let helper = std::env::current_exe().unwrap();
         let p = Plan {
-            schema: "nova.self2.permission-probe/1".into(),
+            schema: "nova.self2.permission-probe/2".into(),
             root_identity: Guard::open(&root, true).unwrap().identity,
             nonce: uuid::Uuid::new_v4().to_string(),
             cli_hash: self_codex::CLI_SHA.into(),
             environment: env(&root).unwrap(),
+            helper_environment: helper_environment(&root, &env(&root).unwrap()).unwrap(),
             helper: helper.clone(),
             helper_hash: tool_hash(&helper).unwrap(),
             controls: BTreeMap::from([(
@@ -149,6 +150,13 @@ fn probe_fixed_surface_and_live_gate_closed() {
         assert_eq!(a[index + 1], profile);
         assert!(a.contains(&"--include-managed-config".into()));
         assert!(a.contains(&"sandbox_workspace_write.network_access=false".into()));
+        assert!(a.contains(&"shell_environment_policy.inherit=\"none\"".into()));
+        let set = a.iter().find(|v| v.starts_with("shell_environment_policy.set=")).unwrap();
+        for (k, v) in &f.p.environment {
+            assert!(set.contains(&format!("{}={}", json!(k), json!(v))));
+        }
+        assert!(a.contains(&format!("shell_environment_policy.include_only={}",
+            json!(f.p.environment.keys().collect::<Vec<_>>()))));
         assert!(!a.iter().any(|x| x.starts_with("sandbox_mode=")
             || x == "--sandbox-state-json"
             || x == "--sandbox-state-disable-network"));
@@ -167,6 +175,72 @@ fn probe_fixed_surface_and_live_gate_closed() {
     )
     .unwrap();
     assert_eq!(validate(&f.root).unwrap_err(), "PROBE_ENVIRONMENT_DRIFT");
+    fs::remove_file(f.root.join("home/config.toml")).unwrap();
+    assert!(validate(&f.root).is_ok());
+    assert!(validate_environment(&f.root, Some(&f.p.helper_environment)).is_ok());
+    fs::write(f.root.join("home/config.toml"), b"SYNTHETIC_CONFIG_INJECTION").unwrap();
+    assert_eq!(validate_environment(&f.root, Some(&f.p.helper_environment)).unwrap_err(), "PROBE_ENVIRONMENT_DRIFT");
+    fs::remove_file(f.root.join("home/config.toml")).unwrap();
+    // Never compare the controller map to the helper or reconstruct/overwrite its PATH.
+    assert_eq!(validate_environment(&f.root, Some(&f.p.environment)).unwrap_err(), "PROBE_ENVIRONMENT_DRIFT");
+    let lower: BTreeMap<_, _> = f.p.helper_environment.iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.clone())).collect();
+    assert!(validate_environment(&f.root, Some(&lower)).is_ok());
+    for key in ["CODEX_HOME", "PATH", "PATHEXT", "TEMP", "TMP", "HTTP_PROXY", "SBX_NONET_ACTIVE", "GIT_PAGER"] {
+        let mut bad = f.p.helper_environment.clone();
+        bad.remove(key);
+        assert_eq!(validate_environment(&f.root, Some(&bad)).unwrap_err(), "PROBE_ENVIRONMENT_DRIFT");
+        bad.insert(key.into(), "SYNTHETIC_SECRET_DRIFT".into());
+        assert_eq!(validate_environment(&f.root, Some(&bad)).unwrap_err(), "PROBE_ENVIRONMENT_DRIFT");
+    }
+    for key in ["OPENAI_API_KEY", "UNEXPECTED", "path"] {
+        let mut bad = f.p.helper_environment.clone();
+        bad.insert(key.into(), "SYNTHETIC_SECRET_DRIFT".into());
+        assert_eq!(validate_environment(&f.root, Some(&bad)).unwrap_err(), "PROBE_ENVIRONMENT_DRIFT");
+    }
+    fs::write(f.root.join("home/AGENTS.md"), b"SYNTHETIC_INJECTION").unwrap();
+    assert_eq!(validate(&f.root).unwrap_err(), "PROBE_ENVIRONMENT_DRIFT");
+    assert_eq!(validate_environment(&f.root, Some(&f.p.helper_environment)).unwrap_err(), "PROBE_ENVIRONMENT_DRIFT");
+    fs::remove_file(f.root.join("home/AGENTS.md")).unwrap();
+    let mut bad_plan = f.p.clone();
+    bad_plan.helper_environment.insert("UNKNOWN".into(), "SYNTHETIC_SECRET_DRIFT".into());
+    fs::write(f.root.join("plan.json"), bytes(&bad_plan).unwrap()).unwrap();
+    assert_eq!(validate_environment(&f.root, Some(&bad_plan.helper_environment)).unwrap_err(), "PROBE_ENVIRONMENT_DRIFT");
+    let mut old_plan = serde_json::to_value(&f.p).unwrap();
+    old_plan.as_object_mut().unwrap().remove("helper_environment");
+    fs::write(f.root.join("plan.json"), bytes(&old_plan).unwrap()).unwrap();
+    assert_eq!(validate(&f.root).unwrap_err(), "PROBE_EVIDENCE_REJECTED");
+
+    // Golden transformations from frozen env.rs, including the Windows PATHEXT fallback.
+    let mut host = f.p.environment.clone();
+    host.insert("PATHEXT".into(), ".EXE;.bAt;;.COM;.cmd;.BAT".into());
+    host.insert("COMPUTERNAME".into(), " /DEV/NULL ".into());
+    let profile = Path::new(r"C:\SYNTHETIC_PROFILE");
+    let child = helper_environment_for_profile(&f.root, &host, profile).unwrap();
+    assert_eq!(child["PATHEXT"], ".bAt;.cmd;.EXE;.COM");
+    assert_eq!(child["COMPUTERNAME"], "NUL");
+    assert_eq!(child["PATH"], format!(r"C:\SYNTHETIC_PROFILE\.sbx-denybin;{}", host["PATH"]));
+    for (k, v) in [("PAGER", "more.com"), ("GIT_PAGER", "more.com"), ("LESS", ""),
+        ("HTTP_PROXY", "http://127.0.0.1:9"), ("NO_PROXY", "localhost,127.0.0.1,::1"),
+        ("GIT_SSH_COMMAND", "cmd /c exit 1"), ("GIT_ALLOW_PROTOCOLS", ""),
+        ("SBX_NONET_ACTIVE", "1"), ("CARGO_NET_OFFLINE", "true")] { assert_eq!(child[k], v); }
+    host.remove("PATHEXT");
+    assert_eq!(helper_environment_for_profile(&f.root, &host, profile).unwrap()["PATHEXT"], ".BAT;.CMD;.COM;.EXE");
+    host.insert("UNKNOWN".into(), "SYNTHETIC_SECRET_DRIFT".into());
+    assert_eq!(helper_environment_for_profile(&f.root, &host, profile), Err("PROBE_ENVIRONMENT_DRIFT"));
+
+    // Export only synthetic values for an independent offline TOML parser check.
+    let mut serialization = f.p.clone();
+    serialization.environment = BTreeMap::from([
+        ("SystemRoot".into(), r"C:\SYNTHETIC_WINDOWS".into()),
+        ("COMPUTERNAME".into(), "SYNTHETIC \"Ä\" \\ line\nnext".into()),
+    ]);
+    let material = f.root.join("evidence/synthetic-shell-contract.json");
+    fs::write(&material, bytes(&json!({
+        "host": serialization.environment,
+        "argv": argv(&f.root, &serialization, "W")
+    })).unwrap()).unwrap();
+    println!("SYNTHETIC_SHELL_CONTRACT_FILE={}", material.display());
 }
 #[test]
 fn probe_current_bytes_identity_controls_and_receipts_rechecked() {
@@ -402,25 +476,25 @@ fn probe_helper_only_owned_existing_targets_exact_bytes() {
     let s = f.start("W");
     reserve(&f.root, "W", &s).unwrap();
     assert_eq!(
-        helper_at(&f.root, "W", "wrong"),
+        helper_at(&f.root, "W", "wrong", &f.p.helper_environment),
         Err("PROBE_NONCE_REJECTED")
     );
-    let (v, exit) = helper_at(&f.root, "W", &f.p.nonce).unwrap();
+    let (v, exit) = helper_at(&f.root, "W", &f.p.nonce, &f.p.helper_environment).unwrap();
     assert_eq!(exit, 0);
     assert_eq!(v["outcome"], "WROTE");
     assert_eq!(current(&f.root).unwrap(), expected(&f.p, "W", true));
     assert_eq!(
-        helper_at(&f.root, "W", &f.p.nonce),
+        helper_at(&f.root, "W", &f.p.nonce, &f.p.helper_environment),
         Err("PROBE_CURRENT_FILE_DRIFT")
     );
     let s = f.start("R");
     reserve(&f.root, "R", &s).unwrap();
-    let (v, exit) = helper_at(&f.root, "R", &f.p.nonce).unwrap();
+    let (v, exit) = helper_at(&f.root, "R", &f.p.nonce, &f.p.helper_environment).unwrap();
     assert_eq!(exit, 24);
     assert_eq!(v["outcome"], "UNEXPECTED_WRITE_OPEN");
     assert_eq!(
         fs::read(f.root.join("workspace/readonly.txt")).unwrap(),
         BEFORE
     );
-    assert!(helper_at(&f.root, "../other", &f.p.nonce).is_err());
+    assert!(helper_at(&f.root, "../other", &f.p.nonce, &f.p.helper_environment).is_err());
 }

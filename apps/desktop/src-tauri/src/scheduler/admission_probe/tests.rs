@@ -24,6 +24,7 @@ impl F {
             root_identity: Guard::open(&root, true).unwrap().identity,
             nonce: uuid::Uuid::new_v4().to_string(),
             cli_hash: self_codex::CLI_SHA.into(),
+            environment: env(&root).unwrap(),
             helper: helper.clone(),
             helper_hash: tool_hash(&helper).unwrap(),
             controls: BTreeMap::from([(

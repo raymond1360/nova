@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-pub const ROOT: &str = r"D:\nova-self2-permission-probe-1119b";
+pub const ROOT: &str = r"D:\nova-self2-permission-probe-1119c";
 pub const CLI: &str = r"C:\Users\Lenovo\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe";
 const BEFORE: &[u8] = b"CANARY_INITIAL\r\n";
 const AFTER: &[u8] = b"CANARY_DEVELOPED\r\n";
@@ -34,6 +34,7 @@ struct Plan {
     root_identity: String,
     nonce: String,
     cli_hash: String,
+    environment: BTreeMap<String, String>,
     helper: PathBuf,
     helper_hash: String,
     controls: BTreeMap<String, Fact>,
@@ -100,6 +101,12 @@ fn pinned(root: &Path) -> Result<Vec<Guard>> {
 }
 fn validate(root: &Path) -> Result<Plan> {
     let p: Plan = load(&root.join("plan.json"))?;
+    if p.environment != env(root)?
+        || root.join("home/config.toml").exists()
+        || root.join("home/AGENTS.md").exists()
+    {
+        return Err("PROBE_ENVIRONMENT_DRIFT");
+    }
     if p.helper != std::env::current_exe().map_err(|_| "SELF_PATH")?
         || uuid::Uuid::parse_str(&p.nonce).is_err()
     {
@@ -333,6 +340,7 @@ pub fn prepare() -> Result<Value> {
         root_identity: Guard::open(root, true)?.identity,
         nonce: uuid::Uuid::new_v4().to_string(),
         cli_hash: self_codex::CLI_SHA.into(),
+        environment: env(root)?,
         helper: helper.clone(),
         helper_hash: tool_hash(&helper)?,
         controls: BTreeMap::from([(
@@ -384,7 +392,7 @@ pub fn run(step: &str, digest: &str, confirmation: &str) -> Result<Value> {
         exe: PathBuf::from(CLI),
         exe_sha256: self_codex::CLI_SHA.into(),
         argv: argv(root, &p, step),
-        env: env(root)?,
+        env: p.environment.clone(),
         cwd: root.join("workspace"),
         session: String::new(),
     };

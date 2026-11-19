@@ -849,6 +849,86 @@ jobs:
             $f=[IO.File]::Open((Join-Path $root "public/$Name"),[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read)
             try { $f.Write($b,0,$b.Length); $f.Flush($true) } finally { $f.Dispose() }
           }
+          # Failure export only: never changes Verify-Ar0 or the verdict.
+          function Get-Ar0FailureLog([string]$Name) {
+            $v=@{name=$Name;state='UNAVAILABLE';bytes=$null;sha256=$null;failed_tests=@();context=@();omitted=$true;truncated=$false}
+            try {
+              $before=$script:inputs.Count; $text=Read-Ar0 $Name 16777216; $fact=$script:inputs[$before]
+              $v.bytes=$fact.bytes; $v.sha256=$fact.sha256; $v.state='BOUNDED_REDACTED'; $names=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+              # No free-form panic messages, operands, credentials, paths or exception text.
+              # Only source grammar and fixed categories are public; all other text is withheld.
+              $reader=[IO.StringReader]::new($text)
+              try { while($null -ne ($line=$reader.ReadLine())) {
+                if($line.Length -gt 1024){$v.truncated=$true;continue}
+                $test=$null; $context=$null
+                if($line -cmatch '^test ([A-Za-z_][A-Za-z0-9_:]{0,255}) \.\.\. FAILED$'){$test=$Matches[1]}
+                elseif($line -cmatch '^---- ([A-Za-z_][A-Za-z0-9_:]{0,255}) stdout ----$'){$test=$Matches[1]}
+                elseif($line -cmatch "^thread '(?<test>[A-Za-z_][A-Za-z0-9_:]{0,255})' (?:\([0-9]+\) )?panicked at (?<file>(?:[A-Za-z0-9_./\\:-]+[/\\])?[A-Za-z_][A-Za-z0-9_-]{0,63}\.rs):(?<row>[0-9]{1,7}):(?<col>[0-9]{1,5}):?$") {
+                  $test=$Matches.test; $file=($Matches.file -split '[/\\]')[-1];$context="PANIC_AT ${file}:$($Matches.row):$($Matches.col)"
+                }
+                elseif($line -cmatch '^assertion `[^`\r\n]{1,256}` failed.*$'){$context='ASSERTION_FAILED; expression/message withheld'}
+                elseif($line -cmatch '^assertion failed: .+$'){$context='ASSERTION_FAILED; expression withheld'}
+                elseif($line -cmatch '^\s*(left|right): .+$'){$context=$Matches[1].ToUpperInvariant()+'_OPERAND_WITHHELD'}
+                elseif($line -cmatch '^error\[(E[0-9]{4})\]: .+$'){$context='RUST_ERROR_'+$Matches[1]+'; message withheld'}
+                elseif($line -cmatch '^called `Result::unwrap\(\)` on an `Err` value: .+$'){$context='RESULT_UNWRAP_ERR; value withheld'}
+                elseif($line -ceq 'called `Option::unwrap()` on a `None` value'){$context='OPTION_UNWRAP_NONE'}
+                if($test -and $names.Add($test)){if($v.failed_tests.Count -lt 4){$v.failed_tests+= $test}else{$v.truncated=$true}}
+                if($context -and $context -cnotin $v.context){if($v.context.Count -lt 4){$v.context+= $context}else{$v.truncated=$true}}
+              }} finally {$reader.Dispose()}
+              if($v.failed_tests.Count -eq 0 -and $v.context.Count -eq 0){$v.state='UNSAFE_OR_UNRECOGNIZED_CONTEXT_WITHHELD'}
+            } catch {
+              $v.state='MISSING_INVALID_OR_OVERSIZE_NOT_EXPORTED'
+              # Oversize context is withheld, but retain a bounded streaming hash where safe.
+              try {
+                $item=Get-Item -LiteralPath (Join-Path $script:root $Name) -Force -ErrorAction Stop
+                Assert-Ar0 (-not $item.PSIsContainer -and $item.Length -le 67108864)
+                for($q=$item;$null -ne $q;$q=$q.Parent){Assert-Ar0 (($q.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)}
+                $stream=[IO.File]::OpenRead($item.FullName)
+                try {$v.bytes=$stream.Length;$v.sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()} finally {$stream.Dispose()}
+              } catch { $v.bytes=$null;$v.sha256=$null }
+            }
+            return $v
+          }
+          function Get-Ar0FailureEvidence($Outer) {
+            $records=@();$ledgers=@()
+            # Deepest ledger first, so the original failure precedes wrapper propagation.
+            foreach($spec in @(@{path='ev/sh1-regression/result.json';scope='SH1';schema='nova.scheduler.local-validation/1';prefix='ev/sh1-regression';allowed=(Get-Sh1ExpectedCommands)},@{path='ev/result.json';scope='RELAY';schema='nova.relay.local-validation/1';prefix='ev';allowed=$Outer})) {
+              $info=@{name=$spec.path;state='MISSING_INVALID_OR_OVERSIZE';bytes=$null;sha256=$null};$ledgers+=$info
+              try {
+                $before=$script:inputs.Count;$ledger=Json-Ar0 $spec.path 262144;$fact=$script:inputs[$before];$info.bytes=$fact.bytes;$info.sha256=$fact.sha256
+                Assert-Ar0 ($ledger.schema -ceq $spec.schema -and $ledger.commands -is [array] -and $ledger.commands.Count -le 128)
+                $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                foreach($row in $ledger.commands) {
+                  Assert-Ar0 ($row.name -is [string] -and ($row.name -cin @($spec.allowed.Keys)) -and $seen.Add($row.name))
+                  Assert-Ar0 ($row.state -cin @('START_FAILED','PARTIAL','COMPLETE'))
+                  Assert-Ar0 ($null -eq $row.exit_code -or (($row.exit_code -is [int] -or $row.exit_code -is [long]) -and $row.exit_code -ge -2147483648 -and $row.exit_code -le 2147483647))
+                }
+                $info.state='VALIDATED'
+                foreach($row in $ledger.commands) {
+                  if($row.state -ceq 'COMPLETE' -and $row.exit_code -eq $spec.allowed[$row.name]){continue}
+                  if($records.Count -ge 4){$info.state='VALIDATED_TRUNCATED';break}
+                  $records+=@{scope=$spec.scope;command=$row.name;state=$row.state;exit_code=$row.exit_code;expected_exit_code=$spec.allowed[$row.name];stdout=(Get-Ar0FailureLog "$($spec.prefix)/$($row.name).stdout.log");stderr=(Get-Ar0FailureLog "$($spec.prefix)/$($row.name).stderr.log")}
+                }
+              } catch { $info.state='MISSING_INVALID_OR_OVERSIZE' }
+            }
+            # Preserve the actual wrapper receipt separately; never substitute it for a child exit.
+            $execution=@{state='UNAVAILABLE';exit_code=$null}
+            try {
+              $e=Json-Ar0 'execution.json' 8192
+              Assert-Ar0 ($e.schema -ceq 'nova.ar0.ci-execution/1' -and $e.sha -ceq $script:identity.sha -and $e.run_id -ceq $script:identity.run_id -and $e.attempt -ceq $script:identity.attempt)
+              Assert-Ar0 ($e.state -cin @('START_FAILED','PARTIAL','COMPLETE'))
+              Assert-Ar0 ($null -eq $e.exit_code -or (($e.exit_code -is [int] -or $e.exit_code -is [long]) -and $e.exit_code -ge -2147483648 -and $e.exit_code -le 2147483647))
+              $execution=@{state=$e.state;exit_code=$e.exit_code}
+            } catch {}
+            return @{schema='nova.ar0.failure-detail/1';ledgers=$ledgers;records=$records;wrapper=$execution;raw_content='WITHHELD';limits=@{records=4;failed_tests_per_log=4;context_per_log=4;input_bytes=16777216};claims_are_not_machine_verdicts=$true}
+          }
+          function Get-Ar0OuterExpectedCommands {
+            $allowed=[ordered]@{}
+            foreach($n in $script:outer){$allowed[$n]=0}
+            foreach($n in @('reject-hash-missing','reject-hash-mismatch','default-nova_scheduler_relay','release-nova_scheduler_relay','default-nova_scheduler_relay_fake_cli','release-nova_scheduler_relay_fake_cli')){$allowed[$n]=101}
+            foreach($n in @('real-false-rejected','v2-history-not-cloned','pilot-approval-missing','pilot-approval-expired')){$allowed[$n]=2}
+            return $allowed
+          }
           # MAIN: no caller-selected paths or arbitrary exception text in public evidence.
           $root=$env:AR0_ROOT; $inputs=[Collections.Generic.List[object]]::new(); $verified=$null; $state='FAIL'; $code='AR0_CONTRACT_REJECTED'
           $identity=@{sha=if($env:GITHUB_SHA -cmatch '^[0-9a-f]{40}$'){$env:GITHUB_SHA}else{$null};run_id=if($env:GITHUB_RUN_ID -cmatch '^[1-9][0-9]{0,19}$'){$env:GITHUB_RUN_ID}else{$null};attempt=if($env:GITHUB_RUN_ATTEMPT -cmatch '^[1-9][0-9]{0,9}$'){$env:GITHUB_RUN_ATTEMPT}else{$null}}
@@ -883,10 +963,11 @@ jobs:
             }
             $diagnostics+=$entry
           }
+          $failureEvidence=if($state -cne 'PASS'){Get-Ar0FailureEvidence (Get-Ar0OuterExpectedCommands)}else{$null}
           Write-Public 'summary.json' @{schema='nova.ar0.ci-summary/1';identity=$identity;verdict=$state;failure_code=$code;scope='FIXED_FAKE_CLI_ONLY';real_execution_authorized=$false} 8192
           Write-Public 'checks.json' @{schema='nova.ar0.ci-checks/1';identity=$identity;state=$state;verified=$verified;claims_are_not_machine_verdicts=$true} 524288
           # Bounded input inventory is diagnostic evidence, not publication of raw logs or secrets.
-          Write-Public 'logs.json' @{schema='nova.ar0.ci-local-inputs/1';identity=$identity;state=$state;inputs=@($inputs|Sort-Object name -Unique);diagnostics=$diagnostics;raw_content='NOT_EXPORTED';missing_or_invalid_input=($state -cne 'PASS')} 131072
+          Write-Public 'logs.json' @{schema='nova.ar0.ci-local-inputs/1';identity=$identity;state=$state;inputs=@($inputs|Sort-Object name -Unique);diagnostics=$diagnostics;failure_detail=$failureEvidence;raw_content='NOT_EXPORTED';missing_or_invalid_input=($state -cne 'PASS')} 131072
           $files=@('summary.json','checks.json','logs.json')|ForEach-Object {$p=Join-Path $root "public/$_";@{name=$_;bytes=(Get-Item -LiteralPath $p).Length;sha256=(Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()}}
           Write-Public 'files.json' @{schema='nova.ar0.ci-files/1';identity=$identity;files=@($files)} 8192
           if ($state -cne 'PASS') { throw $code }

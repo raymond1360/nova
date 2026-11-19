@@ -151,6 +151,12 @@ fn probe_fixed_surface_and_live_gate_closed() {
         run("W", "bad", "bad"),
         Err("PROBE_EXPLICIT_APPROVAL_REQUIRED")
     );
+    fs::write(
+        f.root.join("home/config.toml"),
+        b"SYNTHETIC_CONFIG_INJECTION",
+    )
+    .unwrap();
+    assert_eq!(validate(&f.root).unwrap_err(), "PROBE_ENVIRONMENT_DRIFT");
 }
 #[test]
 fn probe_current_bytes_identity_controls_and_receipts_rechecked() {

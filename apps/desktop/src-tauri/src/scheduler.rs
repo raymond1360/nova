@@ -18,3 +18,6 @@ pub mod task_execution;
 pub mod self_handoff;
 
 pub mod self_codex;
+
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+pub mod admission_probe;

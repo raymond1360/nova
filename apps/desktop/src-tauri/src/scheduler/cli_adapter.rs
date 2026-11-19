@@ -515,6 +515,7 @@ pub struct NativeDriver {
     fake: PathBuf,
     fake_hash: String,
     streamed_identity: Option<String>,
+    probe_home: Option<PathBuf>,
     metadata: bool,
     self2_raw: bool,
     _guard: Guard,
@@ -530,9 +531,25 @@ impl NativeDriver {
         let mut g = Guard::tool(exe)?;
         g.verify_sha256_stream(std::fs::metadata(exe).map_err(|_| "FILE_STAT")?.len(), expected, Instant::now() + Duration::from_secs(60))?;
         let identity = g.identity.clone();
-        Ok(Self { fake: g.path.clone(), fake_hash: expected.into(), streamed_identity: Some(identity),
+        Ok(Self { fake: g.path.clone(), fake_hash: expected.into(), streamed_identity: Some(identity), probe_home: None,
             metadata: false, self2_raw: true, _guard: g, cancel: Arc::new(AtomicBool::new(false)),
             #[cfg(test)] fault: None, #[cfg(windows)] residuals: vec![] })
+    }
+    #[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+    pub(super) fn permission_probe(&mut self, command: &super::admission_probe::Command,
+        end: Instant, running: &mut dyn FnMut(u32, String) -> Result<()>) -> Execution {
+        let s = command.spec();
+        if self._guard.verify().is_err() || s.exe != self.fake || s.exe_sha256 != self.fake_hash
+            || s.profile != "SELF2_PERMISSION_ONLY" || !s.session.is_empty() {
+            return Execution::failed("BINDING_MISMATCH");
+        }
+        #[cfg(windows)] {
+            self.probe_home = Some(s.cwd.parent().unwrap().join("home"));
+            let out = native::execute(self, s, b"", end, running);
+            self.probe_home = None;
+            out
+        }
+        #[cfg(not(windows))] { let _ = (end, running); Execution::failed("WINDOWS_REQUIRED") }
     }
     pub fn new() -> Result<Self> {
         let exe = std::env::current_exe().map_err(|_| "SELF_PATH")?;
@@ -552,6 +569,7 @@ impl NativeDriver {
             fake: g.path.clone(),
             fake_hash: h,
             streamed_identity: None,
+            probe_home: None,
             metadata: false,
             self2_raw: false,
             _guard: g,
@@ -886,7 +904,7 @@ mod native {
         err: Option<File>,
     }
     impl Tree {
-        fn create(s: &Spec, end: Instant, streamed: Option<&str>) -> Result<Self> {
+        fn create(s: &Spec, end: Instant, streamed: Option<&str>, probe_home: Option<&Path>) -> Result<Self> {
             let _serial = loop {
                 match SPAWN.try_lock() {
                     Ok(g) => break g,
@@ -981,14 +999,16 @@ mod native {
                 let mut prior = String::new();
                 for (k, v) in vars {
                     let upper = k.to_ascii_uppercase();
+                    let probe_home_allowed = upper == "CODEX_HOME" && probe_home.is_some_and(|p| p == Path::new(v));
+                    let fake_case_allowed = cfg!(test) && upper == "NOVA_PERMISSION_FAKE_CASE";
                     if !k.is_ascii()
                         || k.is_empty()
                         || k.contains(['=', '\0'])
                         || v.contains('\0')
                         || upper == prior
-                        || forbidden_env(k)
+                        || (forbidden_env(k) && !probe_home_allowed)
                         || !(ENV_ALLOW.iter().any(|a| a.eq_ignore_ascii_case(k))
-                            || ["PATH", "TEMP", "TMP"].contains(&upper.as_str()))
+                            || ["PATH", "TEMP", "TMP"].contains(&upper.as_str()) || probe_home_allowed || fake_case_allowed)
                     {
                         return Err("BINDING_MISMATCH");
                     }
@@ -1223,7 +1243,7 @@ mod native {
         if Instant::now() >= end {
             return Execution::failed("DEADLINE");
         }
-        let tree = match Tree::create(s, end, driver.streamed_identity.as_deref()) {
+        let tree = match Tree::create(s, end, driver.streamed_identity.as_deref(), driver.probe_home.as_deref()) {
             Ok(t) => t,
             Err(c) => {
                 let mut result = Execution::failed(match c {
@@ -1732,6 +1752,7 @@ impl RealDriver {
             fake_hash: DEVELOP_HASH.into(),
             _guard: g,
             streamed_identity: Some(tools[0].identity.clone()),
+            probe_home: None,
             metadata: false,
             self2_raw: false,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -1767,6 +1788,7 @@ impl RealDriver {
                 fake_hash: "0".repeat(64),
                 _guard: g,
                 streamed_identity: Some(tools[0].identity.clone()),
+            probe_home: None,
                 metadata: false,
             self2_raw: false,
                 cancel: Arc::new(AtomicBool::new(false)),

@@ -117,6 +117,13 @@ fn facts(file: &File) -> Result<(String, PathBuf, u32)> {
 fn facts(_: &File) -> Result<(String, PathBuf, u32)> {
     Err("WINDOWS_REQUIRED")
 }
+// Probe helper validates the already-open exclusive write handle before any bytes change.
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+pub(super) fn single_link_identity(file: &File) -> Result<String> {
+    let (id, _, links) = facts(file)?;
+    if links != 1 { return Err("ALIAS_REJECTED"); }
+    Ok(id)
+}
 impl Guard {
     pub fn open(path: &Path, db: bool) -> Result<Self> {
         Self::open_policy(path, db, false)

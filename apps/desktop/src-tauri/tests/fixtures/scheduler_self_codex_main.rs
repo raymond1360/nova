@@ -7,7 +7,8 @@ use nova_lib::scheduler::{
     Result,
 };
 use serde_json::{json, Value};
-use std::path::Path;
+use std::{path::Path, io::{self, IsTerminal}};
+use nova_lib::scheduler::admission_probe as probe;
 fn read<T: serde::de::DeserializeOwned>(p: &str) -> Result<T> {
     safe_location(Path::new(p))?;
     serde_json::from_slice(&read_file(Path::new(p), c::INPUT_CAP)?.0).map_err(|_| "INPUT_REJECTED")
@@ -16,6 +17,22 @@ fn run() -> Result<Value> {
     let a: Vec<_> = std::env::args().skip(1).collect();
     if a.is_empty() {
         return Err("SELF2_COMMAND_REJECTED");
+    }
+    match a[0].as_str() {
+        "permission-prepare" if a.len()==1 => return probe::prepare(),
+        "permission-evaluate" if a.len()==2 => return probe::evaluate(&a[1]),
+        "permission-run" if a.len()==3 => {
+            if !io::stdin().is_terminal() { return Err("CONSOLE_REQUIRED"); }
+            eprintln!("NON-MODEL ONLY: restricted-token capability/ACL/NUL initialization; fixed isolated fixture. Type AUTHORIZE NON-MODEL ACL NUL <phase> <digest>:");
+            let mut line=String::new();io::stdin().read_line(&mut line).map_err(|_|"INPUT_REJECTED")?;
+            if line.len()>256 {return Err("INPUT_BOUND");}
+            return probe::run(&a[1],&a[2],line.trim_end_matches(['\r','\n']));
+        }
+        "permission-helper" if a.len()==3 => {
+            let (v,code)=probe::helper(&a[1],&a[2])?; println!("{v}"); std::process::exit(code);
+        }
+        x if x.starts_with("permission-") => return Err("PROBE_COMMAND_REJECTED"),
+        _ => {}
     }
     if a[0] == "native-run" {
         c::live_admission()?;

@@ -26,7 +26,7 @@ if(-not $SkipTests){Zero 'targeted' $cargo @('test','--offline','--locked','--li
 if(-not $UseBuiltBinary){Zero 'debug-build' $cargo @('build','--offline','--locked','--features','scheduler-validation','--bin','nova_scheduler_self_codex','--bin','nova_scheduler_self2_fake_cli')}
 $bin=Join-Path $TargetDirectory 'debug/nova_scheduler_self_codex.exe'
 $fake=Join-Path $TargetDirectory 'debug/nova_scheduler_self2_fake_cli.exe'
-foreach($case in @(@('default-closed',@(),'SELF2_COMMAND_REJECTED'),@('native-admission',@('native-run'),'SELF2_NATIVE_PERMISSION_AND_UUID_ADMISSION_REQUIRED'))){
+foreach($case in @(@('default-closed',@(),'SELF2_COMMAND_REJECTED'),@('native-admission',@('native-run'),'SELF2_NATIVE_PERMISSION_AND_UUID_ADMISSION_REQUIRED'),@('permission-nonconsole',@('permission-run','W',('0'*64)),'CONSOLE_REQUIRED'),@('permission-helper-scope',@('permission-helper','outside','invalid'),'PROBE_PHASE_REJECTED'))){
  if((Fixed $case[0] $bin $case[1]) -ne 2){throw 'SELF2_NOT_CLOSED'}
  $v=Get-Content (Join-Path $EvidenceDirectory "$($case[0]).stdout.log") -Raw|ConvertFrom-Json
  if($v.error_code -cne $case[2] -or $v.real_codex_started -or $v.network_executed){throw 'SELF2_REASON_REJECTED'}

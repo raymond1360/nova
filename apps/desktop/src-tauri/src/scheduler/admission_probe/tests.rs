@@ -143,7 +143,17 @@ fn probe_fixed_surface_and_live_gate_closed() {
     let a = argv(&f.root, &f.p, "R");
     assert_eq!(a[0], "sandbox");
     assert!(a.contains(&"windows.sandbox=\"unelevated\"".into()));
-    assert!(a.contains(&"sandbox_mode=\"read-only\"".into()));
+    for (phase, profile) in [("W", ":workspace"), ("R", ":read-only")] {
+        let a = argv(&f.root, &f.p, phase);
+        let index = a.iter().position(|x| x == "--permission-profile").unwrap();
+        assert_eq!(a[index + 1], profile);
+        assert!(a.contains(&"--include-managed-config".into()));
+        assert!(a.contains(&"sandbox_workspace_write.network_access=false".into()));
+        assert!(!a.iter().any(|x| x.starts_with("sandbox_mode=")
+            || x == "--sandbox-state-json"
+            || x == "--sandbox-state-disable-network"));
+        assert_eq!(&a[a.len() - 3..], &["permission-helper", phase, &f.p.nonce]);
+    }
     assert!(!a
         .iter()
         .any(|a| ["exec", "resume", "login", "uninstall"].contains(&a.as_str())));
@@ -163,6 +173,17 @@ fn probe_current_bytes_identity_controls_and_receipts_rechecked() {
     let f = F::new();
     f.synthetic("W");
     assert!(check(&f.root, "W").is_ok());
+    let observation = failure_at(&f.root, "permission-evaluate", "W", "SYNTHETIC_ONLY");
+    assert_eq!(
+        observation["sandbox_helper_execution"],
+        "FIXED_TOOL_RECEIPT_OBSERVED_NOT_ADMISSION"
+    );
+    assert_eq!(
+        observation["attempt_observation"]["cli_process_started"],
+        true
+    );
+    assert_eq!(observation["model_started"], false);
+
     f.synthetic("R");
     assert!(check(&f.root, "R").is_ok());
     fs::write(f.root.join("workspace/readonly.txt"), b"DRIFT").unwrap();
@@ -186,6 +207,75 @@ fn probe_current_bytes_identity_controls_and_receipts_rechecked() {
     x.execution.stdout = b"model says denied".to_vec();
     fs::write(p, bytes(&x).unwrap()).unwrap();
     assert!(check(&h.root, "W").is_err());
+    let x = F::new();
+    x.synthetic("W");
+    fs::write(x.root.join("workspace/write.txt"), BEFORE).unwrap();
+    let receipt = x.root.join("evidence/W.exit.json");
+    let mut exit: Exit = load(&receipt).unwrap();
+    exit.execution.exit_code = Some(2);
+    exit.execution.terminal = "RESULT_ERROR".into();
+    exit.execution.stdout.clear();
+    exit.execution.stderr = MISSING_PROFILE_STDERR.as_bytes().to_vec();
+    fs::write(&receipt, bytes(&exit).unwrap()).unwrap();
+    assert_eq!(check(&x.root, "W").unwrap_err(), "PROBE_CLI_EXIT_REJECTED");
+    let detail = failure_at(
+        &x.root,
+        "permission-evaluate",
+        "W",
+        "PROBE_CLI_EXIT_REJECTED",
+    );
+    assert_eq!(detail["attempt_observation"]["cli_process_started"], true);
+    assert_eq!(
+        detail["attempt_observation"]["process_identity_matches"],
+        true
+    );
+    assert_eq!(detail["attempt_observation"]["exit_code"], 2);
+    assert_eq!(
+        detail["attempt_observation"]["safe_stderr"],
+        MISSING_PROFILE_STDERR
+    );
+    assert_eq!(detail["model_started"], false);
+    assert_eq!(
+        detail["sandbox_helper_execution"],
+        "ARGUMENT_REJECTION_BEFORE_DISPATCH_INFERRED_FROM_CLI"
+    );
+    assert!(detail.get("real_codex_started").is_none());
+    fs::write(
+        x.root.join("evidence/W.process.json"),
+        b"{\"pid\":999,\"creation\":\"SYNTHETIC_TIME\"}",
+    )
+    .unwrap();
+    assert_eq!(
+        check(&x.root, "W").unwrap_err(),
+        "PROBE_PROCESS_RECEIPT_REJECTED"
+    );
+
+    fs::write(
+        x.root.join("evidence/W.process.json"),
+        b"{\"pid\":123,\"creation\":\"WRONG_CREATION\"}",
+    )
+    .unwrap();
+    assert_eq!(
+        check(&x.root, "W").unwrap_err(),
+        "PROBE_PROCESS_RECEIPT_REJECTED"
+    );
+    exit.execution
+        .stderr
+        .extend_from_slice(b"SYNTHETIC_SECRET_MUST_NOT_APPEAR");
+    fs::write(&receipt, bytes(&exit).unwrap()).unwrap();
+    let detail = failure_at(
+        &x.root,
+        "permission-run",
+        "W",
+        "PROBE_PROCESS_RECEIPT_REJECTED",
+    );
+    assert!(detail["attempt_observation"]["safe_stderr"].is_null());
+    assert!(!detail
+        .to_string()
+        .contains("SYNTHETIC_SECRET_MUST_NOT_APPEAR"));
+    let empty = F::new();
+    let detail = failure_at(&empty.root, "permission-run", "W", "PROBE_EVIDENCE_UNKNOWN");
+    assert!(detail["attempt_observation"]["cli_process_started"].is_null());
 }
 #[test]
 fn probe_native_success_failure_start_failure_and_no_replay() {

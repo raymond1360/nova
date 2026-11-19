@@ -155,19 +155,18 @@ fn expected(p: &Plan, step: &str, after: bool) -> BTreeMap<String, Fact> {
 fn argv(root: &Path, p: &Plan, step: &str) -> Vec<String> {
     vec![
         "sandbox".into(),
+        "--permission-profile".into(),
+        if step == "W" {
+            ":workspace"
+        } else {
+            ":read-only"
+        }
+        .into(),
+        "--include-managed-config".into(),
         "-C".into(),
         root.join("workspace").to_string_lossy().into_owned(),
         "-c".into(),
         "windows.sandbox=\"unelevated\"".into(),
-        "-c".into(),
-        format!(
-            "sandbox_mode=\"{}\"",
-            if step == "W" {
-                "workspace-write"
-            } else {
-                "read-only"
-            }
-        ),
         "-c".into(),
         "sandbox_workspace_write.network_access=false".into(),
         "--".into(),
@@ -254,6 +253,110 @@ fn capture(
         },
     )
 }
+fn expected_terminal(step: &str) -> &'static str {
+    if step == "W" {
+        "SUCCESS"
+    } else {
+        "RESULT_ERROR"
+    }
+}
+fn check_process(process: &Value, e: &Execution, step: &str) -> Result<()> {
+    if e.pid.is_none()
+        || e.process_creation_utc.is_none()
+        || process["pid"].as_u64() != e.pid.map(|v| v as u64)
+        || process["creation"].as_str() != e.process_creation_utc.as_deref()
+    {
+        return Err("PROBE_PROCESS_RECEIPT_REJECTED");
+    }
+    if e.natural
+        && (e.exit_code != Some(if step == "W" { 0 } else { 23 })
+            || e.terminal != expected_terminal(step))
+    {
+        return Err("PROBE_CLI_EXIT_REJECTED");
+    }
+    Ok(())
+}
+// Only this exact fixed parser message can be shown; arbitrary CLI stderr stays in the raw receipt.
+const MISSING_PROFILE_STDERR: &str = "error: the following required arguments were not provided:\n  --permission-profile <NAME>\n\nUsage: codex sandbox --permission-profile <NAME> --cd <DIR> --config <key=value> <COMMAND>...\n\nFor more information, try '--help'.\n";
+fn safe_stderr(e: &Execution) -> Option<&'static str> {
+    std::str::from_utf8(&e.stderr)
+        .ok()
+        .filter(|v| v.replace("\r\n", "\n") == MISSING_PROFILE_STDERR)
+        .map(|_| MISSING_PROFILE_STDERR)
+}
+/// Observations of a persisted attempt, not a claim that this error-reporting invocation launched it.
+fn failure_at(root: &Path, operation: &str, step: &str, code: &str) -> Value {
+    let mut result = json!({"error_code":code,"admission":"NOT_VERIFIED",
+        "model_started":false,"network_executed":false,"network_scope":"MODEL_REQUESTS",
+        "sandbox_helper_execution":"UNKNOWN","attempt_observation":null});
+    if operation == "permission-helper" {
+        result["sandbox_helper_execution"] = json!("HELPER_HANDLER_ENTERED_NOT_VERIFIED");
+        return result;
+    }
+    if !["permission-run", "permission-evaluate"].contains(&operation) || phase(step).is_err() {
+        return result;
+    }
+    let x = load::<Exit>(&root.join("evidence").join(format!("{step}.exit.json"))).ok();
+    let process = load::<Value>(&root.join("evidence").join(format!("{step}.process.json"))).ok();
+    let started = root
+        .join("evidence")
+        .join(format!("{step}.started.json"))
+        .exists();
+    let e = x.as_ref().map(|v| &v.execution);
+    let process_has_identity = process.as_ref().is_some_and(|p| {
+        p["pid"].as_u64().is_some_and(|v| v > 0)
+            && p["creation"].as_str().is_some_and(|v| !v.is_empty())
+    });
+    let observed_start = match e {
+        Some(v) if !v.created && process_has_identity => None,
+        Some(v) => Some(v.created),
+        None if process_has_identity => Some(true),
+        None => None,
+    };
+    let identity = e.zip(process.as_ref()).map(|(e, p)| {
+        e.pid.is_some()
+            && e.process_creation_utc.is_some()
+            && p["pid"].as_u64() == e.pid.map(|v| v as u64)
+            && p["creation"].as_str() == e.process_creation_utc.as_deref()
+    });
+    let safe = e.and_then(safe_stderr);
+    result["attempt_observation"] = json!({"scope":"PERSISTED_PHASE_ATTEMPT_NOT_THIS_INVOCATION",
+        "phase":step,"started_record_present":started,"cli_process_started":observed_start,
+        "process_receipt_present":process.is_some(),"exit_receipt_present":x.is_some(),
+        "process_identity_matches":identity,"pid":e.and_then(|v|v.pid),
+        "creation":e.and_then(|v|v.process_creation_utc.as_deref()),
+        "exit_code":e.and_then(|v|v.exit_code),"terminal":e.map(|v|v.terminal.as_str()),
+        "natural_exit":e.map(|v|v.natural),"reclaim":e.map(|v|v.reclaim.as_str()),
+        "cleanup":x.as_ref().and_then(|v|v.cleanup.as_ref()),
+        "safe_stderr":safe,"stderr_policy":"EXACT_FIXED_ALLOWLIST_OTHERWISE_WITHHELD",
+        "stderr_bytes":e.map(|v|v.stderr.len()),
+        "raw_stderr_evidence":format!("evidence/{step}.exit.json#execution.stderr")});
+    if e.is_some_and(|v| v.natural && v.exit_code == Some(2) && v.stdout.is_empty())
+        && safe.is_some()
+    {
+        result["sandbox_helper_execution"] =
+            json!("ARGUMENT_REJECTION_BEFORE_DISPATCH_INFERRED_FROM_CLI");
+    }
+    if let Some(e) = e {
+        let tool = api_json(&e.stdout, 16384)
+            .ok()
+            .and_then(|v| serde_json::from_value::<ToolReceipt>(v).ok());
+        let p = load::<Plan>(&root.join("plan.json")).ok();
+        if tool.as_ref().zip(p.as_ref()).is_some_and(|(t, p)| {
+            t.schema == "nova.self2.permission-tool/1"
+                && t.nonce == p.nonce
+                && t.phase == step
+                && t.target == target(step)
+                && ["WROTE", "DENIED", "UNEXPECTED_WRITE_OPEN"].contains(&t.outcome.as_str())
+        }) {
+            result["sandbox_helper_execution"] = json!("FIXED_TOOL_RECEIPT_OBSERVED_NOT_ADMISSION");
+        }
+    }
+    result
+}
+pub fn failure(operation: &str, step: &str, code: &str) -> Value {
+    failure_at(Path::new(ROOT), operation, step, code)
+}
 fn check(root: &Path, step: &str) -> Result<Value> {
     phase(step)?;
     let _guards = pinned(root)?;
@@ -262,17 +365,7 @@ fn check(root: &Path, step: &str) -> Result<Value> {
     let x: Exit = load(&root.join("evidence").join(format!("{step}.exit.json")))?;
     let e = &x.execution;
     let process: Value = load(&root.join("evidence").join(format!("{step}.process.json")))?;
-    if process["pid"].as_u64() != e.pid.map(|v| v as u64)
-        || process["creation"].as_str() != e.process_creation_utc.as_deref()
-        || e.terminal
-            != if step == "W" {
-                "SUCCESS"
-            } else {
-                "RESULT_ERROR"
-            }
-    {
-        return Err("PROBE_PROCESS_RECEIPT_REJECTED");
-    }
+    check_process(&process, e, step)?;
     if s.phase != step
         || s.digest != hash(&bytes(&p)?)
         || s.command_hash != hash(&bytes(&argv(root, &p, step))?)
@@ -283,6 +376,7 @@ fn check(root: &Path, step: &str) -> Result<Value> {
         || e.pid.is_none()
         || e.process_creation_utc.is_none()
         || !e.natural
+        || e.terminal != expected_terminal(step)
         || e.reclaim != "CONFIRMED"
         || !e.unknowns.is_empty()
         || !x
@@ -312,7 +406,7 @@ fn check(root: &Path, step: &str) -> Result<Value> {
         check(root, "W")?;
     }
     Ok(
-        json!({"schema":"nova.self2.permission-verdict/1","phase":step,"tool_verified":true,"model_started":false,"model_admission":false,"plan_digest":s.digest,"command_exit":e.exit_code,"pid":e.pid,"creation":e.process_creation_utc,"reclaim":e.reclaim,"tool_receipt":r,"current_files":current(root)?,"stdout_hash":hash(&e.stdout),"stderr_hash":hash(&e.stderr)}),
+        json!({"schema":"nova.self2.permission-verdict/1","phase":step,"tool_verified":true,"cli_process_started":true,"sandbox_helper_execution":"VERIFIED_FIXED_TOOL_RECEIPT","model_started":false,"model_admission":false,"plan_digest":s.digest,"command_exit":e.exit_code,"pid":e.pid,"creation":e.process_creation_utc,"reclaim":e.reclaim,"tool_receipt":r,"current_files":current(root)?,"stdout_hash":hash(&e.stdout),"stderr_hash":hash(&e.stderr)}),
     )
 }
 pub fn prepare() -> Result<Value> {

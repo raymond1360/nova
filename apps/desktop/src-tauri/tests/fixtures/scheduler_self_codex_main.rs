@@ -81,10 +81,13 @@ fn main() {
     match run() {
         Ok(v) => println!("{v}"),
         Err(e) => {
-            println!(
-                "{}",
+            let a: Vec<_> = std::env::args().skip(1).collect();
+            let value = if a.first().is_some_and(|v|v.starts_with("permission-")) {
+                probe::failure(&a[0],a.get(1).map(String::as_str).unwrap_or(""),e)
+            } else {
                 json!({"error_code":e,"real_codex_started":false,"network_executed":false,"admission":"NOT RUN"})
-            );
+            };
+            println!("{value}");
             std::process::exit(2)
         }
     }

@@ -103,3 +103,13 @@ required-features = ['scheduler-validation']
 name = "nova_scheduler_self_handoff"
 path = "tests/fixtures/scheduler_self_handoff_main.rs"
 required-features = ["scheduler-validation"]
+
+[[bin]]
+name = "nova_scheduler_self_codex"
+path = "tests/fixtures/scheduler_self_codex_main.rs"
+required-features = ["scheduler-validation"]
+
+[[bin]]
+name = "nova_scheduler_self2_fake_cli"
+path = "tests/fixtures/scheduler_self2_fake_cli.rs"
+required-features = ["scheduler-validation"]

@@ -16,3 +16,5 @@ pub mod deepseek_transport;
 pub mod task_execution;
 
 pub mod self_handoff;
+
+pub mod self_codex;

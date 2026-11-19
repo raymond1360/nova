@@ -2515,6 +2515,11 @@ impl Store {
         let row:Option<(i64,String)>=sql(c.query_row("SELECT revision,state_json FROM self_handoff WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?))).optional())?;
         match row { Some((rev,raw))=>Ok((rev,Some(serde_json::from_str(&raw).map_err(|_|"SELF_STATE_REJECTED")?))),None=>Ok((0,None)) }
     }
+    pub(crate) fn self2_launch(&self, revision: i64, state: &Value, attempt: Attempt) -> Result<LaunchPermit> {
+        if attempt.state != "LAUNCHING" || !attempt.profile_id.starts_with("SELF2_") { return Err("BINDING_MISMATCH"); }
+        self.self_cas(revision, state)?;
+        Ok(LaunchPermit { attempt, claimed: std::sync::atomic::AtomicBool::new(false) })
+    }
     pub(crate) fn self_cas(&self, expected:i64, state:&Value) -> Result<()> {
         let raw=serde_json::to_string(state).map_err(|_|"ENCODING")?;
         if raw.len()>2*1024*1024 {return Err("INPUT_BOUND");}

@@ -27,7 +27,7 @@ impl SessionBinding {
         if uuid::Uuid::parse_str(&self.uuid)
             .map(|u| u.to_string() != self.uuid)
             .unwrap_or(true)
-            || self.source != "EXPLICIT_SELECTION"
+            || !["EXPLICIT_SELECTION", "SYNTHETIC_CLI_RECEIPT", "TOOL_CLI_RECEIPT"].contains(&self.source.as_str())
             || self.reference.trim().is_empty()
         {
             return Err("SELF_SESSION_REJECTED");
@@ -43,6 +43,9 @@ pub struct Stage {
     pub reviewer: Option<SessionBinding>,
 }
 impl Stage {
+    fn explicit_input(&self)->Result<()> {
+        if [&self.developer,&self.reviewer].iter().any(|s|s.as_ref().is_some_and(|b|b.source!="EXPLICIT_SELECTION")){return Err("SELF_SESSION_REJECTED");}self.validate()
+    }
     fn validate(&self) -> Result<()> {
         if !id(&self.stage) {
             return Err("SELF_STAGE_REJECTED");
@@ -129,6 +132,8 @@ pub struct State {
     pub stage: Stage,
     pub active: Option<Package>,
     pub closed: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self2: Option<super::self_codex::Journal>,
 }
 fn encode<T: Serialize>(v: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(v).map_err(|_| "ENCODING")
@@ -136,7 +141,7 @@ fn encode<T: Serialize>(v: &T) -> Result<Vec<u8>> {
 fn decode<T: serde::de::DeserializeOwned>(v: Value) -> Result<T> {
     serde_json::from_value(v).map_err(|_| "SELF_STATE_REJECTED")
 }
-fn load(s: &Store) -> Result<(i64, State)> {
+pub(crate) fn load(s: &Store) -> Result<(i64, State)> {
     let (rev, v) = s.self_read()?;
     let st: State = decode(v.ok_or("SELF_UNINITIALIZED")?)?;
     st.stage.validate()?;
@@ -145,12 +150,12 @@ fn load(s: &Store) -> Result<(i64, State)> {
             return Err("SELF_PACKET_TAMPERED");
         }
     }
-    if st.schema != "nova.self-state/1" {
+    if (st.self2.is_none() && st.schema != "nova.self-state/1") || (st.self2.is_some() && st.schema != "nova.self-state/2") {
         return Err("SELF_STATE_REJECTED");
     }
     Ok((rev, st))
 }
-fn verify_packet(s: &Store, p: &Package) -> Result<()> {
+pub(crate) fn verify_packet(s: &Store, p: &Package) -> Result<()> {
     if hash(&encode(&p.packet)?) != p.packet_sha256 {
         return Err("SELF_PACKET_TAMPERED");
     }
@@ -161,8 +166,11 @@ fn verify_packet(s: &Store, p: &Package) -> Result<()> {
     }
     Ok(())
 }
-fn save(s: &Store, rev: i64, st: &State) -> Result<()> {
+pub(crate) fn save(s: &Store, rev: i64, st: &State) -> Result<()> {
     s.self_cas(rev, &serde_json::to_value(st).map_err(|_| "ENCODING")?)
+}
+fn adapter_settled(st:&State)->Result<()> {
+ if st.self2.as_ref().is_some_and(|j|j.records.iter().any(|r|r.outcome!="COMPLETE")){return Err("SELF2_RECONCILE_REQUIRED");}Ok(())
 }
 fn same_stage(st: &State, stage: &str) -> Result<()> {
     if st.stage.stage != stage {
@@ -269,6 +277,9 @@ fn blob_id(b: &[u8]) -> String {
         .collect()
 }
 fn material(root: &Path, input: &DeliveryInput) -> Result<(Packet, Envelope)> {
+    material_for(root, input, true)
+}
+pub(crate) fn material_for(root: &Path, input: &DeliveryInput, delivered: bool) -> Result<(Packet, Envelope)> {
     if !id(&input.package)
         || !id(&input.stage)
         || !hex(&input.base_sha, 40)
@@ -288,7 +299,7 @@ fn material(root: &Path, input: &DeliveryInput) -> Result<(Packet, Envelope)> {
     }
     input.developer_report.validate()?;
     if input.developer_report.report_type != ReportType::Development
-        || input.developer_report.claimed_conclusion != Conclusion::Pass
+        || (delivered && input.developer_report.claimed_conclusion != Conclusion::Pass)
         || input.developer_report.context.package_id != input.package
         || input.developer_report.claimed_delivery_sha != input.head_sha
     {
@@ -494,7 +505,7 @@ pub fn init(
     stage: Stage,
     input: DeliveryInput,
 ) -> Result<Store> {
-    stage.validate()?;
+    stage.explicit_input()?;
     if stage.stage != input.stage {
         return Err("SELF_STAGE_MISMATCH");
     }
@@ -507,13 +518,28 @@ pub fn init(
         stage,
         active: None,
         closed: vec![],
+        self2: None,
     };
     save(&s, 0, &st)?;
     collect(&s, input)?;
     Ok(s)
 }
+pub fn init_work(root: &Path, repo: &Path, reports: &Path, stage: Stage, input: DeliveryInput) -> Result<Store> {
+    stage.explicit_input()?;
+    if stage.stage != input.stage || input.developer_report.claimed_conclusion != Conclusion::NotRun || !input.logs.is_empty() {
+        return Err("SELF_WORK_INPUT_REJECTED");
+    }
+    let (_, mut env) = material_for(repo, &input, false)?;
+    let m = manifest(repo, &input, reports);
+    env.bind(&m)?;
+    let s = Store::self_init(root, &m, &env)?;
+    save(&s, 0, &State { schema: "nova.self-state/1".into(), stage, active: None, closed: vec![], self2: None })?;
+    Ok(s)
+}
 pub fn bind(s: &Store, stage: &str, reviewer: SessionBinding) -> Result<()> {
+    if reviewer.source != "EXPLICIT_SELECTION" {return Err("SELF_SESSION_REJECTED");}
     let (rev, mut st) = load(s)?;
+    adapter_settled(&st)?;
     same_stage(&st, stage)?;
     if st.stage.reviewer.is_some() {
         return Err("SELF_ALREADY_BOUND");
@@ -523,7 +549,9 @@ pub fn bind(s: &Store, stage: &str, reviewer: SessionBinding) -> Result<()> {
     save(s, rev, &st)
 }
 pub fn bind_developer(s: &Store, stage: &str, developer: SessionBinding) -> Result<()> {
+    if developer.source != "EXPLICIT_SELECTION" {return Err("SELF_SESSION_REJECTED");}
     let (rev, mut st) = load(s)?;
+    adapter_settled(&st)?;
     same_stage(&st, stage)?;
     if st.stage.developer.is_some() {
         return Err("SELF_ALREADY_BOUND");
@@ -534,6 +562,7 @@ pub fn bind_developer(s: &Store, stage: &str, developer: SessionBinding) -> Resu
 }
 pub fn collect(s: &Store, input: DeliveryInput) -> Result<()> {
     let (rev, mut st) = load(s)?;
+    adapter_settled(&st)?;
     same_stage(&st, &input.stage)?;
     manifest(
         Path::new(&s.snapshot()?.manifest.repo_path),
@@ -617,6 +646,7 @@ pub fn collect(s: &Store, input: DeliveryInput) -> Result<()> {
 }
 pub fn route(s: &Store, stage: &str, package: &str) -> Result<Value> {
     let (rev, mut st) = load(s)?;
+    adapter_settled(&st)?;
     same_stage(&st, stage)?;
     if st.stage.developer.is_none() {
         return Err("SELF_DEVELOPER_UNBOUND");
@@ -643,6 +673,7 @@ pub fn route(s: &Store, stage: &str, package: &str) -> Result<Value> {
 }
 pub fn review(s: &Store, input: ReviewInput) -> Result<()> {
     let (rev, mut st) = load(s)?;
+    adapter_settled(&st)?;
     same_stage(&st, &input.stage)?;
     if st.stage.reviewer.as_ref().map(|r| r.uuid.as_str()) != Some(input.reviewer_uuid.as_str()) {
         return Err("SELF_REVIEWER_MISMATCH");
@@ -681,6 +712,7 @@ pub fn review(s: &Store, input: ReviewInput) -> Result<()> {
 }
 pub fn approve_repair(s: &Store, stage: &str, package: &str, approval: Report) -> Result<()> {
     let (rev, mut st) = load(s)?;
+    adapter_settled(&st)?;
     same_stage(&st, stage)?;
     let p = active(&mut st, package)?;
     approval.validate()?;
@@ -719,6 +751,7 @@ pub fn uncertain(s: &Store, stage: &str, package: &str, state: &str) -> Result<(
 }
 pub fn close(s: &Store, stage: &str, package: &str, approval: Report) -> Result<()> {
     let (rev, mut st) = load(s)?;
+    adapter_settled(&st)?;
     same_stage(&st, stage)?;
     let p = active(&mut st, package)?;
     approval.validate()?;
@@ -732,6 +765,7 @@ pub fn close(s: &Store, stage: &str, package: &str, approval: Report) -> Result<
     let summary = summary_package(p);
     let package_record = p.clone();
     st.closed.push(json!({"package":package,"package_record":package_record,"summary":summary,"approval":approval,"semantics":"PM_CLOSURE_REFERENCE_NOT_TASK_COMPLETION_OR_USER_ACCEPTANCE"}));
+    if let Some(journal)=st.self2.take(){st.closed.last_mut().ok_or("SELF_NO_PACKAGE")?["self2_journal"]=serde_json::to_value(journal).map_err(|_|"ENCODING")?;st.schema="nova.self-state/1".into();}
     st.active = None;
     save(s, rev, &st)
 }
@@ -794,14 +828,14 @@ pub fn export(s: &Store, output: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    struct F {
-        dir: PathBuf,
-        repo: PathBuf,
-        logs: PathBuf,
-        input: DeliveryInput,
-        stage: Stage,
+    pub(crate) struct F {
+        pub(crate) dir: PathBuf,
+        pub(crate) repo: PathBuf,
+        pub(crate) logs: PathBuf,
+        pub(crate) input: DeliveryInput,
+        pub(crate) stage: Stage,
     }
     impl F {
         fn git(&self, a: &[&str]) -> String {
@@ -818,7 +852,7 @@ mod tests {
             assert!(o.status.success(), "{:?}", o.stderr);
             String::from_utf8(o.stdout).unwrap().trim().into()
         }
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/self1-tests");
             fs::create_dir_all(&base).unwrap();
             let dir = base.join(uuid::Uuid::new_v4().to_string());
@@ -867,7 +901,7 @@ mod tests {
                 "fixture",
             ]);
         }
-        fn init(&self) -> Store {
+        pub(crate) fn init(&self) -> Store {
             init(
                 &store_path(&self.repo).unwrap(),
                 &self.repo,
@@ -890,7 +924,7 @@ mod tests {
             }
         }
     }
-    fn report(package: &str, sha: &str, kind: ReportType, c: Conclusion) -> Report {
+    pub(crate) fn report(package: &str, sha: &str, kind: ReportType, c: Conclusion) -> Report {
         Report {
             schema: "nova.scheduler.report/1".into(),
             report_type: kind,

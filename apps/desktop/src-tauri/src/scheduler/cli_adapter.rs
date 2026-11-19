@@ -164,6 +164,7 @@ pub fn argv(role: RelayRole, root: &Path, model: &str, session: &str) -> Vec<Str
         ]
     }
 }
+#[derive(Clone, Debug)]
 pub struct Spec {
     pub role: RelayRole,
     pub profile: String,
@@ -188,6 +189,7 @@ pub struct Parser {
     role: RelayRole,
     session: String,
     metadata: bool,
+    self2_raw: bool,
     pending: Vec<u8>,
     total: usize,
     first: bool,
@@ -207,6 +209,7 @@ impl Parser {
             role,
             session: session.into(),
             metadata: false,
+            self2_raw: false,
             pending: vec![],
             total: 0,
             first: false,
@@ -222,6 +225,10 @@ impl Parser {
         }
     }
     pub fn feed(&mut self, b: &[u8]) -> Result<()> {
+        if self.self2_raw {
+            self.total = self.total.checked_add(b.len()).ok_or("BOUND")?;
+            return if self.total <= 8388608 { Ok(()) } else { Err("BOUND") };
+        }
         if self.metadata {
             if self.pending.len() + b.len() > 4096 {
                 return Err("BOUND");
@@ -409,7 +416,7 @@ impl Parser {
         Ok(())
     }
     pub fn finish(mut self, exit: Option<i64>) -> Execution {
-        if self.metadata {
+        if self.metadata || self.self2_raw {
             let mut e = Execution::failed(if exit == Some(0) {
                 "SUCCESS"
             } else {
@@ -509,6 +516,7 @@ pub struct NativeDriver {
     fake_hash: String,
     streamed_identity: Option<String>,
     metadata: bool,
+    self2_raw: bool,
     _guard: Guard,
     pub cancel: Arc<AtomicBool>,
     #[cfg(test)]
@@ -517,6 +525,15 @@ pub struct NativeDriver {
     residuals: Vec<native::Session>,
 }
 impl NativeDriver {
+    // SELF-2 uses the same Windows Job/IO/deadline supervisor, then its own Codex wire parser.
+    pub(crate) fn self2_transport(exe: &Path, expected: &str) -> Result<Self> {
+        let mut g = Guard::tool(exe)?;
+        g.verify_sha256_stream(std::fs::metadata(exe).map_err(|_| "FILE_STAT")?.len(), expected, Instant::now() + Duration::from_secs(60))?;
+        let identity = g.identity.clone();
+        Ok(Self { fake: g.path.clone(), fake_hash: expected.into(), streamed_identity: Some(identity),
+            metadata: false, self2_raw: true, _guard: g, cancel: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)] fault: None, #[cfg(windows)] residuals: vec![] })
+    }
     pub fn new() -> Result<Self> {
         let exe = std::env::current_exe().map_err(|_| "SELF_PATH")?;
         Self::from_directory(exe.parent().ok_or("SELF_PATH")?, None)
@@ -536,6 +553,7 @@ impl NativeDriver {
             fake_hash: h,
             streamed_identity: None,
             metadata: false,
+            self2_raw: false,
             _guard: g,
             cancel: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -1254,6 +1272,7 @@ mod native {
         let (tx, rx) = mpsc::sync_channel::<&'static str>(4);
         if error.is_none() {
             let metadata = driver.metadata;
+            let self2_raw = driver.self2_raw;
             let mut out = session.tree.out.take().unwrap();
             let role = s.role;
             let id = s.session.clone();
@@ -1261,6 +1280,7 @@ mod native {
             session.out = Some(thread::spawn(move || {
                 let mut p = Parser::new(role, &id);
                 p.metadata = metadata;
+                p.self2_raw = self2_raw;
                 let mut data = vec![];
                 let mut buf = [0u8; 8192];
                 let mut fail = None;
@@ -1713,6 +1733,7 @@ impl RealDriver {
             _guard: g,
             streamed_identity: Some(tools[0].identity.clone()),
             metadata: false,
+            self2_raw: false,
             cancel: Arc::new(AtomicBool::new(false)),
             #[cfg(windows)]
             residuals: vec![],
@@ -1747,6 +1768,7 @@ impl RealDriver {
                 _guard: g,
                 streamed_identity: Some(tools[0].identity.clone()),
                 metadata: false,
+            self2_raw: false,
                 cancel: Arc::new(AtomicBool::new(false)),
                 fault: None,
                 #[cfg(windows)]

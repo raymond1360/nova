@@ -1063,6 +1063,16 @@ fn canary_trusted_configuration() -> Result<()> {
 }
 #[cfg(test)]
 thread_local! { static SYNTHETIC_CANARY_CONFIGURATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+// The synthetic home is local to a test scope, not a process environment or a production grant.
+#[cfg(test)]
+thread_local! { static SYNTHETIC_CANARY_AUTH_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) }; }
+fn canary_auth_home(runtime:bool)->Result<PathBuf>{
+    #[cfg(test)]
+    if let Some(home)=SYNTHETIC_CANARY_AUTH_HOME.with(|v|v.borrow().clone()){return Ok(home)}
+    if runtime {super::admission_probe::default_auth_home()}
+    else {Ok(PathBuf::from(r"C:\Users\Lenovo\.codex"))}
+}
 fn canary_conditions(c:&Option<CanaryConditions>,p:&Plan)->Result<&'static str>{
     let c=c.as_ref().ok_or("SELF2_CANARY_CONDITIONS_PENDING")?;
     if c.model!=p.model || c.model.trim().is_empty() || c.model.chars().any(char::is_control)
@@ -1071,7 +1081,7 @@ fn canary_conditions(c:&Option<CanaryConditions>,p:&Plan)->Result<&'static str>{
         || c.cli_retry_policy!="STANDARD_CLI_INTERNAL_RETRIES_ACCEPTED"
         || c.subscription_terms.trim().is_empty() || c.subscription_terms.len()>2048
         || c.configuration_reference.trim().is_empty() || c.configuration_reference.len()>2048
-        || c.auth_home!=Path::new(r"C:\Users\Lenovo\.codex") {
+        || c.auth_home!=canary_auth_home(false)? {
         return Err("SELF2_CANARY_CONDITIONS_REJECTED")
     }
     Ok("USER_APPROVED_SUBSCRIPTION_TERMS_NOT_A_BILLING_GUARANTEE")
@@ -1231,7 +1241,7 @@ fn canary_tree(root:&Path)->Result<String>{
 }
 fn canary_environment(parent:&BTreeMap<String,String>,dir:&Path,c:&CanaryConditions)->Result<BTreeMap<String,String>>{
     let env=cli_adapter::environment(parent,dir)?;
-    if c.auth_home!=super::admission_probe::default_auth_home()? {return Err("SELF2_CANARY_AUTH_HOME_MISMATCH")}
+    if c.auth_home!=canary_auth_home(true)? {return Err("SELF2_CANARY_AUTH_HOME_MISMATCH")}
     // Transport intentionally refuses CODEX_* outside the permission helper. Use the pinned CLI default home, no credential copying.
     Ok(env)
 }
@@ -1480,12 +1490,18 @@ mod tests {
                 e
             }
         }
+        let test_home=PathBuf::from(r"C:\NOVA_SYNTHETIC_ONLY\canary-auth-never-opened");
+        let previous=SYNTHETIC_CANARY_AUTH_HOME.with(|v|v.replace(Some(test_home.clone())));
+        struct RestoreHome(Option<PathBuf>);impl Drop for RestoreHome {fn drop(&mut self){SYNTHETIC_CANARY_AUTH_HOME.with(|v|{v.replace(self.0.take());});}}
+        let _restore_home=RestoreHome(previous);
+        assert_eq!(canary_auth_home(false).unwrap(),test_home);
+        assert_eq!(canary_auth_home(true).unwrap(),test_home);
         let j=journal(s).unwrap();let (material,_)=h::material_for(&j.plan.project_root,&j.plan.input,false).unwrap();
         let binding=super::super::admission_probe::bind_permission(scope).unwrap();
         let request=CanaryRequest {schema:"nova.self2.canary-request/1".into(),consumer_sha256:tool_digest(&std::env::current_exe().unwrap()).unwrap(),consumer_path:std::env::current_exe().unwrap(),
             plan_sha256:j.plan_sha256,permission_fingerprint:binding.fingerprint().into(),material_sha256:hash(&bytes(&material).unwrap()),
             initial_source_sha256:hash(b"SELF2_CANARY_PENDING\n"),immutable_project_sha256:canary_tree(&j.plan.project_root).unwrap(),expires_utc:chrono::Utc::now().timestamp()+3600,
-            conditions:Some(CanaryConditions {model:j.plan.model,reasoning:"low".into(),service_tier:"default".into(),subscription_terms:"SYNTHETIC USER TERMS; NO ACCOUNT ACCESS".into(),cli_retry_policy:"STANDARD_CLI_INTERNAL_RETRIES_ACCEPTED".into(),configuration_reference:"SYNTHETIC FROZEN CONFIG".into(),auth_home:r"C:\Users\Lenovo\.codex".into()})};
+            conditions:Some(CanaryConditions {model:j.plan.model,reasoning:"low".into(),service_tier:"default".into(),subscription_terms:"SYNTHETIC USER TERMS; NO ACCOUNT ACCESS".into(),cli_retry_policy:"STANDARD_CLI_INTERNAL_RETRIES_ACCEPTED".into(),configuration_reference:"SYNTHETIC FROZEN CONFIG".into(),auth_home:test_home.clone()})};
         let unchanged=serde_json::to_value(h::load(s).unwrap()).unwrap();
         // Missing trusted facts stay closed even for well-formed conditions and arbitrary claims.
         for reference in ["FORMATTED CONFIG REFERENCE", "EXTRA_MCP_PRESENT; PASS=true", "CONFIGURATION_DRIFT; PASS=true"] {
@@ -1512,6 +1528,9 @@ mod tests {
                 "expired"=>bad.expires_utc=0,"tier"=>bad.conditions.as_mut().unwrap().service_tier="UNCONFIGURED".into(),"auth-home"=>bad.conditions.as_mut().unwrap().auth_home="C:/wrong".into(),"retry"=>bad.conditions.as_mut().unwrap().cli_retry_policy="UNCONFIGURED".into(),_=>bad.conditions.as_mut().unwrap().model="WRONG_MODEL".into() }
             assert!(canary_proposal_at(s,bad,scope).is_err());assert_eq!(unchanged,serde_json::to_value(h::load(s).unwrap()).unwrap());
         }
+        let mut wrong_home=request.conditions.clone().unwrap();wrong_home.auth_home=PathBuf::from(r"C:\WRONG_SYNTHETIC_AUTH_HOME");
+        let parent=cli_adapter::ENV_ALLOW.iter().filter_map(|k|std::env::var(k).ok().map(|v|(k.to_string(),v))).collect();
+        assert_eq!(canary_environment(&parent,&h::store_path(&journal(s).unwrap().plan.project_root).unwrap(),&wrong_home).unwrap_err(),"SELF2_CANARY_AUTH_HOME_MISMATCH");
         assert!(approve_canary_at(s,request.clone(),"AUTHORIZED=true",scope).is_err());
         let proposal=canary_proposal_at(s,request.clone(),scope).unwrap();
         approve_canary_at(s,request.clone(),&format!("AUTHORIZE 1120A CODEX CANARY {}",proposal["digest"].as_str().unwrap()),scope).unwrap();

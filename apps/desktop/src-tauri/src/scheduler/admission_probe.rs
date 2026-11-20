@@ -161,6 +161,10 @@ fn permission_at(root: &Path, scope: &PermissionScope, accepted: &AcceptedPermis
     Ok(PermissionBinding { scope: scope.clone(), fingerprint: hash(&bytes(&json!({"scope":scope,"receipts":accepted.receipts}))?) })
 }
 // Consumer-only registration after real W/R and independent acceptance. Never overwrite the helper.
+pub(super) fn default_auth_home() -> Result<PathBuf> {Ok(legacy_profile_dir()?.join(".codex"))}
+pub(super) fn permission_scope_project() -> PermissionScope {
+    accepted_project().expect("fixed accepted 1120a record").scope
+}
 fn accepted_project() -> Option<AcceptedPermission> {
     // 1120a /3: independently accepted raw W/R receipts (11201640).
     Some(AcceptedPermission { scope: PermissionScope {

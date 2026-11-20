@@ -84,6 +84,8 @@ pub struct Journal {
     pub plan: Plan,
     pub plan_sha256: String,
     pub records: Vec<Record>,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    canary: Option<CanaryApproval>,
 }
 fn bytes<T: Serialize>(v: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(v).map_err(|_| "ENCODING")
@@ -235,6 +237,7 @@ pub fn attach(s: &Store, p: Plan) -> Result<()> {
         plan_sha256: hash(&bytes(&p)?),
         plan: p,
         records: vec![],
+        canary: None,
     });
     h::save(s, rev, &st)
 }
@@ -866,13 +869,15 @@ fn run(s: &Store, d: &mut impl Driver, exe: &Path, sha: &str, synthetic: bool) -
             exe: exe.into(),
             exe_sha256: sha.into(),
             argv: {
-                let mut a = codex_args(&p, role, session, &schema_path)?;
+                let mut a = if let Some(a)=&journal(s)?.canary {
+                    canary_args(&p,a.request.conditions.as_ref().ok_or("SELF2_CANARY_CONDITIONS_PENDING")?,role,session,&schema_path)?
+                } else {codex_args(&p, role, session, &schema_path)?};
                 if synthetic {
                     a.insert(0, "--nova-self2-synthetic-only".into());
                 }
                 a
             },
-            env: cli_adapter::environment(&parent, &dir)?,
+            env: if let Some(a)=&journal(s)?.canary {canary_environment(&parent,&dir,a.request.conditions.as_ref().ok_or("SELF2_CANARY_CONDITIONS_PENDING")?)?}else{cli_adapter::environment(&parent, &dir)?},
             cwd: p.project_root.clone(),
             session: session.unwrap_or("").into(),
         })
@@ -898,6 +903,7 @@ fn run(s: &Store, d: &mut impl Driver, exe: &Path, sha: &str, synthetic: bool) -
         if report.claimed_conclusion != Conclusion::Pass {
             return Err("SELF2_DEVELOPMENT_NOT_SUCCESSFUL");
         }
+        if journal(s)?.canary.is_some(){canary_file(s,b"SELF2_CANARY_READY\n")?;}
         bind_receipt(s, Role::Develop, &id)?;
         let mut delivery = p.input.clone();
         delivery.developer_report = report;
@@ -945,6 +951,7 @@ fn run(s: &Store, d: &mut impl Driver, exe: &Path, sha: &str, synthetic: bool) -
     let input = bytes(
         &json!({"schema":"nova.self2.input/1","role":"REVIEW","stage":p.input.stage,"package":p.input.package,"head_sha":p.input.head_sha,"packet_sha256":active.packet_sha256,"material":active.packet,"instruction":"Independent read-only review of complete packet/source/diff/logs; no writes, tests, external models or remediation. Process exits are tool facts; your conclusion is a model claim.","result_contract":output_schema()}),
     )?;
+    let canary_before=if journal(s)?.canary.is_some(){Some(canary_file(s,b"SELF2_CANARY_READY\n")?)}else{None};
     let e = invoke(
         s,
         d,
@@ -963,6 +970,7 @@ fn run(s: &Store, d: &mut impl Driver, exe: &Path, sha: &str, synthetic: bool) -
         &p,
         &active.packet_sha256,
     )?;
+    if let Some(before)=canary_before {if before!=canary_file(s,b"SELF2_CANARY_READY\n")?{return Err("SELF2_CANARY_REVIEW_WRITE_REJECTED")}}
     bind_receipt(s, Role::Review, &id)?;
     let route = if let Some(id) = &active.route_id {
         id.clone()
@@ -993,8 +1001,297 @@ fn run(s: &Store, d: &mut impl Driver, exe: &Path, sha: &str, synthetic: bool) -
 pub fn status(s: &Store) -> Result<Value> {
     let j = journal(s)?;
     Ok(
-        json!({"schema":"nova.self2.summary/1","self1":h::summary(s)?,"journal":j,"mode":j.plan.mode,"real_codex_started":matches!(j.plan.mode,Mode::RealPendingAdmission)&&!j.records.is_empty(),"native_permission_admission":"NOT RUN","subscription_authorization":"NOT GRANTED","process_liveness":"UNKNOWN_AFTER_RETURN","command_exit_source":"SUPERVISED_PROCESS_RECEIPT; SYNTHETIC DRIVER IF TEST","model_claim_source":"SEPARATE_MODEL_DECLARATION","user_acceptance":"PENDING"}),
+        json!({"schema":"nova.self2.summary/1","self1":h::summary(s)?,"journal":j,"mode":j.plan.mode,"real_codex_started":matches!(j.plan.mode,Mode::RealPendingAdmission)&&j.records.iter().any(|r|r.attempt.pid.is_some() || r.execution.as_ref().is_some_and(|e|e.created)),"native_permission_admission":if j.canary.is_some(){"BOUND_AT_APPROVAL; CURRENT_RECHECK_REQUIRED"}else{"NOT RUN"},"subscription_authorization":if j.canary.is_some(){"USER_CANARY_APPROVAL; NOT_BILLING_VERIFICATION"}else{"NOT GRANTED"},"process_liveness":"UNKNOWN_AFTER_RETURN","command_exit_source":"SUPERVISED_PROCESS_RECEIPT; SYNTHETIC DRIVER IF TEST","model_claim_source":"SEPARATE_MODEL_DECLARATION","user_acceptance":"PENDING","canary_completion":j.canary.as_ref().and_then(|a|a.completion.as_ref()),"canary_result_semantics":"COMPLETION_RECEIPT_REQUIRED; PROCESS_EXIT_IS_NOT_BUSINESS_SUCCESS"}),
     )
+}
+
+#[cfg(test)]
+pub(super) fn test_canary_case(s:&Store,scope:&super::admission_probe::PermissionScope,case:&str){tests::canary_case(s,scope,case)}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanaryConditions {
+    pub model: String,
+    pub reasoning: String,
+    pub service_tier: String,
+    /// Explicit user-supplied usage/credits decision, never represented as a billing guarantee.
+    pub subscription_terms: String,
+    pub cli_retry_policy: String,
+    /// Reference to the reviewed auth/configuration contract, NOT credentials or a PASS bit.
+    pub configuration_reference: String,
+    pub auth_home: PathBuf,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanaryRequest {
+    pub schema: String,
+    pub consumer_sha256: String,
+    pub consumer_path: PathBuf,
+    pub plan_sha256: String,
+    pub permission_fingerprint: String,
+    pub material_sha256: String,
+    pub initial_source_sha256: String,
+    pub immutable_project_sha256: String,
+    pub expires_utc: i64,
+    pub conditions: Option<CanaryConditions>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanaryApproval {
+    request: CanaryRequest,
+    digest: String,
+    approved_utc: i64,
+    /// No automatic resume after a host interruption, even before the first subprocess.
+    consumed: bool,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    completion: Option<CanaryCompletion>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanaryCompletion {packet_sha256:String,reviewer_uuid:String,material_sha256:String,records_sha256:String}
+fn tool_digest(path:&Path)->Result<String>{
+    let mut g=Guard::tool(path)?;
+    g.sha256_stream(fs::metadata(path).map_err(|_|"FILE_STAT")?.len(),Instant::now()+Duration::from_secs(60))
+}
+fn canary_scope()->super::admission_probe::PermissionScope {
+    super::admission_probe::permission_scope_project()
+}
+fn canary_conditions(c:&Option<CanaryConditions>,p:&Plan)->Result<&'static str>{
+    let c=c.as_ref().ok_or("SELF2_CANARY_CONDITIONS_PENDING")?;
+    if c.model!=p.model || c.model.trim().is_empty() || c.model.chars().any(char::is_control)
+        || !["minimal","low","medium","high","xhigh"].contains(&c.reasoning.as_str())
+        || c.service_tier!="default"
+        || c.cli_retry_policy!="STANDARD_CLI_INTERNAL_RETRIES_ACCEPTED"
+        || c.subscription_terms.trim().is_empty() || c.subscription_terms.len()>2048
+        || c.configuration_reference.trim().is_empty() || c.configuration_reference.len()>2048
+        || c.auth_home!=Path::new(r"C:\Users\Lenovo\.codex") {
+        return Err("SELF2_CANARY_CONDITIONS_REJECTED")
+    }
+    Ok("USER_APPROVED_SUBSCRIPTION_TERMS_NOT_A_BILLING_GUARANTEE")
+}
+fn canary_identity(s:&Store,scope:&super::admission_probe::PermissionScope)->Result<()> {
+    let j=journal(s)?;
+    #[cfg(not(test))]
+    if scope!=&canary_scope() || j.plan.input.head_sha!="c29523595afacf3630dccacf8d7ae5f8707ad41d"
+        || j.plan.input.base_sha!="6b6edcd6ac5f3b6893812885f0607c1428fe3636" {return Err("SELF2_CANARY_FIXED_SCOPE_REQUIRED")}
+    if j.plan.project_root!=scope.project_root || j.plan.cli!=scope.cli || j.plan.cli_sha256!=scope.cli_sha256
+        || !matches!(j.plan.mode,Mode::RealPendingAdmission) || !j.plan.commands.is_empty()
+        || j.plan.input.allowed_paths!=vec!["a.txt".to_string()] {
+        return Err("SELF2_CANARY_FIXED_SCOPE_REQUIRED")
+    }
+    if !j.plan.input.required_commands.is_empty(){return Err("SELF2_CANARY_COMMANDS_REJECTED")}
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanaryDraftInput {pub expires_utc:i64,pub conditions:Option<CanaryConditions>}
+pub fn canary_draft(s:&Store,input:CanaryDraftInput)->Result<Value>{
+    let scope=canary_scope();canary_identity(s,&scope)?;let j=journal(s)?;
+    if !j.records.is_empty() || j.canary.is_some(){return Err("SELF2_CANARY_ALREADY_RESERVED")}
+    let binding=super::admission_probe::bind_permission(&scope)?;
+    let (material,_)=h::material_for(&j.plan.project_root,&j.plan.input,false)?;
+    let (raw,_)=super::store::read_file(&j.plan.project_root.join("a.txt"),131072)?;
+    let consumer=std::env::current_exe().map_err(|_|"SELF_PATH")?;
+    let request=CanaryRequest {schema:"nova.self2.canary-request/1".into(),consumer_sha256:tool_digest(&consumer)?,consumer_path:consumer,
+        plan_sha256:j.plan_sha256,permission_fingerprint:binding.fingerprint().into(),material_sha256:hash(&bytes(&material)?),
+        initial_source_sha256:hash(&raw),immutable_project_sha256:canary_tree(&j.plan.project_root)?,expires_utc:input.expires_utc,conditions:input.conditions};
+    Ok(json!({"request":request,"scope":scope,"prepared_only":true,"approval":"NOT GRANTED","model_started":false,
+        "readiness":if request.conditions.is_none(){"SELF2_CANARY_CONDITIONS_PENDING"}else{"REQUIRES_PROPOSAL_VALIDATION"}}))
+}
+/// Read-only exact object to show BEFORE interactive approval. No model/credential access.
+pub fn canary_proposal(s:&Store,request:CanaryRequest)->Result<Value>{
+    let scope=canary_scope();canary_proposal_at(s,request,&scope)
+}
+fn canary_proposal_at(s:&Store,request:CanaryRequest,scope:&super::admission_probe::PermissionScope)->Result<Value>{
+    canary_identity(s,scope)?;
+    let j=journal(s)?;let stage=h::load(s)?.1.stage;
+    if !j.records.is_empty() || j.canary.is_some() || stage.developer.is_some() || stage.reviewer.is_some(){
+        return Err("SELF2_CANARY_ALREADY_RESERVED")
+    }
+    canary_conditions(&request.conditions,&j.plan)?;
+    let binding=super::admission_probe::bind_permission(scope)?;
+    let (material,_)=h::material_for(&j.plan.project_root,&j.plan.input,false)?;
+    let (source,_)=super::store::read_file(&j.plan.project_root.join("a.txt"),131072)?;
+    if source!=b"SELF2_CANARY_PENDING\n" {return Err("SELF2_CANARY_PREIMAGE_REJECTED")}
+    if request.schema!="nova.self2.canary-request/1" || request.plan_sha256!=j.plan_sha256
+        || request.permission_fingerprint!=binding.fingerprint() || request.material_sha256!=hash(&bytes(&material)?)
+        || request.initial_source_sha256!=hash(&source)
+        || request.immutable_project_sha256!=canary_tree(&j.plan.project_root)?
+        || request.consumer_path!=std::env::current_exe().map_err(|_|"SELF_PATH")?
+        || request.consumer_sha256!=tool_digest(&std::env::current_exe().map_err(|_|"SELF_PATH")?)?
+        || request.expires_utc<=chrono::Utc::now().timestamp()
+        || request.expires_utc>chrono::Utc::now().timestamp()+86400 {
+        return Err("SELF2_CANARY_APPROVAL_BINDING_REJECTED")
+    }
+    Ok(json!({"request":request,"digest":hash(&bytes(&request)?),"scope":scope,"store":h::store_path(&j.plan.project_root)?,
+        "material":material,"max_cli_rounds":3,"automatic_retries":0,"repairs":0,"model_started":false,
+        "approval_required":"AUTHORIZE 1120A CODEX CANARY <digest>","billing":"USER_TERMS_NOT_TOOL_VERIFIED","cli_internal_retries":"STANDARD_CLI_BEHAVIOR; THREE_PROCESSES_IS_NOT_THREE_HTTP_REQUESTS"}))
+}
+/// No JSON authorized/PASS field. Caller must obtain the exact phrase on an interactive console.
+pub fn approve_canary(s:&Store,request:CanaryRequest,confirmation:&str)->Result<Value>{
+    approve_canary_at(s,request,confirmation,&canary_scope())
+}
+fn approve_canary_at(s:&Store,request:CanaryRequest,confirmation:&str,scope:&super::admission_probe::PermissionScope)->Result<Value>{
+    let proposal=canary_proposal_at(s,request.clone(),scope)?;
+    let digest=proposal["digest"].as_str().ok_or("ENCODING")?;
+    if confirmation!=format!("AUTHORIZE 1120A CODEX CANARY {digest}"){return Err("SELF2_CANARY_EXPLICIT_APPROVAL_REQUIRED")}
+    let (rev,mut st)=h::load(s)?;let j=st.self2.as_mut().ok_or("SELF2_UNINITIALIZED")?;
+    if j.canary.is_some() || !j.records.is_empty(){return Err("SELF2_CANARY_ALREADY_RESERVED")}
+    j.canary=Some(CanaryApproval {request,digest:digest.into(),approved_utc:chrono::Utc::now().timestamp(),consumed:false,completion:None});
+    h::save(s,rev,&st)?;Ok(proposal)
+}
+fn canary_gate(s:&Store,scope:&super::admission_probe::PermissionScope)->Result<CanaryApproval>{
+    canary_identity(s,scope)?;let j=journal(s)?;
+    let a=j.canary.ok_or("SELF2_MODEL_AUTHORIZATION_REQUIRED")?;
+    canary_conditions(&a.request.conditions,&j.plan)?;
+    if a.request.plan_sha256!=j.plan_sha256 || a.digest!=hash(&bytes(&a.request)?)
+        || a.approved_utc>a.request.expires_utc || a.request.expires_utc<=chrono::Utc::now().timestamp()
+        || a.request.consumer_path!=std::env::current_exe().map_err(|_|"SELF_PATH")?
+        || a.request.consumer_sha256!=tool_digest(&std::env::current_exe().map_err(|_|"SELF_PATH")?)? {
+        return Err("SELF2_CANARY_APPROVAL_BINDING_REJECTED")
+    }
+    let stage=h::load(s)?.1.stage;
+    if (j.records.is_empty() || (j.records.len()==1 && j.records[0].outcome=="STARTED"))
+        && (stage.developer.is_some() || stage.reviewer.is_some()){return Err("SELF2_CANARY_INITIAL_IDENTITY_DRIFT")}
+    let binding=super::admission_probe::bind_permission(scope)?;
+    if a.request.permission_fingerprint!=binding.fingerprint(){return Err("SELF2_CANARY_PERMISSION_DRIFT")}
+    let (material,_)=h::material_for(&j.plan.project_root,&j.plan.input,false)?;
+    if (j.records.is_empty() || (j.records.len()==1 && j.records[0].outcome=="STARTED"))
+        && a.request.material_sha256!=hash(&bytes(&material)?){return Err("SELF2_CANARY_MATERIAL_DRIFT")}
+    if a.request.immutable_project_sha256!=canary_tree(&j.plan.project_root)?{return Err("SELF2_CANARY_TREE_DRIFT")}
+    if a.request.expires_utc<=chrono::Utc::now().timestamp(){return Err("SELF2_CANARY_APPROVAL_BINDING_REJECTED")}
+    Ok(a)
+}
+fn canary_args(p:&Plan,c:&CanaryConditions,role:Role,session:Option<&str>,schema:&Path)->Result<Vec<String>>{
+    let mut a=codex_args(p,role,session,schema)?;
+    // exec shared --sandbox is the frozen source interface; permission-profile is sandbox-only.
+    a.pop();a.push("--ignore-rules".into());
+    for value in ["windows.sandbox=\"unelevated\"".to_string(),"forced_login_method=\"chatgpt\"".into(),
+        "model_provider=\"openai\"".into(),format!("model_reasoning_effort={}",json!(c.reasoning)),
+        format!("service_tier={}",json!(c.service_tier)),"sandbox_workspace_write.network_access=false".into(),
+        "web_search=\"disabled\"".into(),"features.multi_agent=false".into(),"features.multi_agent_v2=false".into(),
+        "features.plugins=false".into(),"features.hooks=false".into(),"features.plugin_hooks=false".into(),
+        "features.skip_host_skill_discovery=true".into(),"project_doc_max_bytes=0".into()] {a.extend(["-c".into(),value]);}
+    a.push("-".into());Ok(a)
+}
+// This adapter is NOT a second supervisor: it rechecks the capability and delegates to the shared Driver.
+struct CanaryDriver<'a,D:Driver> {store:&'a Store,scope:&'a super::admission_probe::PermissionScope,inner:&'a mut D}
+impl<D:Driver> sealed::Sealed for CanaryDriver<'_,D>{}
+impl<D:Driver> Driver for CanaryDriver<'_,D>{
+    fn invoke(&mut self,spec:&Spec,b:&[u8],permit:&LaunchPermit,end:Instant,receipt:&mut dyn FnMut(u32,String)->Result<()>)->Execution{
+        let checked=(||->Result<()> {
+            let a=canary_gate(self.store,self.scope)?;
+            if !a.consumed{return Err("SELF2_CANARY_NOT_CONSUMED")}
+            let j=journal(self.store)?;let n=j.records.len();
+            if !(1..=3).contains(&n) || j.records[..n-1].iter().any(|r|r.outcome!="COMPLETE")
+                || j.records[n-1].outcome!="STARTED" {return Err("SELF2_RECONCILE_REQUIRED")}
+            let stage=h::load(self.store)?.1.stage;
+            if n==1 {
+                if spec.role!=RelayRole::Develop || !spec.session.is_empty(){return Err("SELF2_CANARY_SEQUENCE_REJECTED")}
+            } else {
+                if spec.role!=RelayRole::Review || stage.developer.as_ref().map(|v|v.uuid.as_str())!=j.records[0].attempt.session_id.as_deref(){return Err("SELF2_CANARY_SEQUENCE_REJECTED")}
+                if n==3 && stage.reviewer.as_ref().map(|v|v.uuid.as_str())!=j.records[1].attempt.session_id.as_deref(){return Err("SELF2_UUID_MISMATCH")}
+                if (n==2 && (!spec.session.is_empty() || stage.reviewer.is_some()))
+                    || (n==3 && stage.reviewer.as_ref().map(|v|v.uuid.as_str())!=Some(spec.session.as_str())) {
+                    return Err("SELF2_UUID_MISMATCH")
+                }
+            }
+            Ok(())
+        })();
+        if let Err(code)=checked{return Execution::failed(code)}
+        self.inner.invoke(spec,b,permit,end,receipt)
+    }
+}
+
+fn canary_tree(root:&Path)->Result<String>{
+    fn visit(root:&Path,path:&Path,rows:&mut BTreeMap<String,Value>)->Result<()> {
+        let _pin=Guard::open(path,true)?;
+        for entry in fs::read_dir(path).map_err(|_|"SELF2_CANARY_TREE")? {
+            let path=entry.map_err(|_|"SELF2_CANARY_TREE")?.path();
+            let rel=path.strip_prefix(root).map_err(|_|"SELF2_CANARY_TREE")?.to_string_lossy().replace('\\',"/");
+            if rel=="a.txt"{continue}
+            if rows.len()>=256{return Err("SELF2_CANARY_TREE_BOUND")}
+            let md=fs::symlink_metadata(&path).map_err(|_|"SELF2_CANARY_TREE")?;
+            if md.is_dir(){let g=Guard::open(&path,true)?;rows.insert(rel,json!({"directory":g.identity}));visit(root,&path,rows)?;}
+            else {let (raw,id)=super::store::read_file(&path,1048576)?;rows.insert(rel,json!({"identity":id,"sha256":hash(&raw)}));}
+        }
+        Ok(())
+    }
+    let mut rows=BTreeMap::new();visit(root,root,&mut rows)?;Ok(hash(&bytes(&rows)?))
+}
+fn canary_environment(parent:&BTreeMap<String,String>,dir:&Path,c:&CanaryConditions)->Result<BTreeMap<String,String>>{
+    let env=cli_adapter::environment(parent,dir)?;
+    if c.auth_home!=super::admission_probe::default_auth_home()? {return Err("SELF2_CANARY_AUTH_HOME_MISMATCH")}
+    // Transport intentionally refuses CODEX_* outside the permission helper. Use the pinned CLI default home, no credential copying.
+    Ok(env)
+}
+fn canary_file(s:&Store,expected:&[u8])->Result<String>{
+    let p=journal(s)?.plan;let (raw,id)=super::store::read_file(&p.project_root.join("a.txt"),131072)?;
+    if raw!=expected{return Err("SELF2_CANARY_CONTENT_REJECTED")}
+    let (material,_)=h::material_for(&p.project_root,&p.input,false)?;
+    let a=journal(s)?.canary.ok_or("SELF2_MODEL_AUTHORIZATION_REQUIRED")?;
+    if a.request.immutable_project_sha256!=canary_tree(&p.project_root)?{return Err("SELF2_CANARY_TREE_DRIFT")}
+    Ok(hash(&bytes(&json!({"material":material,"identity":id,"bytes_hash":hash(&raw)}))?))
+}
+pub fn run_canary(s:&Store)->Result<Value>{
+    let scope=canary_scope();let a=canary_gate(s,&scope)?;let p=journal(s)?.plan;
+    let mut driver=NativeCodex {root:p.project_root,tools:BTreeMap::from([(p.cli,p.cli_sha256)]),cancel:std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))};
+    let mut console=cli_adapter::ConsoleHandler::install()?;
+    // NativeDriver polls the existing CONSOLE_CANCEL flag installed by ConsoleHandler.
+    let result=run_canary_at(s,&scope,&a,&mut driver);console.close()?;result
+}
+fn run_canary_at(s:&Store,scope:&super::admission_probe::PermissionScope,a:&CanaryApproval,d:&mut impl Driver)->Result<Value>{
+    if a.consumed{return Err("SELF2_CANARY_ALREADY_CONSUMED")}
+    canary_file(s,b"SELF2_CANARY_PENDING\n")?;
+    let (rev,mut st)=h::load(s)?;let j=st.self2.as_mut().ok_or("SELF2_UNINITIALIZED")?;
+    if !j.records.is_empty() || j.canary.as_ref().is_none_or(|x|x.digest!=a.digest || x.consumed){return Err("SELF2_CANARY_ALREADY_CONSUMED")}
+    j.canary.as_mut().unwrap().consumed=true;h::save(s,rev,&st)?;
+    let mut driver=CanaryDriver {store:s,scope,inner:d};
+    run_canary_rounds(s,&mut driver)?;
+    canary_gate(s,scope)?;
+    let j=journal(s)?;let st=h::load(s)?.1;
+    if j.records.len()!=3 || j.records.iter().any(|r|r.outcome!="COMPLETE"){return Err("SELF2_RECONCILE_REQUIRED")}
+    let completion=CanaryCompletion {packet_sha256:st.active.as_ref().ok_or("SELF_NO_PACKAGE")?.packet_sha256.clone(),
+        reviewer_uuid:st.stage.reviewer.as_ref().ok_or("SELF2_UUID_MISSING")?.uuid.clone(),
+        material_sha256:canary_file(s,b"SELF2_CANARY_READY\n")?,records_sha256:hash(&bytes(&j.records)?)};
+    let (rev,mut state)=h::load(s)?;let current=state.self2.as_mut().ok_or("SELF2_UNINITIALIZED")?;
+    if hash(&bytes(&current.records)?)!=completion.records_sha256 || current.canary.as_ref().is_none_or(|c|c.completion.is_some()){return Err("SELF2_RECONCILE_REQUIRED")}
+    current.canary.as_mut().unwrap().completion=Some(completion.clone());h::save(s,rev,&state)?;
+    Ok(json!({"schema":"nova.self2.canary-summary/1","approval_digest":a.digest,"permission_fingerprint":a.request.permission_fingerprint,
+        "native_permission_admission":"BOUND_ACCEPTED_EVIDENCE","model_authorization":"EXPLICIT_CONSUMED",
+        "subscription_terms_source":"USER_APPROVAL_NOT_BILLING_VERIFICATION","cli_rounds":j.records.len(),"completion_receipt":completion,"journal":journal(s)?,
+        "developer_uuid":st.stage.developer,"reviewer_uuid":st.stage.reviewer,"same_uuid_resume_verified":true,
+        "source_tool_check":"EXACT_READY_BYTES_AND_SCOPE","review_write_check":"PRE_POST_IDENTITY_BYTES_UNCHANGED",
+        "self1":h::summary(s)?,"process_liveness":"UNKNOWN_AFTER_RETURN","user_acceptance":"PENDING","daily_native_admission":"CLOSED"}))
+}
+fn run_canary_rounds(s:&Store,d:&mut impl Driver)->Result<()> {
+    // Reuse the existing D1/R1 packet, acceptance and route chain; select only canary arguments/checks.
+    let p=journal(s)?.plan;
+    run(s,d,&p.cli,&p.cli_sha256,false)?;
+    let st=h::load(s)?.1;let active=st.active.as_ref().ok_or("SELF_NO_PACKAGE")?;
+    let review=active.review.as_ref().ok_or("SELF2_CANARY_REVIEW_REQUIRED")?;
+    if serde_json::to_value(review).map_err(|_|"ENCODING")?["report"]["claimed_conclusion"]!="PASS" {
+        return Err("SELF2_CANARY_REVIEW_NOT_PASS")
+    }
+    let reviewer=st.stage.reviewer.as_ref().ok_or("SELF2_UUID_MISSING")?.uuid.clone();
+    let before=canary_file(s,b"SELF2_CANARY_READY\n")?;
+    let input=bytes(&json!({"schema":"nova.self2.input/1","role":"REVIEW","stage":p.input.stage,"package":p.input.package,
+        "head_sha":p.input.head_sha,"packet_sha256":active.packet_sha256,"material":active.packet,
+        "instruction":"Resume this exact review session. Recheck the SAME packet read-only; no writes, commands, new review or remediation. Return the existing conclusion and exact binding.","result_contract":output_schema()}))?;
+    let schema=h::store_path(&p.project_root)?.join("backups/self2").join("output.schema.json");
+    let c=journal(s)?.canary.ok_or("SELF2_MODEL_AUTHORIZATION_REQUIRED")?.request.conditions.ok_or("SELF2_CANARY_CONDITIONS_PENDING")?;
+    let parent=cli_adapter::ENV_ALLOW.iter().filter_map(|k|std::env::var(k).ok().map(|v|(k.to_string(),v))).collect();
+    let spec=Spec {role:RelayRole::Review,profile:Role::Review.profile(),exe:p.cli.clone(),exe_sha256:p.cli_sha256.clone(),
+        argv:canary_args(&p,&c,Role::Review,Some(&reviewer),&schema)?,env:canary_environment(&parent,schema.parent().unwrap(),&c)?,cwd:p.project_root.clone(),session:reviewer.clone()};
+    let e=invoke(s,d,Role::Review,1,spec,input,Some(reviewer.clone()),schema.parent().unwrap())?;
+    let (id,r)=accept_saved(s,&e,Role::Review,Some(&reviewer),&p,&active.packet_sha256)?;
+    if id!=reviewer || r.claimed_conclusion!=Conclusion::Pass || before!=canary_file(s,b"SELF2_CANARY_READY\n")? {
+        return Err("SELF2_CANARY_RESUME_REJECTED")
+    }
+    // Do not overwrite the R1 report or register a second review.
+    let current=h::load(s)?.1.active.ok_or("SELF_NO_PACKAGE")?.review;
+    if serde_json::to_value(current).map_err(|_|"ENCODING")?!=serde_json::to_value(Some(review)).map_err(|_|"ENCODING")? {return Err("SELF2_CANARY_REVIEW_CHANGED")}
+    Ok(())
 }
 /// Build the synthetic fixture's JSONL without reading any real account/session content.
 /// It returns a labelled synthetic claim and never edits project files.
@@ -1135,6 +1432,90 @@ mod tests {
     }
     fn run_memory(s: &Store, d: &mut Fake) -> Result<Value> {
         run(s, d, Path::new("C:/synthetic/codex.exe"), CLI_SHA, true)
+    }
+
+    pub(super) fn canary_case(s:&Store,scope:&super::super::admission_probe::PermissionScope,case:&str){
+        struct CanaryFake {calls:Vec<Spec>,case:String}
+        impl sealed::Sealed for CanaryFake {}
+        impl Driver for CanaryFake {
+            fn invoke(&mut self,s:&Spec,b:&[u8],p:&LaunchPermit,_:Instant,r:&mut dyn FnMut(u32,String)->Result<()>)->Execution{
+                assert!(p.claim_once());assert!(!p.claim_once());self.calls.push(s.clone());
+                let n=self.calls.len();r(321,"SYNTHETIC_CANARY_TIME".into()).unwrap();
+                let mut e=Execution::failed("SUCCESS");e.natural=true;e.created=true;e.exit_code=Some(0);e.reclaim="CONFIRMED".into();
+                if (n==1 && self.case=="fail-d1") || (n==2 && self.case=="fail-r1") {
+                    e.exit_code=Some(2);e.terminal="RESULT_ERROR".into();return e
+                }
+                if n==1 && self.case=="unknown" {e.reclaim="UNKNOWN".into();return e}
+                if n==1 && self.case=="timeout" {e.natural=false;e.exit_code=None;e.terminal="TIMED_OUT".into();return e}
+                if n==1 && self.case=="cancel" {e.natural=false;e.exit_code=None;e.terminal="CANCELLED".into();return e}
+                if n==1 {fs::write(s.cwd.join("a.txt"),b"SELF2_CANARY_READY\n").unwrap();}
+                if n==2 && self.case=="review-write" {fs::write(s.cwd.join("a.txt"),b"UNAUTHORIZED\n").unwrap();}
+                let id=if n==3 && self.case=="wrong-uuid" {uuid::Uuid::new_v4().to_string()}
+                    else if s.session.is_empty(){uuid::Uuid::new_v4().to_string()}else{s.session.clone()};
+                e.stdout=fixture_wire(b,&id).unwrap();
+                if n==2 && self.case=="review-decline" {
+                    let mut lines=Vec::new();
+                    for line in e.stdout.split(|b|*b==b'\n').filter(|l|!l.is_empty()) {
+                        let mut event:Value=serde_json::from_slice(line).unwrap();
+                        if event["type"]=="item.completed" {
+                            let mut reply:Value=serde_json::from_str(event["item"]["text"].as_str().unwrap()).unwrap();
+                            let mut report:Report=serde_json::from_str(reply["report"].as_str().unwrap()).unwrap();report.claimed_conclusion=Conclusion::Fail;
+                            reply["report"]=json!(serde_json::to_string(&report).unwrap());event["item"]["text"]=json!(serde_json::to_string(&reply).unwrap());
+                        }
+                        lines.extend(bytes(&event).unwrap());lines.push(b'\n');
+                    }
+                    e.stdout=lines;
+                }
+                e
+            }
+        }
+        let j=journal(s).unwrap();let (material,_)=h::material_for(&j.plan.project_root,&j.plan.input,false).unwrap();
+        let binding=super::super::admission_probe::bind_permission(scope).unwrap();
+        let request=CanaryRequest {schema:"nova.self2.canary-request/1".into(),consumer_sha256:tool_digest(&std::env::current_exe().unwrap()).unwrap(),consumer_path:std::env::current_exe().unwrap(),
+            plan_sha256:j.plan_sha256,permission_fingerprint:binding.fingerprint().into(),material_sha256:hash(&bytes(&material).unwrap()),
+            initial_source_sha256:hash(b"SELF2_CANARY_PENDING\n"),immutable_project_sha256:canary_tree(&j.plan.project_root).unwrap(),expires_utc:chrono::Utc::now().timestamp()+3600,
+            conditions:Some(CanaryConditions {model:j.plan.model,reasoning:"low".into(),service_tier:"default".into(),subscription_terms:"SYNTHETIC USER TERMS; NO ACCOUNT ACCESS".into(),cli_retry_policy:"STANDARD_CLI_INTERNAL_RETRIES_ACCEPTED".into(),configuration_reference:"SYNTHETIC FROZEN CONFIG".into(),auth_home:r"C:\Users\Lenovo\.codex".into()})};
+        let unchanged=serde_json::to_value(h::load(s).unwrap()).unwrap();
+        assert!(matches!(canary_gate(s,scope),Err("SELF2_MODEL_AUTHORIZATION_REQUIRED")));
+        let mut wrong_scope=scope.clone();wrong_scope.cli_sha256="0".repeat(64);assert!(canary_proposal_at(s,request.clone(),&wrong_scope).is_err());
+        for fault in ["pending","consumer","consumer-path","plan","material","fingerprint","source","tree","expired","model","tier","auth-home","retry"] {
+            let mut bad=request.clone();match fault {
+                "pending"=>bad.conditions=None,"consumer"=>bad.consumer_sha256="0".repeat(64),"consumer-path"=>bad.consumer_path="C:/wrong.exe".into(),"plan"=>bad.plan_sha256="0".repeat(64),
+                "material"=>bad.material_sha256="0".repeat(64),"fingerprint"=>bad.permission_fingerprint="0".repeat(64),
+                "source"=>bad.initial_source_sha256="0".repeat(64),"tree"=>bad.immutable_project_sha256="0".repeat(64),
+                "expired"=>bad.expires_utc=0,"tier"=>bad.conditions.as_mut().unwrap().service_tier="UNCONFIGURED".into(),"auth-home"=>bad.conditions.as_mut().unwrap().auth_home="C:/wrong".into(),"retry"=>bad.conditions.as_mut().unwrap().cli_retry_policy="UNCONFIGURED".into(),_=>bad.conditions.as_mut().unwrap().model="WRONG_MODEL".into() }
+            assert!(canary_proposal_at(s,bad,scope).is_err());assert_eq!(unchanged,serde_json::to_value(h::load(s).unwrap()).unwrap());
+        }
+        assert!(approve_canary_at(s,request.clone(),"AUTHORIZED=true",scope).is_err());
+        let proposal=canary_proposal_at(s,request.clone(),scope).unwrap();
+        approve_canary_at(s,request.clone(),&format!("AUTHORIZE 1120A CODEX CANARY {}",proposal["digest"].as_str().unwrap()),scope).unwrap();
+        assert!(approve_canary_at(s,request.clone(),"duplicate",scope).is_err());
+        let a=canary_gate(s,scope).unwrap();
+        let (rev,mut state)=h::load(s).unwrap();state.self2.as_mut().unwrap().canary.as_mut().unwrap().request.expires_utc=0;h::save(s,rev,&state).unwrap();
+        assert!(canary_gate(s,scope).is_err());let (rev,mut state)=h::load(s).unwrap();state.self2.as_mut().unwrap().canary=Some(a.clone());h::save(s,rev,&state).unwrap();
+        let mut d=CanaryFake {calls:vec![],case:case.into()};
+        let result=run_canary_at(s,scope,&a,&mut d);
+        if case=="ok" {
+            assert!(result.is_ok(),"{result:?}");assert_eq!(d.calls.len(),3);
+            assert!(d.calls[0].session.is_empty());assert!(d.calls[1].session.is_empty());
+            let state=h::load(s).unwrap().1;assert_ne!(state.stage.developer.unwrap().uuid,state.stage.reviewer.as_ref().unwrap().uuid);
+            assert_eq!(d.calls[2].session,state.stage.reviewer.unwrap().uuid);
+            let p=journal(s).unwrap().plan;
+            for (i,spec) in d.calls.iter().enumerate(){
+                assert!(spec.argv.windows(2).any(|v|v==["--sandbox",if i==0 {"workspace-write"}else{"read-only"}]));
+                assert!(spec.argv.iter().any(|v|v=="windows.sandbox=\"unelevated\""));
+                assert!(!spec.env.contains_key("CODEX_HOME"));
+                let schema=h::store_path(&p.project_root).unwrap().join("backups/self2").join("output.schema.json");
+                assert_eq!(spec.argv,canary_args(&p,request.conditions.as_ref().unwrap(),if i==0 {Role::Develop}else{Role::Review},if i==2 {Some(spec.session.as_str())}else{None},&schema).unwrap());
+            }
+            assert!(d.calls[2].argv.windows(2).any(|v|v==["resume",d.calls[2].session.as_str()]));
+        } else {assert!(result.is_err(),"{case}");assert_eq!(d.calls.len(),if case=="wrong-uuid"{3}else if case=="fail-r1"||case=="review-write"||case=="review-decline"{2}else{1});}
+        let calls=d.calls.len();assert!(run_canary_at(s,scope,&a,&mut d).is_err());assert_eq!(d.calls.len(),calls);
+        let reopened=Store::self_open(&h::store_path(&journal(s).unwrap().plan.project_root).unwrap()).unwrap();
+        assert!(run_canary_at(&reopened,scope,&a,&mut d).is_err());assert_eq!(d.calls.len(),calls);
+        let trace=h::store_path(&journal(s).unwrap().plan.project_root).unwrap().join("canary-synthetic-evidence.json");
+        fs::write(&trace,bytes(&json!({"case":case,"synthetic_only":true,"calls":d.calls.iter().map(|s|json!({"role":s.role,"argv":s.argv,"session":s.session,"env":s.env})).collect::<Vec<_>>(),"result":format!("{result:?}"),"journal":journal(s).unwrap()})).unwrap()).unwrap();
+        println!("CANARY_SYNTHETIC_EVIDENCE={}",trace.display());
     }
     #[test]
     fn self2_normal_relay_shared_packet_and_summary() {

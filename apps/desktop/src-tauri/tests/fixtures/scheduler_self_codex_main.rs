@@ -64,8 +64,22 @@ fn run() -> Result<Value> {
     if a.len() < 2 {
         return Err("SELF2_COMMAND_REJECTED");
     }
+    if a[0].starts_with("canary-") && Path::new(&a[1])!=nova_lib::scheduler::self_handoff::store_path(&Path::new(probe::PROJECT_ROOT).join("workspace"))? {
+        return Err("SELF2_CANARY_FIXED_STORE_REQUIRED");
+    }
     let s = Store::self_open(Path::new(&a[1]))?;
     match a[0].as_str() {
+        "canary-draft" if a.len()==3 => c::canary_draft(&s,read(&a[2])?),
+        "canary-proposal" if a.len()==3 => c::canary_proposal(&s,read(&a[2])?),
+        "canary-approve" if a.len()==3 => {
+            if !io::stdin().is_terminal(){return Err("CONSOLE_REQUIRED")}
+            let request=read(&a[2])?;let proposal=c::canary_proposal(&s,request)?;
+            eprintln!("{proposal}");eprintln!("Type AUTHORIZE 1120A CODEX CANARY <digest>:");
+            let mut line=String::new();io::stdin().read_line(&mut line).map_err(|_|"INPUT_REJECTED")?;
+            if line.len()>256{return Err("INPUT_BOUND")}
+            c::approve_canary(&s,read(&a[2])?,line.trim_end_matches(['\r','\n']))
+        },
+        "canary-run" if a.len()==2 => c::run_canary(&s),
         "status" if a.len() == 2 => c::status(&s),
         "attach" if a.len() == 3 => {
             c::attach(&s, read(&a[2])?)?;
@@ -89,6 +103,8 @@ fn main() {
             let a: Vec<_> = std::env::args().skip(1).collect();
             let value = if a.first().is_some_and(|v|v.starts_with("permission-")) {
                 probe::failure(&a[0],a.get(1).map(String::as_str).unwrap_or(""),e)
+            } else if a.first().is_some_and(|v|v.starts_with("canary-")) {
+                json!({"error_code":e,"real_codex_started":"CONSULT_PERSISTENT_RECEIPTS","network_executed":"UNKNOWN","model_admission":"NOT_A_SUCCESS","retry":"FORBIDDEN"})
             } else {
                 json!({"error_code":e,"real_codex_started":false,"network_executed":false,"admission":"NOT RUN"})
             };

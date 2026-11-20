@@ -252,6 +252,28 @@ fn probe_fixed_surface_and_live_gate_closed() {
 }
 #[test]
 fn probe_current_bytes_identity_controls_and_receipts_rechecked() {
+    // The same /3 production constructor and real permission validation feed the canary tests.
+    for case in ["ok","fail-d1","fail-r1","cancel","timeout","unknown","wrong-uuid","review-write","review-decline"] {
+        use super::super::{self_handoff as h,self_codex as c,contract::{Conclusion,ReportType}};
+        let root=std::env::temp_dir().join(format!("nova-canary-{}",uuid::Uuid::new_v4()));
+        let helper=std::env::temp_dir().join(format!("canary-identity-only-{}.exe",uuid::Uuid::new_v4()));
+        fs::write(&helper,b"SYNTHETIC CLI/HELPER IDENTITY; NEVER EXECUTED").unwrap();let sha=tool_hash(&helper).unwrap();
+        let prepared=prepare_project_at(&root,&helper,&helper,&sha).unwrap();
+        let f=F{p:load(&root.join("plan.json")).unwrap(),root};f.synthetic("W");f.synthetic("R");
+        let mut accepted=f.accepted();accepted.scope.cli=helper;
+        SYNTHETIC_ACCEPTED.with(|v|*v.borrow_mut()=Some(accepted.clone()));
+        struct Clear;impl Drop for Clear {fn drop(&mut self){SYNTHETIC_ACCEPTED.with(|v|*v.borrow_mut()=None)}}let _clear=Clear;
+        let head=prepared["source_contract"]["head_sha"].as_str().unwrap();
+        let report=h::tests::report("canary-package",head,ReportType::Development,Conclusion::NotRun);
+        let input:h::DeliveryInput=serde_json::from_value(json!({"stage":"canary-stage","package":"canary-package",
+            "base_sha":prepared["source_contract"]["base_sha"],"head_sha":head,"goal":"Exact canary edit","acceptance":["READY bytes only"],
+            "allowed_paths":["a.txt"],"required_commands":[],"logs":[],"developer_report":report})).unwrap();
+        let workspace=f.root.join("workspace");let store=h::init_work(&h::store_path(&workspace).unwrap(),&workspace,&f.root.join("reports"),h::Stage{stage:"canary-stage".into(),developer:None,reviewer:None},input.clone()).unwrap();
+        c::attach(&store,c::Plan{mode:c::Mode::RealPendingAdmission,schema:"nova.self2.plan/1".into(),input,project_root:workspace,
+            cli:accepted.scope.cli.clone(),cli_sha256:sha,cli_version:c::CLI_VERSION.into(),model:"SYNTHETIC_CANARY_MODEL".into(),commands:vec![]}).unwrap();
+        c::test_canary_case(&store,&accepted.scope,case);
+    }
+
     // Full public admission path, ordinary .git directory and declared editable source.
     {
         use super::super::{self_handoff as h, self_codex as c, contract::{Conclusion,ReportType}, store::Store};

@@ -1,6 +1,8 @@
 #requires -Version 7.0
 param([Parameter(Mandatory)][string]$EvidenceDirectory,[string]$TargetDirectory,[switch]$SkipDefaultRegression)
 $ErrorActionPreference='Stop'
+. (Join-Path $PSScriptRoot 'sh1_failure_diagnostics.ps1')
+$failureDetail=$null;$diagnosticFacts=@{}
 $repo=Split-Path -Parent $PSScriptRoot
 if(-not [IO.Path]::IsPathRooted($EvidenceDirectory) -or (Test-Path -LiteralPath $EvidenceDirectory)){throw 'New absolute evidence directory required'}
 New-Item -ItemType Directory -Path $EvidenceDirectory | Out-Null
@@ -82,10 +84,14 @@ try {
  $stage='DEFAULT_REQUIRED_FEATURES'
  $code=Invoke-Fixed 'default-required-features' $cargo @('build','--offline','--locked','--bin','nova_scheduler_handoff')
  $err=[string](Get-Content (Join-Path $EvidenceDirectory 'default-required-features.stderr.log') -Raw)
+ $diagnosticFacts=@{exit_is_101=($code -eq 101);required_message_match=($err -match '(?m)^error: target `nova_scheduler_handoff` in package `nova` requires the features: `scheduler-validation`\r?$');could_not_compile_present=($err -match 'could not compile')}
  if($code -ne 101 -or $err -notmatch '(?m)^error: target `nova_scheduler_handoff` in package `nova` requires the features: `scheduler-validation`\r?$' -or $err -match 'could not compile'){throw 'Not exact required-features rejection'}
  $stage='RELEASE_GUARD'
  $code=Invoke-Fixed 'release-guard' $cargo @('check','--offline','--locked','--release','--features','scheduler-validation','--bin','nova_scheduler_handoff','--message-format=json')
- $errors=@(Get-Content (Join-Path $EvidenceDirectory 'release-guard.stdout.log') | ForEach-Object {if($_.StartsWith('{')){$v=ConvertFrom-Json $_;if($v.reason -eq 'compiler-message' -and $v.message.level -eq 'error'){$v}}})
+ $diagnosticFacts=@{exit_is_101=($code -eq 101);json_parse_complete=$false;json_line=0}
+ $errors=@(Get-Content (Join-Path $EvidenceDirectory 'release-guard.stdout.log') | ForEach-Object {$diagnosticFacts.json_line++;if($_.StartsWith('{')){$v=ConvertFrom-Json $_;if($v.reason -eq 'compiler-message' -and $v.message.level -eq 'error'){$v}}})
+ $diagnosticFacts.json_parse_complete=$true;$diagnosticFacts.error_count=$errors.Count;$diagnosticFacts.error_count_is_one=($errors.Count -eq 1)
+ if($errors.Count -gt 0){$diagnosticFacts.target_is_nova_lib=($errors[0].target.name -ceq 'nova_lib');$diagnosticFacts.message_is_guard=($errors[0].message.message -ceq 'scheduler-validation is debug-only and must never ship')}
  if($code -ne 101 -or $errors.Count -ne 1 -or $errors[0].target.name -cne 'nova_lib' -or $errors[0].message.message -cne 'scheduler-validation is debug-only and must never ship'){throw 'Not exact scheduler guard'}
  $stage='FOUR_COMMAND_FIXTURE'
  $fixture=Join-Path $EvidenceDirectory 'git-fixture';$reports=Join-Path $EvidenceDirectory 'reports';$owned=Join-Path $EvidenceDirectory 'owned'
@@ -180,8 +186,12 @@ try {
  Require-Zero 'default-build' $cargo @('build','--offline','--locked')
  }
  $verdict='PASS'
+} catch {
+ $failureRecord=$_
+ try {$failureDetail=New-Sh1FailureDetail $failureRecord $stage $diagnosticFacts $EvidenceDirectory $PSCommandPath} catch {$failureDetail=ConvertTo-Sh1FailureDetail $null}
+ throw $failureRecord
 } finally {
  $inventory=@(Get-ChildItem -LiteralPath $EvidenceDirectory -File | Where-Object {$_.Extension -eq '.log'} | ForEach-Object {@{name=$_.Name;bytes=$_.Length;sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}})
- Write-Json (Join-Path $EvidenceDirectory 'result.json') @{schema='nova.scheduler.local-validation/1';verdict=$verdict;stage=$stage;default_regression_executed=(@($rows | Where-Object {$_.name -ceq 'default-tests' -and $_.state -cne 'START_FAILED'}).Count -gt 0);git_process_identity_boundary='Guarded launcher only; delegated images not frozen';commands=$rows;logs=$inventory;external_actions_executed='FIXED_LOCAL_FIXTURE_AND_CARGO_ONLY';github_verified=$false}
+ Write-Json (Join-Path $EvidenceDirectory 'result.json') @{schema='nova.scheduler.local-validation/1';verdict=$verdict;stage=$stage;failure_detail=$failureDetail;default_regression_executed=(@($rows | Where-Object {$_.name -ceq 'default-tests' -and $_.state -cne 'START_FAILED'}).Count -gt 0);git_process_identity_boundary='Guarded launcher only; delegated images not frozen';commands=$rows;logs=$inventory;external_actions_executed='FIXED_LOCAL_FIXTURE_AND_CARGO_ONLY';github_verified=$false}
 }
 if($verdict -ne 'PASS'){exit 1}

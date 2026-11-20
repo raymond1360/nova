@@ -1055,6 +1055,14 @@ fn tool_digest(path:&Path)->Result<String>{
 fn canary_scope()->super::admission_probe::PermissionScope {
     super::admission_probe::permission_scope_project()
 }
+// No production verifier is connected. References, home paths and user PASS cannot grant this capability.
+fn canary_trusted_configuration() -> Result<()> {
+    #[cfg(test)]
+    if SYNTHETIC_CANARY_CONFIGURATION.with(|v|v.get()) { return Ok(()) }
+    Err("SELF2_CANARY_TRUSTED_CONFIGURATION_REQUIRED")
+}
+#[cfg(test)]
+thread_local! { static SYNTHETIC_CANARY_CONFIGURATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 fn canary_conditions(c:&Option<CanaryConditions>,p:&Plan)->Result<&'static str>{
     let c=c.as_ref().ok_or("SELF2_CANARY_CONDITIONS_PENDING")?;
     if c.model!=p.model || c.model.trim().is_empty() || c.model.chars().any(char::is_control)
@@ -1132,6 +1140,7 @@ pub fn approve_canary(s:&Store,request:CanaryRequest,confirmation:&str)->Result<
     approve_canary_at(s,request,confirmation,&canary_scope())
 }
 fn approve_canary_at(s:&Store,request:CanaryRequest,confirmation:&str,scope:&super::admission_probe::PermissionScope)->Result<Value>{
+    canary_trusted_configuration()?;
     let proposal=canary_proposal_at(s,request.clone(),scope)?;
     let digest=proposal["digest"].as_str().ok_or("ENCODING")?;
     if confirmation!=format!("AUTHORIZE 1120A CODEX CANARY {digest}"){return Err("SELF2_CANARY_EXPLICIT_APPROVAL_REQUIRED")}
@@ -1141,6 +1150,7 @@ fn approve_canary_at(s:&Store,request:CanaryRequest,confirmation:&str,scope:&sup
     h::save(s,rev,&st)?;Ok(proposal)
 }
 fn canary_gate(s:&Store,scope:&super::admission_probe::PermissionScope)->Result<CanaryApproval>{
+    canary_trusted_configuration()?;
     canary_identity(s,scope)?;let j=journal(s)?;
     let a=j.canary.ok_or("SELF2_MODEL_AUTHORIZATION_REQUIRED")?;
     canary_conditions(&a.request.conditions,&j.plan)?;
@@ -1241,6 +1251,7 @@ pub fn run_canary(s:&Store)->Result<Value>{
     let result=run_canary_at(s,&scope,&a,&mut driver);console.close()?;result
 }
 fn run_canary_at(s:&Store,scope:&super::admission_probe::PermissionScope,a:&CanaryApproval,d:&mut impl Driver)->Result<Value>{
+    canary_trusted_configuration()?;
     if a.consumed{return Err("SELF2_CANARY_ALREADY_CONSUMED")}
     canary_file(s,b"SELF2_CANARY_PENDING\n")?;
     let (rev,mut st)=h::load(s)?;let j=st.self2.as_mut().ok_or("SELF2_UNINITIALIZED")?;
@@ -1476,6 +1487,21 @@ mod tests {
             initial_source_sha256:hash(b"SELF2_CANARY_PENDING\n"),immutable_project_sha256:canary_tree(&j.plan.project_root).unwrap(),expires_utc:chrono::Utc::now().timestamp()+3600,
             conditions:Some(CanaryConditions {model:j.plan.model,reasoning:"low".into(),service_tier:"default".into(),subscription_terms:"SYNTHETIC USER TERMS; NO ACCOUNT ACCESS".into(),cli_retry_policy:"STANDARD_CLI_INTERNAL_RETRIES_ACCEPTED".into(),configuration_reference:"SYNTHETIC FROZEN CONFIG".into(),auth_home:r"C:\Users\Lenovo\.codex".into()})};
         let unchanged=serde_json::to_value(h::load(s).unwrap()).unwrap();
+        // Missing trusted facts stay closed even for well-formed conditions and arbitrary claims.
+        for reference in ["FORMATTED CONFIG REFERENCE", "EXTRA_MCP_PRESENT; PASS=true", "CONFIGURATION_DRIFT; PASS=true"] {
+            let mut unverified=request.clone();
+            unverified.conditions.as_mut().unwrap().configuration_reference=reference.into();
+            let mut blocked=CanaryFake {calls:vec![],case:case.into()};
+            let approval=CanaryApproval {request:unverified.clone(),digest:hash(&bytes(&unverified).unwrap()),approved_utc:chrono::Utc::now().timestamp(),consumed:false,completion:None};
+            assert_eq!(approve_canary_at(s,unverified,"PASS",scope).unwrap_err(),"SELF2_CANARY_TRUSTED_CONFIGURATION_REQUIRED");
+            assert_eq!(canary_gate(s,scope).unwrap_err(),"SELF2_CANARY_TRUSTED_CONFIGURATION_REQUIRED");
+            assert_eq!(run_canary_at(s,scope,&approval,&mut blocked).unwrap_err(),"SELF2_CANARY_TRUSTED_CONFIGURATION_REQUIRED");
+            assert!(blocked.calls.is_empty());
+            assert_eq!(unchanged,serde_json::to_value(h::load(s).unwrap()).unwrap());
+        }
+        SYNTHETIC_CANARY_CONFIGURATION.with(|v|v.set(true));
+        struct ClearConfiguration;impl Drop for ClearConfiguration {fn drop(&mut self){SYNTHETIC_CANARY_CONFIGURATION.with(|v|v.set(false));}}
+        let _clear_configuration=ClearConfiguration;
         assert!(matches!(canary_gate(s,scope),Err("SELF2_MODEL_AUTHORIZATION_REQUIRED")));
         let mut wrong_scope=scope.clone();wrong_scope.cli_sha256="0".repeat(64);assert!(canary_proposal_at(s,request.clone(),&wrong_scope).is_err());
         for fault in ["pending","consumer","consumer-path","plan","material","fingerprint","source","tree","expired","model","tier","auth-home","retry"] {

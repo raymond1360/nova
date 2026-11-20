@@ -161,7 +161,23 @@ fn permission_at(root: &Path, scope: &PermissionScope, accepted: &AcceptedPermis
     Ok(PermissionBinding { scope: scope.clone(), fingerprint: hash(&bytes(&json!({"scope":scope,"receipts":accepted.receipts}))?) })
 }
 // Consumer-only registration after real W/R and independent acceptance. Never overwrite the helper.
-fn accepted_project() -> Option<AcceptedPermission> { None }
+fn accepted_project() -> Option<AcceptedPermission> {
+    // 1120a /3: independently accepted raw W/R receipts (11201640).
+    Some(AcceptedPermission { scope: PermissionScope {
+        project_root: Path::new(PROJECT_ROOT).join("workspace"),
+        cli: CLI.into(), cli_sha256: self_codex::CLI_SHA.into(),
+        controller: PathBuf::from(r"D:\nova\audit\self2-project-v3-ready-1120144841\helper\nova_scheduler_self_codex.exe"),
+        controller_sha256: "6861e23552154677d68a2d9475e23e0f0c593a9e1b397b7604f8e72639feb312".into(),
+        permission_plan_sha256: "f72e8fa5cf9cf1181ec4b6fe4adbef13f408c079501a4dfd1705b2959737b463".into(),
+    }, receipts: [
+        ("R.exit.json", "3813931762de00fa5097cf6552dda1d54639babde67aceb848dee9c2fe026613"),
+        ("R.process.json", "0f8f431240c1794f009dffcadfff9d6c222aba4e246b6f2551300545eef13876"),
+        ("R.started.json", "64e140a91caeaea1881466707f142a8637f13ca4ca1f022312ec1e7143e10216"),
+        ("W.exit.json", "bc3152f952136916603e5e093c969aa37c0cac9b65af88e17b5bdc870ed00688"),
+        ("W.process.json", "f6e423f906aaf7d94b995fd2eb35281f85e310f97d3358c1cad7432ec657dce3"),
+        ("W.started.json", "0e59c8f901a5ffa9d4781d02a90f3fbfdd903506b167f1b1c5e47c940aa44927"),
+    ].into_iter().map(|(n,h)|(n.into(),h.into())).collect() })
+}
 pub(super) fn bind_permission(scope: &PermissionScope) -> Result<PermissionBinding> {
     #[cfg(test)]
     if SYNTHETIC_PENDING.with(|v|v.borrow().as_ref()==Some(scope))
@@ -758,8 +774,11 @@ pub fn project_status()->Result<Value>{
     if p.project.is_none(){return Err("PROBE_PLAN_REJECTED")}
     validate_bound(root,None,&p.helper,self_codex::CLI_SHA)?;
     let scope=project_scope(root,&p,Path::new(CLI))?;
-    let accepted=match bind_permission(&scope){Ok(_)=>true,Err("SELF2_PERMISSION_OBJECT_NOT_ACCEPTED")=>false,Err(e)=>return Err(e)};
-    Ok(json!({"scope":scope,"accepted":accepted,"model_admission":false}))
+    let accepted=match bind_permission(&scope){Ok(binding)=>{
+        if self_codex::finish_admission(Some(&binding),None,"permission-status")!=Err("SELF2_MODEL_AUTHORIZATION_REQUIRED"){return Err("PROBE_MODEL_GATE_REJECTED")}
+        true
+    },Err("SELF2_PERMISSION_OBJECT_NOT_ACCEPTED")=>false,Err(e)=>return Err(e)};
+    Ok(json!({"scope":scope,"accepted":accepted,"model_admission":false,"model_authorization":if accepted {"SELF2_MODEL_AUTHORIZATION_REQUIRED"}else{"NOT_ACCEPTED"}}))
 }
 
 pub fn prepare() -> Result<Value> {

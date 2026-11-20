@@ -300,7 +300,7 @@ fn probe_current_bytes_identity_controls_and_receipts_rechecked() {
         assert_eq!(accepted.scope.controller,f.p.helper);
         assert_ne!(accepted.scope.controller,std::env::current_exe().unwrap());
         let mut production_pending=accepted.scope.clone();production_pending.project_root=Path::new(PROJECT_ROOT).join("workspace");
-        assert!(matches!(bind_permission(&production_pending),Err("SELF2_PERMISSION_OBJECT_NOT_ACCEPTED")));
+        assert!(matches!(bind_permission(&production_pending),Err("SELF2_PERMISSION_SCOPE_MISMATCH")));
         // A legitimate in-scope source edit is independent of immutable permission sentinels.
         fs::write(workspace.join("a.txt"),b"legal uncommitted model edit\n").unwrap();
         assert_eq!(admission(&store),Err("SELF2_MODEL_AUTHORIZATION_REQUIRED"));

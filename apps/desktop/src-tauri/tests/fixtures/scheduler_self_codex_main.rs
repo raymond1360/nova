@@ -19,17 +19,22 @@ fn run() -> Result<Value> {
         return Err("SELF2_COMMAND_REJECTED");
     }
     match a[0].as_str() {
+        "permission-project-prepare" if a.len()==1 => return probe::prepare_project(),
+        "permission-project-status" if a.len()==1 => return probe::project_status(),
+        "permission-project-evaluate" if a.len()==2 => return probe::evaluate_project(&a[1]),
         "permission-prepare" if a.len()==1 => return probe::prepare(),
         "permission-evaluate" if a.len()==2 => return probe::evaluate(&a[1]),
-        "permission-run" if a.len()==3 => {
+        "permission-run" | "permission-project-run" if a.len()==3 => {
             if !io::stdin().is_terminal() { return Err("CONSOLE_REQUIRED"); }
             eprintln!("NON-MODEL ONLY: restricted-token capability/ACL/NUL initialization; fixed isolated fixture. Type AUTHORIZE NON-MODEL ACL NUL <phase> <digest>:");
             let mut line=String::new();io::stdin().read_line(&mut line).map_err(|_|"INPUT_REJECTED")?;
             if line.len()>256 {return Err("INPUT_BOUND");}
-            return probe::run(&a[1],&a[2],line.trim_end_matches(['\r','\n']));
+            let invoke=if a[0]=="permission-project-run" {probe::run_project}else{probe::run};
+            return invoke(&a[1],&a[2],line.trim_end_matches(['\r','\n']));
         }
-        "permission-helper" if a.len()==3 => {
-            let (v,code)=probe::helper(&a[1],&a[2])?; println!("{v}"); std::process::exit(code);
+        "permission-helper" | "permission-project-helper" if a.len()==3 => {
+            let invoke=if a[0]=="permission-project-helper" {probe::helper_project}else{probe::helper};
+            let (v,code)=invoke(&a[1],&a[2])?; println!("{v}"); std::process::exit(code);
         }
         x if x.starts_with("permission-") => return Err("PROBE_COMMAND_REJECTED"),
         _ => {}

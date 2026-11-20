@@ -255,32 +255,28 @@ fn probe_current_bytes_identity_controls_and_receipts_rechecked() {
     // Full public admission path, ordinary .git directory and declared editable source.
     {
         use super::super::{self_handoff as h, self_codex as c, contract::{Conclusion,ReportType}, store::Store};
-        let mut f=F::new();let workspace=f.root.join("workspace");
-        fs::create_dir(workspace.join(PROJECT_TARGETS)).unwrap();
-        for n in ["write.txt","readonly.txt"] {fs::rename(workspace.join(n),workspace.join(PROJECT_TARGETS).join(n)).unwrap()}
-        fs::write(workspace.join(".gitignore"),b"/.nova-permission/\n").unwrap();
-        fs::write(workspace.join("a.txt"),b"before\n").unwrap();
-        let git=|args:&[&str]| -> String {
-            let out=std::process::Command::new(r"C:\Program Files\Git\cmd\git.exe")
-                .env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","NUL")
-                .arg("-C").arg(&workspace).args(args).output().unwrap();
-            assert!(out.status.success(),"synthetic Git failed");String::from_utf8(out.stdout).unwrap().trim().into()
-        };
-        git(&["init","-q"]);git(&["add","--","a.txt",".gitignore"]);
-        git(&["-c","user.name=synthetic","-c","user.email=synthetic@invalid","-c","core.hooksPath=NUL","-c","commit.gpgsign=false","commit","-qm","base"]);
-        let base=git(&["rev-parse","HEAD"]);fs::write(workspace.join("a.txt"),b"after\n").unwrap();git(&["add","--","a.txt"]);
-        git(&["-c","user.name=synthetic","-c","user.email=synthetic@invalid","-c","core.hooksPath=NUL","-c","commit.gpgsign=false","commit","-qm","candidate"]);
-        let head=git(&["rev-parse","HEAD"]);
-        f.p.schema="nova.self2.permission-probe/3".into();f.p.project=Some(project_layout(&f.root).unwrap());
-        f.p.cli_hash=tool_hash(&f.p.helper).unwrap();fs::write(f.root.join("plan.json"),bytes(&f.p).unwrap()).unwrap();
+        let root=std::env::temp_dir().join(format!("nova-project-producer-{}",uuid::Uuid::new_v4()));
+        let helper=std::env::temp_dir().join(format!("synthetic-immutable-helper-{}.exe",uuid::Uuid::new_v4()));
+        fs::write(&helper,b"SYNTHETIC IDENTITY ONLY; NEVER EXECUTED").unwrap();
+        let sha=tool_hash(&helper).unwrap();
+        let prepared=prepare_project_at(&root,&helper,&helper,&sha).unwrap();
+        assert_eq!(prepared["accepted"],false);assert_eq!(prepared["model_admission"],false);
+        assert!(prepared["write_argv"].to_string().contains("permission-project-helper"));
+        assert_eq!(prepare_project_at(&root,&helper,&helper,&sha),Err("PROBE_ROOT_ALREADY_EXISTS"));
+        let f=F {p:load(&root.join("plan.json")).unwrap(),root};let workspace=f.root.join("workspace");
+        let base=prepared["source_contract"]["base_sha"].as_str().unwrap().to_string();
+        let head=prepared["source_contract"]["head_sha"].as_str().unwrap().to_string();
+        assert!(f.p.project.is_some());assert!(workspace.join(".git").is_dir());
         f.synthetic("W");f.synthetic("R");let mut accepted=f.accepted();accepted.scope.cli=f.p.helper.clone();
-        SYNTHETIC_ACCEPTED.with(|v|*v.borrow_mut()=Some(accepted.clone()));
-        struct ClearTrust;impl Drop for ClearTrust {fn drop(&mut self){SYNTHETIC_ACCEPTED.with(|v|*v.borrow_mut()=None)}}
+        SYNTHETIC_PENDING.with(|v|*v.borrow_mut()=Some(accepted.scope.clone()));
+        struct ClearTrust;impl Drop for ClearTrust {fn drop(&mut self){
+            SYNTHETIC_ACCEPTED.with(|v|*v.borrow_mut()=None);SYNTHETIC_PENDING.with(|v|*v.borrow_mut()=None);
+        }}
         let _clear=ClearTrust;
         let report=h::tests::report("project-package",&head,ReportType::Development,Conclusion::NotRun);
         let input:h::DeliveryInput=serde_json::from_value(json!({"stage":"project-stage","package":"project-package","base_sha":base,"head_sha":head,
             "goal":"Only edit a.txt","acceptance":["declared source only"],"allowed_paths":["a.txt"],"required_commands":[],"logs":[],"developer_report":report})).unwrap();
-        let reports=f.root.join("reports");fs::create_dir(&reports).unwrap();
+        let reports=f.root.join("reports");
         let stage=h::Stage {stage:"project-stage".into(),developer:None,reviewer:None};
         let store=h::init_work(&h::store_path(&workspace).unwrap(),&workspace,&reports,stage,input.clone()).unwrap();
         c::attach(&store,c::Plan {mode:c::Mode::RealPendingAdmission,schema:"nova.self2.plan/1".into(),input,
@@ -293,7 +289,18 @@ fn probe_current_bytes_identity_controls_and_receipts_rechecked() {
             assert_eq!(serde_json::to_value(&before.1).unwrap(),serde_json::to_value(&after.1).unwrap());
             observed.borrow_mut().push(json!({"result":format!("{r:?}"),"revision_before":before.0,"revision_after":after.0,"records":after.1.self2.as_ref().unwrap().records.len(),"state_unchanged":true}));r
         };
+        assert_eq!(admission(&store),Err("SELF2_PERMISSION_OBJECT_NOT_ACCEPTED"));
+        SYNTHETIC_ACCEPTED.with(|v|*v.borrow_mut()=Some(accepted.clone()));
         assert_eq!(admission(&store),Err("SELF2_MODEL_AUTHORIZATION_REQUIRED"));
+        let before=h::load(&store).unwrap();let mut wrong=accepted.scope.clone();
+        wrong.permission_plan_sha256="0".repeat(64);
+        assert!(c::admission_for(&store,&wrong,None).is_err());
+        assert_eq!(serde_json::to_value(h::load(&store).unwrap()).unwrap(),serde_json::to_value(before).unwrap());
+        // The accepted scope pins the immutable helper, not this consumer's executable identity.
+        assert_eq!(accepted.scope.controller,f.p.helper);
+        assert_ne!(accepted.scope.controller,std::env::current_exe().unwrap());
+        let mut production_pending=accepted.scope.clone();production_pending.project_root=Path::new(PROJECT_ROOT).join("workspace");
+        assert!(matches!(bind_permission(&production_pending),Err("SELF2_PERMISSION_OBJECT_NOT_ACCEPTED")));
         // A legitimate in-scope source edit is independent of immutable permission sentinels.
         fs::write(workspace.join("a.txt"),b"legal uncommitted model edit\n").unwrap();
         assert_eq!(admission(&store),Err("SELF2_MODEL_AUTHORIZATION_REQUIRED"));

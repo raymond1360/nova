@@ -17,6 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 pub const ROOT: &str = r"D:\nova-self2-permission-probe-1119e";
+pub const PROJECT_ROOT: &str = r"D:\nova-self2-permission-project-1120a";
 pub const CLI: &str = r"C:\Users\Lenovo\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe";
 const BEFORE: &[u8] = b"CANARY_INITIAL\r\n";
 const AFTER: &[u8] = b"CANARY_DEVELOPED\r\n";
@@ -159,21 +160,34 @@ fn permission_at(root: &Path, scope: &PermissionScope, accepted: &AcceptedPermis
     if receipt_hashes(root)?!=accepted.receipts {return Err("SELF2_PERMISSION_EVIDENCE_REJECTED")}
     Ok(PermissionBinding { scope: scope.clone(), fingerprint: hash(&bytes(&json!({"scope":scope,"receipts":accepted.receipts}))?) })
 }
+// Consumer-only registration after real W/R and independent acceptance. Never overwrite the helper.
+fn accepted_project() -> Option<AcceptedPermission> { None }
 pub(super) fn bind_permission(scope: &PermissionScope) -> Result<PermissionBinding> {
+    #[cfg(test)]
+    if SYNTHETIC_PENDING.with(|v|v.borrow().as_ref()==Some(scope))
+        && !SYNTHETIC_ACCEPTED.with(|v|v.borrow().as_ref().is_some_and(|a|a.scope==*scope)) {
+        return Err("SELF2_PERMISSION_OBJECT_NOT_ACCEPTED");
+    }
+
     #[cfg(test)]
     if let Some(accepted)=SYNTHETIC_ACCEPTED.with(|v|v.borrow().clone()).filter(|v|v.scope==*scope) {
         return permission_at(scope.project_root.parent().ok_or("PROBE_PATH")?,scope,&accepted,&tool_hash(&scope.cli)?);
     }
 
-    let accepted=accepted_1119e();
+    let root=if scope.project_root==Path::new(PROJECT_ROOT).join("workspace") {Path::new(PROJECT_ROOT)}else{Path::new(ROOT)};
+    let accepted=if root==Path::new(PROJECT_ROOT) {accepted_project().ok_or("SELF2_PERMISSION_OBJECT_NOT_ACCEPTED")?}else{accepted_1119e()};
     if scope!=&accepted.scope {return Err("SELF2_PERMISSION_SCOPE_MISMATCH")}
-    permission_at(Path::new(r"D:\nova-self2-permission-probe-1119e"),scope,&accepted,&tool_hash(&scope.cli)?)
+    permission_at(root,scope,&accepted,&tool_hash(&scope.cli)?)
 }
 #[cfg(test)]
-thread_local! { static SYNTHETIC_ACCEPTED: std::cell::RefCell<Option<AcceptedPermission>> = const { std::cell::RefCell::new(None) }; }
+thread_local! {
+    static SYNTHETIC_ACCEPTED: std::cell::RefCell<Option<AcceptedPermission>> = const { std::cell::RefCell::new(None) };
+    static SYNTHETIC_PENDING: std::cell::RefCell<Option<PermissionScope>> = const { std::cell::RefCell::new(None) };
+}
 #[cfg(test)]
 pub(super) fn synthetic_cli_binding(root: &Path, cli: &Path, sha: &str) -> bool {
     SYNTHETIC_ACCEPTED.with(|v|v.borrow().as_ref().is_some_and(|a|a.scope.project_root==root && a.scope.cli==cli && a.scope.cli_sha256==sha))
+        || SYNTHETIC_PENDING.with(|v|v.borrow().as_ref().is_some_and(|s|s.project_root==root && s.cli==cli && s.cli_sha256==sha))
 }
 /// Read-only preparation interface. A binding is rechecked on each call and is never a launch permit.
 pub fn permission_preflight(scope: &PermissionScope) -> Result<Value> {
@@ -335,7 +349,7 @@ fn argv(root: &Path, p: &Plan, step: &str) -> Vec<String> {
         format!("shell_environment_policy.include_only={}", json!(p.environment.keys().collect::<Vec<_>>())),
         "--".into(),
         p.helper.to_string_lossy().into_owned(),
-        "permission-helper".into(),
+        if p.project.is_some() {"permission-project-helper"}else{"permission-helper"}.into(),
         step.into(),
         p.nonce.clone(),
     ]
@@ -532,11 +546,11 @@ fn failure_at(root: &Path, operation: &str, step: &str, code: &str) -> Value {
     let mut result = json!({"error_code":code,"admission":"NOT_VERIFIED",
         "model_started":false,"network_executed":false,"network_scope":"MODEL_REQUESTS",
         "sandbox_helper_execution":"UNKNOWN","attempt_observation":null});
-    if operation == "permission-helper" {
+    if ["permission-helper","permission-project-helper"].contains(&operation) {
         result["sandbox_helper_execution"] = json!("HELPER_HANDLER_ENTERED_NOT_VERIFIED");
         return result;
     }
-    if !["permission-run", "permission-evaluate"].contains(&operation) || phase(step).is_err() {
+    if !["permission-run","permission-evaluate","permission-project-run","permission-project-evaluate"].contains(&operation) || phase(step).is_err() {
         return result;
     }
     let x = load::<Exit>(&root.join("evidence").join(format!("{step}.exit.json"))).ok();
@@ -598,7 +612,7 @@ fn failure_at(root: &Path, operation: &str, step: &str, code: &str) -> Value {
     result
 }
 pub fn failure(operation: &str, step: &str, code: &str) -> Value {
-    failure_at(Path::new(ROOT), operation, step, code)
+    failure_at(if operation.starts_with("permission-project-"){Path::new(PROJECT_ROOT)}else{Path::new(ROOT)},operation,step,code)
 }
 fn check(root: &Path, step: &str) -> Result<Value> {
     check_for(root, step, &std::env::current_exe().map_err(|_| "SELF_PATH")?)
@@ -658,6 +672,96 @@ fn check_bound(root: &Path, step: &str, expected_helper: &Path, expected_cli: &s
         json!({"schema":"nova.self2.permission-verdict/1","phase":step,"tool_verified":true,"cli_process_started":true,"sandbox_helper_execution":"VERIFIED_FIXED_TOOL_RECEIPT","model_started":false,"model_admission":false,"plan_digest":s.digest,"command_exit":e.exit_code,"pid":e.pid,"creation":e.process_creation_utc,"reclaim":e.reclaim,"tool_receipt":r,"current_files":current_for(root,&p)?,"stdout_hash":hash(&e.stdout),"stderr_hash":hash(&e.stderr)}),
     )
 }
+
+// Only fixed preparation uses this command list; never accepts user/model commands.
+fn project_git(workspace: &Path, args: &[&str]) -> Result<String> {
+    use std::process::{Command, Stdio};
+    use std::os::windows::process::CommandExt;
+    let mut c=Command::new(r"C:\Program Files\Git\cmd\git.exe");
+    c.env_clear().env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","NUL")
+        .env("GIT_TERMINAL_PROMPT","0").env("GIT_NO_REPLACE_OBJECTS","1");
+    if let Some(v)=std::env::var_os("SystemRoot") {c.env("SystemRoot",v);}
+    c.args(["-c","init.templateDir=","-c","core.hooksPath=NUL","-c","commit.gpgsign=false",
+        "-c","core.autocrlf=false","-c","user.name=Nova SELF2 fixture","-c","user.email=fixture@invalid"])
+        .arg("-C").arg(workspace).args(args).creation_flags(0x08000000)
+        .stdin(Stdio::null()).stderr(Stdio::null()).stdout(Stdio::piped());
+    let mut child=c.spawn().map_err(|_|"PROBE_PROJECT_GIT_START")?;
+    let deadline=Instant::now()+Duration::from_secs(10);
+    let status=loop {
+        match child.try_wait() {
+            Ok(Some(s))=>break s,
+            Ok(None) if Instant::now()<deadline=>std::thread::sleep(Duration::from_millis(10)),
+            _=>{let _=child.kill();let _=child.wait();return Err("PROBE_PROJECT_GIT_WAIT");}
+        }
+    };
+    if !status.success(){return Err("PROBE_PROJECT_GIT_EXIT")}
+    let mut out=Vec::new();child.stdout.take().ok_or("PROBE_PROJECT_GIT_OUTPUT")?.take(4097)
+        .read_to_end(&mut out).map_err(|_|"PROBE_PROJECT_GIT_OUTPUT")?;
+    if out.len()>4096{return Err("PROBE_PROJECT_GIT_OUTPUT")}
+    Ok(String::from_utf8(out).map_err(|_|"PROBE_PROJECT_GIT_OUTPUT")?.trim().into())
+}
+fn project_scope(root:&Path,p:&Plan,cli:&Path)->Result<PermissionScope>{
+    Ok(PermissionScope {project_root:root.join("workspace"),cli:cli.into(),cli_sha256:p.cli_hash.clone(),
+        controller:p.helper.clone(),controller_sha256:p.helper_hash.clone(),
+        permission_plan_sha256:hash(&super::store::read_file(&root.join("plan.json"),1048576)?.0)})
+}
+// Shared production constructor. Only the fixed wrapper is public; tests substitute identities.
+fn prepare_project_at(root:&Path,helper:&Path,cli:&Path,cli_hash:&str)->Result<Value>{
+    if root.exists(){return Err("PROBE_ROOT_ALREADY_EXISTS")}
+    super::store::approved_root(root,false)?;
+    let _parent=Guard::open(root.parent().ok_or("PROBE_ROOT_REJECTED")?,true)?;
+    if tool_hash(cli)?!=cli_hash{return Err("PROBE_CLI_REJECTED")}
+    let helper_hash=tool_hash(helper)?;
+    fs::create_dir(root).map_err(|_|"PROBE_CREATE")?;
+    for n in ["workspace","control","evidence","home","tmp","reports"] {
+        fs::create_dir(root.join(n)).map_err(|_|"PROBE_CREATE")?;
+    }
+    let _guards=pinned(root)?;
+    let workspace=root.join("workspace");
+    fs::create_dir(workspace.join(PROJECT_TARGETS)).map_err(|_|"PROBE_CREATE")?;
+    for n in ["write.txt","readonly.txt"] {fs::write(workspace.join(PROJECT_TARGETS).join(n),BEFORE).map_err(|_|"PROBE_CREATE")?;}
+    fs::write(workspace.join(".gitignore"),b"/.nova-permission/\n").map_err(|_|"PROBE_CREATE")?;
+    fs::write(workspace.join("a.txt"),b"SELF2_CANARY_BASE\n").map_err(|_|"PROBE_CREATE")?;
+    project_git(&workspace,&["init","-q","--initial-branch=self2-canary"])?;
+    fs::create_dir_all(workspace.join(".git/info")).map_err(|_|"PROBE_CREATE")?;
+    fs::write(workspace.join(".git/info/exclude"),b"").map_err(|_|"PROBE_CREATE")?;
+    project_git(&workspace,&["add","--","a.txt",".gitignore"])?;
+    project_git(&workspace,&["commit","--no-gpg-sign","--no-verify","-qm","canary base"])?;
+    let base=project_git(&workspace,&["rev-parse","HEAD"])?;
+    fs::write(workspace.join("a.txt"),b"SELF2_CANARY_PENDING\n").map_err(|_|"PROBE_CREATE")?;
+    project_git(&workspace,&["add","--","a.txt"])?;
+    project_git(&workspace,&["commit","--no-gpg-sign","--no-verify","-qm","canary pending"])?;
+    let head=project_git(&workspace,&["rev-parse","HEAD"])?;
+    let source=json!({"path":"a.txt","allowed_paths":["a.txt"],"base_sha":base,"head_sha":head,
+        "initial_text":"SELF2_CANARY_PENDING\n","candidate_text":"SELF2_CANARY_READY\n","model_authorized":false});
+    fresh(&root.join("control/instructions.txt"),&json!({"purpose":"NON-MODEL permission only; no model authorization. ACL/capability/NUL and denybin initialization require separate approval.","source_contract":source}))?;
+    let environment=env(root)?;
+    let p=Plan {schema:"nova.self2.permission-probe/3".into(),root_identity:Guard::open(root,true)?.identity,
+        nonce:uuid::Uuid::new_v4().to_string(),cli_hash:cli_hash.into(),helper:helper.into(),helper_hash,
+        helper_environment:helper_environment(root,&environment)?,environment,
+        controls:BTreeMap::from([("instructions.txt".into(),fact(&root.join("control/instructions.txt"))?)]),
+        targets:BTreeMap::from([("write.txt".into(),fact(&workspace.join(PROJECT_TARGETS).join("write.txt"))?),("readonly.txt".into(),fact(&workspace.join(PROJECT_TARGETS).join("readonly.txt"))?)]),project:Some(project_layout(root)?)};
+    fresh(&root.join("plan.json"),&p)?;
+    validate_bound(root,None,helper,cli_hash)?;
+    Ok(json!({"prepared_only":true,"accepted":false,"model_admission":false,"root":root,"plan":p,
+        "scope":project_scope(root,&p,cli)?,"digest":hash(&bytes(&p)?),"source_contract":source,
+        "write_argv":argv(root,&p,"W"),"readonly_argv":argv(root,&p,"R"),"sandbox_started":false}))
+}
+pub fn prepare_project()->Result<Value>{
+    let helper=std::env::current_exe().map_err(|_|"SELF_PATH")?;
+    if helper.file_name().and_then(|n|n.to_str())!=Some("nova_scheduler_self_codex.exe"){return Err("PROBE_CLI_REJECTED")}
+    prepare_project_at(Path::new(PROJECT_ROOT),&helper,Path::new(CLI),self_codex::CLI_SHA)
+}
+pub fn project_status()->Result<Value>{
+    let root=Path::new(PROJECT_ROOT);let p:Plan=load(&root.join("plan.json"))?;
+    let _guards=pinned(root)?;
+    if p.project.is_none(){return Err("PROBE_PLAN_REJECTED")}
+    validate_bound(root,None,&p.helper,self_codex::CLI_SHA)?;
+    let scope=project_scope(root,&p,Path::new(CLI))?;
+    let accepted=match bind_permission(&scope){Ok(_)=>true,Err("SELF2_PERMISSION_OBJECT_NOT_ACCEPTED")=>false,Err(e)=>return Err(e)};
+    Ok(json!({"scope":scope,"accepted":accepted,"model_admission":false}))
+}
+
 pub fn prepare() -> Result<Value> {
     let root = Path::new(ROOT);
     if root.exists() {
@@ -701,13 +805,18 @@ pub fn prepare() -> Result<Value> {
 }
 /// Permission-only native path: fixed CLI, fixed root, generated command, interactive approval.
 pub fn run(step: &str, digest: &str, confirmation: &str) -> Result<Value> {
+    run_at(Path::new(ROOT),step,digest,confirmation)
+}
+pub fn run_project(step: &str, digest: &str, confirmation: &str) -> Result<Value> {
+    run_at(Path::new(PROJECT_ROOT),step,digest,confirmation)
+}
+fn run_at(root: &Path, step: &str, digest: &str, confirmation: &str) -> Result<Value> {
     phase(step)?;
     if !super::contract::hex(digest, 64)
         || confirmation != format!("AUTHORIZE NON-MODEL ACL NUL {step} {digest}")
     {
         return Err("PROBE_EXPLICIT_APPROVAL_REQUIRED");
     }
-    let root = Path::new(ROOT);
     let _guards = pinned(root)?;
     let p = validate(root)?;
     let actual = hash(&bytes(&p)?);
@@ -762,6 +871,8 @@ pub fn run(step: &str, digest: &str, confirmation: &str) -> Result<Value> {
     result?;
     check(root, step)
 }
+pub fn evaluate_project(step: &str) -> Result<Value> {check(Path::new(PROJECT_ROOT),step)}
+pub fn helper_project(step: &str, nonce: &str) -> Result<(Value,i32)> {helper_at(Path::new(PROJECT_ROOT),step,nonce,&std::env::vars().collect())}
 pub fn evaluate(step: &str) -> Result<Value> {
     check(Path::new(ROOT), step)
 }

@@ -40,6 +40,28 @@ foreach($case in @('exact','duplicate','wrong-fields','malformed')){
  Check ((Read-Sh1FailureDetail (Join-Path $EvidenceDirectoryCase 'result.json')).classification -eq $detail.classification) 'reader roundtrip'
  Write-Output "PASS $case"
 }
+# Synthetic compiler identities only: no compiler or SH1 execution.
+$primary=@{is_primary=$true;file_name='src\scheduler\self_codex.rs';line_start=123}
+$known=@{target=@{name='nova_lib'};message=@{message=$guard;code=@{code='E0425'};spans=@($primary)}}
+$unknownError=@{target=@{name=@($secret)};message=@{message=@($secret);code=@{code='E0425'+$secret};spans=@(@{is_primary=$true;file_name=('C:/'+$secret+'/src/lib.rs');line_start=$secret})}}
+$other=@{target=@{name='other'};message=@{message=$secret;code=$null;spans=@(@{is_primary=$true;file_name='src/lib.rs';line_start=7})}}
+$multi=New-Sh1CompilerErrors @($known,$unknownError,$other)
+Check ($multi.total -eq 3 -and -not $multi.truncated -and $multi.errors.Count -eq 3) 'multi total retained'
+Check ($multi.errors[0].target_is_nova_lib -ceq $true -and $multi.errors[0].message_is_guard -ceq $true -and $multi.errors[0].rust_code -ceq 'E0425' -and $multi.errors[0].source_category -ceq 'SELF_CODEX_RS' -and $multi.errors[0].line -eq 123) 'known fixed identities'
+Check ($multi.errors[1].target_is_nova_lib -ceq 'UNKNOWN' -and $multi.errors[1].message_is_guard -ceq 'UNKNOWN' -and $multi.errors[1].rust_code -ceq 'UNKNOWN' -and $multi.errors[1].source_category -ceq 'UNKNOWN' -and $multi.errors[1].line -ceq 'UNKNOWN') 'unknown fields explicit'
+Check ($multi.errors[2].target_is_nova_lib -ceq $false -and $multi.errors[2].message_is_guard -ceq $false -and $multi.errors[2].rust_code -ceq 'UNKNOWN' -and $multi.errors[2].source_category -ceq 'LIB_RS') 'nonmatching known values'
+$many=New-Sh1CompilerErrors (@($known)*20)
+Check ($many.total -eq 20 -and $many.truncated -and $many.errors.Count -eq 16) 'sixteen record cap'
+Check ((New-Sh1CompilerErrors @()).total -eq 0) 'zero errors'
+try {throw 'Not exact scheduler guard'}catch{$compilerDetail=New-Sh1FailureDetail $_ 'RELEASE_GUARD' @{error_count=20;json_parse_complete=$true} $EvidenceDirectory $PSCommandPath $many}
+$projected=ConvertTo-Sh1FailureDetail $compilerDetail
+Check ($projected.compiler_errors.errors.Count -eq 16 -and $projected.compiler_errors.total -eq 20) 'public projection total and cap'
+Check (-not (($multi|ConvertTo-Json -Depth 20).Contains($secret))) 'no source message or path leakage'
+Check (($projected|ConvertTo-Json -Depth 20).Length -lt 10000) 'bounded compiler projection'
+Put (Join-Path $EvidenceDirectory 'compiler-roundtrip.json') @{failure_detail=$compilerDetail}
+Check ((Read-Sh1FailureDetail (Join-Path $EvidenceDirectory 'compiler-roundtrip.json')).compiler_errors.errors.Count -eq 16) 'compiler reader roundtrip'
+Put (Join-Path $EvidenceDirectory 'multi-identities.json') $multi
+Write-Output 'PASS compiler-multi-unknown-truncated-empty-roundtrip'
 try {throw ('arbitrary '+$secret)}catch{$unknown=New-Sh1FailureDetail $_ $secret @{} $EvidenceDirectory 'not-this-script'}
 Check ($unknown.classification -eq 'SCRIPT_EXCEPTION' -and $unknown.stage -eq 'UNKNOWN' -and $null -eq $unknown.line) 'unknown text and foreign location withheld'
 $hostile=@{schema='nova.sh1.failure-detail/1';stage=@('BUILD')*100;classification=$secret;line=$secret;facts=@{target_is_nova_lib=$secret};logs=@(@{name=$secret;bytes=1;sha256=$secret})*100;raw=$secret}
@@ -57,10 +79,11 @@ $step=(($wf.Substring($begin,$finish-$begin) -split "`n")|ForEach-Object {if($_.
 $env:SH1_ROOT=Join-Path $EvidenceDirectory 'export';New-Item -ItemType Directory (Join-Path $env:SH1_ROOT 'evidence') | Out-Null;New-Item -ItemType Directory (Join-Path $env:SH1_ROOT 'ci-public') | Out-Null
 $env:GITHUB_SHA='1111111111111111111111111111111111111111';$env:GITHUB_RUN_ID='123';$env:GITHUB_RUN_ATTEMPT='1'
 Put (Join-Path $env:SH1_ROOT 'execution.json') @{state='COMPLETE';exit_code=1}
-Put (Join-Path $env:SH1_ROOT 'evidence/result.json') @{failure_detail=$detail;commands=@();raw=$secret}
+Put (Join-Path $env:SH1_ROOT 'evidence/result.json') @{failure_detail=$compilerDetail;commands=@();raw=$secret}
 try {. ([scriptblock]::Create($step));throw 'Expected failure'}catch{Check ($_.Exception.Message -eq 'SH1_INPUT_MISSING') 'original rejection unchanged'}
 $public=Join-Path $env:SH1_ROOT 'ci-public';$checks=Get-Content (Join-Path $public 'checks.json') -Raw | ConvertFrom-Json -AsHashtable
-Check ($checks.failure_detail.classification -eq 'JSON_PARSE_REJECTED' -and $checks.state -eq 'FAIL') 'real exporter carries safe failure'
+Check ($checks.failure_detail.classification -eq 'RELEASE_GUARD_ASSERTION' -and $checks.state -eq 'FAIL') 'real exporter carries safe failure'
+Check ($checks.failure_detail.compiler_errors.total -eq 20 -and $checks.failure_detail.compiler_errors.errors.Count -eq 16 -and $checks.failure_detail.compiler_errors.truncated) 'compiler identities propagated by actual exporter'
 Check (@(Get-ChildItem $public -File).Count -eq 4) 'four-file structure'
 $manifest=Get-Content (Join-Path $public 'files.json') -Raw|ConvertFrom-Json
 foreach($row in $manifest.files){Check ((Get-FileHash (Join-Path $public $row.name)).Hash.ToLowerInvariant() -eq $row.sha256) 'manifest hashes'}

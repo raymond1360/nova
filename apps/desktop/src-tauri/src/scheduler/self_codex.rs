@@ -1052,6 +1052,28 @@ fn tool_digest(path:&Path)->Result<String>{
     let mut g=Guard::tool(path)?;
     g.sha256_stream(fs::metadata(path).map_err(|_|"FILE_STAT")?.len(),Instant::now()+Duration::from_secs(60))
 }
+// Keep the public interface fail-closed when the permission module is not compiled.
+#[cfg(not(any(test, all(feature = "scheduler-validation", debug_assertions))))]
+pub fn canary_draft(_s:&Store,_input:CanaryDraftInput)->Result<Value>{
+    Err("SELF2_NATIVE_PERMISSION_AND_UUID_ADMISSION_REQUIRED")
+}
+#[cfg(not(any(test, all(feature = "scheduler-validation", debug_assertions))))]
+pub fn canary_proposal(_s:&Store,_request:CanaryRequest)->Result<Value>{
+    Err("SELF2_NATIVE_PERMISSION_AND_UUID_ADMISSION_REQUIRED")
+}
+#[cfg(not(any(test, all(feature = "scheduler-validation", debug_assertions))))]
+pub fn approve_canary(_s:&Store,_request:CanaryRequest,_confirmation:&str)->Result<Value>{
+    Err("SELF2_NATIVE_PERMISSION_AND_UUID_ADMISSION_REQUIRED")
+}
+#[cfg(not(any(test, all(feature = "scheduler-validation", debug_assertions))))]
+pub fn run_canary(_s:&Store)->Result<Value>{
+    Err("SELF2_NATIVE_PERMISSION_AND_UUID_ADMISSION_REQUIRED")
+}
+#[cfg(not(any(test, all(feature = "scheduler-validation", debug_assertions))))]
+fn canary_auth_home(_runtime:bool)->Result<PathBuf>{
+    Err("SELF2_NATIVE_PERMISSION_AND_UUID_ADMISSION_REQUIRED")
+}
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 fn canary_scope()->super::admission_probe::PermissionScope {
     super::admission_probe::permission_scope_project()
 }
@@ -1067,6 +1089,7 @@ thread_local! { static SYNTHETIC_CANARY_CONFIGURATION: std::cell::Cell<bool> = c
 // The synthetic home is local to a test scope, not a process environment or a production grant.
 #[cfg(test)]
 thread_local! { static SYNTHETIC_CANARY_AUTH_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 fn canary_auth_home(runtime:bool)->Result<PathBuf>{
     #[cfg(test)]
     if let Some(home)=SYNTHETIC_CANARY_AUTH_HOME.with(|v|v.borrow().clone()){return Ok(home)}
@@ -1086,6 +1109,7 @@ fn canary_conditions(c:&Option<CanaryConditions>,p:&Plan)->Result<&'static str>{
     }
     Ok("USER_APPROVED_SUBSCRIPTION_TERMS_NOT_A_BILLING_GUARANTEE")
 }
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 fn canary_identity(s:&Store,scope:&super::admission_probe::PermissionScope)->Result<()> {
     let j=journal(s)?;
     #[cfg(not(test))]
@@ -1103,6 +1127,7 @@ fn canary_identity(s:&Store,scope:&super::admission_probe::PermissionScope)->Res
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanaryDraftInput {pub expires_utc:i64,pub conditions:Option<CanaryConditions>}
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 pub fn canary_draft(s:&Store,input:CanaryDraftInput)->Result<Value>{
     let scope=canary_scope();canary_identity(s,&scope)?;let j=journal(s)?;
     if !j.records.is_empty() || j.canary.is_some(){return Err("SELF2_CANARY_ALREADY_RESERVED")}
@@ -1117,9 +1142,11 @@ pub fn canary_draft(s:&Store,input:CanaryDraftInput)->Result<Value>{
         "readiness":if request.conditions.is_none(){"SELF2_CANARY_CONDITIONS_PENDING"}else{"REQUIRES_PROPOSAL_VALIDATION"}}))
 }
 /// Read-only exact object to show BEFORE interactive approval. No model/credential access.
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 pub fn canary_proposal(s:&Store,request:CanaryRequest)->Result<Value>{
     let scope=canary_scope();canary_proposal_at(s,request,&scope)
 }
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 fn canary_proposal_at(s:&Store,request:CanaryRequest,scope:&super::admission_probe::PermissionScope)->Result<Value>{
     canary_identity(s,scope)?;
     let j=journal(s)?;let stage=h::load(s)?.1.stage;
@@ -1146,9 +1173,11 @@ fn canary_proposal_at(s:&Store,request:CanaryRequest,scope:&super::admission_pro
         "approval_required":"AUTHORIZE 1120A CODEX CANARY <digest>","billing":"USER_TERMS_NOT_TOOL_VERIFIED","cli_internal_retries":"STANDARD_CLI_BEHAVIOR; THREE_PROCESSES_IS_NOT_THREE_HTTP_REQUESTS"}))
 }
 /// No JSON authorized/PASS field. Caller must obtain the exact phrase on an interactive console.
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 pub fn approve_canary(s:&Store,request:CanaryRequest,confirmation:&str)->Result<Value>{
     approve_canary_at(s,request,confirmation,&canary_scope())
 }
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 fn approve_canary_at(s:&Store,request:CanaryRequest,confirmation:&str,scope:&super::admission_probe::PermissionScope)->Result<Value>{
     canary_trusted_configuration()?;
     let proposal=canary_proposal_at(s,request.clone(),scope)?;
@@ -1159,6 +1188,7 @@ fn approve_canary_at(s:&Store,request:CanaryRequest,confirmation:&str,scope:&sup
     j.canary=Some(CanaryApproval {request,digest:digest.into(),approved_utc:chrono::Utc::now().timestamp(),consumed:false,completion:None});
     h::save(s,rev,&st)?;Ok(proposal)
 }
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 fn canary_gate(s:&Store,scope:&super::admission_probe::PermissionScope)->Result<CanaryApproval>{
     canary_trusted_configuration()?;
     canary_identity(s,scope)?;let j=journal(s)?;
@@ -1195,8 +1225,11 @@ fn canary_args(p:&Plan,c:&CanaryConditions,role:Role,session:Option<&str>,schema
     a.push("-".into());Ok(a)
 }
 // This adapter is NOT a second supervisor: it rechecks the capability and delegates to the shared Driver.
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 struct CanaryDriver<'a,D:Driver> {store:&'a Store,scope:&'a super::admission_probe::PermissionScope,inner:&'a mut D}
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 impl<D:Driver> sealed::Sealed for CanaryDriver<'_,D>{}
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 impl<D:Driver> Driver for CanaryDriver<'_,D>{
     fn invoke(&mut self,spec:&Spec,b:&[u8],permit:&LaunchPermit,end:Instant,receipt:&mut dyn FnMut(u32,String)->Result<()>)->Execution{
         let checked=(||->Result<()> {
@@ -1253,6 +1286,7 @@ fn canary_file(s:&Store,expected:&[u8])->Result<String>{
     if a.request.immutable_project_sha256!=canary_tree(&p.project_root)?{return Err("SELF2_CANARY_TREE_DRIFT")}
     Ok(hash(&bytes(&json!({"material":material,"identity":id,"bytes_hash":hash(&raw)}))?))
 }
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 pub fn run_canary(s:&Store)->Result<Value>{
     let scope=canary_scope();let a=canary_gate(s,&scope)?;let p=journal(s)?.plan;
     let mut driver=NativeCodex {root:p.project_root,tools:BTreeMap::from([(p.cli,p.cli_sha256)]),cancel:std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))};
@@ -1260,6 +1294,7 @@ pub fn run_canary(s:&Store)->Result<Value>{
     // NativeDriver polls the existing CONSOLE_CANCEL flag installed by ConsoleHandler.
     let result=run_canary_at(s,&scope,&a,&mut driver);console.close()?;result
 }
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 fn run_canary_at(s:&Store,scope:&super::admission_probe::PermissionScope,a:&CanaryApproval,d:&mut impl Driver)->Result<Value>{
     canary_trusted_configuration()?;
     if a.consumed{return Err("SELF2_CANARY_ALREADY_CONSUMED")}

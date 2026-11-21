@@ -253,7 +253,7 @@ fn probe_fixed_surface_and_live_gate_closed() {
 #[test]
 fn probe_current_bytes_identity_controls_and_receipts_rechecked() {
     // The same /3 production constructor and real permission validation feed the canary tests.
-    for case in ["ok","fail-d1","fail-r1","cancel","timeout","unknown","wrong-uuid","review-write","review-decline"] {
+    for case in ["ok","fail-d1","fail-r1","cancel","timeout","unknown","wrong-uuid","review-write","review-decline","config-drift"] {
         use super::super::{self_handoff as h,self_codex as c,contract::{Conclusion,ReportType}};
         let root=std::env::temp_dir().join(format!("nova-canary-{}",uuid::Uuid::new_v4()));
         let helper=std::env::temp_dir().join(format!("canary-identity-only-{}.exe",uuid::Uuid::new_v4()));

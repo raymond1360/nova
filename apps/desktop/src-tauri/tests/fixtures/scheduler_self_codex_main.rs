@@ -39,6 +39,7 @@ fn run() -> Result<Value> {
         x if x.starts_with("permission-") => return Err("PROBE_COMMAND_REJECTED"),
         _ => {}
     }
+    if a[0] == "canary-configuration-readiness" && a.len()==1 {return Ok(c::canary_configuration_readiness());}
     if a[0] == "native-run" {
         c::live_admission()?;
         return Err("SELF2_COMMAND_REJECTED");

@@ -16,6 +16,8 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+mod config_guard;
 pub const INPUT_CAP: usize = 2 * 1024 * 1024;
 pub const LOG_CAP: usize = 256 * 1024;
 pub const CLI_VERSION: &str = "codex-cli 0.162.1";
@@ -502,6 +504,12 @@ fn invoke(
     if j.records.iter().any(|r| r.outcome != "COMPLETE") {
         return Err("SELF2_RECONCILE_REQUIRED");
     }
+    #[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+    let _configuration = if let Some(a)=&j.canary {
+        let scope=configuration_scope(s)?;
+        config_guard::spec(s,&a.request,&spec)?;
+        Some(canary_trusted_configuration(s,&a.request,&scope)?)
+    }else{None};
     let a = Attempt {
         attempt_id: uuid::Uuid::new_v4().to_string(),
         role: role.relay(),
@@ -554,6 +562,8 @@ fn invoke(
         stdout_path: None,
         stderr_path: None,
     });
+    #[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+    if let Some(proof)=&_configuration {proof.verify()?;}
     let permit = s.self2_launch(
         rev,
         &serde_json::to_value(&st).map_err(|_| "ENCODING")?,
@@ -1033,6 +1043,8 @@ pub struct CanaryRequest {
     pub immutable_project_sha256: String,
     pub expires_utc: i64,
     pub conditions: Option<CanaryConditions>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub configuration_sha256: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1077,15 +1089,23 @@ fn canary_auth_home(_runtime:bool)->Result<PathBuf>{
 fn canary_scope()->super::admission_probe::PermissionScope {
     super::admission_probe::permission_scope_project()
 }
-// No production verifier is connected. References, home paths and user PASS cannot grant this capability.
-fn canary_trusted_configuration() -> Result<()> {
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+fn configuration_scope(s:&Store)->Result<super::admission_probe::PermissionScope> {
     #[cfg(test)]
-    if SYNTHETIC_CANARY_CONFIGURATION.with(|v|v.get()) { return Ok(()) }
-    Err("SELF2_CANARY_TRUSTED_CONFIGURATION_REQUIRED")
+    { return config_guard::test_scope(s); }
+    #[cfg(not(test))]
+    { let _=s;Ok(canary_scope()) }
 }
-#[cfg(test)]
-thread_local! { static SYNTHETIC_CANARY_CONFIGURATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-
+// Production stays fail-closed until cloud/thread source provenance can be observed safely.
+pub fn canary_configuration_readiness()->Value {
+    json!({"model_admission":"CLOSED","configuration_read":"NOT RUN","model_started":false,
+        "blockers":["FROZEN_CLI_CLOUD_BUNDLE_AUTH_BOUND_SOURCE_UNRESOLVED","RESUME_THREAD_CONFIG_SOURCE_UNRESOLVED"],
+        "supported":"OFFLINE_FIXED_SOURCE_SUBSET_ONLY","credentials_read":false})
+}
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+fn canary_trusted_configuration(s:&Store,request:&CanaryRequest,scope:&super::admission_probe::PermissionScope)->Result<config_guard::TrustedConfiguration> {
+    config_guard::read(s,request,scope,false)
+}
 // The synthetic home is local to a test scope, not a process environment or a production grant.
 #[cfg(test)]
 thread_local! { static SYNTHETIC_CANARY_AUTH_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) }; }
@@ -1135,9 +1155,10 @@ pub fn canary_draft(s:&Store,input:CanaryDraftInput)->Result<Value>{
     let (material,_)=h::material_for(&j.plan.project_root,&j.plan.input,false)?;
     let (raw,_)=super::store::read_file(&j.plan.project_root.join("a.txt"),131072)?;
     let consumer=std::env::current_exe().map_err(|_|"SELF_PATH")?;
-    let request=CanaryRequest {schema:"nova.self2.canary-request/1".into(),consumer_sha256:tool_digest(&consumer)?,consumer_path:consumer,
+    let mut request=CanaryRequest {schema:"nova.self2.canary-request/1".into(),consumer_sha256:tool_digest(&consumer)?,consumer_path:consumer,
         plan_sha256:j.plan_sha256,permission_fingerprint:binding.fingerprint().into(),material_sha256:hash(&bytes(&material)?),
-        initial_source_sha256:hash(&raw),immutable_project_sha256:canary_tree(&j.plan.project_root)?,expires_utc:input.expires_utc,conditions:input.conditions};
+        initial_source_sha256:hash(&raw),immutable_project_sha256:canary_tree(&j.plan.project_root)?,expires_utc:input.expires_utc,conditions:input.conditions,configuration_sha256:None};
+    request.configuration_sha256=Some(config_guard::read(s,&request,&scope,true)?.digest().into());
     Ok(json!({"request":request,"scope":scope,"prepared_only":true,"approval":"NOT GRANTED","model_started":false,
         "readiness":if request.conditions.is_none(){"SELF2_CANARY_CONDITIONS_PENDING"}else{"REQUIRES_PROPOSAL_VALIDATION"}}))
 }
@@ -1168,6 +1189,7 @@ fn canary_proposal_at(s:&Store,request:CanaryRequest,scope:&super::admission_pro
         || request.expires_utc>chrono::Utc::now().timestamp()+86400 {
         return Err("SELF2_CANARY_APPROVAL_BINDING_REJECTED")
     }
+    let _configuration=canary_trusted_configuration(s,&request,scope)?;
     Ok(json!({"request":request,"digest":hash(&bytes(&request)?),"scope":scope,"store":h::store_path(&j.plan.project_root)?,
         "material":material,"max_cli_rounds":3,"automatic_retries":0,"repairs":0,"model_started":false,
         "approval_required":"AUTHORIZE 1120A CODEX CANARY <digest>","billing":"USER_TERMS_NOT_TOOL_VERIFIED","cli_internal_retries":"STANDARD_CLI_BEHAVIOR; THREE_PROCESSES_IS_NOT_THREE_HTTP_REQUESTS"}))
@@ -1179,20 +1201,22 @@ pub fn approve_canary(s:&Store,request:CanaryRequest,confirmation:&str)->Result<
 }
 #[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 fn approve_canary_at(s:&Store,request:CanaryRequest,confirmation:&str,scope:&super::admission_probe::PermissionScope)->Result<Value>{
-    canary_trusted_configuration()?;
+    let _configuration=canary_trusted_configuration(s,&request,scope)?;
     let proposal=canary_proposal_at(s,request.clone(),scope)?;
     let digest=proposal["digest"].as_str().ok_or("ENCODING")?;
     if confirmation!=format!("AUTHORIZE 1120A CODEX CANARY {digest}"){return Err("SELF2_CANARY_EXPLICIT_APPROVAL_REQUIRED")}
     let (rev,mut st)=h::load(s)?;let j=st.self2.as_mut().ok_or("SELF2_UNINITIALIZED")?;
     if j.canary.is_some() || !j.records.is_empty(){return Err("SELF2_CANARY_ALREADY_RESERVED")}
+    _configuration.verify()?;
     j.canary=Some(CanaryApproval {request,digest:digest.into(),approved_utc:chrono::Utc::now().timestamp(),consumed:false,completion:None});
     h::save(s,rev,&st)?;Ok(proposal)
 }
 #[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 fn canary_gate(s:&Store,scope:&super::admission_probe::PermissionScope)->Result<CanaryApproval>{
-    canary_trusted_configuration()?;
+    config_guard::available()?;
     canary_identity(s,scope)?;let j=journal(s)?;
     let a=j.canary.ok_or("SELF2_MODEL_AUTHORIZATION_REQUIRED")?;
+    let _configuration=canary_trusted_configuration(s,&a.request,scope)?;
     canary_conditions(&a.request.conditions,&j.plan)?;
     if a.request.plan_sha256!=j.plan_sha256 || a.digest!=hash(&bytes(&a.request)?)
         || a.approved_utc>a.request.expires_utc || a.request.expires_utc<=chrono::Utc::now().timestamp()
@@ -1234,6 +1258,8 @@ impl<D:Driver> Driver for CanaryDriver<'_,D>{
     fn invoke(&mut self,spec:&Spec,b:&[u8],permit:&LaunchPermit,end:Instant,receipt:&mut dyn FnMut(u32,String)->Result<()>)->Execution{
         let checked=(||->Result<()> {
             let a=canary_gate(self.store,self.scope)?;
+            config_guard::spec(self.store,&a.request,spec)?;
+            let proof=canary_trusted_configuration(self.store,&a.request,self.scope)?;proof.verify()?;
             if !a.consumed{return Err("SELF2_CANARY_NOT_CONSUMED")}
             let j=journal(self.store)?;let n=j.records.len();
             if !(1..=3).contains(&n) || j.records[..n-1].iter().any(|r|r.outcome!="COMPLETE")
@@ -1296,11 +1322,12 @@ pub fn run_canary(s:&Store)->Result<Value>{
 }
 #[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 fn run_canary_at(s:&Store,scope:&super::admission_probe::PermissionScope,a:&CanaryApproval,d:&mut impl Driver)->Result<Value>{
-    canary_trusted_configuration()?;
+    let _configuration=canary_trusted_configuration(s,&a.request,scope)?;
     if a.consumed{return Err("SELF2_CANARY_ALREADY_CONSUMED")}
     canary_file(s,b"SELF2_CANARY_PENDING\n")?;
     let (rev,mut st)=h::load(s)?;let j=st.self2.as_mut().ok_or("SELF2_UNINITIALIZED")?;
     if !j.records.is_empty() || j.canary.as_ref().is_none_or(|x|x.digest!=a.digest || x.consumed){return Err("SELF2_CANARY_ALREADY_CONSUMED")}
+    _configuration.verify()?;
     j.canary.as_mut().unwrap().consumed=true;h::save(s,rev,&st)?;
     let mut driver=CanaryDriver {store:s,scope,inner:d};
     run_canary_rounds(s,&mut driver)?;
@@ -1505,6 +1532,7 @@ mod tests {
                 if n==1 && self.case=="timeout" {e.natural=false;e.exit_code=None;e.terminal="TIMED_OUT".into();return e}
                 if n==1 && self.case=="cancel" {e.natural=false;e.exit_code=None;e.terminal="CANCELLED".into();return e}
                 if n==1 {fs::write(s.cwd.join("a.txt"),b"SELF2_CANARY_READY\n").unwrap();}
+                if n==1 && self.case=="config-drift" {config_guard::test_rotate_source();}
                 if n==2 && self.case=="review-write" {fs::write(s.cwd.join("a.txt"),b"UNAUTHORIZED\n").unwrap();}
                 let id=if n==3 && self.case=="wrong-uuid" {uuid::Uuid::new_v4().to_string()}
                     else if s.session.is_empty(){uuid::Uuid::new_v4().to_string()}else{s.session.clone()};
@@ -1533,10 +1561,10 @@ mod tests {
         assert_eq!(canary_auth_home(true).unwrap(),test_home);
         let j=journal(s).unwrap();let (material,_)=h::material_for(&j.plan.project_root,&j.plan.input,false).unwrap();
         let binding=super::super::admission_probe::bind_permission(scope).unwrap();
-        let request=CanaryRequest {schema:"nova.self2.canary-request/1".into(),consumer_sha256:tool_digest(&std::env::current_exe().unwrap()).unwrap(),consumer_path:std::env::current_exe().unwrap(),
+        let mut request=CanaryRequest {schema:"nova.self2.canary-request/1".into(),consumer_sha256:tool_digest(&std::env::current_exe().unwrap()).unwrap(),consumer_path:std::env::current_exe().unwrap(),
             plan_sha256:j.plan_sha256,permission_fingerprint:binding.fingerprint().into(),material_sha256:hash(&bytes(&material).unwrap()),
             initial_source_sha256:hash(b"SELF2_CANARY_PENDING\n"),immutable_project_sha256:canary_tree(&j.plan.project_root).unwrap(),expires_utc:chrono::Utc::now().timestamp()+3600,
-            conditions:Some(CanaryConditions {model:j.plan.model,reasoning:"low".into(),service_tier:"default".into(),subscription_terms:"SYNTHETIC USER TERMS; NO ACCOUNT ACCESS".into(),cli_retry_policy:"STANDARD_CLI_INTERNAL_RETRIES_ACCEPTED".into(),configuration_reference:"SYNTHETIC FROZEN CONFIG".into(),auth_home:test_home.clone()})};
+            conditions:Some(CanaryConditions {model:j.plan.model,reasoning:"low".into(),service_tier:"default".into(),subscription_terms:"SYNTHETIC USER TERMS; NO ACCOUNT ACCESS".into(),cli_retry_policy:"STANDARD_CLI_INTERNAL_RETRIES_ACCEPTED".into(),configuration_reference:"SYNTHETIC FROZEN CONFIG".into(),auth_home:test_home.clone()}),configuration_sha256:None};
         let unchanged=serde_json::to_value(h::load(s).unwrap()).unwrap();
         // Missing trusted facts stay closed even for well-formed conditions and arbitrary claims.
         for reference in ["FORMATTED CONFIG REFERENCE", "EXTRA_MCP_PRESENT; PASS=true", "CONFIGURATION_DRIFT; PASS=true"] {
@@ -1550,9 +1578,23 @@ mod tests {
             assert!(blocked.calls.is_empty());
             assert_eq!(unchanged,serde_json::to_value(h::load(s).unwrap()).unwrap());
         }
-        SYNTHETIC_CANARY_CONFIGURATION.with(|v|v.set(true));
-        struct ClearConfiguration;impl Drop for ClearConfiguration {fn drop(&mut self){SYNTHETIC_CANARY_CONFIGURATION.with(|v|v.set(false));}}
-        let _clear_configuration=ClearConfiguration;
+        let source=config_guard::test_source(s,&request,scope);
+        request.configuration_sha256=Some(config_guard::read(s,&request,scope,true).unwrap().digest().into());
+        if case=="ok" {
+            for fault in ["package","system","managed","cloud","profile","cwd","ancestor","repo","runtime","thread","user","binding","expired","mcp","provider","endpoint","permission","cap-hooks","cap-agents","cap-extra_tools"] {
+                source.fault(fault);
+                let before=serde_json::to_value(h::load(s).unwrap()).unwrap();
+                let mut blocked=CanaryFake {calls:vec![],case:case.into()};
+                let a=CanaryApproval {request:request.clone(),digest:hash(&bytes(&request).unwrap()),approved_utc:chrono::Utc::now().timestamp(),consumed:false,completion:None};
+                assert!(approve_canary_at(s,request.clone(),"PASS",scope).is_err(),"{fault}");
+                assert!(run_canary_at(s,scope,&a,&mut blocked).is_err(),"{fault}");
+                assert!(blocked.calls.is_empty());assert_eq!(before,serde_json::to_value(h::load(s).unwrap()).unwrap());
+            }
+            source.fault("valid");
+            let mut forged=request.clone();forged.configuration_sha256=Some("0".repeat(64));
+            assert!(approve_canary_at(s,forged,"PASS",scope).is_err());
+            config_guard::test_spec_rejections(s,&request);
+        }
         assert!(matches!(canary_gate(s,scope),Err("SELF2_MODEL_AUTHORIZATION_REQUIRED")));
         let mut wrong_scope=scope.clone();wrong_scope.cli_sha256="0".repeat(64);assert!(canary_proposal_at(s,request.clone(),&wrong_scope).is_err());
         for fault in ["pending","consumer","consumer-path","plan","material","fingerprint","source","tree","expired","model","tier","auth-home","retry"] {
@@ -1571,6 +1613,14 @@ mod tests {
         approve_canary_at(s,request.clone(),&format!("AUTHORIZE 1120A CODEX CANARY {}",proposal["digest"].as_str().unwrap()),scope).unwrap();
         assert!(approve_canary_at(s,request.clone(),"duplicate",scope).is_err());
         let a=canary_gate(s,scope).unwrap();
+        if case=="ok" {
+            let before=serde_json::to_value(h::load(s).unwrap()).unwrap();
+            source.fault("mcp");let mut blocked=CanaryFake {calls:vec![],case:case.into()};
+            assert!(canary_gate(s,scope).is_err());assert!(run_canary_at(s,scope,&a,&mut blocked).is_err());
+            assert!(blocked.calls.is_empty());assert_eq!(before,serde_json::to_value(h::load(s).unwrap()).unwrap());
+            source.fault("valid");
+        }
+
         let (rev,mut state)=h::load(s).unwrap();state.self2.as_mut().unwrap().canary.as_mut().unwrap().request.expires_utc=0;h::save(s,rev,&state).unwrap();
         assert!(canary_gate(s,scope).is_err());let (rev,mut state)=h::load(s).unwrap();state.self2.as_mut().unwrap().canary=Some(a.clone());h::save(s,rev,&state).unwrap();
         let mut d=CanaryFake {calls:vec![],case:case.into()};
@@ -1590,6 +1640,7 @@ mod tests {
             }
             assert!(d.calls[2].argv.windows(2).any(|v|v==["resume",d.calls[2].session.as_str()]));
         } else {assert!(result.is_err(),"{case}");assert_eq!(d.calls.len(),if case=="wrong-uuid"{3}else if case=="fail-r1"||case=="review-write"||case=="review-decline"{2}else{1});}
+        if case=="config-drift" {assert_eq!(journal(s).unwrap().records.len(),1);assert!(h::load(s).unwrap().1.stage.reviewer.is_none());}
         let calls=d.calls.len();assert!(run_canary_at(s,scope,&a,&mut d).is_err());assert_eq!(d.calls.len(),calls);
         let reopened=Store::self_open(&h::store_path(&journal(s).unwrap().plan.project_root).unwrap()).unwrap();
         assert!(run_canary_at(&reopened,scope,&a,&mut d).is_err());assert_eq!(d.calls.len(),calls);

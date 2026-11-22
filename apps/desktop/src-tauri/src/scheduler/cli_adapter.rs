@@ -825,6 +825,32 @@ pub fn recover_identity(pid: Option<u32>, created: Option<&str>) -> String {
         "UNKNOWN".into()
     }
 }
+
+// Fixed SELF-2 app-server only. The unforgeable binding has no production issuer in this package.
+#[cfg(all(windows, any(test, all(feature = "scheduler-validation", debug_assertions))))]
+pub(crate) struct AppServerChannel { io: native::Duplex, driver: NativeDriver }
+#[cfg(all(windows, any(test, all(feature = "scheduler-validation", debug_assertions))))]
+impl AppServerChannel {
+    pub(crate) fn open(binding: &super::self_codex::app_server::TransportBinding, spec: &Spec,
+        permit: &LaunchPermit, end: Instant, running: &mut dyn FnMut(u32,String)->Result<()>) -> Result<Self> {
+        binding.check(spec)?;
+        if !permit.claim_once() || permit.attempt().profile_id != "SELF2_APP_SERVER"
+            || permit.attempt().exe_sha256 != spec.exe_sha256
+            || permit.attempt().argv_sha256 != spec.argv_sha256() { return Err("BINDING_MISMATCH"); }
+        let mut driver=NativeDriver::self2_transport(&spec.exe,&spec.exe_sha256)?;
+        #[cfg(test)] { driver.fault=binding.test_fault(); }
+        let io=native::Duplex::open(&driver,spec,end,running)?;
+        Ok(Self {io,driver})
+    }
+    pub(crate) fn send(&mut self,b:&[u8],end:Instant)->Result<()> { self.driver._guard.verify()?;self.io.send(b,end) }
+    pub(crate) fn receive(&mut self,end:Instant)->Result<Vec<u8>> {self.io.receive(end)}
+    pub(crate) fn only_server(&self)->bool {self.io.only_server()}
+    pub(crate) fn job_sample(&self)->(Option<u32>,Option<u32>,bool) {self.io.job_sample()}
+    #[cfg(test)] pub(crate) fn job_names(&self)->Vec<String> {self.io.job_names()}
+    pub(crate) fn finish(&mut self)->Execution {self.io.finish()}
+    #[cfg(test)] pub(crate) fn cancel_handle(&self)->Arc<AtomicBool> {self.driver.cancel.clone()}
+}
+
 #[cfg(windows)]
 mod native {
     use super::*;
@@ -1031,7 +1057,7 @@ mod native {
                     null(),
                     1,
                     CREATE_SUSPENDED
-                        | CREATE_NO_WINDOW
+                        | if s.profile == "SELF2_APP_SERVER" { DETACHED_PROCESS } else { CREATE_NO_WINDOW }
                         | EXTENDED_STARTUPINFO_PRESENT
                         | CREATE_UNICODE_ENVIRONMENT,
                     env.as_ptr() as _,
@@ -1217,6 +1243,121 @@ mod native {
             }
         }
     }
+
+    #[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+    pub(super) struct Duplex {
+        session: Session,
+        sender: Option<mpsc::SyncSender<Vec<u8>>>,
+        written: mpsc::Receiver<bool>,
+        lines: mpsc::Receiver<Result<Vec<u8>>>,
+        cancel: Arc<AtomicBool>,
+        finished: bool,
+    }
+    #[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+    impl Duplex {
+        pub(super) fn open(driver:&NativeDriver,s:&Spec,end:Instant,running:&mut dyn FnMut(u32,String)->Result<()>) -> Result<Self> {
+            if driver.cancel.load(Ordering::Acquire) || CONSOLE_CANCEL.load(Ordering::Acquire) {return Err("CANCELLED")}
+            if Instant::now()>=end {return Err("DEADLINE")}
+            let tree=Tree::create(s,end,driver.streamed_identity.as_deref(),None)?;
+            let mut session=Session {tree,out:None,err:None,writer:None};
+            let start=(|| {session.tree.start(None)?;running(session.tree.pid,session.tree.created.clone())})();
+            if let Err(e)=start {let _=session.cleanup(Instant::now()+Duration::from_secs(12));return Err(e)}
+            let (tx,lines)=mpsc::sync_channel(64);
+            let mut stdout=session.tree.out.take().ok_or("LIFECYCLE_UNKNOWN")?;
+            session.out=Some(thread::spawn(move || {
+                let mut data=Vec::new();let mut pending=Vec::new();let mut buf=[0u8;4096];let mut failure=None;
+                'read: loop {match stdout.read(&mut buf) {
+                    Ok(0)=>{let _=tx.try_send(Err("APP_SERVER_DISCONNECTED"));break},
+                    Ok(n)=>{
+                        if data.len()+n>8*1024*1024 {failure=Some("BOUND");break}
+                        data.extend_from_slice(&buf[..n]);pending.extend_from_slice(&buf[..n]);
+                        while let Some(i)=pending.iter().position(|b|*b==b'\n') {
+                            let line:Vec<_>=pending.drain(..=i).collect();
+                            // Only the explicitly selected test-harness child has this prefix.
+                            #[cfg(test)] if line==b"running 1 test\n" || line==b"\n" {continue}
+                            if line.len()>1024*1024 || tx.try_send(Ok(line)).is_err() {failure=Some("BOUND");break 'read}
+                        }
+                        if pending.len()>1024*1024 {failure=Some("BOUND");break}
+                    },Err(_)=>{failure=Some("APP_SERVER_DISCONNECTED");break}
+                }}
+                if let Some(e)=failure {let _=tx.try_send(Err(e));}
+                (data,failure.map_or_else(||Ok(Parser::new(s_role(),"")),Err))
+            }));
+            let mut stderr=session.tree.err.take().ok_or("LIFECYCLE_UNKNOWN")?;
+            session.err=Some(thread::spawn(move|| {
+                let mut data=vec![];let mut buf=[0;4096];loop {match stderr.read(&mut buf) {
+                    Ok(0)=>return(data,true),Ok(n)=>{if data.len()+n>LOG_LIMIT {return(data,false)}data.extend_from_slice(&buf[..n])},Err(_)=>return(data,false)
+                }}
+            }));
+            let (sender,rx)=mpsc::sync_channel::<Vec<u8>>(1);let (ack,written)=mpsc::sync_channel(1);
+            let mut stdin=session.tree.stdin.take().ok_or("LIFECYCLE_UNKNOWN")?;
+            #[cfg(test)] let half=driver.fault==Some("duplex-half");
+            session.writer=Some(thread::spawn(move|| {
+                while let Ok(bytes)=rx.recv() {
+                    #[cfg(test)] if half && bytes.windows(10).any(|w|w==b"turn/start") {let _=stdin.write_all(&bytes[..bytes.len()/2]);let _=stdin.flush();let _=ack.try_send(false);return false}
+                    let ok=stdin.write_all(&bytes).and_then(|_|stdin.flush()).is_ok();
+                    if ack.try_send(ok).is_err() || !ok {return false}
+                }true
+            }));
+            Ok(Self {session,sender:Some(sender),written,lines,cancel:driver.cancel.clone(),finished:false})
+        }
+        fn check(&self,end:Instant)->Result<()> {
+            if self.finished {return Err("APP_SERVER_CLOSED")}
+            if self.cancel.load(Ordering::Acquire) || CONSOLE_CANCEL.load(Ordering::Acquire) {return Err("CANCELLED")}
+            if Instant::now()>=end {return Err("DEADLINE")}
+            let (flags,active,exited)=self.session.tree.query();
+            if flags!=Some(0x2000) || active.is_none() {return Err("LIFECYCLE_UNKNOWN")}
+            if exited {return Err("APP_SERVER_DISCONNECTED")}
+            if self.session.out.as_ref().is_some_and(|h|h.is_finished()) || self.session.err.as_ref().is_some_and(|h|h.is_finished()) {return Err("APP_SERVER_IO_UNKNOWN")}
+            Ok(())
+        }
+        pub(super) fn send(&mut self,b:&[u8],end:Instant)->Result<()> {
+            self.check(end)?;
+            if b.len()>2*1024*1024 || !b.ends_with(b"\n") {return Err("BOUND")}
+            self.sender.as_ref().ok_or("APP_SERVER_CLOSED")?.try_send(b.to_vec()).map_err(|_|"APP_SERVER_SEND_UNKNOWN")?;
+            loop {self.check(end)?;match self.written.try_recv() {
+                Ok(true)=>return Ok(()),Ok(false)|Err(mpsc::TryRecvError::Disconnected)=>return Err("APP_SERVER_SEND_UNKNOWN"),Err(mpsc::TryRecvError::Empty)=>thread::sleep(Duration::from_millis(2))
+            }}
+        }
+        pub(super) fn receive(&mut self,end:Instant)->Result<Vec<u8>> {
+            loop {self.check(end)?;match self.lines.try_recv() {
+                Ok(line)=>return line,Err(mpsc::TryRecvError::Disconnected)=>return Err("APP_SERVER_DISCONNECTED"),Err(mpsc::TryRecvError::Empty)=>thread::sleep(Duration::from_millis(2))
+            }}
+        }
+        pub(super) fn job_sample(&self)->(Option<u32>,Option<u32>,bool) {self.session.tree.query()}
+        #[cfg(test)] pub(super) fn job_names(&self)->Vec<String> {
+            unsafe {
+                let mut raw=vec![0usize;128];let ptr=raw.as_mut_ptr() as *mut JOBOBJECT_BASIC_PROCESS_ID_LIST;
+                if QueryInformationJobObject(self.session.tree.job.0,JobObjectBasicProcessIdList,ptr as _,(raw.len()*std::mem::size_of::<usize>()) as u32,null_mut())==0 {return vec!["QUERY_UNKNOWN".into()]}
+                let n=(*ptr).NumberOfProcessIdsInList.min(64) as usize;let ids=std::slice::from_raw_parts((*ptr).ProcessIdList.as_ptr(),n);let mut names=vec![];
+                for pid in ids {let h=H(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,0,*pid as u32));let mut path=vec![0u16;32768];let mut size=path.len() as u32;
+                    if !h.0.is_null() && QueryFullProcessImageNameW(h.0,0,path.as_mut_ptr(),&mut size)!=0 {names.push(Path::new(&String::from_utf16_lossy(&path[..size as usize])).file_name().unwrap().to_string_lossy().into_owned())}
+                    else {names.push("IMAGE_UNKNOWN".into())}
+                }names
+            }
+        }
+
+        pub(super) fn only_server(&self)->bool {self.job_sample()==(Some(0x2000),Some(1),false) && self.session.out.as_ref().is_some_and(|h|!h.is_finished()) && self.session.err.as_ref().is_some_and(|h|!h.is_finished())}
+        pub(super) fn finish(&mut self)->Execution {
+            self.sender.take();
+            let grace=Instant::now()+Duration::from_millis(200);
+            while !self.session.tree.query().2 && Instant::now()<grace && !self.cancel.load(Ordering::Acquire) {thread::sleep(Duration::from_millis(2));}
+            let observed=self.session.cleanup(Instant::now()+Duration::from_secs(12));self.finished=true;
+            let mut e=Execution::failed("APP_SERVER_CLOSED");e.created=true;e.pid=Some(self.session.tree.pid);e.process_creation_utc=Some(self.session.tree.created.clone());
+            e.natural=observed.root_exited_before;e.exit_code=self.session.tree.code();
+            e.reclaim=if observed.job_confirmed && observed.readers_finished {"CONFIRMED"}else{"UNKNOWN"}.into();
+            if self.session.out.as_ref().is_some_and(|h|h.is_finished()) {if let Ok((b,_))=self.session.out.take().unwrap().join(){e.stdout=b}}
+            if self.session.err.as_ref().is_some_and(|h|h.is_finished()) {if let Ok((b,_))=self.session.err.take().unwrap().join(){e.stderr=b}}
+            e.cleanup=Some(observed);e
+        }
+    }
+    #[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+    const LOG_LIMIT:usize=256*1024;
+    #[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+    fn s_role()->RelayRole {RelayRole::Develop}
+    #[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+    impl Drop for Duplex {fn drop(&mut self){if !self.finished {let _=self.finish();}}}
+
     #[cfg(test)]
     pub(super) fn test_spawn_contention(
         d: &mut NativeDriver,

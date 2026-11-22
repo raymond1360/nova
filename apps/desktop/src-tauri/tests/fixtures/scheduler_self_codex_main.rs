@@ -40,6 +40,7 @@ fn run() -> Result<Value> {
         _ => {}
     }
     if a[0] == "canary-configuration-readiness" && a.len()==1 {return Ok(c::canary_configuration_readiness());}
+    if a[0].starts_with("app-server-") { return c::app_server_admission(); }
     if a[0] == "native-run" {
         c::live_admission()?;
         return Err("SELF2_COMMAND_REJECTED");

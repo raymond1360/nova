@@ -130,6 +130,7 @@ impl F {
 #[test]
 fn probe_fake_child() {
     if let Ok(c) = std::env::var("NOVA_PERMISSION_FAKE_CASE") {
+        if c.starts_with("app-server:") { self_codex::app_server::tests::fake_child(&c); }
         match c.as_str() {
             "success" => {
                 println!("SYNTHETIC_PERMISSION_RECEIPT");

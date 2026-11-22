@@ -18,6 +18,8 @@ use std::{
 };
 #[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
 mod config_guard;
+#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
+pub(crate) mod app_server;
 pub const INPUT_CAP: usize = 2 * 1024 * 1024;
 pub const LOG_CAP: usize = 256 * 1024;
 pub const CLI_VERSION: &str = "codex-cli 0.162.1";
@@ -88,6 +90,8 @@ pub struct Journal {
     pub records: Vec<Record>,
     #[serde(default, skip_serializing_if="Option::is_none")]
     canary: Option<CanaryApproval>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    app_server: Option<Value>,
 }
 fn bytes<T: Serialize>(v: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(v).map_err(|_| "ENCODING")
@@ -98,7 +102,7 @@ fn uuid_ok(s: &str) -> bool {
 fn plan_cli_pin(p: &Plan) -> bool {
     if p.cli_sha256==CLI_SHA {return true}
     #[cfg(test)]
-    { return super::admission_probe::synthetic_cli_binding(&p.project_root,&p.cli,&p.cli_sha256); }
+    { return super::admission_probe::synthetic_cli_binding(&p.project_root,&p.cli,&p.cli_sha256) || app_server::tests::test_cli_binding(p); }
     #[cfg(not(test))]
     { false }
 }
@@ -240,6 +244,7 @@ pub fn attach(s: &Store, p: Plan) -> Result<()> {
         plan: p,
         records: vec![],
         canary: None,
+        app_server: None,
     });
     h::save(s, rev, &st)
 }
@@ -389,6 +394,7 @@ mod sealed {
     pub trait Sealed {}
 }
 pub trait Driver: sealed::Sealed {
+    fn app_server_transport(&self) -> bool { false }
     fn invoke(
         &mut self,
         s: &Spec,
@@ -592,7 +598,9 @@ fn invoke(
             h::save(s, rev, &st)
         },
     );
-    if role != Role::Verify && e.natural && e.exit_code == Some(0) && e.terminal == "SUCCESS" {
+    let app_turn = d.app_server_transport() && e.terminal == "TURN_COMPLETED"
+        && !e.created && e.pid.is_some() && !e.natural && e.exit_code.is_none() && e.reclaim == "ACTIVE_JOB";
+    if role != Role::Verify && (app_turn || (e.natural && e.exit_code == Some(0) && e.terminal == "SUCCESS")) {
         match parse_wire(&e.stdout, role, expected.as_deref()) {
             Ok((id, _, usage)) => {
                 e.session_id = Some(id);
@@ -610,12 +618,9 @@ fn invoke(
         && e.stderr.len() <= LOG_CAP
         && save_new(&out, &e.stdout).is_ok()
         && save_new(&err, &e.stderr).is_ok();
-    let ok = e.natural
-        && e.exit_code == Some(0)
-        && e.terminal == "SUCCESS"
-        && e.reclaim == "CONFIRMED"
-        && e.unknowns.is_empty()
-        && saved;
+    let ok = (if d.app_server_transport() {app_turn && e.terminal == "TURN_COMPLETED"}
+        else {e.natural && e.exit_code == Some(0) && e.terminal == "SUCCESS" && e.reclaim == "CONFIRMED"})
+        && e.unknowns.is_empty() && saved;
     if !saved {
         e.unknowns.push("SELF2_EVIDENCE_UNAVAILABLE".into());
     }
@@ -644,7 +649,7 @@ fn invoke(
     }
     .into();
     r.attempt.state = if r.outcome == "COMPLETE" {
-        "EXITED"
+        if d.app_server_transport() {"TURN_COMPLETE"} else {"EXITED"}
     } else {
         &r.outcome
     }
@@ -840,6 +845,7 @@ pub fn run_fake(s: &Store, d: &mut FakeCli) -> Result<Value> {
 }
 fn run(s: &Store, d: &mut impl Driver, exe: &Path, sha: &str, synthetic: bool) -> Result<Value> {
     let j = journal(s)?;
+    if j.app_server.is_some() != d.app_server_transport() { return Err("SELF2_APP_SERVER_TRANSPORT_MISMATCH"); }
     if j.records.iter().any(|r| r.outcome != "COMPLETE") {
         return Err("SELF2_RECONCILE_REQUIRED");
     }
@@ -1097,6 +1103,9 @@ fn configuration_scope(s:&Store)->Result<super::admission_probe::PermissionScope
     { let _=s;Ok(canary_scope()) }
 }
 // Production stays fail-closed until cloud/thread source provenance can be observed safely.
+pub fn app_server_admission() -> Result<Value> {
+    Err("SELF2_APP_SERVER_NATIVE_ADMISSION_CLOSED")
+}
 pub fn canary_configuration_readiness()->Value {
     json!({"model_admission":"CLOSED","configuration_read":"NOT RUN","model_started":false,
         "blockers":["FROZEN_CLI_CLOUD_BUNDLE_AUTH_BOUND_SOURCE_UNRESOLVED","RESUME_THREAD_CONFIG_SOURCE_UNRESOLVED"],
@@ -1688,6 +1697,8 @@ mod tests {
     }
     #[test]
     fn self2_exact_review_uuid_and_readonly_parameters() {
+        #[cfg(windows)]
+        app_server::tests::offline_matrix();
         let (f, s, p) = fixture();
         let mut d = fake("ok");
         run_memory(&s, &mut d).unwrap();

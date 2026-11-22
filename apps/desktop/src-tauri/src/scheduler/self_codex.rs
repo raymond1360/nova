@@ -102,7 +102,7 @@ fn uuid_ok(s: &str) -> bool {
 fn plan_cli_pin(p: &Plan) -> bool {
     if p.cli_sha256==CLI_SHA {return true}
     #[cfg(test)]
-    { return super::admission_probe::synthetic_cli_binding(&p.project_root,&p.cli,&p.cli_sha256) || app_server::tests::test_cli_binding(p); }
+    { return super::admission_probe::synthetic_cli_binding(&p.project_root,&p.cli,&p.cli_sha256) || app_server::tests::test_cli_binding(p) || app_server::probe::test_cli_binding(p); }
     #[cfg(not(test))]
     { false }
 }
@@ -1103,6 +1103,19 @@ fn configuration_scope(s:&Store)->Result<super::admission_probe::PermissionScope
     { let _=s;Ok(canary_scope()) }
 }
 // Production stays fail-closed until cloud/thread source provenance can be observed safely.
+/// Named P commands are never aliases for the model canary/native entry.
+pub fn app_server_p(action:&str,input:Value,authorization:&str)->Result<Value> {
+    #[cfg(all(windows, any(test, all(feature="scheduler-validation",debug_assertions))))]
+    { match action {
+        "check-admission" if input.is_null()=>{app_server::probe::startup_admission()?;return Ok(json!({"model_authorized":false}))},
+        "prepare"=>return app_server::probe::prepare(serde_json::from_value(input).map_err(|_|"P_INPUT_REJECTED")?),
+        "approve"=>return app_server::probe::approve(input.as_str().ok_or("P_INPUT_REJECTED")?,authorization),
+        "probe" if input.is_null()=>return app_server::probe::run(),
+        "evaluate" if input.is_null()=>return app_server::probe::evaluate(),
+        _=>return Err("P_COMMAND_REJECTED")
+    }}
+    #[allow(unreachable_code)] {let _=(action,input,authorization);Err("SELF2_APP_SERVER_NATIVE_ADMISSION_CLOSED")}
+}
 pub fn app_server_admission() -> Result<Value> {
     Err("SELF2_APP_SERVER_NATIVE_ADMISSION_CLOSED")
 }
@@ -1800,6 +1813,7 @@ mod tests {
     }
     #[test]
     fn self2_live_admission_closed_and_fake_path_rejects_real_codex() {
+        #[cfg(windows)] app_server::probe::tests::offline_matrix();
         assert_eq!(
             live_admission().unwrap_err(),
             "SELF2_NATIVE_PERMISSION_AND_UUID_ADMISSION_REQUIRED"

@@ -828,21 +828,28 @@ pub fn recover_identity(pid: Option<u32>, created: Option<&str>) -> String {
 
 // Fixed SELF-2 app-server only. The unforgeable binding has no production issuer in this package.
 #[cfg(all(windows, any(test, all(feature = "scheduler-validation", debug_assertions))))]
-pub(crate) struct AppServerChannel { io: native::Duplex, driver: NativeDriver }
+pub(crate) struct AppServerChannel { io: native::Duplex, driver: NativeDriver, p_gate: Option<super::self_codex::app_server::probe::WireGate> }
 #[cfg(all(windows, any(test, all(feature = "scheduler-validation", debug_assertions))))]
 impl AppServerChannel {
     pub(crate) fn open(binding: &super::self_codex::app_server::TransportBinding, spec: &Spec,
         permit: &LaunchPermit, end: Instant, running: &mut dyn FnMut(u32,String)->Result<()>) -> Result<Self> {
         binding.check(spec)?;
-        if !permit.claim_once() || permit.attempt().profile_id != "SELF2_APP_SERVER"
+        let p_gate=binding.probe_gate()?;
+        if !permit.claim_once() || permit.attempt().profile_id != spec.profile
             || permit.attempt().exe_sha256 != spec.exe_sha256
             || permit.attempt().argv_sha256 != spec.argv_sha256() { return Err("BINDING_MISMATCH"); }
         let mut driver=NativeDriver::self2_transport(&spec.exe,&spec.exe_sha256)?;
         #[cfg(test)] { driver.fault=binding.test_fault(); }
         let io=native::Duplex::open(&driver,spec,end,running)?;
-        Ok(Self {io,driver})
+        Ok(Self {io,driver,p_gate})
     }
-    pub(crate) fn send(&mut self,b:&[u8],end:Instant)->Result<()> { self.driver._guard.verify()?;self.io.send(b,end) }
+    pub(crate) fn send(&mut self,b:&[u8],end:Instant)->Result<()> {
+        self.driver._guard.verify()?;
+        if let Some(g)=self.p_gate.as_ref() {g.check(b)?;}
+        self.io.send(b,end)?;
+        if let Some(g)=self.p_gate.as_mut(){g.advance();} Ok(())
+    }
+    pub(crate) fn bind_p_threads(&mut self,dev:&str,review:&str)->Result<()> {self.p_gate.as_mut().ok_or("P_MODE_REQUIRED")?.bind(dev,review)}
     pub(crate) fn receive(&mut self,end:Instant)->Result<Vec<u8>> {self.io.receive(end)}
     pub(crate) fn only_server(&self)->bool {self.io.only_server()}
     pub(crate) fn job_sample(&self)->(Option<u32>,Option<u32>,bool) {self.io.job_sample()}
@@ -1026,15 +1033,17 @@ mod native {
                 for (k, v) in vars {
                     let upper = k.to_ascii_uppercase();
                     let probe_home_allowed = upper == "CODEX_HOME" && probe_home.is_some_and(|p| p == Path::new(v));
+                    let p_remote_disabled = s.profile == "SELF2_APP_SERVER_P"
+                        && upper == "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED" && v == "1";
                     let fake_case_allowed = cfg!(test) && upper == "NOVA_PERMISSION_FAKE_CASE";
                     if !k.is_ascii()
                         || k.is_empty()
                         || k.contains(['=', '\0'])
                         || v.contains('\0')
                         || upper == prior
-                        || (forbidden_env(k) && !probe_home_allowed)
+                        || (forbidden_env(k) && !probe_home_allowed && !p_remote_disabled)
                         || !(ENV_ALLOW.iter().any(|a| a.eq_ignore_ascii_case(k))
-                            || ["PATH", "TEMP", "TMP"].contains(&upper.as_str()) || probe_home_allowed || fake_case_allowed)
+                            || ["PATH", "TEMP", "TMP"].contains(&upper.as_str()) || probe_home_allowed || fake_case_allowed || p_remote_disabled)
                     {
                         return Err("BINDING_MISMATCH");
                     }
@@ -1057,7 +1066,7 @@ mod native {
                     null(),
                     1,
                     CREATE_SUSPENDED
-                        | if s.profile == "SELF2_APP_SERVER" { DETACHED_PROCESS } else { CREATE_NO_WINDOW }
+                        | if ["SELF2_APP_SERVER","SELF2_APP_SERVER_P"].contains(&s.profile.as_str()) { DETACHED_PROCESS } else { CREATE_NO_WINDOW }
                         | EXTENDED_STARTUPINFO_PRESENT
                         | CREATE_UNICODE_ENVIRONMENT,
                     env.as_ptr() as _,

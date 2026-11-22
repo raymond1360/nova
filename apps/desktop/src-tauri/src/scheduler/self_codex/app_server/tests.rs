@@ -39,6 +39,9 @@ fn event(method: &str, p: Value) {
 }
 pub(crate) fn fake_child(case: &str) -> ! {
     let case = case.strip_prefix("app-server:").unwrap();
+    let p_mode=case.starts_with("p-");
+    let case=case.strip_prefix("p-").unwrap_or(case);
+    let mut starts=0;
     let root = std::env::current_dir().unwrap();
     let dev = uuid::Uuid::new_v4().to_string();
     let review = uuid::Uuid::new_v4().to_string();
@@ -56,6 +59,7 @@ pub(crate) fn fake_child(case: &str) -> ! {
             .unwrap();
         writeln!(f, "{v}").unwrap();
         f.sync_all().unwrap();
+        if case == "error" { eprintln!("SYNTHETIC_SECRET_NOT_FOR_DIAGNOSTICS"); emit(json!({"error":{"message":"SYNTHETIC_SECRET_NOT_FOR_DIAGNOSTICS"},"id":1})); std::thread::sleep(Duration::from_secs(2)); std::process::exit(2) }
         if case == "disconnect" {
             std::process::exit(7)
         }
@@ -70,7 +74,7 @@ pub(crate) fn fake_child(case: &str) -> ! {
             "initialized" => {}
             "config/read" => {
                 let mut c = json!({"model":"EXPLICIT_SYNTHETIC_MODEL","model_provider":"openai","mcp_servers":{},"project_doc_max_bytes":0,
-                    "features":{"plugins":false,"hooks":false,"plugin_hooks":false,"multi_agent":false,"multi_agent_v2":false}});
+                    "instructions":"SYNTHETIC_SECRET_NOT_FOR_DIAGNOSTICS","features":{"plugins":false,"hooks":false,"plugin_hooks":false,"multi_agent":false,"multi_agent_v2":false}});
                 if case == "config" {
                     c["mcp_servers"] = json!({"unapproved":{}})
                 }
@@ -81,7 +85,8 @@ pub(crate) fn fake_child(case: &str) -> ! {
                 json!({"data":if case=="unloaded" {vec![]}else{vec![dev.clone(),review.clone()]},"nextCursor":null}),
             ),
             "thread/start" | "thread/resume" => {
-                let is_review = n > 0;
+                let is_review = if p_mode {starts>0}else{n>0};
+                if v["method"]=="thread/start" {starts+=1;}
                 let resume = v["method"] == "thread/resume";
                 let uid = if is_review {
                     if case == "same-uuid" {
@@ -353,6 +358,8 @@ pub(crate) fn offline_matrix() {
             session: String::new(),
         };
         let binding = TransportBinding {
+            probe_only: false,
+            probe_model: None,
             spec_sha256: spec_hash(&spec).unwrap(),
             plan_sha256: journal(&store).unwrap().plan_sha256,
             root: f.repo.clone(),

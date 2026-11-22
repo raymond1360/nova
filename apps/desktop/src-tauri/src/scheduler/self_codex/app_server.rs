@@ -6,6 +6,8 @@ use std::collections::BTreeSet;
 
 // Constructors remain test-only until actual tool permissions and quiescence have been admitted.
 pub(crate) struct TransportBinding {
+    probe_only: bool,
+    probe_model: Option<String>,
     spec_sha256: String,
     plan_sha256: String,
     root: PathBuf,
@@ -21,8 +23,9 @@ fn spec_hash(s: &Spec) -> Result<String> {
     )?))
 }
 impl TransportBinding {
+    pub(crate) fn probe_gate(&self)->Result<Option<probe::WireGate>> { if self.probe_only {Ok(Some(probe::WireGate::new(self.probe_model.as_deref().ok_or("P_BINDING_REJECTED")?, &self.root)))}else{Ok(None)} }
     pub(crate) fn check(&self, spec: &Spec) -> Result<()> {
-        if spec.profile != "SELF2_APP_SERVER"
+        if spec.profile != if self.probe_only { "SELF2_APP_SERVER_P" } else { "SELF2_APP_SERVER" }
             || spec.cwd != self.root
             || spec_hash(spec)? != self.spec_sha256
         {
@@ -126,6 +129,9 @@ impl Adapter<'_> {
         {
             return Err("APP_SERVER_METHOD_REJECTED");
         }
+        if self.binding.probe_only {
+            probe::check_frame(self, method, params, id)?;
+        }
         let value = if let Some(id) = id {
             json!({"id":id,"method":method,"params":params})
         } else {
@@ -168,7 +174,11 @@ impl Adapter<'_> {
                 return Err("APP_SERVER_RECONCILE_REQUIRED");
             }
             row["state"] = json!("COMPLETE");
-            row["response_sha256"] = json!(hash(&bytes(response)?));
+            if self.binding.probe_only {
+                row["reply"] = probe::safe_reply(response);
+            } else {
+                row["response_sha256"] = json!(hash(&bytes(response)?));
+            }
             Ok(())
         })
     }
@@ -205,6 +215,7 @@ impl Adapter<'_> {
         }
         self.started_threads.insert(id.to_owned());
         self.pending_thread_started = None;
+        let notice_fact = if self.binding.probe_only {json!({"thread":id,"session":actual["sessionId"].as_str().filter(|v|uuid_ok(v)),"idle":actual["status"]["type"]=="idle"})}else{v.clone()};
         modify(self.store, |a| {
             if a.get("notifications").is_none() {
                 a["notifications"] = json!([])
@@ -216,7 +227,7 @@ impl Adapter<'_> {
                 return Err("APP_SERVER_FRAME_BOUND");
             }
             rows.push(
-                json!({"method":"thread/started","thread":id,"frame_sha256":hash(&bytes(v)?)}),
+                json!({"method":"thread/started","thread":id,"frame_sha256":hash(&bytes(&notice_fact)?)}),
             );
             Ok(())
         })?;
@@ -381,6 +392,9 @@ impl Adapter<'_> {
             if !self.thread_started(&notice)? {
                 return Err("APP_SERVER_NOTIFICATION_ORDER_REJECTED");
             }
+        }
+        if self.binding.probe_only && review && !resume {
+            self.io.bind_p_threads(self.developer.as_deref().ok_or("P_THREAD_BINDING")?, id)?;
         }
         Ok(id.into())
     }
@@ -632,6 +646,7 @@ impl Driver for Adapter<'_> {
 #[cfg(windows)]
 fn execute(s: &Store, binding: &TransportBinding, spec: Spec) -> Result<Value> {
     binding.check(&spec)?;
+    if binding.probe_only { return Err("P_MODEL_EXECUTION_FORBIDDEN"); }
     let (rev, mut state) = h::load(s)?;
     let j = state.self2.as_mut().ok_or("SELF2_UNINITIALIZED")?;
     if j.app_server.is_some()
@@ -804,3 +819,6 @@ fn execute(s: &Store, binding: &TransportBinding, spec: Spec) -> Result<Value> {
 }
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(windows)]
+pub(crate) mod probe;

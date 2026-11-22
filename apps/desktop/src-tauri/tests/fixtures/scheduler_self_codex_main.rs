@@ -7,7 +7,7 @@ use nova_lib::scheduler::{
     Result,
 };
 use serde_json::{json, Value};
-use std::{path::Path, io::{self, IsTerminal}};
+use std::{path::Path, io::{self, IsTerminal, Read, BufRead}};
 use nova_lib::scheduler::admission_probe as probe;
 fn read<T: serde::de::DeserializeOwned>(p: &str) -> Result<T> {
     safe_location(Path::new(p))?;
@@ -40,6 +40,21 @@ fn run() -> Result<Value> {
         _ => {}
     }
     if a[0] == "canary-configuration-readiness" && a.len()==1 {return Ok(c::canary_configuration_readiness());}
+    match a[0].as_str() {
+        "app-server-p-prepare" if a.len()==2=>return c::app_server_p("prepare",read(&a[1])?,""),
+        "app-server-p-evaluate" if a.len()==1=>return c::app_server_p("evaluate",Value::Null,""),
+        "app-server-p-probe" if a.len()==1=>return c::app_server_p("probe",Value::Null,""),
+        "app-server-p-approve" if a.len()==2=>{
+            c::app_server_p("check-admission",Value::Null,"")?;
+            eprintln!("{}",c::app_server_p("evaluate",Value::Null,"")?);
+            if !io::stdin().is_terminal(){return Err("CONSOLE_REQUIRED")}
+            eprintln!("P: no user turn; CLI may use authentication/network/cache/trust. Type AUTHORIZE P ZERO TURN 1 SERVER <digest>:");
+            let mut line=String::new();io::BufReader::new(io::stdin().take(257)).read_line(&mut line).map_err(|_|"INPUT_REJECTED")?;
+            if line.len()>256{return Err("INPUT_BOUND")}
+            return c::app_server_p("approve",json!(a[1]),line.trim_end_matches(['\r','\n']));
+        },
+        _=>{}
+    }
     if a[0].starts_with("app-server-") { return c::app_server_admission(); }
     if a[0] == "native-run" {
         c::live_admission()?;
@@ -105,6 +120,8 @@ fn main() {
             let a: Vec<_> = std::env::args().skip(1).collect();
             let value = if a.first().is_some_and(|v|v.starts_with("permission-")) {
                 probe::failure(&a[0],a.get(1).map(String::as_str).unwrap_or(""),e)
+            } else if a.first().is_some_and(|v|v.starts_with("app-server-p-")) {
+                json!({"error_code":e,"server_started":if e=="P_HOST_TOOL_INITIALIZATION_UNVERIFIED" {"NO"}else{"CONSULT_PERSISTENT_RECEIPTS"},"network_executed":if e=="P_HOST_TOOL_INITIALIZATION_UNVERIFIED" {"NOT_STARTED"}else{"UNKNOWN"},"turn_start_sent":0,"model_authorized":false,"retry":"FORBIDDEN"})
             } else if a.first().is_some_and(|v|v.starts_with("canary-")) {
                 json!({"error_code":e,"real_codex_started":"CONSULT_PERSISTENT_RECEIPTS","network_executed":"UNKNOWN","model_admission":"NOT_A_SUCCESS","retry":"FORBIDDEN"})
             } else {

@@ -1,0 +1,4 @@
+
+[[bin]]
+name = "nova-p-only-skip-host"
+path = "src/bin/nova_p_only_skip_host.rs"

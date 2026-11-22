@@ -1,0 +1,5 @@
+--- a/codex-rs/Cargo.toml
++++ b/codex-rs/Cargo.toml
+@@ -163,1 +163,1 @@
+-version = "0.162.1"
++version = "0.0.0"

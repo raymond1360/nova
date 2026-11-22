@@ -2,12 +2,19 @@ name: WP2A Windows validation (unsigned, not a release)
 
 on:
   workflow_dispatch:
+    inputs:
+      host_build_only:
+        description: Build fixed P-only host only; never run it
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   windows-validation:
+    if: ${{ !inputs.host_build_only }}
     runs-on: windows-2022
     timeout-minutes: 90
     defaults:
@@ -545,6 +552,7 @@ jobs:
             ${{ runner.temp }}/wp2a-validation-artifacts/release-guard.log
 
   ar0-validation:
+    if: ${{ !inputs.host_build_only }}
     # A separate runner: never reuse SH1/default targets or a cached fake CLI.
     runs-on: windows-2022
     timeout-minutes: 90
@@ -991,6 +999,7 @@ jobs:
             ${{ steps.ar0_paths.outputs.root }}/public/files.json
 
   scheduler-api-validation:
+    if: ${{ !inputs.host_build_only }}
     runs-on: windows-2022
     timeout-minutes: 110
     defaults:
@@ -1121,3 +1130,42 @@ jobs:
             ${{ steps.api_paths.outputs.root }}/public/checks.json
             ${{ steps.api_paths.outputs.root }}/public/tests.json
             ${{ steps.api_paths.outputs.root }}/public/files.json
+
+  p-only-skip-host-build:
+    if: ${{ inputs.host_build_only }}
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Initialize host build evidence
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $e = Join-Path $env:RUNNER_TEMP 'p-only-host-package'
+          New-Item -ItemType Directory -Path $e -ErrorAction Stop | Out-Null
+          @{schema='nova.p-host.bootstrap/1'; workflow_sha=$env:GITHUB_SHA;
+            run_id=$env:GITHUB_RUN_ID; attempt=$env:GITHUB_RUN_ATTEMPT;
+            status='BUILD_NOT_STARTED'; host_present=$false; host_executed=$false} |
+            ConvertTo-Json | Set-Content (Join-Path $e 'bootstrap.json') -Encoding utf8
+          "P_HOST_PACKAGE=$e" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Checkout host build candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Build fixed host without executing it
+        run: |
+          & ./scripts/build_p_only_skip_host_ci.ps1 `
+            -HostSourceSha '94092300d30eb3a96fffea04ea52c3d9522692ea' `
+            -OfficialSha '092d3acd6bec3e3a14bdc7e7a2810ab628ab759d' `
+            -EvidenceRoot $env:P_HOST_PACKAGE
+      - name: Preserve host build and failure evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: p-only-host-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.P_HOST_PACKAGE }}
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error

@@ -16,6 +16,18 @@ impl Drop for Scope {
     }
 }
 fn emit(v: Value) {
+    // Synthetic producer evidence only, never a logger for real configuration/model frames.
+    let path = std::env::current_dir()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("fake-frames.jsonl");
+    let mut trace = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(trace, "{v}").unwrap();
     println!("{v}");
     std::io::stdout().flush().unwrap()
 }
@@ -108,16 +120,43 @@ pub(crate) fn fake_child(case: &str) -> ! {
                     "r1-permission" if is_review => r["sandbox"]["type"] = json!("workspaceWrite"),
                     _ => {}
                 }
+                let mut notice = r["thread"].clone();
+                if case == "thread-notify-wrong-thread" {
+                    notice["id"] = json!(uuid::Uuid::new_v4().to_string())
+                }
+                if case == "thread-notify-wrong-session" {
+                    notice["sessionId"] = json!(uuid::Uuid::new_v4().to_string())
+                }
+                if !resume && case == "thread-notify-order" {
+                    event("thread/started", json!({"thread":notice}));
+                }
                 result(id, r.clone());
                 if case == "duplicate-response" {
                     result(id, r);
+                }
+                // Frozen thread_processor.rs:1638-1654: reply, then ThreadStarted notification.
+                if !resume && case != "thread-notify-missing" && case != "thread-notify-order" {
+                    if case == "thread-notify-delayed" {
+                        std::thread::sleep(Duration::from_millis(30));
+                    }
+                    event("thread/started", json!({"thread":notice}));
+                    if case == "thread-notify-duplicate" {
+                        event("thread/started", json!({"thread":notice}));
+                    }
                 }
             }
             "turn/start" => {
                 n += 1;
                 let tid = format!("synthetic-turn-{n}");
                 let thread = p["threadId"].as_str().unwrap();
-                result(id, json!({"turn":{"id":tid,"status":"inProgress"}}));
+                result(
+                    &if case == "turn-ack-wrong-id" {
+                        json!(id.as_u64().unwrap() + 1)
+                    } else {
+                        id.clone()
+                    },
+                    json!({"turn":{"id":tid,"status":"inProgress"}}),
+                );
                 if case == "out-of-order" {
                     event(
                         "turn/completed",
@@ -125,14 +164,30 @@ pub(crate) fn fake_child(case: &str) -> ! {
                     );
                     continue;
                 }
-                event(
-                    "turn/started",
-                    json!({"threadId":thread,"turn":{"id":tid,"status":"inProgress"}}),
-                );
+                if case != "turn-notify-missing" {
+                    event(
+                        "turn/started",
+                        json!({"threadId":if case=="turn-notify-wrong-thread" {&review}else{thread},"turn":{"id":if case=="turn-notify-wrong-id" {"wrong-turn"}else{&tid},"status":"inProgress"}}),
+                    );
+                }
+                if case == "notification-bound" {
+                    for i in 0..70 {
+                        let item = json!({"id":format!("reason-{i}"),"type":"reasoning"});
+                        event(
+                            "item/started",
+                            json!({"threadId":thread,"turnId":tid,"item":item}),
+                        );
+                        event(
+                            "item/completed",
+                            json!({"threadId":thread,"turnId":tid,"item":item}),
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
                 if case == "duplicate-event" {
                     event(
                         "turn/started",
-                        json!({"threadId":thread,"turn":{"id":tid,"status":"inProgress"}}),
+                        json!({"threadId":if case=="turn-notify-wrong-thread" {&review}else{thread},"turn":{"id":if case=="turn-notify-wrong-id" {"wrong-turn"}else{&tid},"status":"inProgress"}}),
                     );
                 }
                 if case == "unexpected-config" {
@@ -212,7 +267,18 @@ pub(crate) fn offline_matrix() {
         ("cwd", 0),
         ("missing", 0),
         ("config", 0),
-        ("duplicate-response", 1),
+        ("duplicate-response", 0),
+        ("thread-notify-delayed", 3),
+        ("thread-notify-wrong-thread", 0),
+        ("thread-notify-wrong-session", 0),
+        ("thread-notify-missing", 0),
+        ("thread-notify-order", 0),
+        ("thread-notify-duplicate", 1),
+        ("turn-ack-wrong-id", 1),
+        ("turn-notify-missing", 1),
+        ("turn-notify-wrong-thread", 1),
+        ("turn-notify-wrong-id", 1),
+        ("notification-bound", 1),
         ("r1-permission", 1),
         ("same-uuid", 1),
         ("cold", 2),
@@ -316,7 +382,7 @@ pub(crate) fn offline_matrix() {
         if case == "unloaded" {
             assert!(!calls.iter().any(|v| v["method"] == "thread/resume"));
         }
-        if case == "ok" {
+        if ["ok", "thread-notify-delayed"].contains(&case) {
             let summary = out.as_ref().unwrap_or_else(|e| panic!("{case}: {e}"));
             assert_eq!(summary["self1"]["active"]["status"], "AWAITING_PM_AND_USER");
             assert_eq!(journal(&store).unwrap().records.len(), 3);
@@ -351,6 +417,50 @@ pub(crate) fn offline_matrix() {
             );
         } else {
             assert!(out.is_err(), "{case}");
+        }
+        let terminal = journal(&store)
+            .unwrap()
+            .records
+            .last()
+            .and_then(|r| r.attempt.terminal.clone());
+        let expected = match case {
+            "thread-notify-wrong-thread" | "thread-notify-wrong-session" => {
+                Some("APP_SERVER_NOTIFICATION_BINDING_REJECTED")
+            }
+            "thread-notify-missing" => Some("DEADLINE"),
+            "thread-notify-order" | "duplicate-response" => {
+                Some("APP_SERVER_NOTIFICATION_ORDER_REJECTED")
+            }
+            "thread-notify-duplicate" => Some("APP_SERVER_NOTIFICATION_DUPLICATE"),
+            "turn-notify-wrong-thread" => Some("APP_SERVER_EVENT_BINDING_REJECTED"),
+            "turn-notify-wrong-id" | "turn-notify-missing" => {
+                Some("APP_SERVER_EVENT_ORDER_REJECTED")
+            }
+            "turn-ack-wrong-id" => Some("APP_SERVER_RPC_ORDER_REJECTED"),
+            "notification-bound" => Some("APP_SERVER_FRAME_BOUND"),
+            _ => None,
+        };
+        if let Some(expected) = expected {
+            assert_eq!(terminal.as_deref(), Some(expected), "{case}");
+        }
+        if ["ok", "thread-notify-delayed"].contains(&case) {
+            assert_eq!(app["notifications"].as_array().unwrap().len(), 2);
+            let frames: Vec<Value> = fs::read_to_string(f.dir.join("fake-frames.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            for request in calls.iter().filter(|v| v["method"] == "thread/start") {
+                let pos = frames
+                    .iter()
+                    .position(|v| v["id"] == request["id"])
+                    .unwrap();
+                assert_eq!(frames[pos + 1]["method"], "thread/started");
+                assert_eq!(
+                    frames[pos + 1]["params"]["thread"],
+                    frames[pos]["result"]["thread"]
+                );
+            }
         }
         let before = bytes(&h::load(&store).unwrap()).unwrap();
         let reopened = Store::self_open(&h::store_path(&f.repo).unwrap()).unwrap();

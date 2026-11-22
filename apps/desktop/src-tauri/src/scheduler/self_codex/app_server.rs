@@ -89,6 +89,11 @@ struct Adapter<'a> {
     binding: &'a TransportBinding,
     io: AppServerChannel,
     next_id: u64,
+    // Only the fixed thread/started notification; never an arbitrary response/event queue.
+    received_frames: usize,
+    pending_thread_started: Option<Value>,
+    started_threads: BTreeSet<String>,
+    turn_ids: BTreeSet<(String, String)>,
     round: usize,
     developer: Option<String>,
     reviewer: Option<String>,
@@ -102,7 +107,7 @@ struct Adapter<'a> {
 impl Adapter<'_> {
     fn deadline(&self) -> Instant {
         #[cfg(test)]
-        if self.binding.case == "timeout" || self.binding.case == "cancel" {
+        if ["timeout", "cancel", "thread-notify-missing"].contains(&self.binding.case.as_str()) {
             return self.end.min(Instant::now() + Duration::from_millis(500));
         }
         self.end.min(Instant::now() + Duration::from_secs(60))
@@ -167,20 +172,82 @@ impl Adapter<'_> {
             Ok(())
         })
     }
+    fn receive_frame(&mut self, end: Instant) -> Result<Value> {
+        // Includes replies and events: bounded even when each individual frame is small.
+        if self.received_frames >= 128 {
+            return Err("APP_SERVER_FRAME_BOUND");
+        }
+        let v = relay_json(&self.io.receive(end)?, 1024 * 1024)?;
+        self.received_frames += 1;
+        Ok(v)
+    }
+    fn thread_started(&mut self, v: &Value) -> Result<bool> {
+        if v["method"] != "thread/started" {
+            return Ok(false);
+        }
+        if v.get("id").is_some() || v.get("error").is_some() || v.get("result").is_some() {
+            return Err("APP_SERVER_NOTIFICATION_SHAPE_REJECTED");
+        }
+        let actual = &v["params"]["thread"];
+        let id = actual["id"]
+            .as_str()
+            .ok_or("APP_SERVER_NOTIFICATION_BINDING_REJECTED")?;
+        if self.started_threads.contains(id) {
+            return Err("APP_SERVER_NOTIFICATION_DUPLICATE");
+        }
+        // Frozen thread_processor: response is emitted before this notification, using the same Thread.
+        let expected = self
+            .pending_thread_started
+            .as_ref()
+            .ok_or("APP_SERVER_NOTIFICATION_ORDER_REJECTED")?;
+        if actual != expected {
+            return Err("APP_SERVER_NOTIFICATION_BINDING_REJECTED");
+        }
+        self.started_threads.insert(id.to_owned());
+        self.pending_thread_started = None;
+        modify(self.store, |a| {
+            if a.get("notifications").is_none() {
+                a["notifications"] = json!([])
+            }
+            let rows = a["notifications"]
+                .as_array_mut()
+                .ok_or("APP_SERVER_STATE_REJECTED")?;
+            if rows.len() >= 2 {
+                return Err("APP_SERVER_FRAME_BOUND");
+            }
+            rows.push(
+                json!({"method":"thread/started","thread":id,"frame_sha256":hash(&bytes(v)?)}),
+            );
+            Ok(())
+        })?;
+        Ok(true)
+    }
+    fn response(&mut self, id: u64, end: Instant) -> Result<Value> {
+        loop {
+            let v = self.receive_frame(end)?;
+            if v.get("id").is_some() {
+                if v["id"] != id
+                    || v.get("method").is_some()
+                    || v.get("error").is_some()
+                    || v.get("result").is_none()
+                {
+                    return Err("APP_SERVER_RPC_ORDER_REJECTED");
+                }
+                return Ok(v);
+            }
+            if self.thread_started(&v)? {
+                continue;
+            }
+            return Err("APP_SERVER_EVENT_ORDER_REJECTED");
+        }
+    }
     fn rpc(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         let wire = self.reserve_send(method, &params, Some(id))?;
         let end = self.deadline();
         self.io.send(&wire, end)?;
-        let v: Value = relay_json(&self.io.receive(end)?, 1024 * 1024)?;
-        if v["id"] != id
-            || v.get("error").is_some()
-            || v.get("method").is_some()
-            || v.get("result").is_none()
-        {
-            return Err("APP_SERVER_RPC_ORDER_REJECTED");
-        }
+        let v = self.response(id, end)?;
         self.sent(&v)?;
         Ok(v["result"].clone())
     }
@@ -304,6 +371,17 @@ impl Adapter<'_> {
         } else {
             self.developer = Some(id.into());
         }
+        if !resume {
+            if self.pending_thread_started.is_some() {
+                return Err("APP_SERVER_NOTIFICATION_ORDER_REJECTED");
+            }
+            self.pending_thread_started = Some(r["thread"].clone());
+            let end = self.deadline();
+            let notice = self.receive_frame(end)?;
+            if !self.thread_started(&notice)? {
+                return Err("APP_SERVER_NOTIFICATION_ORDER_REJECTED");
+            }
+        }
         Ok(id.into())
     }
     fn material(&self, input: &Value) -> Result<()> {
@@ -401,29 +479,38 @@ impl Adapter<'_> {
         let wire = self.reserve_send("turn/start", &params, Some(request_id))?;
         let end = self.deadline();
         self.io.send(&wire, end)?;
-        let ack: Value = relay_json(&self.io.receive(end)?, 1024 * 1024)?;
-        if ack["id"] != request_id
-            || ack.get("error").is_some()
-            || ack["result"]["turn"]["status"] != "inProgress"
-        {
+        let ack = self.response(request_id, end)?;
+        if ack["result"]["turn"]["status"] != "inProgress" {
             return Err("APP_SERVER_TURN_ACK_REJECTED");
         }
         let tid = ack["result"]["turn"]["id"]
             .as_str()
             .ok_or("APP_SERVER_TURN_ACK_REJECTED")?
             .to_string();
+        if tid.is_empty() || tid.len() > 128 || !self.turn_ids.insert((id.clone(), tid.clone())) {
+            return Err("APP_SERVER_TURN_ACK_REJECTED");
+        }
         let mut active = BTreeSet::new();
         let mut seen = BTreeSet::new();
         let mut message = None;
         let mut started = false;
         loop {
-            let event: Value = relay_json(&self.io.receive(end)?, 1024 * 1024)?;
+            let event = self.receive_frame(end)?;
+            if self.thread_started(&event)? {
+                continue;
+            }
             if event.get("id").is_some() || event["params"]["threadId"] != id {
                 return Err("APP_SERVER_EVENT_BINDING_REJECTED");
             }
             let p = &event["params"];
             match event["method"].as_str() {
-                Some("turn/started") if !started && p["turn"]["id"] == tid => started = true,
+                Some("turn/started")
+                    if !started
+                        && p["turn"]["id"] == tid
+                        && p["turn"]["status"] == "inProgress" =>
+                {
+                    started = true
+                }
                 Some("item/started") if started && p["turnId"] == tid => {
                     let key = p["item"]["id"].as_str().ok_or("APP_SERVER_ITEM_REJECTED")?;
                     if ![
@@ -602,6 +689,10 @@ fn execute(s: &Store, binding: &TransportBinding, spec: Spec) -> Result<Value> {
         binding,
         io,
         next_id: 1,
+        received_frames: 0,
+        pending_thread_started: None,
+        started_threads: BTreeSet::new(),
+        turn_ids: BTreeSet::new(),
         round: 0,
         developer: None,
         reviewer: None,

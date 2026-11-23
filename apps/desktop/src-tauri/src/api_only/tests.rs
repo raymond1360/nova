@@ -1406,3 +1406,80 @@ fn full_loop_edits_python_function_runs_real_unittest_reviews_and_waits_for_user
         .unwrap();
     assert_eq!(f.db.task(&task.id).unwrap().state, TaskState::Completed);
 }
+#[test]
+fn disk_reopen_keeps_repair_limit_and_unknown_without_resending() {
+    for unknown in [false, true] {
+        let f = Fixture::new();
+        let p = prepare_scoped(
+            &f.db,
+            &f.vault,
+            &f.task,
+            &f.config.id,
+            vec!["note.txt".into()],
+            vec![f.test()],
+            true,
+            None,
+        )
+        .unwrap();
+        approve(&f.db, &p.id, &hash(encode(&p).unwrap().as_bytes())).unwrap();
+        let mut tests = FakeTests {
+            state: "PASS",
+            calls: 0,
+        };
+        let result = if unknown {
+            let (r, _, _) = execute_case(&f, &p, "timeout", "PASS");
+            r
+        } else {
+            let mut a = LoopApi {
+                calls: 0,
+                reviews: 0,
+                fail_second: false,
+            };
+            let r = task_loop::execute_loop(
+                &f.db,
+                &p.id,
+                &f.vault,
+                &mut a,
+                &mut tests,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(a.calls, 4);
+            r
+        };
+        let path = f.root.with_extension("sqlite3");
+        f.db.conn()
+            .execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])
+            .unwrap();
+        let reopened = Database::open(&path).unwrap();
+        reopened.migrate().unwrap();
+        assert_eq!(
+            task_loop::report(&reopened, &f.task).unwrap()["repair_count"],
+            if unknown { 0 } else { 1 }
+        );
+        let mut a = FakeApi::default();
+        assert!(task_loop::execute_loop(
+            &reopened,
+            result["run_id"].as_str().unwrap(),
+            &f.vault,
+            &mut a,
+            &mut tests,
+            &CancellationToken::new()
+        )
+        .is_err());
+        assert!(a.calls.is_empty());
+        assert!(task_loop::repair(
+            &reopened,
+            &f.vault,
+            &p.id,
+            vec!["note.txt".into()],
+            vec![f.test()],
+            &f.config.id
+        )
+        .is_err());
+        assert!(reopened
+            .conn()
+            .execute("DELETE FROM api_task_runs", [])
+            .is_err());
+    }
+}

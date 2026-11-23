@@ -124,6 +124,10 @@ pub fn run() {
         .invoke_handler({
             let real: Arc<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> = std::sync::Arc::new(tauri::generate_handler![
             commands::initialize_app,
+            api_only::commands::api_only_task_report,
+            api_only::commands::api_only_repair,
+            api_only::commands::api_only_user_decision,
+            api_only::commands::api_only_cleanup_status,
             api_only::commands::api_only_catalog,
             api_only::commands::api_only_configs,
             api_only::commands::api_only_save_config,

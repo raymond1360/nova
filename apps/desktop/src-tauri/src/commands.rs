@@ -973,6 +973,7 @@ pub fn cancel_core_loop(task_id: String, state: State<'_, AppState>) -> Result<(
             token.cancel();
             Ok(())
         }
+        None if crate::api_only::API_ONLY => crate::api_only::task_loop::cancel_pending(&*state.db.lock().map_err(|_|"API_DATABASE_BUSY")?,&task_id).map_err(str::to_string),
         None => Err("该任务当前没有正在运行的核心循环，无法取消".to_string()),
     }
 }

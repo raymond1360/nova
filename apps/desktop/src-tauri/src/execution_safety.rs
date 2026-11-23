@@ -625,7 +625,7 @@ impl ExclusiveTarget {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Candidate {
     pub text: String,
     pub candidate_sha256: String,

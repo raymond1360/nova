@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// Current schema version this build of Nova understands. Bump this and
 /// append a new [`Migration`] to [`MIGRATIONS`] whenever the schema changes
 /// — never edit an already-shipped migration's SQL in place.
-pub const CURRENT_SCHEMA_VERSION: i64 = 13;
+pub const CURRENT_SCHEMA_VERSION: i64 = 14;
 
 #[derive(Debug)]
 pub enum MigrationError {
@@ -1081,6 +1081,7 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration { version: 12, requires_backup: true, sql: V12_SQL },
     Migration { version: 13, requires_backup: true, sql: include_str!("api_only_v13.sql") },
+    Migration { version: 14, requires_backup: true, sql: include_str!("api_only_v14.sql") },
 ];
 
 #[cfg(test)]
@@ -2925,3 +2926,20 @@ mod tests {
 #[cfg(test)]
 #[path = "workspace_migration_tests.rs"]
 mod workspace_migration_tests;
+
+#[cfg(test)]
+mod api2_upgrade_tests {
+ use super::*;
+ #[test]
+ fn api_v13_receipt_survives_upgrade_and_task_scope_cannot_be_deleted(){
+  let db=crate::db::Database::memory().unwrap();
+  for m in MIGRATIONS.iter().take_while(|m|m.version<=13){db.conn().execute_batch(m.sql).unwrap();db.conn().pragma_update(None,"user_version",m.version).unwrap();}
+  use crate::models::{CreateProjectRequest,CreateTaskRequest,Actor};
+  let root=std::env::temp_dir().join(format!("nova-api2-upgrade-{}",Uuid::new_v4()));fs::create_dir_all(&root).unwrap();
+  let project=db.create_project(&CreateProjectRequest{name:"synthetic".into(),local_path:root.to_string_lossy().into(),source_type:"local".into(),source_url:None,purpose:None,long_term_goal:None,user_preferences:None,prohibitions:None}).unwrap();
+  let task=db.create_task(&CreateTaskRequest{project_id:project.id.clone(),title:"synthetic".into(),goal:None,in_scope:None,not_in_scope:None,done_criteria:None,ai_kind:None},Actor::User).unwrap();
+  db.conn().execute("INSERT INTO api_task_runs VALUES('old-run',?1,?2,'original-plan',?3,'UNKNOWN',3,'original-summary')",rusqlite::params![task.id,project.id,"a".repeat(64)]).unwrap();
+  db.migrate().unwrap();let row:(String,String,i64)=db.conn().query_row("SELECT plan_json,summary_json,revision FROM api_task_runs WHERE id='old-run'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();assert_eq!(row,("original-plan".into(),"original-summary".into(),3));
+  let first:String=db.conn().query_row("SELECT first_run FROM api_task_scopes WHERE task_id=?1",[task.id],|r|r.get(0)).unwrap();assert_eq!(first,"old-run");assert!(db.conn().execute("DELETE FROM api_task_runs",[]).is_err());assert!(db.conn().execute("DELETE FROM api_task_scopes",[]).is_err());
+ }
+}

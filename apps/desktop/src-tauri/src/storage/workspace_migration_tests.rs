@@ -45,7 +45,7 @@ fn path() -> PathBuf {
     dir.join("fixture.sqlite3")
 }
 #[test]
-fn v12_only_adds_tables_without_modifying_any_old_business_row() {
+fn current_upgrade_only_adds_tables_without_modifying_v11_business_rows() {
     let conn = Connection::open_in_memory().unwrap();
     v11(&conn);
     conn.execute_batch("INSERT INTO confirmed_requirement_items VALUES ('req','p','t','goal',0,'raw','old');
@@ -59,7 +59,7 @@ fn v12_only_adds_tables_without_modifying_any_old_business_row() {
     for old in &before {
         assert_eq!(Some(old), after.iter().find(|v| v.0 == old.0), "{}", old.0);
     }
-    assert_eq!(after.len(), before.len() + 8);
+    assert_eq!(after.len(), before.len() + 12);
     assert_eq!(
         conn.query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
             .optional()
@@ -69,7 +69,7 @@ fn v12_only_adds_tables_without_modifying_any_old_business_row() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        12
+        CURRENT_SCHEMA_VERSION
     );
 }
 #[test]
@@ -136,7 +136,7 @@ fn concurrent_migrations_both_read_v11_then_second_skips_ddl_under_lock() {
                 assert_eq!(
                     conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                         .unwrap(),
-                    12
+                    CURRENT_SCHEMA_VERSION
                 );
                 locked
             })
@@ -147,7 +147,12 @@ fn concurrent_migrations_both_read_v11_then_second_skips_ddl_under_lock() {
         witnessed.extend(t.join().unwrap());
     }
     witnessed.sort_unstable();
-    assert_eq!(witnessed, vec![(12, 11), (12, 12)]);
+    for version in 12..=CURRENT_SCHEMA_VERSION {
+        let rows:Vec<_>=witnessed.iter().filter(|r|r.0==version).collect();
+        assert_eq!(rows.len(),2,"both migrations read stale v11 and must recheck each step");
+        assert_eq!(rows.iter().filter(|r|r.1==version-1).count(),1,"each DDL applied exactly once");
+        assert_eq!(rows.iter().filter(|r|r.1>=version&&r.1<=CURRENT_SCHEMA_VERSION).count(),1,"other writer skips under lock");
+    }
     let conn = Connection::open(p).unwrap();
     assert_eq!(conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='requirement_conversations'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
 }

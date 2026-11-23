@@ -418,6 +418,13 @@ impl Database {
             return Ok(Err(CompletionRejectReason::InvalidCompletionState));
         }
 
+        let api_scope:i64 = self.conn().query_row("SELECT count(*) FROM api_task_scopes WHERE task_id=?1",[&task.id],|r|r.get(0))?;
+        if api_scope==1 {
+            if !crate::api_only::task_loop::passing_evidence(self,task).unwrap_or(false) {return Ok(Err(CompletionRejectReason::NoAdoptedEvidence));}
+            if require_acceptance && !self.user_acceptance_for_task(&task.id)?.is_some_and(|a|a.accepted) {return Ok(Err(CompletionRejectReason::UserAcceptanceMissing));}
+            return Ok(Ok(()));
+        }
+
         // Freeze the authoritative adoption before checking attribution. A failed
         // check must never search another generation/round for a rescue.
         let Some((generation, adopted_round)) = crate::core_loop::documents::adopted_passing_generation_round(

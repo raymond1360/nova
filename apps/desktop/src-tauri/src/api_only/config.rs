@@ -211,13 +211,13 @@ pub fn save_config(
     };
     if !matches!(saved, Ok(1)) {
         if old.as_ref().is_none_or(|r| r.1 != slot) {
-            let _ = vault.delete_api_key(&slot);
+            cleanup(db, vault, &slot, "CONFLICT_NEW_SLOT")?;
         }
         return Err("API_CONFIG_CONFLICT");
     }
     if let Some(o) = old {
         if o.1 != slot {
-            let _ = vault.delete_api_key(&o.1);
+            cleanup(db, vault, &o.1, "ROTATED_OLD_SLOT")?;
         }
     }
     Ok(load_config(db, &config.id)?.view)
@@ -227,10 +227,10 @@ pub fn delete_key(db: &Database, vault: &dyn CredentialStore, id: &str) -> Resul
     vault
         .delete_api_key(&c.slot)
         .map_err(|_| "API_CREDENTIAL_DELETE_FAILED")?;
-    sql(db.conn().execute(
-        "UPDATE api_model_configs SET has_key=0,revision=revision+1 WHERE id=?1",
-        [id],
-    ))?;
+    if sql(db.conn().execute(
+        "UPDATE api_model_configs SET has_key=0,revision=revision+1 WHERE id=?1 AND revision=?2 AND credential_slot=?3",
+        rusqlite::params![id,c.view.revision,c.slot],
+    ))?!=1{return Err("API_KEY_DELETE_CONFIG_CONFLICT")};
     Ok(load_config(db, id)?.view)
 }
 pub(crate) fn acquire(c: &StoredConfig, vault: &dyn CredentialStore) -> Result<SecretLease> {
@@ -244,4 +244,24 @@ pub(crate) fn acquire(c: &StoredConfig, vault: &dyn CredentialStore) -> Result<S
     let result = SecretLease::real(key.as_bytes().to_vec());
     unsafe { key.as_bytes_mut().fill(0) };
     result
+}
+
+fn cleanup(db: &Database, vault: &dyn CredentialStore, slot: &str, reason: &str) -> Result<()> {
+    if vault.delete_api_key(slot).is_err() {
+        sql(db.conn().execute(
+            "INSERT INTO api_credential_cleanup(id,slot,reason) VALUES(?1,?2,?3)",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), slot, reason],
+        ))
+        .map_err(|_| "API_CREDENTIAL_CLEANUP_UNRECORDED")?;
+    }
+    Ok(())
+}
+pub fn cleanup_status(db: &Database) -> Result<Value> {
+    let n: i64 =
+        sql(db
+            .conn()
+            .query_row("SELECT count(*) FROM api_credential_cleanup", [], |r| {
+                r.get(0)
+            }))?;
+    Ok(json!({"pending":n,"status":if n==0{"NO_RECORDED_FAILURE"}else{"CLEANUP_PENDING"}}))
 }

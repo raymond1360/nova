@@ -8,6 +8,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import RequirementWorkspace from './RequirementWorkspace.vue'
+import ApiTaskPanel from './ApiTaskPanel.vue'
 import { invoke } from '@tauri-apps/api/core'
 import type { Binding } from '../stores/workspace'
 import { useCoreLoopStore } from '../stores/coreLoop'
@@ -32,6 +33,7 @@ function parseJsonStringArray(raw: string | null): string[] {
 }
 
 const showRequirementDraft = ref(false)
+const legacyCliControls = ref(false) // API-only: preserved historical controls are never enabled.
 const store = useCoreLoopStore()
 async function openBoundTask(binding: Binding) {
   const project = store.currentProject?.id
@@ -324,7 +326,8 @@ async function handleViewDocument(documentType: string) {
 
 <template>
   <div class="core-loop-view">
-    <h2>项目与任务（Phase 3 最小闭环）</h2>
+    <h2>项目与任务 · API开发</h2>
+    <ApiTaskPanel v-if="store.currentTask" :key="store.currentTask.id" :task="store.currentTask" @refresh="store.refreshCurrentTask()" />
     <p v-if="store.restoring" class="hint">正在恢复上次会话…</p>
     <p v-if="store.lastError" class="error-banner" role="alert">{{ store.lastError }}</p>
     <p v-if="refreshMessage" role="status">{{ refreshMessage }}</p>
@@ -351,7 +354,7 @@ async function handleViewDocument(documentType: string) {
       </ul>
     </section>
 
-    <section class="block">
+    <section v-if="legacyCliControls" class="block">
       <h3>CLI 配置与信任确认</h3>
       <p class="hint">
         只需配置你选择使用的开发 AI 对应的 CLI；未选用的另一个 CLI 未安装或未登录不影响任务启动。
@@ -402,7 +405,7 @@ async function handleViewDocument(documentType: string) {
         <textarea v-model="taskDoneCriteria" placeholder="完成标准"></textarea>
       </div>
       <div class="row">
-        <label>
+        <label v-if="legacyCliControls">
           开发 AI：
           <select v-model="store.devAiKind" :disabled="!store.canChangeRoles">
             <option value="codex_cli">Codex</option>
@@ -421,7 +424,7 @@ async function handleViewDocument(documentType: string) {
     </section>
 
     <section v-if="store.currentTask" class="block">
-      <h3>3. 确认需求与测试命令</h3>
+      <h3>3. 确认需求</h3>
       <p><strong>当前任务状态：</strong>{{ stateLabels[store.currentTask.state] ?? store.currentTask.state }}</p>
       <p v-if="store.currentTask.document_sync_pending" class="hint">
         文档同步未完成，可手动重试。
@@ -447,6 +450,7 @@ async function handleViewDocument(documentType: string) {
         <p v-if="store.snapshotMessage">{{ store.snapshotMessage }}</p>
       </details>
 
+      <template v-if="legacyCliControls">
       <div v-if="store.currentTask.test_command_source">
         <p><strong>测试命令（{{ store.currentTask.test_command_source === 'auto' ? '自动检测' : '用户确认' }}）：</strong>
           {{ store.currentTask.test_command_redacted }}</p>
@@ -471,6 +475,7 @@ async function handleViewDocument(documentType: string) {
           {{ store.verifyingOnly ? '正在请求仅验证…' : '重新验证现有修改' }}
         </button>
       </div>
+      </template>
     </section>
 
     <!-- Second re-review remediation (Blocker 3), backend-authoritative
@@ -482,7 +487,7 @@ async function handleViewDocument(documentType: string) {
          the recovery UI for a half-success confirmation: calling this
          again after a prior partial failure safely completes the
          reconciliation. -->
-    <section v-if="store.noTestsConfirmationNeeded" class="block no-tests-card">
+    <section v-if="legacyCliControls && store.noTestsConfirmationNeeded" class="block no-tests-card">
       <h3>⚠ 未检测到可运行的自动测试</h3>
       <p>Nova 未检测到可运行的自动测试。是否确认该项目目前没有适用测试？</p>
       <div class="row">
@@ -510,7 +515,7 @@ async function handleViewDocument(documentType: string) {
          the recovery UI for a half-success confirmation: calling this
          again after a prior partial failure safely completes the
          reconciliation. -->
-    <section v-if="store.noBuildConfirmationNeeded" class="block no-tests-card">
+    <section v-if="legacyCliControls && store.noBuildConfirmationNeeded" class="block no-tests-card">
       <h3>⚠ 无法判断该项目是否需要构建</h3>
       <p>Nova 无法自动判断这个项目是否需要构建步骤。是否确认该项目当前无需构建？</p>
       <div class="row">
@@ -521,6 +526,7 @@ async function handleViewDocument(documentType: string) {
       </div>
     </section>
 
+    <template v-if="legacyCliControls"><!-- paused CLI controls; API-only panel above owns execution -->
     <section v-if="store.currentTask && ['confirmed', 'queued'].includes(store.currentTask.state)" class="block">
       <h3>4. CLI 就绪检查与启动</h3>
       <button @click="store.checkReadiness">检查 Codex / Claude CLI 就绪状态</button>
@@ -649,7 +655,8 @@ async function handleViewDocument(documentType: string) {
          event for something that has not actually happened. Available for
          a task in any state, including terminal ones — viewing evidence
          never re-executes anything. -->
-    <section v-if="store.currentTask" class="block">
+    </template>
+    <section v-if="legacyCliControls && store.currentTask" class="block">
       <h3>7. 时间线与 Nova 验证</h3>
       <div v-if="store.evidenceOverview">
         <p>
@@ -713,7 +720,7 @@ async function handleViewDocument(documentType: string) {
     <!-- Phase 4: the seven result documents, listed by their real
          generation/existence status and shown only in their redacted form
          — no arbitrary file path is ever accepted from the UI. -->
-    <section v-if="store.currentTask" class="block">
+    <section v-if="legacyCliControls && store.currentTask" class="block">
       <h3>8. 任务文档</h3>
       <button :disabled="store.syncingDocuments || !!store.documentSyncDisabledReason" @click="store.resyncDocuments">{{ store.syncingDocuments ? '正在更新…' : '重新生成任务文档' }}</button>
       <p class="hint">根据已有执行证据更新报告，不会重新开发、运行测试或构建。</p>

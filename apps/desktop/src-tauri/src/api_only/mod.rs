@@ -1,6 +1,8 @@
 //! API-only product execution receipt. Task state remains owned by the existing Database.
 pub mod commands;
 pub mod config;
+pub mod recipes;
+pub mod task_loop;
 pub mod transport;
 use crate::{credential::CredentialStore, db::Database, execution_safety::*};
 pub use config::{Config, ConfigView, Protocol, Provider};
@@ -57,6 +59,8 @@ fn permitted_path(s: &str) -> Result<()> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FixedTest {
+    #[serde(default)]
+    pub recipe: String,
     pub program: PathBuf,
     pub file: String,
     pub contains: String,
@@ -64,6 +68,14 @@ pub struct FixedTest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovedTest {
+    #[serde(default)]
+    pub cwd: PathBuf,
+    #[serde(default)]
+    pub environment: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub trust_notice: String,
     pub specification: FixedTest,
     pub program_identity: String,
     pub program_sha256: String,
@@ -78,6 +90,12 @@ pub struct FileSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Plan {
+    #[serde(default)]
+    pub allow_repair: bool,
+    #[serde(default)]
+    pub parent_run: Option<String>,
+    #[serde(default)]
+    pub prior_issues: Value,
     pub schema: String,
     pub id: String,
     pub task_id: String,
@@ -94,7 +112,20 @@ pub struct Plan {
 }
 fn task_snapshot(db: &Database, id: &str) -> Result<Value> {
     let task = db.task(id).map_err(|_| "API_TASK_MISSING")?;
-    if task.state != crate::models::TaskState::Confirmed {
+    if crate::storage::tasks::is_legacy_frozen(&task) {
+        return Err("API_LEGACY_TASK_FROZEN");
+    }
+    if task.state != crate::models::TaskState::Confirmed
+        && !(matches!(
+            task.state,
+            crate::models::TaskState::NeedsUserAction
+                | crate::models::TaskState::AwaitingUserAcceptance
+        ) && sql(db.conn().query_row(
+            "SELECT count(*) FROM api_task_scopes WHERE task_id=?1",
+            [id],
+            |r| r.get::<_, i64>(0),
+        ))? == 1)
+    {
         return Err("API_CONFIRMED_TASK_REQUIRED");
     }
     let binding: Option<(String, i64, String)> = sql(db
@@ -127,12 +158,13 @@ fn tool_snapshot(t: &FixedTest, root: &Path, files: &[FileSnapshot]) -> Result<A
                 .unwrap_or("")
                 .to_ascii_lowercase()
                 .as_str(),
-            "python.exe" | "python3.exe"
+            "python.exe" | "python3.exe" | "node.exe"
         )
     {
         return Err("API_FIXED_TEST_REJECTED");
     }
     safe_text(&t.contains)?;
+    let (argv, environment, trust_notice, cwd) = recipes::freeze(t, root)?;
     let mut g = Guard::tool(&t.program)?;
     if inside(&g.path, root) {
         return Err("API_TEST_TOOL_INSIDE_PROJECT");
@@ -142,10 +174,15 @@ fn tool_snapshot(t: &FixedTest, root: &Path, files: &[FileSnapshot]) -> Result<A
         .len();
     let digest = g.sha256_stream(size, Instant::now() + Duration::from_secs(5))?;
     Ok(ApprovedTest {
+        cwd,
+        argv,
+        environment,
+        trust_notice,
         specification: FixedTest {
             program: g.path.clone(),
             file: t.file.clone(),
             contains: t.contains.clone(),
+            recipe: t.recipe.clone(),
         },
         program_identity: g.identity,
         program_sha256: digest,
@@ -159,6 +196,20 @@ pub fn prepare(
     paths: Vec<String>,
     tests: Vec<FixedTest>,
 ) -> Result<Plan> {
+    prepare_scoped(db, vault, task_id, config_id, paths, tests, false, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_scoped(
+    db: &Database,
+    vault: &dyn CredentialStore,
+    task_id: &str,
+    config_id: &str,
+    paths: Vec<String>,
+    tests: Vec<FixedTest>,
+    allow_repair: bool,
+    parent: Option<&str>,
+) -> Result<Plan> {
     let c = config::load_config(db, config_id)?;
     c.view.config.require_adapter()?;
     if !c.view.has_key {
@@ -167,6 +218,7 @@ pub fn prepare(
     if paths.is_empty() || paths.len() > 3 || tests.is_empty() || tests.len() > 2 {
         return Err("API_SCOPE_BOUND");
     }
+    let original_paths = paths.clone();
     let task = task_snapshot(db, task_id)?;
     let project_id = task["task"]["project_id"]
         .as_str()
@@ -182,7 +234,10 @@ pub fn prepare(
         if !seen.insert(path.to_ascii_lowercase()) {
             return Err("API_DUPLICATE_PATH");
         }
-        let (raw, identity) = read_file(&root.path.join(&path), 8192)?;
+        let (raw, identity) = read_file(
+            &root.path.join(&path),
+            if parent.is_some() { 32768 } else { 8192 },
+        )?;
         let before = String::from_utf8(raw).map_err(|_| "API_UTF8_REQUIRED")?;
         safe_text(&before)?;
         files.push(FileSnapshot {
@@ -197,13 +252,22 @@ pub fn prepare(
         .iter()
         .map(|t| tool_snapshot(t, &root.path, &files))
         .collect::<Result<Vec<_>>>()?;
-    let plan=Plan{schema:"nova.api.task/1".into(),id:uuid::Uuid::new_v4().to_string(),task_id:task_id.into(),project_id:project_id.clone(),root:root.path,root_identity:root.identity,task_digest:hash(encode(&task)?.as_bytes()),task,config:c.view.clone(),files,tests,expires_utc:chrono::Utc::now().timestamp()+3600,notice:"At most DEVELOP 1 + independent REVIEW 1, no retries/remediation. Approved files only; non-atomic in-place writes may be partial. Fixed read-only Python content assertions only, no project code/shell. API requests expose this packet and incur provider charges. No automatic restore/completion/commit.".into()};
+    let prior_issues = task_loop::repair_context(
+        db,
+        task_id,
+        parent,
+        &c.view,
+        &original_paths,
+        &tests,
+        allow_repair,
+    )?;
+    let plan=Plan{allow_repair,parent_run:parent.map(str::to_string),prior_issues,schema:"nova.api.task/1".into(),id:uuid::Uuid::new_v4().to_string(),task_id:task_id.into(),project_id:project_id.clone(),root:root.path,root_identity:root.identity,task_digest:hash(encode(&task)?.as_bytes()),task,config:c.view.clone(),files,tests,expires_utc:chrono::Utc::now().timestamp()+3600,notice:"At most DEVELOP 1 + independent REVIEW 1, no automatic network retries. Approved files only; non-atomic in-place writes may be partial. Only the displayed fixed test recipe/argv/environment is approved; never model-generated shell. API requests expose this packet and incur provider charges. No automatic restore/completion/commit. A task-level one-repair grant permits at most 4 model requests total, same configuration/files/tests only; no additional tools or budget. Project unittest executes trusted project code and dependencies with user permissions, may write/spawn/access network; not a sandbox.".into()};
     let raw = encode(&plan)?;
     config::acquire(&c, vault)?.scan_json(raw.as_bytes(), 65536)?;
     if raw.len() > 49152 {
         return Err("API_CONTEXT_BOUND");
     }
-    sql(db.conn().execute("INSERT INTO api_task_runs(id,task_id,project_id,plan_json,digest,phase,revision,summary_json) VALUES(?1,?2,?3,?4,?5,'PREPARED',0,'{}')",rusqlite::params![plan.id,task_id,project_id,raw,hash(raw.as_bytes())]))?;
+    task_loop::insert_plan(db, &plan, &raw, parent)?;
     Ok(plan)
 }
 fn load_plan(db: &Database, id: &str) -> Result<(Plan, String, String, Value)> {
@@ -223,9 +287,23 @@ fn load_plan(db: &Database, id: &str) -> Result<(Plan, String, String, Value)> {
         decode(summary.as_bytes(), 2 * 1024 * 1024)?,
     ))
 }
+fn validate_root(db: &Database, p: &Plan) -> Result<()> {
+    let project = db
+        .project(&p.project_id)
+        .map_err(|_| "API_PROJECT_MISSING")?;
+    let root = Guard::open(Path::new(&project.local_path), true)?;
+    if root.path != p.root || root.identity != p.root_identity {
+        return Err("API_PROJECT_ROOT_DRIFT");
+    };
+    Ok(())
+}
 fn validate_current(db: &Database, p: &Plan) -> Result<config::StoredConfig> {
+    validate_root(db, p)?;
     if p.schema != "nova.api.task/1" || p.expires_utc <= chrono::Utc::now().timestamp() {
         return Err("API_APPROVAL_EXPIRED");
+    }
+    if p.tests.iter().any(|t| t.argv.is_empty()) {
+        return Err("API_LEGACY_PLAN_REQUIRES_NEW_APPROVAL");
     }
     let c = config::load_config(db, &p.config.config.id)?;
     if encode(&c.view)? != encode(&p.config)?
@@ -279,10 +357,10 @@ pub fn approve(db: &Database, id: &str, digest: &str) -> Result<Value> {
 pub fn status(db: &Database, id: &str) -> Result<Value> {
     let (p, d, phase, summary) = load_plan(db, id)?;
     Ok(
-        json!({"run_id":id,"task_id":p.task_id,"digest":d,"phase":phase,"summary":summary,"task_completed":false,"process_liveness":"UNKNOWN","automatic_retry":false}),
+        json!({"run_id":id,"task_id":p.task_id,"digest":d,"phase":phase,"summary":summary,"task_completed":phase=="ACCEPTED","process_liveness":"UNKNOWN","automatic_retry":false}),
     )
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Change {
     path: String,
     candidate: Candidate,
@@ -321,17 +399,11 @@ impl TestPort for FixedTestRunner {
     ) -> Result<TestEvidence> {
         let mut r = crate::runtime::types::ExecutionRequest::new(
             t.specification.program.to_string_lossy(),
-            vec![
-                "-I".into(),
-                "-S".into(),
-                "-c".into(),
-                CHECKER.into(),
-                root.join(&t.specification.file).to_string_lossy().into(),
-                t.specification.contains.clone(),
-            ],
-            root.into(),
+            t.argv.clone(),
+            t.cwd.clone(),
             Some(root.into()),
         );
+        r.environment = Some(t.environment.clone());
         r.timeout = Duration::from_secs(10);
         r.max_output_bytes = 4096;
         let e = crate::runtime::process::execute_blocking(r, cancel.clone());
@@ -379,7 +451,7 @@ pub fn execute<P: ApiPort, T: TestPort>(
     let result = (|| -> Result<()> {
         let key = config::acquire(&c, vault)?;
         key.scan_json(encode(&p)?.as_bytes(), 65536)?;
-        let input = json!({"task":p.task,"files":p.files,"fixed_tests":p.tests,"scope":p.notice});
+        let input = json!({"task":p.task,"files":p.files,"fixed_tests":p.tests,"scope":p.notice,"prior_issues":p.prior_issues});
         summary["develop_attempts_reserved"] = json!(1);
         cas(db, id, stage, stage, &summary)?;
         let proposed =

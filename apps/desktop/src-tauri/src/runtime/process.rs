@@ -215,11 +215,12 @@ fn run_windows(
 
     // Step 3: create the target process *suspended*. Its initial thread
     // has not run any of the target's code yet.
-    let mut child = match win_spawn::spawn_suspended(
+    let mut child = match win_spawn::spawn_suspended_with_env(
         &request.program,
         &request.args,
         resolved_cwd,
         request.stdin.is_some(),
+        request.environment.as_ref(),
     ) {
         Ok(child) => child,
         Err(error) => {
@@ -413,6 +414,7 @@ fn run_generic(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    if let Some(env) = &request.environment { command.env_clear().envs(env); }
     let mut child: Child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {

@@ -55,15 +55,18 @@ pub fn api_only_prepare(
     config_id: String,
     paths: Vec<String>,
     tests: Vec<a::FixedTest>,
+    allow_repair: bool,
     state: State<'_, AppState>,
 ) -> Result<a::Plan, String> {
-    a::prepare(
+    a::prepare_scoped(
         &*state.db.lock().map_err(|_| "API_DATABASE_BUSY")?,
         state.credentials.as_ref(),
         &task_id,
         &config_id,
         paths,
         tests,
+        allow_repair,
+        None,
     )
     .map_err(str::to_string)
 }
@@ -147,7 +150,7 @@ pub async fn api_only_execute(id: String, state: State<'_, AppState>) -> Result<
         let _slot = slot;
         let db =
             crate::db::Database::open(&db_path).map_err(|_| "API_DATABASE_ERROR".to_string())?;
-        a::execute(
+        a::task_loop::execute_loop(
             &db,
             &id,
             vault.as_ref(),
@@ -159,4 +162,52 @@ pub async fn api_only_execute(id: String, state: State<'_, AppState>) -> Result<
     })
     .await
     .map_err(|_| "API_RESULT_UNKNOWN_NO_REPLAY".to_string())?
+}
+
+#[tauri::command]
+pub fn api_only_task_report(task_id: String, state: State<'_, AppState>) -> Result<Value, String> {
+    a::task_loop::report(
+        &*state.db.lock().map_err(|_| "API_DATABASE_BUSY")?,
+        &task_id,
+    )
+    .map_err(str::to_string)
+}
+#[tauri::command]
+pub fn api_only_repair(
+    parent: String,
+    paths: Vec<String>,
+    tests: Vec<a::FixedTest>,
+    config_id: String,
+    state: State<'_, AppState>,
+) -> Result<a::Plan, String> {
+    a::task_loop::repair(
+        &*state.db.lock().map_err(|_| "API_DATABASE_BUSY")?,
+        state.credentials.as_ref(),
+        &parent,
+        paths,
+        tests,
+        &config_id,
+    )
+    .map_err(str::to_string)
+}
+#[tauri::command]
+pub fn api_only_user_decision(
+    id: String,
+    accepted: bool,
+    note: String,
+    state: State<'_, AppState>,
+) -> Result<Value, String> {
+    a::task_loop::user_decision_with_vault(
+        &*state.db.lock().map_err(|_| "API_DATABASE_BUSY")?,
+        state.credentials.as_ref(),
+        &id,
+        accepted,
+        &note,
+    )
+    .map_err(str::to_string)
+}
+#[tauri::command]
+pub fn api_only_cleanup_status(state: State<'_, AppState>) -> Result<Value, String> {
+    config::cleanup_status(&*state.db.lock().map_err(|_| "API_DATABASE_BUSY")?)
+        .map_err(str::to_string)
 }

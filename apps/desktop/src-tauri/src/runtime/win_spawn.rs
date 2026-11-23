@@ -498,6 +498,10 @@ pub fn spawn_suspended(
     cwd: &Path,
     with_stdin_pipe: bool,
 ) -> io::Result<SuspendedChild> {
+    spawn_suspended_with_env(program, args, cwd, with_stdin_pipe, None)
+}
+
+pub fn spawn_suspended_with_env(program: &str, args: &[String], cwd: &Path, with_stdin_pipe: bool, environment: Option<&std::collections::BTreeMap<String,String>>) -> io::Result<SuspendedChild> {
     validate_process_request_strings(program, args, cwd)?;
 
     let resolved = resolve_executable(program)?;
@@ -622,6 +626,14 @@ pub fn spawn_suspended(
     startup_info_ex.StartupInfo.hStdError = stderr_pipe.write.0;
     startup_info_ex.lpAttributeList = attribute_list;
 
+    let mut env_block: Vec<u16> = Vec::new();
+    if let Some(values) = environment {
+        for (k,v) in values { if k.is_empty() || k.contains(['=', '\0']) || v.contains('\0') { return Err(io::Error::new(io::ErrorKind::InvalidInput,"invalid child environment")); }
+            env_block.extend(format!("{k}={v}").encode_utf16()); env_block.push(0);
+        }
+        env_block.push(0); if env_block.len()==1 {env_block.push(0);}
+        if env_block.len()>32767 {return Err(io::Error::new(io::ErrorKind::InvalidInput,"child environment bound"));}
+    }
     let mut process_information: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
     // SAFETY: all pointer arguments are valid for the duration of this
@@ -636,8 +648,8 @@ pub fn spawn_suspended(
             null(),
             null(),
             1, // bInheritHandles: required for the attribute-list handle whitelist to take effect.
-            CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
-            null(),
+            CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | if environment.is_some() { windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT } else { 0 },
+            if environment.is_some() { env_block.as_ptr() as *const std::ffi::c_void } else { null() },
             cwd_wide.as_ptr(),
             &startup_info_ex.StartupInfo,
             &mut process_information,

@@ -105,6 +105,8 @@ pub struct ExecutionRequest {
     /// reviewer CLI as real stdin content — never a file path masquerading
     /// as a prompt.
     pub stdin: Option<Vec<u8>>,
+    /// None preserves legacy behavior; Some replaces the complete child environment.
+    pub environment: Option<std::collections::BTreeMap<String,String>>,
 }
 
 impl ExecutionRequest {
@@ -122,6 +124,7 @@ impl ExecutionRequest {
             timeout: Duration::from_secs(20),
             max_output_bytes: 64 * 1024,
             stdin: None,
+            environment: None,
         }
     }
 

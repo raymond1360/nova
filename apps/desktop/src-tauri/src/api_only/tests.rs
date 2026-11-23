@@ -73,6 +73,7 @@ impl Fixture {
     }
     fn test(&self) -> FixedTest {
         FixedTest {
+            recipe: "content".into(),
             program: std::env::var_os("NOVA_API_TEST_PYTHON")
                 .map(PathBuf::from)
                 .or_else(|| {
@@ -620,5 +621,693 @@ fn two_approved_files_change_and_other_files_remain_untouched() {
     assert_eq!(
         std::fs::read(f.root.join("untouched.txt")).unwrap(),
         b"USER WORK"
+    );
+}
+// API-2 fixtures only; never reads an OS credential or contacts a provider.
+struct LoopApi {
+    calls: usize,
+    reviews: usize,
+    fail_second: bool,
+}
+impl ApiPort for LoopApi {
+    fn send(
+        &mut self,
+        r: &transport::WireRequest,
+        _: &SecretLease,
+        _: &CancellationToken,
+    ) -> Result<Vec<u8>> {
+        self.calls += 1;
+        let b: Value = decode(&r.body, 131072)?;
+        let i: Value = decode(
+            b["messages"][1]["content"].as_str().unwrap().as_bytes(),
+            131072,
+        )?;
+        assert_eq!(b["messages"].as_array().unwrap().len(), 2);
+        assert!(b.get("tools").is_none());
+        let v = if i.get("files").is_some() {
+            let before = i["files"][0]["before"].as_str().unwrap();
+            let old = if before.contains("Alpha") {
+                "Alpha"
+            } else {
+                "beta"
+            };
+            json!({"schema":"nova.api.edits/1","edits":[{"schema":"nova.relay.proposal/1","target_path":"note.txt","old_text":old,"new_text":if old=="Alpha"{"beta"}else{"gamma"},"rationale":"Approved repair"}]})
+        } else {
+            self.reviews += 1;
+            json!({"schema":"nova.relay.review/1","base_sha256":i["base_sha256"],"candidate_sha256":i["candidate_sha256"],"verdict":if self.reviews==1||self.fail_second{"CHANGES_REQUIRED"}else{"PASS"},"issues":[],"unknowns":[]})
+        };
+        Ok(serde_json::to_vec(&json!({"model":b["model"],"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":encode(&v)?}}]})).unwrap())
+    }
+}
+#[test]
+fn preauthorized_repair_persists_once_then_user_accepts_through_gate() {
+    let f = Fixture::new();
+    let p = prepare_scoped(
+        &f.db,
+        &f.vault,
+        &f.task,
+        &f.config.id,
+        vec!["note.txt".into()],
+        vec![f.test()],
+        true,
+        None,
+    )
+    .unwrap();
+    approve(&f.db, &p.id, &hash(encode(&p).unwrap().as_bytes())).unwrap();
+    let mut api = LoopApi {
+        calls: 0,
+        reviews: 0,
+        fail_second: false,
+    };
+    let mut tests = FakeTests {
+        state: "PASS",
+        calls: 0,
+    };
+    let r = task_loop::execute_loop(
+        &f.db,
+        &p.id,
+        &f.vault,
+        &mut api,
+        &mut tests,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(r["phase"], "AWAITING_USER");
+    assert_eq!(api.calls, 4);
+    assert_eq!(tests.calls, 2);
+    assert_eq!(
+        f.db.task(&f.task).unwrap().state,
+        TaskState::AwaitingUserAcceptance
+    );
+    assert!(f
+        .db
+        .transition_task(
+            &f.task,
+            TaskState::Completed,
+            Actor::Nova,
+            None,
+            None,
+            false,
+            None
+        )
+        .is_err());
+    assert!(task_loop::repair(
+        &f.db,
+        &f.vault,
+        &p.id,
+        vec!["note.txt".into()],
+        vec![f.test()],
+        &f.config.id
+    )
+    .is_err());
+    assert!(f
+        .db
+        .conn()
+        .execute("DELETE FROM api_task_runs", [])
+        .is_err());
+    assert!(f
+        .db
+        .conn()
+        .execute("DELETE FROM api_task_scopes", [])
+        .is_err());
+    task_loop::user_decision(
+        &f.db,
+        r["run_id"].as_str().unwrap(),
+        true,
+        "verified by user",
+    )
+    .unwrap();
+    assert_eq!(f.db.task(&f.task).unwrap().state, TaskState::Completed);
+    assert_eq!(
+        task_loop::report(&f.db, &f.task).unwrap()["repair_count"],
+        1
+    );
+}
+#[test]
+fn no_grant_requires_new_approval_and_scope_expansion_is_not_inherited() {
+    let f = Fixture::new();
+    let p = f.approved();
+    let mut a = LoopApi {
+        calls: 0,
+        reviews: 0,
+        fail_second: false,
+    };
+    let mut t = FakeTests {
+        state: "PASS",
+        calls: 0,
+    };
+    let r = task_loop::execute_loop(
+        &f.db,
+        &p.id,
+        &f.vault,
+        &mut a,
+        &mut t,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(r["phase"], "NEEDS_REMEDIATION");
+    assert_eq!(a.calls, 2);
+    std::fs::write(f.root.join("extra.txt"), "extra").unwrap();
+    let next = task_loop::repair(
+        &f.db,
+        &f.vault,
+        &p.id,
+        vec!["note.txt".into(), "extra.txt".into()],
+        vec![f.test()],
+        &f.config.id,
+    )
+    .unwrap();
+    assert!(execute(
+        &f.db,
+        &next.id,
+        &f.vault,
+        &mut a,
+        &mut t,
+        &CancellationToken::new()
+    )
+    .is_err());
+    assert_eq!(a.calls, 2);
+    assert_eq!(status(&f.db, &next.id).unwrap()["phase"], "PREPARED");
+}
+#[test]
+fn repair_failure_stops_and_unknown_cannot_get_new_plan() {
+    let f = Fixture::new();
+    let p = prepare_scoped(
+        &f.db,
+        &f.vault,
+        &f.task,
+        &f.config.id,
+        vec!["note.txt".into()],
+        vec![f.test()],
+        true,
+        None,
+    )
+    .unwrap();
+    approve(&f.db, &p.id, &hash(encode(&p).unwrap().as_bytes())).unwrap();
+    let mut a = LoopApi {
+        calls: 0,
+        reviews: 0,
+        fail_second: true,
+    };
+    let mut t = FakeTests {
+        state: "PASS",
+        calls: 0,
+    };
+    let r = task_loop::execute_loop(
+        &f.db,
+        &p.id,
+        &f.vault,
+        &mut a,
+        &mut t,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(r["phase"], "NEEDS_REMEDIATION");
+    assert_eq!(a.calls, 4);
+    assert!(task_loop::repair(
+        &f.db,
+        &f.vault,
+        r["run_id"].as_str().unwrap(),
+        vec!["note.txt".into()],
+        vec![f.test()],
+        &f.config.id
+    )
+    .is_err());
+    let f = Fixture::new();
+    let p = f.approved();
+    let (r, _, _) = execute_case(&f, &p, "timeout", "PASS");
+    assert_eq!(r["phase"], "UNKNOWN");
+    assert!(task_loop::repair(
+        &f.db,
+        &f.vault,
+        &p.id,
+        vec!["note.txt".into()],
+        vec![f.test()],
+        &f.config.id
+    )
+    .is_err());
+}
+#[test]
+fn user_feedback_and_post_delivery_drift_do_not_complete() {
+    let f = Fixture::new();
+    let p = f.approved();
+    let mut a = FakeApi {
+        root: f.root.clone(),
+        ..Default::default()
+    };
+    let mut t = FakeTests {
+        state: "PASS",
+        calls: 0,
+    };
+    let r = task_loop::execute_loop(
+        &f.db,
+        &p.id,
+        &f.vault,
+        &mut a,
+        &mut t,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(r["phase"], "AWAITING_USER");
+    task_loop::user_decision(&f.db, &p.id, false, "please adjust").unwrap();
+    assert_eq!(
+        f.db.task(&f.task).unwrap().state,
+        TaskState::NeedsUserAction
+    );
+    std::fs::write(f.root.join("note.txt"), "beta USER EDIT\r\n").unwrap();
+    let next = task_loop::repair(
+        &f.db,
+        &f.vault,
+        &p.id,
+        vec!["note.txt".into()],
+        vec![f.test()],
+        &f.config.id,
+    )
+    .unwrap();
+    assert_eq!(next.files[0].before, "beta USER EDIT\r\n");
+    assert!(!next.allow_repair);
+    assert_eq!(next.prior_issues["user_feedback"], "please adjust");
+    let f = Fixture::new();
+    let p = f.approved();
+    let mut a = FakeApi {
+        root: f.root.clone(),
+        ..Default::default()
+    };
+    task_loop::execute_loop(
+        &f.db,
+        &p.id,
+        &f.vault,
+        &mut a,
+        &mut t,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    std::fs::write(f.root.join("note.txt"), "USER EDIT").unwrap();
+    assert!(task_loop::user_decision(&f.db, &p.id, true, "accept").is_err());
+    assert_eq!(
+        f.db.task(&f.task).unwrap().state,
+        TaskState::AwaitingUserAcceptance
+    );
+}
+#[test]
+fn project_unittest_real_success_failure_timeout_and_environment_is_empty_of_secrets() {
+    let f = Fixture::new();
+    std::fs::create_dir(f.root.join("tests")).unwrap();
+    let path = f.root.join("tests/test_canary.py");
+    let spec = FixedTest {
+        recipe: "python_unittest".into(),
+        ..f.test()
+    };
+    let original = vec![FileSnapshot {
+        path: "note.txt".into(),
+        identity: "unused".into(),
+        before: "unused".into(),
+        sha256: "unused".into(),
+    }];
+    let t = tool_snapshot(&spec, &f.root, &original).unwrap();
+    assert!(t
+        .environment
+        .keys()
+        .all(|k| matches!(k.as_str(), "SystemRoot" | "WINDIR")));
+    for (source,expected) in [("import unittest,os\nclass T(unittest.TestCase):\n def test_env(self):\n  self.assertNotIn('NOVA_SYNTHETIC_PROVIDER_KEY',os.environ)\n  self.assertNotIn('PATH',os.environ)\n", "PASS"),("import unittest\nclass T(unittest.TestCase):\n def test_bad(self): self.fail('synthetic failure')\n","FAIL"),("import time\ntime.sleep(60)\n","UNKNOWN")] {
+  std::fs::write(&path,source).unwrap();let ev=FixedTestRunner.run(&t,&f.root,&CancellationToken::new()).unwrap();assert_eq!(ev.status,expected);assert!(!ev.stdout.contains("SYNTHETIC_SECRET"));
+ }
+}
+#[test]
+fn credential_rotation_cleanup_failure_is_recorded_without_secret() {
+    struct FailingDelete(MemoryCredentialStore);
+    impl CredentialStore for FailingDelete {
+        fn save_api_key(&self, s: &str, k: &str) -> crate::error::NovaResult<()> {
+            self.0.save_api_key(s, k)
+        }
+        fn read_api_key(&self, s: &str) -> crate::error::NovaResult<Option<String>> {
+            self.0.read_api_key(s)
+        }
+        fn delete_api_key(&self, _: &str) -> crate::error::NovaResult<()> {
+            Err(crate::error::NovaError::Credential(
+                "synthetic failure".into(),
+            ))
+        }
+    }
+    let f = Fixture::new();
+    let v = FailingDelete(MemoryCredentialStore::default());
+    config::save_config(
+        &f.db,
+        &v,
+        f.config.clone(),
+        Some("NEW_SYNTHETIC_SECRET".into()),
+    )
+    .unwrap();
+    let status = config::cleanup_status(&f.db).unwrap();
+    assert_eq!(status["status"], "CLEANUP_PENDING");
+    assert_eq!(status["pending"], 1);
+    assert!(!encode(&status).unwrap().contains("SECRET"));
+    assert_eq!(
+        config::delete_key(&f.db, &v, &f.config.id).unwrap_err(),
+        "API_CREDENTIAL_DELETE_FAILED"
+    );
+}
+#[test]
+fn nova_node_recipe_uses_fixed_argv_cwd_and_explicit_environment_on_synthetic_project() {
+    let f = Fixture::new();
+    let program = std::env::var_os("PATH")
+        .and_then(|v| {
+            std::env::split_paths(&v)
+                .map(|p| p.join("node.exe"))
+                .find(|p| p.is_file())
+        })
+        .expect("installed Node required for Nova recipe test");
+    let module = f.root.join("apps/desktop/node_modules/vitest");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(module.join("vitest.mjs"),"import assert from 'node:assert/strict'; assert.equal(process.env.PATH,undefined); assert.equal(process.argv[2],'run'); assert.equal(process.argv[3],'src/apiTaskPanel.interaction.test.ts'); console.log('SYNTHETIC_NODE_PASS');").unwrap();
+    let spec = FixedTest {
+        program,
+        recipe: "nova_vitest_api2".into(),
+        ..f.test()
+    };
+    let files = vec![FileSnapshot {
+        path: "note.txt".into(),
+        identity: "unused".into(),
+        before: "unused".into(),
+        sha256: "unused".into(),
+    }];
+    let t = tool_snapshot(&spec, &f.root, &files).unwrap();
+    assert_eq!(t.cwd, f.root.join("apps/desktop"));
+    let ev = FixedTestRunner
+        .run(&t, &f.root, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(ev.status, "PASS");
+    assert!(ev.stdout.contains("SYNTHETIC_NODE_PASS"));
+}
+#[test]
+fn missing_test_evidence_and_receipt_binding_cannot_pass_existing_completion_gate() {
+    let f = Fixture::new();
+    let p = f.approved();
+    let mut api = FakeApi {
+        root: f.root.clone(),
+        ..Default::default()
+    };
+    let mut tests = FakeTests {
+        state: "PASS",
+        calls: 0,
+    };
+    task_loop::execute_loop(
+        &f.db,
+        &p.id,
+        &f.vault,
+        &mut api,
+        &mut tests,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let (_, _, _, mut summary) = load_plan(&f.db, &p.id).unwrap();
+    summary["tests"] = json!([]);
+    f.db.conn()
+        .execute(
+            "UPDATE api_task_runs SET summary_json=?1 WHERE id=?2",
+            rusqlite::params![encode(&summary).unwrap(), p.id],
+        )
+        .unwrap();
+    assert!(f
+        .db
+        .evaluate_acceptance_submission(&f.db.task(&f.task).unwrap())
+        .unwrap()
+        .is_err());
+    assert!(task_loop::user_decision(&f.db, &p.id, true, "must not accept").is_err());
+    assert!(f.db.user_acceptance_for_task(&f.task).unwrap().is_none());
+}
+#[test]
+fn failed_config_cas_cleanup_is_recorded_and_delete_cas_never_claims_success() {
+    struct FailDelete(MemoryCredentialStore);
+    impl CredentialStore for FailDelete {
+        fn save_api_key(&self, s: &str, k: &str) -> crate::error::NovaResult<()> {
+            self.0.save_api_key(s, k)
+        }
+        fn read_api_key(&self, s: &str) -> crate::error::NovaResult<Option<String>> {
+            self.0.read_api_key(s)
+        }
+        fn delete_api_key(&self, _: &str) -> crate::error::NovaResult<()> {
+            Err(crate::error::NovaError::Credential("synthetic".into()))
+        }
+    }
+    let f = Fixture::new();
+    f.db.conn().execute_batch("CREATE TRIGGER synthetic_conflict BEFORE UPDATE ON api_model_configs BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+    let v = FailDelete(MemoryCredentialStore::default());
+    assert_eq!(
+        config::save_config(
+            &f.db,
+            &v,
+            f.config.clone(),
+            Some("SYNTHETIC_NEW_KEY".into())
+        )
+        .unwrap_err(),
+        "API_CONFIG_CONFLICT"
+    );
+    assert_eq!(config::cleanup_status(&f.db).unwrap()["pending"], 1);
+    assert_eq!(
+        config::delete_key(&f.db, &f.vault, &f.config.id).unwrap_err(),
+        "API_KEY_DELETE_CONFIG_CONFLICT"
+    );
+}
+#[test]
+fn feedback_key_echo_rejected_before_acceptance_record_and_config_drift_can_be_declined() {
+    let f = Fixture::new();
+    let p = f.approved();
+    let mut a = FakeApi {
+        root: f.root.clone(),
+        ..Default::default()
+    };
+    let mut t = FakeTests {
+        state: "PASS",
+        calls: 0,
+    };
+    task_loop::execute_loop(
+        &f.db,
+        &p.id,
+        &f.vault,
+        &mut a,
+        &mut t,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert!(task_loop::user_decision_with_vault(
+        &f.db,
+        &f.vault,
+        &p.id,
+        true,
+        "SYNTHETIC_SECRET_VALUE_12345678"
+    )
+    .is_err());
+    assert!(f.db.user_acceptance_for_task(&f.task).unwrap().is_none());
+    config::save_config(&f.db, &f.vault, f.config.clone(), None).unwrap();
+    assert!(task_loop::user_decision_with_vault(&f.db, &f.vault, &p.id, true, "accept").is_err());
+    task_loop::user_decision_with_vault(
+        &f.db,
+        &f.vault,
+        &p.id,
+        false,
+        "update configuration then reapprove",
+    )
+    .unwrap();
+    assert_eq!(
+        f.db.task(&f.task).unwrap().state,
+        TaskState::NeedsUserAction
+    );
+}
+#[test]
+fn pending_cancellation_releases_serial_slot_without_erasing_approval_scope() {
+    let f = Fixture::new();
+    let p = f.approved();
+    task_loop::cancel_pending(&f.db, &f.task).unwrap();
+    assert_eq!(status(&f.db, &p.id).unwrap()["phase"], "CANCELLED");
+    let mut a = FakeApi::default();
+    let mut t = FakeTests {
+        state: "PASS",
+        calls: 0,
+    };
+    assert!(execute(
+        &f.db,
+        &p.id,
+        &f.vault,
+        &mut a,
+        &mut t,
+        &CancellationToken::new()
+    )
+    .is_err());
+    assert!(a.calls.is_empty());
+    assert_eq!(
+        f.db.conn()
+            .query_row(
+                "SELECT count(*) FROM api_task_runs WHERE phase NOT IN ('CANCELLED')",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        f.db.conn()
+            .query_row("SELECT count(*) FROM api_task_scopes", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+#[test]
+fn publication_failure_is_unknown_and_frozen_legacy_task_never_prepares() {
+    let f = Fixture::new();
+    let p = f.approved();
+    f.db.conn().execute_batch("CREATE TRIGGER synthetic_publish_failure BEFORE UPDATE OF state ON tasks WHEN NEW.state='queued' BEGIN SELECT RAISE(ABORT,'synthetic publication failure'); END;").unwrap();
+    let mut a = FakeApi {
+        root: f.root.clone(),
+        ..Default::default()
+    };
+    let mut t = FakeTests {
+        state: "PASS",
+        calls: 0,
+    };
+    let r = task_loop::execute_loop(
+        &f.db,
+        &p.id,
+        &f.vault,
+        &mut a,
+        &mut t,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(r["phase"], "UNKNOWN");
+    assert_eq!(a.calls.len(), 2);
+    assert_eq!(f.db.task(&f.task).unwrap().state, TaskState::Confirmed);
+    assert!(execute(
+        &f.db,
+        &p.id,
+        &f.vault,
+        &mut a,
+        &mut t,
+        &CancellationToken::new()
+    )
+    .is_err());
+    assert_eq!(a.calls.len(), 2);
+    let f = Fixture::new();
+    f.db.conn()
+        .execute(
+            "UPDATE tasks SET legacy_classification='unknown_insufficient' WHERE id=?1",
+            [&f.task],
+        )
+        .unwrap();
+    assert_eq!(
+        prepare(
+            &f.db,
+            &f.vault,
+            &f.task,
+            &f.config.id,
+            vec!["note.txt".into()],
+            vec![f.test()]
+        )
+        .unwrap_err(),
+        "API_LEGACY_TASK_FROZEN"
+    );
+}
+#[test]
+fn user_feedback_can_consume_existing_grant_but_drift_cannot_inherit_it() {
+    for drift in [false, true] {
+        let f = Fixture::new();
+        let p = prepare_scoped(
+            &f.db,
+            &f.vault,
+            &f.task,
+            &f.config.id,
+            vec!["note.txt".into()],
+            vec![f.test()],
+            true,
+            None,
+        )
+        .unwrap();
+        approve(&f.db, &p.id, &hash(encode(&p).unwrap().as_bytes())).unwrap();
+        let mut first = FakeApi {
+            root: f.root.clone(),
+            ..Default::default()
+        };
+        let mut tests = FakeTests {
+            state: "PASS",
+            calls: 0,
+        };
+        task_loop::execute_loop(
+            &f.db,
+            &p.id,
+            &f.vault,
+            &mut first,
+            &mut tests,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        task_loop::user_decision_with_vault(&f.db, &f.vault, &p.id, false, "repair within scope")
+            .unwrap();
+        if drift {
+            std::fs::write(f.root.join("note.txt"), "USER EDIT").unwrap();
+        }
+        let mut second = LoopApi {
+            calls: 0,
+            reviews: 1,
+            fail_second: false,
+        };
+        let r = task_loop::execute_loop(
+            &f.db,
+            &p.id,
+            &f.vault,
+            &mut second,
+            &mut tests,
+            &CancellationToken::new(),
+        );
+        if drift {
+            assert!(r.is_err());
+            assert_eq!(second.calls, 0);
+            assert_eq!(
+                std::fs::read_to_string(f.root.join("note.txt")).unwrap(),
+                "USER EDIT"
+            );
+        } else {
+            assert_eq!(r.unwrap()["phase"], "AWAITING_USER");
+            assert_eq!(second.calls, 2);
+            assert_eq!(
+                task_loop::report(&f.db, &f.task).unwrap()["repair_count"],
+                1
+            );
+        }
+    }
+}
+#[test]
+fn selected_project_root_drift_rejects_before_send() {
+    let f = Fixture::new();
+    let p = f.approved();
+    let other = f.root.join("different-root");
+    std::fs::create_dir(&other).unwrap();
+    f.db.conn()
+        .execute(
+            "UPDATE nova_projects SET local_path=?1 WHERE id=?2",
+            rusqlite::params![other.to_string_lossy(), p.project_id],
+        )
+        .unwrap();
+    let mut a = FakeApi::default();
+    let mut t = FakeTests {
+        state: "PASS",
+        calls: 0,
+    };
+    assert_eq!(
+        execute(
+            &f.db,
+            &p.id,
+            &f.vault,
+            &mut a,
+            &mut t,
+            &CancellationToken::new()
+        )
+        .unwrap_err(),
+        "API_PROJECT_ROOT_DRIFT"
+    );
+    assert!(a.calls.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("note.txt")).unwrap(),
+        p.files[0].before
     );
 }

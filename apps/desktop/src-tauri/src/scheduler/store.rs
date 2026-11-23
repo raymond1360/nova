@@ -201,7 +201,7 @@ impl Store {
                 step(&db, &task.id, state, actor, "INIT")?;
             }
             let v: i64 = sql(db.conn().query_row("PRAGMA user_version", [], |r| r.get(0)))?;
-            if !matches!(v, 12 | 13) {
+            if !matches!(v, 12 | 13 | 14) {
                 return Err("PRODUCT_SCHEMA_UNSUPPORTED");
             }
             sql(db.conn().execute("INSERT INTO scheduler_meta VALUES(1,'NOVA_SH1_OWNED_V1','INTERNAL_HANDOFF_ONLY',?4,?1,?2,?3,1)",params![owner.db_id,owner.root,v,version]))?;
@@ -273,7 +273,7 @@ impl Store {
                 product_version,
                 1,
             )
-            || !matches!(product_version, 12 | 13)
+            || !matches!(product_version, 12 | 13 | 14)
             || sql(
                 c.query_row("SELECT COUNT(*) FROM scheduler_packages", [], |r| {
                     r.get::<_, i64>(0)

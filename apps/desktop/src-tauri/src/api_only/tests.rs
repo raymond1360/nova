@@ -1311,3 +1311,98 @@ fn selected_project_root_drift_rejects_before_send() {
         p.files[0].before
     );
 }
+#[test]
+fn full_loop_edits_python_function_runs_real_unittest_reviews_and_waits_for_user() {
+    let f = Fixture::new();
+    std::fs::write(
+        f.root.join("subject.py"),
+        "def normalize(value):\n    return value\n",
+    )
+    .unwrap();
+    std::fs::create_dir(f.root.join("tests")).unwrap();
+    std::fs::write(f.root.join("tests/test_subject.py"),"import unittest,importlib.util\ns=importlib.util.spec_from_file_location('subject','subject.py')\nm=importlib.util.module_from_spec(s)\ns.loader.exec_module(m)\nclass T(unittest.TestCase):\n def test_behavior(self):\n  self.assertEqual(m.normalize(' Alpha '),'alpha')\n  self.assertEqual(m.normalize(' Ä '),'ä')\n").unwrap();
+    let old = f.db.task(&f.task).unwrap();
+    let task =
+        f.db.create_task(
+            &CreateTaskRequest {
+                project_id: old.project_id,
+                title: "Normalize function".into(),
+                goal: Some("Normalize input by trimming and lowercasing".into()),
+                in_scope: Some("subject.py".into()),
+                not_in_scope: Some("No other source edits".into()),
+                done_criteria: Some("Python unittest passes".into()),
+                ai_kind: None,
+            },
+            Actor::User,
+        )
+        .unwrap();
+    for state in [TaskState::AwaitingConfirmation, TaskState::Confirmed] {
+        f.db.transition_task(&task.id, state, Actor::User, None, None, false, None)
+            .unwrap();
+    }
+    let test = FixedTest {
+        file: "subject.py".into(),
+        recipe: "python_unittest".into(),
+        ..f.test()
+    };
+    let p = prepare_scoped(
+        &f.db,
+        &f.vault,
+        &task.id,
+        &f.config.id,
+        vec!["subject.py".into()],
+        vec![test],
+        false,
+        None,
+    )
+    .unwrap();
+    approve(&f.db, &p.id, &hash(encode(&p).unwrap().as_bytes())).unwrap();
+    struct FunctionalApi(usize);
+    impl ApiPort for FunctionalApi {
+        fn send(
+            &mut self,
+            r: &transport::WireRequest,
+            _: &SecretLease,
+            _: &CancellationToken,
+        ) -> Result<Vec<u8>> {
+            self.0 += 1;
+            let b: Value = decode(&r.body, 131072)?;
+            let input: Value = decode(
+                b["messages"][1]["content"].as_str().unwrap().as_bytes(),
+                131072,
+            )?;
+            let v = if self.0 == 1 {
+                json!({"schema":"nova.api.edits/1","edits":[{"schema":"nova.relay.proposal/1","target_path":"subject.py","old_text":"return value","new_text":"return value.strip().lower()","rationale":"Implement approved function behavior"}]})
+            } else {
+                assert_eq!(input["actual_tests"][0]["status"], "PASS");
+                assert_eq!(input["actual_tests"][0]["exit_code"], 0);
+                json!({"schema":"nova.relay.review/1","base_sha256":input["base_sha256"],"candidate_sha256":input["candidate_sha256"],"verdict":"PASS","issues":[],"unknowns":[]})
+            };
+            Ok(serde_json::to_vec(&json!({"model":b["model"],"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":encode(&v)?}}]})).unwrap())
+        }
+    }
+    let mut api = FunctionalApi(0);
+    let result = task_loop::execute_loop(
+        &f.db,
+        &p.id,
+        &f.vault,
+        &mut api,
+        &mut FixedTestRunner,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(api.0, 2);
+    assert_eq!(result["phase"], "AWAITING_USER");
+    assert_eq!(
+        f.db.task(&task.id).unwrap().state,
+        TaskState::AwaitingUserAcceptance
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("subject.py")).unwrap(),
+        "def normalize(value):\n    return value.strip().lower()\n"
+    );
+    assert!(!f.root.join("__pycache__").exists());
+    task_loop::user_decision_with_vault(&f.db, &f.vault, &p.id, true, "synthetic user acceptance")
+        .unwrap();
+    assert_eq!(f.db.task(&task.id).unwrap().state, TaskState::Completed);
+}

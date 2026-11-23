@@ -9,6 +9,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import RequirementWorkspace from './RequirementWorkspace.vue'
 import ApiTaskPanel from './ApiTaskPanel.vue'
+import ApiPmPanel from './ApiPmPanel.vue'
 import { invoke } from '@tauri-apps/api/core'
 import type { Binding } from '../stores/workspace'
 import { useCoreLoopStore } from '../stores/coreLoop'
@@ -54,6 +55,17 @@ async function openBoundTask(binding: Binding) {
 
 watch(() => [store.currentProject?.id, store.currentTask?.id, store.currentTask?.state,
   store.currentTask?.result_generation], () => { void store.loadVerifyOnlyEligibility() }, { immediate: true })
+async function refreshPmTask(taskId: string) {
+  const projectId = store.currentProject?.id
+  if (!projectId) return
+  try {
+    const tasks = await invoke<import('../types').Task[]>('list_tasks_for_project', { projectId })
+    if (store.currentProject?.id !== projectId) return
+    store.tasks = tasks
+    const task = tasks.find(t => t.id === taskId)
+    if (task) store.selectTask(task)
+  } catch { store.lastError = '协调记录已保留，任务列表读取失败，请刷新项目。' }
+}
 const refreshMessage = ref('')
 async function handleRefreshTask() {
   refreshMessage.value = ''
@@ -327,6 +339,7 @@ async function handleViewDocument(documentType: string) {
 <template>
   <div class="core-loop-view">
     <h2>项目与任务 · API开发</h2>
+    <ApiPmPanel v-if="store.currentProject" :key="store.currentProject.id" :project-id="store.currentProject.id" @task-created="refreshPmTask" @refresh="refreshPmTask" />
     <ApiTaskPanel v-if="store.currentTask" :key="store.currentTask.id" :task="store.currentTask" @refresh="store.refreshCurrentTask()" />
     <p v-if="store.restoring" class="hint">正在恢复上次会话…</p>
     <p v-if="store.lastError" class="error-banner" role="alert">{{ store.lastError }}</p>

@@ -340,7 +340,7 @@ fn task_snapshot_for_gate(db: &Database, t: &crate::models::Task) -> Result<Valu
         json!({"task":t,"binding":binding,"requirements":db.list_confirmed_requirement_items(&t.id).map_err(|_|"API_REQUIREMENT_READ_FAILED")?}),
     )
 }
-fn publish(db: &Database, id: &str) -> Result<()> {
+pub(super) fn publish(db: &Database, id: &str) -> Result<()> {
     let (p, _, phase, mut s) = load_plan(db, id)?;
     if phase != "AWAITING_USER" {
         return Err("API_ACCEPTANCE_NOT_READY");
@@ -461,12 +461,13 @@ pub fn report(db: &Database, task: &str) -> Result<Value> {
         .collect::<Result<Vec<_>>>()?;
     let task = db.task(task).map_err(|_| "API_TASK_MISSING")?;
     let latest = runs.last().cloned().unwrap_or(Value::Null);
+    let pm_packet_id:Option<String>=sql(db.conn().query_row("SELECT id FROM api_pm_packets WHERE task_id=?1",[&task.id],|r|r.get(0)).optional())?;
     let config_id = ids
         .last()
         .map(|id| load_plan(db, id).map(|p| p.0.config.config.id))
         .transpose()?;
     Ok(
-        json!({"schema":"nova.api.pm-report/1","task":task,"task_goal":task.goal,"changes":latest["summary"]["changes"],"actual_tests":latest["summary"]["tests"],"self_check":latest["summary"]["review"],"blockers":{"phase":latest["phase"],"error":latest["summary"]["error_code"]},"plans":ids.iter().map(|id|load_plan(db,id).map(|v|v.0)).collect::<Result<Vec<_>>>()?,"runs":runs,"repair_count":ids.len().saturating_sub(1),"roles":{"developer":{"config_id":config_id},"reviewer":{"config_id":config_id,"independent_context":true},"pm":null},"decision_required":if task.state==TaskState::Completed{"NONE"}else{"USER_ACCEPTANCE_OR_PM_REMEDIATION"}}),
+        json!({"pm_packet_id":pm_packet_id,"schema":"nova.api.pm-report/1","task":task,"task_goal":task.goal,"changes":latest["summary"]["changes"],"actual_tests":latest["summary"]["tests"],"self_check":latest["summary"]["review"],"blockers":{"phase":latest["phase"],"error":latest["summary"]["error_code"]},"plans":ids.iter().map(|id|load_plan(db,id).map(|v|v.0)).collect::<Result<Vec<_>>>()?,"runs":runs,"repair_count":ids.len().saturating_sub(1),"roles":{"developer":{"config_id":config_id},"reviewer":{"config_id":config_id,"independent_context":true},"pm":null},"decision_required":if task.state==TaskState::Completed{"NONE"}else{"USER_ACCEPTANCE_OR_PM_REMEDIATION"}}),
     )
 }
 

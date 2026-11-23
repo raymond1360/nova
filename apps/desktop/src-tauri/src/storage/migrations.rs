@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// Current schema version this build of Nova understands. Bump this and
 /// append a new [`Migration`] to [`MIGRATIONS`] whenever the schema changes
 /// — never edit an already-shipped migration's SQL in place.
-pub const CURRENT_SCHEMA_VERSION: i64 = 14;
+pub const CURRENT_SCHEMA_VERSION: i64 = 15;
 
 #[derive(Debug)]
 pub enum MigrationError {
@@ -1082,6 +1082,7 @@ const MIGRATIONS: &[Migration] = &[
     Migration { version: 12, requires_backup: true, sql: V12_SQL },
     Migration { version: 13, requires_backup: true, sql: include_str!("api_only_v13.sql") },
     Migration { version: 14, requires_backup: true, sql: include_str!("api_only_v14.sql") },
+    Migration { version: 15, requires_backup: true, sql: include_str!("api_pm_v15.sql") },
 ];
 
 #[cfg(test)]

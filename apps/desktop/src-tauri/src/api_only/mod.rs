@@ -3,6 +3,7 @@ pub mod commands;
 pub mod config;
 pub mod recipes;
 pub mod task_loop;
+pub mod pm;
 pub mod transport;
 use crate::{credential::CredentialStore, db::Database, execution_safety::*};
 pub use config::{Config, ConfigView, Protocol, Provider};
@@ -345,6 +346,7 @@ fn validate_current(db: &Database, p: &Plan) -> Result<config::StoredConfig> {
         let parent = p.parent_run.as_deref().ok_or("API_APPROVAL_MISMATCH")?;
         task_loop::parent_grant(db, parent, Some(p), true)?;
     }
+    pm::validate_bound(db, p)?;
     validate_root(db, p)?;
     if p.schema != "nova.api.task/1" || p.expires_utc <= now_utc() {
         return Err("API_APPROVAL_EXPIRED");
@@ -503,7 +505,14 @@ pub fn execute<P: ApiPort, T: TestPort>(
     test: &mut T,
     cancel: &CancellationToken,
 ) -> Result<Value> {
+    execute_staged(db, id, vault, api, test, cancel, None)
+}
+pub(super) trait ReviewPolicy {
+    fn before_review(&mut self, plan: &Plan, evidence: &Value) -> Result<()>;
+}
+fn execute_staged<P: ApiPort, T: TestPort>(db: &Database, id: &str, vault: &dyn CredentialStore, api: &mut P, test: &mut T, cancel: &CancellationToken, mut policy: Option<&mut dyn ReviewPolicy>) -> Result<Value> {
     let (p, _, phase, mut summary) = load_plan(db, id)?;
+    if pm::managed(db, &p.task_id)? && policy.is_none() { return Err("API_PM_COORDINATOR_REQUIRED"); }
     if phase != "APPROVED" {
         return Err("API_RUN_ALREADY_STARTED");
     }
@@ -665,6 +674,7 @@ pub fn execute<P: ApiPort, T: TestPort>(
         );
         let after:Vec<_>=p.files.iter().map(|f|json!({"path":f.path,"sha256":changes.iter().find(|c|c.path==f.path).map_or(&f.sha256,|c|&c.candidate.candidate_sha256)})).collect();
         let after_hash = hash(encode(&after)?.as_bytes());
+        if let Some(polic) = policy.as_mut() { polic.before_review(&p, &summary)?; }
         summary["review_attempts_reserved"] = json!(1);
         cas(db, id, stage, "REVIEW_STARTED", &summary)?;
         stage = "REVIEW_STARTED";

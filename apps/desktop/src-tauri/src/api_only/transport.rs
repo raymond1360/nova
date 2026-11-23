@@ -58,6 +58,10 @@ pub(crate) fn completion<P: ApiPort>(
     key.scan_json(content.as_bytes(), 131072)?;
     let contract = if role == "DEVELOP" {
         "Return only JSON {schema:nova.api.edits/1,edits:[Proposal]}. Each Proposal has exactly five String fields: schema=nova.relay.proposal/1,target_path,old_text,new_text,rationale. Only listed paths; unique replacement fragments, not whole files. old_text nonempty <=8192 UTF8 bytes, new_text<=16384, rationale<=2048; no CR/NUL in fragments. No tools or commands."
+    } else if role == "PM_PLAN" {
+        "Return exactly JSON {schema:nova.api.pm.draft/1,action:ARRANGE_DEVELOP|CLARIFY|STOP,goal:String,requirements:String,acceptance:String,files:[String],test_recipes:[String],reason:String}. Use the user's exact selected files and test recipes, never expand scope. Provide concrete requirements and acceptance criteria or request clarification/splitting. No tools, user approval, or claims of execution."
+    } else if role == "PM_DECIDE" {
+        "Return exactly JSON {schema:nova.api.pm.decision/1,action:ARRANGE_REVIEW|REPAIR|DELIVER|CLARIFY|STOP,reason:String}. Choose only one of allowed_actions in this tool-fact packet. Never invent tests, approval, acceptance, or change scope. Independent review is mandatory. No tools."
     } else {
         "Return only ReviewClaim JSON: schema=nova.relay.review/1,base_sha256 and candidate_sha256 exactly from this packet,verdict PASS/CHANGES_REQUIRED/BLOCKED,issues array (id R-1 etc,severity BLOCKER/HIGH/MEDIUM/LOW/INFO,blocking bool,location,summary),unknowns array. Independent read-only review. No tools; never claim tests ran if NOT RUN. PASS requires no issues or unknowns."
     };

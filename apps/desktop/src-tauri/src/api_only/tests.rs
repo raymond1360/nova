@@ -2022,3 +2022,616 @@ fn child_rechecks_persisted_parent_grant_and_link() {
     assert!(api.calls.is_empty());
     assert_eq!(tests.calls, 0);
 }
+
+#[cfg(test)]
+mod pm_cases {
+    use super::*;
+    use crate::api_only::pm;
+    struct PmApi {
+        calls: Vec<Value>,
+        mode: &'static str,
+    }
+    impl ApiPort for PmApi {
+        fn send(
+            &mut self,
+            r: &transport::WireRequest,
+            _: &SecretLease,
+            cancel: &CancellationToken,
+        ) -> Result<Vec<u8>> {
+            let body: Value = decode(&r.body, 131072)?;
+            let input: Value = decode(
+                body["messages"][1]["content"].as_str().unwrap().as_bytes(),
+                131072,
+            )?;
+            self.calls.push(body.clone());
+            assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+            assert!(body.get("tools").is_none());
+            if self.mode == "unknown" {
+                return Err("API_RESPONSE_UNKNOWN");
+            }
+            if self.mode == "cancel" {
+                cancel.cancel();
+                return Err("API_CANCELLED_UNKNOWN");
+            }
+            if self.mode == "expired" {
+                TEST_CLOCK.with(|v| v.set(Some(now_utc() + 4000)));
+            }
+            let output = if input.get("goal").is_some() {
+                json!({"schema":"nova.api.pm.draft/1","action":"ARRANGE_DEVELOP","goal":"Change Alpha to beta","requirements":"Change the approved word only","acceptance":"Expected exact beta text; fixed tests and independent review pass","files":if self.mode=="outside"{json!(["../secret"])}else{json!(["note.txt"])},"test_recipes":input["fixed_tests"].as_array().unwrap().iter().map(|v|v["specification"]["recipe"].clone()).collect::<Vec<_>>(),"reason":"Concrete bounded task"})
+            } else {
+                let allowed = input["allowed_actions"].as_array().unwrap();
+                let action = if self.mode == "invalid" {
+                    "COMPLETE_TASK"
+                } else if self.mode == "skip" {
+                    "DELIVER"
+                } else if self.mode == "second_repair" && self.calls.len() == 5 {
+                    "REPAIR"
+                } else {
+                    allowed[0].as_str().unwrap()
+                };
+                json!({"schema":"nova.api.pm.decision/1","action":action,"reason":"Based only on actual tool receipts"})
+            };
+            Ok(encode(&json!({"model":body["model"],"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":encode(&output)?}}]}))?.into_bytes())
+        }
+    }
+    fn request(f: &Fixture, test: FixedTest) -> pm::Request {
+        pm::Request {
+            project_id: f.db.task(&f.task).unwrap().project_id,
+            goal: "Change Alpha to beta".into(),
+            pm_config_id: f.config.id.clone(),
+            execution_config_id: f.config.id.clone(),
+            paths: vec!["note.txt".into()],
+            tests: vec![test],
+            allow_repair: true,
+        }
+    }
+    fn prepared(f: &Fixture, test: FixedTest, pm_api: &mut PmApi) -> Value {
+        let s = pm::prepare(&f.db, &f.vault, request(f, test)).unwrap();
+        pm::plan(
+            &f.db,
+            &f.vault,
+            s["id"].as_str().unwrap(),
+            s["digest"].as_str().unwrap(),
+            true,
+            pm_api,
+            &CancellationToken::new(),
+        )
+        .unwrap()
+    }
+    fn ready(f: &Fixture, test: FixedTest, api: &mut PmApi) -> Value {
+        let s = prepared(f, test, api);
+        let s = pm::confirm(&f.db, &f.vault, s["id"].as_str().unwrap()).unwrap();
+        pm::approve(
+            &f.db,
+            s["id"].as_str().unwrap(),
+            s["execution_approval_digest"].as_str().unwrap(),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn pm_planning_consent_and_refresh_are_read_only() {
+        let f = Fixture::new();
+        let s = pm::prepare(&f.db, &f.vault, request(&f, f.test())).unwrap();
+        let id = s["id"].as_str().unwrap();
+        let mut api = PmApi {
+            calls: vec![],
+            mode: "",
+        };
+        assert_eq!(
+            pm::plan(
+                &f.db,
+                &f.vault,
+                id,
+                s["digest"].as_str().unwrap(),
+                false,
+                &mut api,
+                &CancellationToken::new()
+            )
+            .unwrap_err(),
+            "API_PM_PLANNING_CONSENT_REQUIRED"
+        );
+        for _ in 0..3 {
+            assert_eq!(pm::status(&f.db, id).unwrap()["pm_requests_reserved"], 0);
+        }
+        assert!(api.calls.is_empty());
+        assert_eq!(
+            std::fs::read(f.root.join("note.txt")).unwrap(),
+            b"Alpha \xc3\x84\r\nend\r\n"
+        );
+    }
+    #[test]
+    fn pm_end_to_end_real_unittest_and_user_only_acceptance() {
+        let f = Fixture::new();
+        std::fs::create_dir(f.root.join("tests")).unwrap();
+        // Python recipe intentionally retains -I/-S; test accesses an explicit local fixture path.
+        let path = encode(&f.root.join("note.txt").to_string_lossy()).unwrap();
+        std::fs::write(f.root.join("tests/test_word.py"),format!("import unittest\nfrom pathlib import Path\nclass Word(unittest.TestCase):\n def test_word(self):\n  self.assertEqual(Path({path}).read_bytes(), b'beta \\xc3\\x84\\r\\nend\\r\\n')\n")).unwrap();
+        let mut spec = f.test();
+        spec.recipe = "python_unittest".into();
+        let mut pm_api = PmApi {
+            calls: vec![],
+            mode: "",
+        };
+        let s = ready(&f, spec, &mut pm_api);
+        let id = s["id"].as_str().unwrap();
+        let mut api = FakeApi {
+            root: f.root.clone(),
+            ..Default::default()
+        };
+        let result = pm::execute(
+            &f.db,
+            &f.vault,
+            id,
+            &mut pm_api,
+            &mut api,
+            &mut FixedTestRunner,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(result["phase"], "AWAITING_USER");
+        assert_eq!(pm_api.calls.len(), 3);
+        assert_eq!(api.calls.len(), 2);
+        assert_eq!(
+            result["execution"]["summary"]["tests"][0]["counts"]["executed"],
+            1
+        );
+        let task = result["task_id"].as_str().unwrap();
+        assert_eq!(
+            f.db.task(task).unwrap().state,
+            TaskState::AwaitingUserAcceptance
+        );
+        assert!(pm::execute(
+            &f.db,
+            &f.vault,
+            id,
+            &mut pm_api,
+            &mut api,
+            &mut FixedTestRunner,
+            &CancellationToken::new()
+        )
+        .is_err());
+        assert_eq!(api.calls.len(), 2);
+        task_loop::user_decision(
+            &f.db,
+            result["run_id"].as_str().unwrap(),
+            true,
+            "User accepts",
+        )
+        .unwrap();
+        assert_eq!(f.db.task(task).unwrap().state, TaskState::Completed);
+    }
+    #[test]
+    fn pm_authorized_once_repair_preserves_shared_scope() {
+        let f = Fixture::new();
+        std::fs::create_dir(f.root.join("tests")).unwrap();
+        let path = encode(&f.root.join("note.txt").to_string_lossy()).unwrap();
+        std::fs::write(f.root.join("tests/test_repair.py"),format!("import unittest\nfrom pathlib import Path\nclass Word(unittest.TestCase):\n def test_repair(self):\n  self.assertTrue(Path({path}).read_bytes().startswith(b'gamma'))\n")).unwrap();
+        let mut spec = f.test();
+        spec.recipe = "python_unittest".into();
+        let mut pm_api = PmApi {
+            calls: vec![],
+            mode: "",
+        };
+        let s = ready(&f, spec, &mut pm_api);
+        let mut api = LoopApi {
+            calls: 0,
+            reviews: 0,
+            fail_second: false,
+        };
+        let r = pm::execute(
+            &f.db,
+            &f.vault,
+            s["id"].as_str().unwrap(),
+            &mut pm_api,
+            &mut api,
+            &mut FixedTestRunner,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(r["phase"], "AWAITING_USER");
+        assert_eq!(r["pm_requests_reserved"], 5);
+        assert_eq!(api.calls, 4);
+        assert_eq!(r["report"]["repair_count"], 1);
+        assert_eq!(
+            r["report"]["runs"][0]["summary"]["tests"][0]["status"],
+            "FAIL"
+        );
+        assert_eq!(
+            r["execution"]["summary"]["tests"][0]["counts"]["executed"],
+            1
+        );
+    }
+    #[test]
+    fn pm_invalid_skip_review_and_second_repair_are_rejected() {
+        for mode in ["invalid", "skip", "second_repair"] {
+            let f = Fixture::new();
+            let mut pm_api = PmApi {
+                calls: vec![],
+                mode: "",
+            };
+            let s = ready(&f, f.test(), &mut pm_api);
+            pm_api.mode = mode;
+            let mut api = LoopApi {
+                calls: 0,
+                reviews: 0,
+                fail_second: false,
+            };
+            let mut tests = FakeTests {
+                state: "PASS",
+                calls: 0,
+            };
+            assert!(pm::execute(
+                &f.db,
+                &f.vault,
+                s["id"].as_str().unwrap(),
+                &mut pm_api,
+                &mut api,
+                &mut tests,
+                &CancellationToken::new()
+            )
+            .is_err());
+            assert_ne!(
+                f.db.task(s["task_id"].as_str().unwrap()).unwrap().state,
+                TaskState::Completed
+            );
+            if mode != "second_repair" {
+                assert_eq!(api.calls, 1);
+            } else {
+                assert_eq!(api.calls, 4);
+            }
+        }
+    }
+    #[test]
+    fn pm_failed_tests_cannot_be_delivered() {
+        let f = Fixture::new();
+        let mut pm_api = PmApi {
+            calls: vec![],
+            mode: "",
+        };
+        let s = ready(&f, f.test(), &mut pm_api);
+        // Review still happens, then an impossible DELIVER action must be rejected.
+        struct SkipAfter(PmApi);
+        impl ApiPort for SkipAfter {
+            fn send(
+                &mut self,
+                r: &transport::WireRequest,
+                k: &SecretLease,
+                c: &CancellationToken,
+            ) -> Result<Vec<u8>> {
+                if self.0.calls.len() == 2 {
+                    self.0.mode = "skip"
+                }
+                self.0.send(r, k, c)
+            }
+        }
+        let mut pm_api = SkipAfter(pm_api);
+        let mut api = FakeApi {
+            root: f.root.clone(),
+            ..Default::default()
+        };
+        let mut tests = FakeTests {
+            state: "FAIL",
+            calls: 0,
+        };
+        assert!(pm::execute(
+            &f.db,
+            &f.vault,
+            s["id"].as_str().unwrap(),
+            &mut pm_api,
+            &mut api,
+            &mut tests,
+            &CancellationToken::new()
+        )
+        .is_err());
+        assert_eq!(api.calls.len(), 2);
+        assert_eq!(tests.calls, 1);
+        assert_eq!(
+            f.db.task(s["task_id"].as_str().unwrap()).unwrap().state,
+            TaskState::Confirmed
+        );
+    }
+    #[test]
+    fn pm_scope_invalid_response_failure_cancel_unknown_no_replay() {
+        for mode in ["outside", "unknown", "cancel"] {
+            let f = Fixture::new();
+            let s = pm::prepare(&f.db, &f.vault, request(&f, f.test())).unwrap();
+            let id = s["id"].as_str().unwrap();
+            let mut api = PmApi {
+                calls: vec![],
+                mode,
+            };
+            assert!(pm::plan(
+                &f.db,
+                &f.vault,
+                id,
+                s["digest"].as_str().unwrap(),
+                true,
+                &mut api,
+                &CancellationToken::new()
+            )
+            .is_err());
+            assert!(pm::plan(
+                &f.db,
+                &f.vault,
+                id,
+                s["digest"].as_str().unwrap(),
+                true,
+                &mut api,
+                &CancellationToken::new()
+            )
+            .is_err());
+            assert_eq!(api.calls.len(), 1);
+            assert!(pm::status(&f.db, id).unwrap()["task_id"].is_null());
+            assert_eq!(
+                std::fs::read(f.root.join("note.txt")).unwrap(),
+                b"Alpha \xc3\x84\r\nend\r\n"
+            );
+        }
+    }
+    #[test]
+    fn pm_config_drift_and_expiry_stop_before_send() {
+        for expired in [false, true] {
+            let f = Fixture::new();
+            let mut api = PmApi {
+                calls: vec![],
+                mode: "",
+            };
+            let s = ready(&f, f.test(), &mut api);
+            if expired {
+                TEST_CLOCK.with(|v| v.set(Some(now_utc() + 4000)));
+            } else {
+                let mut cfg = f.config.clone();
+                cfg.model = "changed-selected-model".into();
+                config::save_config(&f.db, &f.vault, cfg, None).unwrap();
+            }
+            let mut dev = FakeApi::default();
+            let mut tests = FakeTests {
+                state: "PASS",
+                calls: 0,
+            };
+            assert!(pm::execute(
+                &f.db,
+                &f.vault,
+                s["id"].as_str().unwrap(),
+                &mut api,
+                &mut dev,
+                &mut tests,
+                &CancellationToken::new()
+            )
+            .is_err());
+            assert_eq!(api.calls.len(), 1);
+            assert!(dev.calls.is_empty());
+            assert_eq!(tests.calls, 0);
+            TEST_CLOCK.with(|v| v.set(None));
+        }
+    }
+    #[test]
+    fn pm_response_crossing_deadline_does_not_create_task() {
+        let f = Fixture::new();
+        let s = pm::prepare(&f.db, &f.vault, request(&f, f.test())).unwrap();
+        let mut api = PmApi {
+            calls: vec![],
+            mode: "expired",
+        };
+        let r = pm::plan(
+            &f.db,
+            &f.vault,
+            s["id"].as_str().unwrap(),
+            s["digest"].as_str().unwrap(),
+            true,
+            &mut api,
+            &CancellationToken::new(),
+        );
+        TEST_CLOCK.with(|v| v.set(None));
+        assert_eq!(r.unwrap_err(), "API_APPROVAL_EXPIRED");
+        assert!(pm::status(&f.db, s["id"].as_str().unwrap()).unwrap()["task_id"].is_null());
+    }
+    #[test]
+    fn pm_different_configuration_references_are_preserved() {
+        let f = Fixture::new();
+        let mut pmconfig = f.config.clone();
+        pmconfig.id = uuid::Uuid::new_v4().to_string();
+        pmconfig.model = "independent-pm-model".into();
+        config::save_config(
+            &f.db,
+            &f.vault,
+            pmconfig.clone(),
+            Some("SYNTHETIC_PM_SECRET_123456789".into()),
+        )
+        .unwrap();
+        let mut req = request(&f, f.test());
+        req.pm_config_id = pmconfig.id.clone();
+        let s = pm::prepare(&f.db, &f.vault, req).unwrap();
+        let mut api = PmApi {
+            calls: vec![],
+            mode: "",
+        };
+        let s = pm::plan(
+            &f.db,
+            &f.vault,
+            s["id"].as_str().unwrap(),
+            s["digest"].as_str().unwrap(),
+            true,
+            &mut api,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(api.calls[0]["model"], pmconfig.model);
+        assert_eq!(s["packet"]["execution"]["config"]["id"], f.config.id);
+    }
+    #[test]
+    fn pm_direct_api_loop_cannot_bypass_coordination() {
+        let f = Fixture::new();
+        let mut pm_api = PmApi {
+            calls: vec![],
+            mode: "",
+        };
+        let s = ready(&f, f.test(), &mut pm_api);
+        let mut api = FakeApi {
+            root: f.root.clone(),
+            ..Default::default()
+        };
+        let mut tests = FakeTests {
+            state: "PASS",
+            calls: 0,
+        };
+        assert_eq!(
+            task_loop::execute_loop(
+                &f.db,
+                s["run_id"].as_str().unwrap(),
+                &f.vault,
+                &mut api,
+                &mut tests,
+                &CancellationToken::new()
+            )
+            .unwrap_err(),
+            "API_PM_COORDINATOR_REQUIRED"
+        );
+        assert!(api.calls.is_empty());
+    }
+    #[test]
+    fn pm_mid_handoff_failure_unknown_cancel_and_reopen_do_not_send_review() {
+        for mode in ["unknown", "cancel", "invalid"] {
+            let f = Fixture::new();
+            let mut pm_api = PmApi {
+                calls: vec![],
+                mode: "",
+            };
+            let s = ready(&f, f.test(), &mut pm_api);
+            pm_api.mode = mode;
+            let mut dev = FakeApi {
+                root: f.root.clone(),
+                ..Default::default()
+            };
+            let mut tests = FakeTests {
+                state: "PASS",
+                calls: 0,
+            };
+            let id = s["id"].as_str().unwrap();
+            assert!(pm::execute(
+                &f.db,
+                &f.vault,
+                id,
+                &mut pm_api,
+                &mut dev,
+                &mut tests,
+                &CancellationToken::new()
+            )
+            .is_err());
+            assert_eq!(dev.calls.len(), 1);
+            assert_eq!(tests.calls, 1);
+            assert_eq!(pm_api.calls.len(), 2);
+            let saved = pm::status(&f.db, id).unwrap();
+            if mode != "invalid" {
+                assert_eq!(saved["phase"], "UNKNOWN")
+            }
+            let path = f.root.join("reopened.sqlite3");
+            f.db.conn()
+                .execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])
+                .unwrap();
+            let db = Database::open(&path).unwrap();
+            assert!(pm::execute(
+                &db,
+                &f.vault,
+                id,
+                &mut pm_api,
+                &mut dev,
+                &mut tests,
+                &CancellationToken::new()
+            )
+            .is_err());
+            assert_eq!(dev.calls.len(), 1);
+            assert_eq!(pm_api.calls.len(), 2);
+            assert_eq!(pm::status(&db, id).unwrap()["revision"], saved["revision"]);
+        }
+    }
+    #[test]
+    fn pm_started_planning_and_running_reservations_survive_reopen() {
+        for starting in ["PLANNING_STARTED", "RUNNING"] {
+            let f = Fixture::new();
+            let mut api = PmApi {
+                calls: vec![],
+                mode: "",
+            };
+            let s = if starting == "RUNNING" {
+                ready(&f, f.test(), &mut api)
+            } else {
+                pm::prepare(&f.db, &f.vault, request(&f, f.test())).unwrap()
+            };
+            let id = s["id"].as_str().unwrap();
+            f.db.conn()
+                .execute(
+                    "UPDATE api_pm_packets SET phase=?1 WHERE id=?2",
+                    rusqlite::params![starting, id],
+                )
+                .unwrap();
+            let path = f.root.join("started.sqlite3");
+            f.db.conn()
+                .execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])
+                .unwrap();
+            let db = Database::open(&path).unwrap();
+            let count = api.calls.len();
+            assert!(pm::plan(
+                &db,
+                &f.vault,
+                id,
+                s["digest"].as_str().unwrap(),
+                true,
+                &mut api,
+                &CancellationToken::new()
+            )
+            .is_err());
+            let mut dev = FakeApi::default();
+            let mut tests = FakeTests {
+                state: "PASS",
+                calls: 0,
+            };
+            assert!(pm::execute(
+                &db,
+                &f.vault,
+                id,
+                &mut api,
+                &mut dev,
+                &mut tests,
+                &CancellationToken::new()
+            )
+            .is_err());
+            assert_eq!(api.calls.len(), count);
+            assert!(dev.calls.is_empty());
+        }
+    }
+    #[test]
+    fn pm_material_secrets_and_file_drift_are_rejected_without_api() {
+        let f = Fixture::new();
+        let mut req = request(&f, f.test());
+        req.goal = "SYNTHETIC_SECRET_VALUE_12345678".into();
+        assert!(pm::prepare(&f.db, &f.vault, req).is_err());
+        let mut api = PmApi {
+            calls: vec![],
+            mode: "",
+        };
+        let s = ready(&f, f.test(), &mut api);
+        std::fs::write(f.root.join("note.txt"), b"user edit").unwrap();
+        let mut dev = FakeApi::default();
+        let mut tests = FakeTests {
+            state: "PASS",
+            calls: 0,
+        };
+        assert_eq!(
+            pm::execute(
+                &f.db,
+                &f.vault,
+                s["id"].as_str().unwrap(),
+                &mut api,
+                &mut dev,
+                &mut tests,
+                &CancellationToken::new()
+            )
+            .unwrap_err(),
+            "API_FILE_DRIFT"
+        );
+        assert!(dev.calls.is_empty());
+        let snapshot = encode(&pm::status(&f.db, s["id"].as_str().unwrap()).unwrap()).unwrap();
+        assert!(!snapshot.contains("SYNTHETIC_SECRET_VALUE_12345678"));
+    }
+}

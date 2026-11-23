@@ -216,7 +216,7 @@ impl Fixture {
         ))?;
         sql(db.execute_batch("PRAGMA query_only=ON; BEGIN;"))?;
         // v13 only adds API-only receipt/config tables; the frozen v12 Task contract is unchanged.
-        if !matches!(sql(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)))?, 12 | 13 | 14) {
+        if !matches!(sql(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)))?, 12 | 13 | 14 | 15) {
             return Err("TASK_DATABASE_REJECTED");
         }
         let identity = rg.identity.clone();

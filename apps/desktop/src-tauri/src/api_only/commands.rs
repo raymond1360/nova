@@ -58,6 +58,7 @@ pub fn api_only_prepare(
     allow_repair: bool,
     state: State<'_, AppState>,
 ) -> Result<a::Plan, String> {
+    if a::pm::managed(&*state.db.lock().map_err(|_| "API_BUSY")?, &task_id).map_err(str::to_string)? { return Err("API_PM_COORDINATOR_REQUIRED".into()); }
     a::prepare_scoped(
         &*state.db.lock().map_err(|_| "API_DATABASE_BUSY")?,
         state.credentials.as_ref(),
@@ -76,6 +77,8 @@ pub fn api_only_approve(
     digest: String,
     state: State<'_, AppState>,
 ) -> Result<Value, String> {
+    let task=a::status(&*state.db.lock().map_err(|_| "API_BUSY")?, &id).map_err(str::to_string)?;
+    if a::pm::managed(&*state.db.lock().map_err(|_| "API_BUSY")?, task["task_id"].as_str().ok_or("API_TASK_INVALID")?).map_err(str::to_string)? { return Err("API_PM_COORDINATOR_REQUIRED".into()); }
     a::approve(
         &*state.db.lock().map_err(|_| "API_DATABASE_BUSY")?,
         &id,
@@ -180,6 +183,8 @@ pub fn api_only_repair(
     config_id: String,
     state: State<'_, AppState>,
 ) -> Result<a::Plan, String> {
+    let task=a::status(&*state.db.lock().map_err(|_| "API_BUSY")?, &parent).map_err(str::to_string)?;
+    if a::pm::managed(&*state.db.lock().map_err(|_| "API_BUSY")?, task["task_id"].as_str().ok_or("API_TASK_INVALID")?).map_err(str::to_string)? { return Err("API_PM_COORDINATOR_REQUIRED".into()); }
     a::task_loop::repair(
         &*state.db.lock().map_err(|_| "API_DATABASE_BUSY")?,
         state.credentials.as_ref(),
@@ -210,4 +215,103 @@ pub fn api_only_user_decision(
 pub fn api_only_cleanup_status(state: State<'_, AppState>) -> Result<Value, String> {
     config::cleanup_status(&*state.db.lock().map_err(|_| "API_DATABASE_BUSY")?)
         .map_err(str::to_string)
+}
+
+#[tauri::command]
+pub fn api_pm_prepare(
+    request: a::pm::Request,
+    state: State<'_, AppState>,
+) -> Result<Value, String> {
+    a::pm::prepare(
+        &*state.db.lock().map_err(|_| "API_BUSY")?,
+        state.credentials.as_ref(),
+        request,
+    )
+    .map_err(str::to_string)
+}
+#[tauri::command]
+pub fn api_pm_status(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<Value>, String> {
+    a::pm::latest(&*state.db.lock().map_err(|_| "API_BUSY")?, &project_id).map_err(str::to_string)
+}
+#[tauri::command]
+pub fn api_pm_confirm(id: String, state: State<'_, AppState>) -> Result<Value, String> {
+    a::pm::confirm(
+        &*state.db.lock().map_err(|_| "API_BUSY")?,
+        state.credentials.as_ref(),
+        &id,
+    )
+    .map_err(str::to_string)
+}
+#[tauri::command]
+pub fn api_pm_approve(
+    id: String,
+    digest: String,
+    state: State<'_, AppState>,
+) -> Result<Value, String> {
+    a::pm::approve(&*state.db.lock().map_err(|_| "API_BUSY")?, &id, &digest).map_err(str::to_string)
+}
+#[tauri::command]
+pub async fn api_pm_run(
+    id: String,
+    planning_digest: Option<String>,
+    explicit_network: bool,
+    state: State<'_, AppState>,
+) -> Result<Value, String> {
+    let cancel = CancellationToken::new();
+    {
+        let mut map = state.core_loop_cancel.lock().map_err(|_| "API_BUSY")?;
+        if !map.is_empty() {
+            return Err("API_BUSY".into());
+        }
+        map.insert(id.clone(), cancel.clone());
+    }
+    let slot = Slot {
+        map: state.core_loop_cancel.clone(),
+        task: id.clone(),
+    };
+    let path = state.app_data_dir.join("nova.sqlite3");
+    let vault = state.credentials.clone();
+    tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        let db = crate::db::Database::open(&path).map_err(|_| "API_DATABASE_ERROR".to_string())?;
+        match planning_digest {
+            Some(d) => a::pm::plan(
+                &db,
+                vault.as_ref(),
+                &id,
+                &d,
+                explicit_network,
+                &mut a::DeepSeekHttp,
+                &cancel,
+            ),
+            None => a::pm::execute(
+                &db,
+                vault.as_ref(),
+                &id,
+                &mut a::DeepSeekHttp,
+                &mut a::DeepSeekHttp,
+                &mut a::FixedTestRunner,
+                &cancel,
+            ),
+        }
+        .map_err(str::to_string)
+    })
+    .await
+    .map_err(|_| "API_RESULT_UNKNOWN_NO_REPLAY".to_string())?
+}
+#[tauri::command]
+pub fn api_pm_cancel(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(c) = state
+        .core_loop_cancel
+        .lock()
+        .map_err(|_| "API_BUSY")?
+        .get(&id)
+    {
+        c.cancel();
+        return Ok(());
+    }
+    a::pm::cancel_pending(&*state.db.lock().map_err(|_| "API_BUSY")?, &id).map_err(str::to_string)
 }

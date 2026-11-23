@@ -28,7 +28,8 @@ async function cancel(){await action(async()=>{await invoke('cancel_core_loop',{
 async function decide(accepted:boolean){await action(async()=>{if(!accepted&&!feedback.value.trim()){error.value='请写下需要修改的内容。';return}const useGrant=!accepted&&plan.value?.allow_repair&&report.value?.repair_count===0;await invoke('api_only_user_decision',{id:run.value.run_id,accepted,note:feedback.value});await load();emit('refresh');if(useGrant){await execute()}})}
 </script>
 <template>
-<section class="api-panel block" aria-label="API单任务开发">
+<p v-if="report?.pm_packet_id">本任务由上方产品经理协调区处理；不会通过手动执行入口重复运行。</p>
+<section v-else class="api-panel block" aria-label="API单任务开发">
 <h3>API单任务开发 · {{task.title}}</h3>
 <p>开发和只读自检使用同一模型、独立上下文。仅DeepSeek适配已实现；其他服务可先保存配置。</p>
 <p v-if="error" role="alert">{{error}}</p><details v-if="diagnostic"><summary>详细原因（供排查）</summary>{{diagnostic}}</details><p v-if="message" role="status">{{message}}</p>

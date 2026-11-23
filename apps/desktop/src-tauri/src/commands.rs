@@ -371,6 +371,7 @@ where
 pub async fn detect_runtime_environment(
     state: State<'_, AppState>,
 ) -> Result<RuntimeEnvironmentReport, String> {
+    if crate::api_only::API_ONLY { return Err("API_ONLY_ROUTE_REQUIRED: CLI product execution is paused".into()); }
     let (cancel, _handle) = state
         .detection_cancel
         .try_start()
@@ -780,6 +781,7 @@ pub fn get_core_loop_readiness(
     dev_ai_kind: String,
     state: State<'_, AppState>,
 ) -> Result<CoreLoopReadiness, String> {
+    if crate::api_only::API_ONLY { return Err("API_ONLY_ROUTE_REQUIRED: CLI product execution is paused".into()); }
     let dev_kind = crate::runtime::ai_adapter::ai_kind_from_str(&dev_ai_kind)
         .ok_or_else(|| "未知的开发 AI 类型".to_string())?;
     let reviewer_kind = crate::runtime::ai_adapter::the_other(dev_kind);
@@ -856,6 +858,7 @@ pub fn start_core_loop(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    if crate::api_only::API_ONLY { return Err("API_ONLY_ROUTE_REQUIRED: CLI product execution is paused".into()); }
     let dev_kind = crate::workspace_commands::reserve(&state.core_loop_cancel, &state.db,
         &task_id, CancellationToken::new(), |db| {
         let task = db.task(&task_id).map_err(public_error)?;
@@ -988,6 +991,7 @@ pub fn get_verify_only_eligibility(project_id: String, task_id: String, state: S
 #[tauri::command]
 pub fn verify_existing_changes(project_id: String, task_id: String,
     expected: crate::core_loop::verify_only::Eligibility, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if crate::api_only::API_ONLY { return Err("API_ONLY_ROUTE_REQUIRED: CLI product execution is paused".into()); }
     let cancel = CancellationToken::new();
     crate::workspace_commands::reserve(&state.core_loop_cancel, &state.db, &task_id, cancel.clone(), |db| {
         let current = crate::core_loop::verify_only::eligibility(db, &project_id, &task_id).map_err(public_error)?;

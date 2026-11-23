@@ -1,77 +1,12 @@
 //! Pure injected API contract. No HTTP client, credential store, environment lookup or process backend.
 use super::{contract::*, store::ApiDispatchPermit, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
-const SENTINEL: &[u8] = b"NOVA_INJECTED_ONLY_SECRET_SENTINEL";
-pub struct SecretLease(Vec<u8>);
-impl SecretLease {
-    pub(crate) fn real(bytes: Vec<u8>) -> Result<Self> {
-        if bytes.len()<8 || bytes.len()>4096 || bytes.iter().any(|b| b.is_ascii_control()) {return Err("CREDENTIAL_REJECTED");}
-        Ok(Self(bytes))
-    }
-    pub(crate) fn bearer(&self) -> Result<&str> {std::str::from_utf8(&self.0).map_err(|_|"CREDENTIAL_REJECTED")}
-    fn injected() -> Self {
-        Self(SENTINEL.to_vec())
-    }
-    pub fn scan_text(&self, b: &[u8]) -> Result<()> {
-        if b.windows(self.0.len()).any(|x| x == self.0.as_slice()) {
-            Err("SECRET_ECHO")
-        } else {
-            Ok(())
-        }
-    }
-    pub fn scan_json(&self, b: &[u8], cap: usize) -> Result<Value> {
-        self.scan_text(b)?;
-        let v: Value = api_json(b, cap)?;
-        self.walk(&v, 0)?;
-        Ok(v)
-    }
-    // Only the response envelope defines JSON-encoded assistant content.
-    // A field named content inside a proposal remains ordinary code/text.
-    pub(super) fn scan_response(&self, b: &[u8]) -> Result<Value> {
-        let value = self.scan_json(b, 131072)?;
-        if let Some(choices) = value["choices"].as_array() {
-            for choice in choices {
-                if let Some(content) = choice["message"]["content"].as_str() {
-                    self.scan_json(content.as_bytes(), 65536)?;
-                }
-            }
-        }
-        Ok(value)
-    }
-    fn walk(&self, v: &Value, depth: usize) -> Result<()> {
-        if depth > 16 {
-            return Err("BOUND");
-        }
-        match v {
-            Value::String(s) => {
-                self.scan_text(s.as_bytes())?;
-            }
-            Value::Array(a) => {
-                for x in a {
-                    self.walk(x, depth + 1)?
-                }
-            }
-            Value::Object(m) => {
-                for (k, x) in m {
-                    self.scan_text(k.as_bytes())?;
-                    self.walk(x, depth + 1)?
-                }
-            }
-            _ => (),
-        }
-        Ok(())
-    }
-}
-impl Drop for SecretLease {
-    fn drop(&mut self) {
-        self.0.fill(0)
-    }
-}
+pub use crate::execution_safety::SecretLease;
 pub trait SecretProvider {
     fn acquire(&mut self, role: RelayRole, plan_hash: &str) -> Result<SecretLease>;
 }

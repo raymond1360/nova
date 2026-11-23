@@ -11,6 +11,8 @@ mod isolated_validation;
 pub use isolated_validation::run_validation;
 
 mod api;
+mod execution_safety;
+pub mod api_only;
 mod app_paths;
 mod commands;
 mod workspace_commands;
@@ -122,6 +124,15 @@ pub fn run() {
         .invoke_handler({
             let real: Arc<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> = std::sync::Arc::new(tauri::generate_handler![
             commands::initialize_app,
+            api_only::commands::api_only_catalog,
+            api_only::commands::api_only_configs,
+            api_only::commands::api_only_save_config,
+            api_only::commands::api_only_delete_key,
+            api_only::commands::api_only_prepare,
+            api_only::commands::api_only_approve,
+            api_only::commands::api_only_status,
+            api_only::commands::api_only_test_connection,
+            api_only::commands::api_only_execute,
             workspace_commands::requirement_workspace,
             workspace_commands::get_planning_capability,
             commands::get_provider,

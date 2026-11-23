@@ -13,265 +13,14 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
 };
 
-pub const TOOL_HASH_CAP: u64 = 512 * 1024 * 1024;
-/// Approval paths are not normalized on behalf of their author.
-pub fn approved_final_path(approved: &Path, actual: &Path) -> Result<()> {
-    if approved.as_os_str() != actual.as_os_str() {
-        return Err("APPROVAL_MISMATCH");
-    }
-    Ok(())
-}
-pub fn approved_root(path: &Path, exists: bool) -> Result<()> {
-    absolute(path)?;
-    safe_location(path)?;
-    let parent = Guard::open(path.parent().ok_or("PATH_REJECTED")?, true)?;
-    let expected = parent.path.join(path.file_name().ok_or("PATH_REJECTED")?);
-    approved_final_path(path, &expected)?;
-    if exists {
-        approved_final_path(path, &Guard::open(path, true)?.path)?;
-    } else if path.try_exists().map_err(|_| "PATH_REJECTED")? {
-        return Err("CREATE_NEW_REJECTED");
-    }
-    Ok(())
-}
-pub struct Guard {
-    file: File,
-    pub path: PathBuf,
-    pub identity: String,
-    tool_links: bool,
-}
-fn normal(s: &str) -> String {
-    s.trim_start_matches("\\\\?\\")
-        .replace('/', "\\")
-        .to_lowercase()
-}
-pub fn absolute(path: &Path) -> Result<()> {
-    let s = path.to_str().ok_or("PATH_REJECTED")?;
-    if !path.is_absolute()
-        || s.starts_with("\\\\")
-        || s.contains('\0')
-        || s.chars().filter(|c| *c == ':').count() != 1
-        || s.split(['\\', '/'])
-            .skip(1)
-            .any(|p| p == ".." || p == "." || p.ends_with(['.', ' ']))
-    {
-        return Err("PATH_REJECTED");
-    }
-    Ok(())
-}
-fn components(path: &Path) -> Result<()> {
-    absolute(path)?;
-    let mut part = PathBuf::new();
-    for c in path.components() {
-        part.push(c);
-        let m = fs::symlink_metadata(&part).map_err(|_| "PATH_MISSING")?;
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            if m.file_attributes() & 0x400 != 0 {
-                return Err("LINK_REJECTED");
-            }
-        }
-        if m.file_type().is_symlink() {
-            return Err("LINK_REJECTED");
-        }
-    }
-    Ok(())
-}
-#[cfg(windows)]
-fn facts(file: &File) -> Result<(String, PathBuf, u32)> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
-    };
-    let mut i: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    let h = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-    if unsafe { GetFileInformationByHandle(h, &mut i) } == 0 || i.dwFileAttributes & 0x400 != 0 {
-        return Err("FILE_IDENTITY_UNKNOWN");
-    }
-    let mut buffer = vec![0u16; 32768];
-    let n = unsafe { GetFinalPathNameByHandleW(h, buffer.as_mut_ptr(), buffer.len() as u32, 0) }
-        as usize;
-    if n == 0 || n >= buffer.len() {
-        return Err("FILE_IDENTITY_UNKNOWN");
-    }
-    let p = String::from_utf16(&buffer[..n]).map_err(|_| "PATH_REJECTED")?;
-    if p.starts_with("\\\\?\\UNC\\") {
-        return Err("PATH_REJECTED");
-    }
-    Ok((
-        format!(
-            "{:08x}:{:08x}{:08x}",
-            i.dwVolumeSerialNumber, i.nFileIndexHigh, i.nFileIndexLow
-        ),
-        PathBuf::from(p.trim_start_matches("\\\\?\\")),
-        i.nNumberOfLinks,
-    ))
-}
-#[cfg(not(windows))]
-fn facts(_: &File) -> Result<(String, PathBuf, u32)> {
-    Err("WINDOWS_REQUIRED")
-}
-// Probe helper validates the already-open exclusive write handle before any bytes change.
-#[cfg(any(test, all(feature = "scheduler-validation", debug_assertions)))]
-pub(super) fn single_link_identity(file: &File) -> Result<String> {
-    let (id, _, links) = facts(file)?;
-    if links != 1 { return Err("ALIAS_REJECTED"); }
-    Ok(id)
-}
-impl Guard {
-    pub fn open(path: &Path, db: bool) -> Result<Self> {
-        Self::open_policy(path, db, false)
-    }
-    /// Installed tools may legitimately be hardlinked (Git for Windows). This
-    /// exception never applies to repositories, reports or owned databases.
-    pub fn tool(path: &Path) -> Result<Self> {
-        Self::open_policy(path, false, true)
-    }
-    fn open_policy(path: &Path, db: bool, tool_links: bool) -> Result<Self> {
-        components(path)?;
-        let mut opts = OpenOptions::new();
-        opts.read(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            opts.share_mode(if db { 3 } else { 1 })
-                .custom_flags(0x00200000 | 0x02000000);
-        }
-        let file = opts.open(path).map_err(|_| "FILE_OPEN_REJECTED")?;
-        let (identity, final_path, links) = facts(&file)?;
-        if normal(path.to_str().ok_or("PATH_REJECTED")?)
-            != normal(final_path.to_str().ok_or("PATH_REJECTED")?)
-            || (!tool_links && !file.metadata().map_err(|_| "FILE_STAT")?.is_dir() && links != 1)
-        {
-            return Err("ALIAS_REJECTED");
-        }
-        Ok(Self {
-            file,
-            path: final_path,
-            identity,
-            tool_links,
-        })
-    }
-    pub fn verify(&self) -> Result<()> {
-        let (id, path, _) = facts(&self.file)?;
-        let other = Guard::open_policy(&self.path, true, self.tool_links)?;
-        if id != self.identity || path != self.path || other.identity != id {
-            return Err("FILE_CHANGED");
-        }
-        Ok(())
-    }
-    pub fn verify_sha256_stream(
-        &mut self,
-        bytes: u64,
-        expected: &str,
-        end: std::time::Instant,
-    ) -> Result<()> {
-        if !hex(expected, 64) || self.sha256_stream(bytes, end)? != expected {
-            return Err("TOOL_HASH_MISMATCH");
-        }
-        Ok(())
-    }
-    pub fn sha256_stream(
-        &mut self,
-        expected_bytes: u64,
-        end: std::time::Instant,
-    ) -> Result<String> {
-        use std::io::{Seek, SeekFrom};
-        if expected_bytes > TOOL_HASH_CAP {
-            return Err("FILE_BOUND");
-        }
-        let before = self.file.metadata().map_err(|_| "FILE_STAT")?;
-        if !before.is_file() || before.len() != expected_bytes {
-            return Err("TOOL_SIZE_MISMATCH");
-        }
-        self.verify()?;
-        self.file
-            .seek(SeekFrom::Start(0))
-            .map_err(|_| "FILE_READ")?;
-        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
-        let mut buf = vec![0u8; 1048576];
-        let mut count = 0u64;
-        loop {
-            if std::time::Instant::now() >= end {
-                return Err("TOOL_HASH_DEADLINE");
-            }
-            let n = self.file.read(&mut buf).map_err(|_| "FILE_READ")?;
-            if n == 0 {
-                break;
-            }
-            count = count.checked_add(n as u64).ok_or("FILE_BOUND")?;
-            if count > expected_bytes {
-                return Err("FILE_CHANGED");
-            }
-            ctx.update(&buf[..n]);
-        }
-        let after = self.file.metadata().map_err(|_| "FILE_STAT")?;
-        self.verify()?;
-        if count != expected_bytes
-            || after.len() != before.len()
-            || before.modified().ok() != after.modified().ok()
-        {
-            return Err("FILE_CHANGED");
-        }
-        Ok(ctx
-            .finish()
-            .as_ref()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect())
-    }
-    pub fn bytes(&mut self, limit: usize) -> Result<Vec<u8>> {
-        let before = self.file.metadata().map_err(|_| "FILE_STAT")?;
-        if !before.is_file() || before.len() > limit as u64 {
-            return Err("FILE_BOUND");
-        }
-        let mut b = vec![];
-        (&mut self.file)
-            .take(limit as u64 + 1)
-            .read_to_end(&mut b)
-            .map_err(|_| "FILE_READ")?;
-        let after = self.file.metadata().map_err(|_| "FILE_STAT")?;
-        self.verify()?;
-        if b.len() as u64 != before.len()
-            || after.len() != before.len()
-            || before.modified().ok() != after.modified().ok()
-        {
-            return Err("FILE_CHANGED");
-        }
-        Ok(b)
-    }
-}
-pub fn read_file(path: &Path, limit: usize) -> Result<(Vec<u8>, String)> {
-    let mut g = Guard::open(path, false)?;
-    let b = g.bytes(limit)?;
-    Ok((b, g.identity))
-}
-pub fn inside(path: &Path, root: &Path) -> bool {
-    let p = normal(&path.to_string_lossy());
-    let r = normal(&root.to_string_lossy());
-    p == r || p.starts_with(&(r + "\\"))
-}
-pub fn safe_location(path: &Path) -> Result<()> {
-    absolute(path)?;
-    let s = normal(&path.to_string_lossy());
-    if s.contains("\\appdata\\")
-        || s.split('\\')
-            .any(|p| matches!(p, ".ssh" | ".aws" | "credentials"))
-        || matches!(
-            path.file_name().and_then(|s| s.to_str()),
-            Some("auth.json" | ".npmrc" | ".env")
-        )
-    {
-        return Err("SENSITIVE_PATH_REJECTED");
-    }
-    Ok(())
-}
+pub use crate::execution_safety::{TOOL_HASH_CAP,approved_final_path,approved_root,Guard,absolute,read_file,inside,safe_location};
+#[cfg(any(test, all(feature="scheduler-validation",debug_assertions)))]
+pub(crate) use crate::execution_safety::single_link_identity;
 fn new_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut f = OpenOptions::new()
         .write(true)
@@ -452,7 +201,7 @@ impl Store {
                 step(&db, &task.id, state, actor, "INIT")?;
             }
             let v: i64 = sql(db.conn().query_row("PRAGMA user_version", [], |r| r.get(0)))?;
-            if v != 12 {
+            if !matches!(v, 12 | 13) {
                 return Err("PRODUCT_SCHEMA_UNSUPPORTED");
             }
             sql(db.conn().execute("INSERT INTO scheduler_meta VALUES(1,'NOVA_SH1_OWNED_V1','INTERNAL_HANDOFF_ONLY',?4,?1,?2,?3,1)",params![owner.db_id,owner.root,v,version]))?;
@@ -513,6 +262,7 @@ impl Store {
         check_layout(&s.root)?;
         let c = s.read_connection()?;
         let mark=sql(c.query_row("SELECT magic,purpose,schema_version,db_id,owner_root,product_user_version_at_init,ready FROM scheduler_meta WHERE singleton=1",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,i64>(5)?,r.get::<_,i64>(6)?)))).map_err(|_|"PARTIAL_INIT")?;
+        let product_version = sql(c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)))?;
         if mark
             != (
                 "NOVA_SH1_OWNED_V1".into(),
@@ -520,10 +270,10 @@ impl Store {
                 mark.2,
                 s.owner.db_id.clone(),
                 s.owner.root.clone(),
-                12,
+                product_version,
                 1,
             )
-            || sql(c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)))? != 12
+            || !matches!(product_version, 12 | 13)
             || sql(
                 c.query_row("SELECT COUNT(*) FROM scheduler_packages", [], |r| {
                     r.get::<_, i64>(0)

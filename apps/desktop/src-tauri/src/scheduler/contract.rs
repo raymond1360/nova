@@ -1,37 +1,22 @@
+pub use crate::execution_safety::{hash,hex,relative,relay_json,api_json,Proposal,ReviewClaim,ReviewIssue,Severity};
+use crate::execution_safety::Unique;
 use super::Result;
 use serde::{
-    de::{self, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer, Serialize,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const REPORT_LIMIT: usize = 2 * 1024 * 1024;
-pub fn hash(bytes: &[u8]) -> String {
-    ring::digest::digest(&ring::digest::SHA256, bytes)
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-pub fn hex(s: &str, n: usize) -> bool {
-    s.len() == n
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
+
+
 pub fn id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 80
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
-pub fn relative(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 512
-        && !s.contains(['\\', ':', '*', '?', '[', ']', '\0'])
-        && s.split('/')
-            .all(|p| !p.is_empty() && p != "." && p != ".." && !p.ends_with(['.', ' ']))
-}
+
 fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     d: D,
 ) -> std::result::Result<Option<T>, D::Error> {
@@ -39,68 +24,6 @@ fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
 }
 
 // Parse recursively before typed decoding: Value alone would silently retain the last duplicate key.
-struct Unique(Value);
-impl<'de> Deserialize<'de> for Unique {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Unique;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("bounded JSON")
-            }
-            fn visit_map<M: MapAccess<'de>>(
-                self,
-                mut m: M,
-            ) -> std::result::Result<Unique, M::Error> {
-                let mut out = serde_json::Map::new();
-                while let Some(k) = m.next_key::<String>()? {
-                    if out.contains_key(&k) {
-                        return Err(de::Error::custom("duplicate key"));
-                    }
-                    out.insert(k, m.next_value::<Unique>()?.0);
-                }
-                Ok(Unique(Value::Object(out)))
-            }
-            fn visit_seq<S: SeqAccess<'de>>(
-                self,
-                mut s: S,
-            ) -> std::result::Result<Unique, S::Error> {
-                let mut v = vec![];
-                while let Some(x) = s.next_element::<Unique>()? {
-                    v.push(x.0)
-                }
-                Ok(Unique(Value::Array(v)))
-            }
-            fn visit_str<E: de::Error>(self, s: &str) -> std::result::Result<Unique, E> {
-                Ok(Unique(Value::String(s.into())))
-            }
-            fn visit_string<E: de::Error>(self, s: String) -> std::result::Result<Unique, E> {
-                Ok(Unique(Value::String(s)))
-            }
-            fn visit_bool<E: de::Error>(self, b: bool) -> std::result::Result<Unique, E> {
-                Ok(Unique(Value::Bool(b)))
-            }
-            fn visit_unit<E: de::Error>(self) -> std::result::Result<Unique, E> {
-                Ok(Unique(Value::Null))
-            }
-            fn visit_none<E: de::Error>(self) -> std::result::Result<Unique, E> {
-                Ok(Unique(Value::Null))
-            }
-            fn visit_i64<E: de::Error>(self, n: i64) -> std::result::Result<Unique, E> {
-                Ok(Unique(n.into()))
-            }
-            fn visit_u64<E: de::Error>(self, n: u64) -> std::result::Result<Unique, E> {
-                Ok(Unique(n.into()))
-            }
-            fn visit_f64<E: de::Error>(self, n: f64) -> std::result::Result<Unique, E> {
-                serde_json::Number::from_f64(n)
-                    .map(|v| Unique(Value::Number(v)))
-                    .ok_or_else(|| de::Error::custom("number"))
-            }
-        }
-        d.deserialize_any(V)
-    }
-}
 pub fn json<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T> {
     if b.is_empty() || b.len() > REPORT_LIMIT {
         return Err("INPUT_BOUND");
@@ -218,15 +141,6 @@ pub enum Conclusion {
     Blocked,
     NotRun,
     Recorded,
-}
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Severity {
-    Blocker,
-    High,
-    Medium,
-    Low,
-    Info,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -558,29 +472,7 @@ pub fn issue_map(r: &Report) -> BTreeMap<&str, &Issue> {
 }
 
 // Separate AR0 bounds; V1 parser and DTOs remain unchanged.
-pub fn relay_json<T: serde::de::DeserializeOwned>(b: &[u8], limit: usize) -> Result<T> {
-    if b.is_empty() || b.len() > limit {
-        return Err("BOUND");
-    }
-    let u: Unique = serde_json::from_slice(b).map_err(|_| "SCHEMA_REJECTED")?;
-    fn valid(v: &Value, d: usize) -> bool {
-        if d > 32 {
-            return false;
-        }
-        match v {
-            Value::String(s) => s.len() <= 65536,
-            Value::Array(a) => a.len() <= 256 && a.iter().all(|v| valid(v, d + 1)),
-            Value::Object(m) => {
-                m.len() <= 128 && m.iter().all(|(k, v)| k.len() <= 256 && valid(v, d + 1))
-            }
-            _ => true,
-        }
-    }
-    if !valid(&u.0, 0) {
-        return Err("BOUND");
-    }
-    serde_json::from_value(u.0).map_err(|_| "SCHEMA_REJECTED")
-}
+
 pub const RELAY_SIGNATURE: &str = "pub fn normalize_label(s: &str) -> String {";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -644,82 +536,9 @@ impl RelayPlan {
         Ok(())
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Proposal {
-    pub schema: String,
-    pub target_path: String,
-    pub old_text: String,
-    pub new_text: String,
-    pub rationale: String,
-}
 impl Proposal {
     pub fn validate(&self, p: &RelayPlan) -> Result<()> {
         self.validate_target(&p.target_path)
-    }
-    pub fn validate_target(&self, target: &str) -> Result<()> {
-        if self.schema != "nova.relay.proposal/1"
-            || self.target_path != target
-            || self.old_text.is_empty()
-            || self.old_text.len() > 8192
-            || self.new_text.len() > 16384
-            || self.rationale.len() > 2048
-            || self.old_text.contains(['\0', '\r'])
-            || self.new_text.contains(['\0', '\r'])
-        {
-            return Err("SCHEMA_REJECTED");
-        }
-        Ok(())
-    }
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReviewIssue {
-    pub id: String,
-    pub severity: Severity,
-    pub blocking: bool,
-    pub location: String,
-    pub summary: String,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReviewClaim {
-    pub schema: String,
-    pub base_sha256: String,
-    pub candidate_sha256: String,
-    pub verdict: String,
-    pub issues: Vec<ReviewIssue>,
-    pub unknowns: Vec<String>,
-}
-impl ReviewClaim {
-    pub fn validate(&self, b: &str, c: &str) -> Result<()> {
-        if self.schema != "nova.relay.review/1"
-            || self.base_sha256 != b
-            || self.candidate_sha256 != c
-        {
-            return Err("BINDING_MISMATCH");
-        }
-        if !["PASS", "CHANGES_REQUIRED", "BLOCKED"].contains(&self.verdict.as_str())
-            || self.issues.len() > 32
-            || self.unknowns.len() > 16
-            || self.unknowns.iter().any(|s| s.len() > 512)
-        {
-            return Err("SCHEMA_REJECTED");
-        }
-        let mut seen = BTreeSet::new();
-        for i in &self.issues {
-            let n = i.id.strip_prefix("R-").ok_or("SCHEMA_REJECTED")?;
-            if n.is_empty()
-                || n.len() > 3
-                || !n.bytes().all(|b| b.is_ascii_digit())
-                || !seen.insert(&i.id)
-                || i.location.len() > 256
-                || i.summary.len() > 1024
-            {
-                return Err("SCHEMA_REJECTED");
-            }
-        }
-        Ok(())
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1347,39 +1166,7 @@ pub struct ApiAttempt {
     pub evidence: Option<serde_json::Value>,
 }
 /// Duplicate-key rejection is shared; API has stricter independent traversal limits.
-pub fn api_json<T: serde::de::DeserializeOwned>(b: &[u8], cap: usize) -> Result<T> {
-    let v: serde_json::Value = relay_json(b, cap)?;
-    fn walk(v: &serde_json::Value, d: usize, n: &mut usize) -> Result<()> {
-        if d > 16 {
-            return Err("BOUND");
-        };
-        *n = n.checked_add(1).ok_or("BOUND")?;
-        if *n > 2048 {
-            return Err("BOUND");
-        }
-        match v {
-            serde_json::Value::String(s) if s.len() > 65536 => Err("BOUND"),
-            serde_json::Value::Array(a) => {
-                for x in a {
-                    walk(x, d + 1, n)?
-                }
-                Ok(())
-            }
-            serde_json::Value::Object(m) => {
-                for (k, x) in m {
-                    if k.len() > 4096 {
-                        return Err("BOUND");
-                    };
-                    walk(x, d + 1, n)?
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-    walk(&v, 0, &mut 0)?;
-    serde_json::from_value(v).map_err(|_| "SCHEMA_REJECTED")
-}
+
 
 // A real request is never accepted by the injected initializer.
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -12,71 +12,7 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
-#[derive(Clone, Debug, Serialize)]
-pub struct Candidate {
-    pub text: String,
-    pub candidate_sha256: String,
-    pub diff: String,
-    pub diff_sha256: String,
-    pub proposal_sha256: String,
-    pub signature_preserved: bool,
-}
-fn unified(a: &str, b: &str, path: &str) -> String {
-    let a: Vec<_> = a.split_inclusive('\n').collect();
-    let b: Vec<_> = b.split_inclusive('\n').collect();
-    let mut prefix = 0;
-    while prefix < a.len().min(b.len()) && a[prefix] == b[prefix] {
-        prefix += 1
-    }
-    let mut suffix = 0;
-    while suffix
-        < a.len()
-            .saturating_sub(prefix)
-            .min(b.len().saturating_sub(prefix))
-        && a[a.len() - 1 - suffix] == b[b.len() - 1 - suffix]
-    {
-        suffix += 1
-    }
-    let start = prefix.saturating_sub(3);
-    let ae = (a.len() - suffix + 3).min(a.len());
-    let be = (b.len() - suffix + 3).min(b.len());
-    let mut d = format!(
-        "--- a/{path}\n+++ b/{path}\n@@ -{},{} +{},{} @@\n",
-        start + 1,
-        ae - start,
-        start + 1,
-        be - start
-    );
-    for line in &a[start..prefix] {
-        d.push(' ');
-        d.push_str(line);
-        if !line.ends_with('\n') {
-            d.push_str("\n\\ No newline at end of file\n")
-        }
-    }
-    for line in &a[prefix..a.len() - suffix] {
-        d.push('-');
-        d.push_str(line);
-        if !line.ends_with('\n') {
-            d.push_str("\n\\ No newline at end of file\n")
-        }
-    }
-    for line in &b[prefix..b.len() - suffix] {
-        d.push('+');
-        d.push_str(line);
-        if !line.ends_with('\n') {
-            d.push_str("\n\\ No newline at end of file\n")
-        }
-    }
-    for line in &a[a.len() - suffix..ae] {
-        d.push(' ');
-        d.push_str(line);
-        if !line.ends_with('\n') {
-            d.push_str("\n\\ No newline at end of file\n")
-        }
-    }
-    d
-}
+pub use crate::execution_safety::Candidate;
 /// Minimal shared material view; contains no backend profile or authorization.
 pub struct TaskMaterial<'a> {
     pub target_path: &'a str,
@@ -96,56 +32,7 @@ pub fn candidate(p: &RelayPlan, base: &[u8], raw: &[u8]) -> Result<Candidate> {
 pub fn candidate_material(p: &TaskMaterial<'_>, base: &[u8], raw: &[u8]) -> Result<Candidate> {
     candidate_text(p.target_path,p.base_sha256,base,raw,true)
 }
-pub(crate) fn candidate_text(target:&str,base_sha256:&str,base:&[u8],raw:&[u8],sample_signature:bool)->Result<Candidate> {
-    if base.len() > 65536 || hash(base) != base_sha256 {
-        return Err("BASE_CHANGED");
-    }
-    let b = std::str::from_utf8(base).map_err(|_| "BASE_ENCODING")?;
-    if (b.contains('\0') || (sample_signature && b.contains('\r'))) || (sample_signature && !b.lines().any(|l| l == RELAY_SIGNATURE)) {
-        return Err("BASE_SIGNATURE");
-    }
-    let proposal: Proposal = relay_json(raw, 32768)?;
-    proposal.validate_target(target)?;
-    let matches: Vec<_> = base
-        .windows(proposal.old_text.len())
-        .enumerate()
-        .filter(|(_, v)| *v == proposal.old_text.as_bytes())
-        .map(|(i, _)| i)
-        .collect();
-    if matches.is_empty() {
-        return Err("PROPOSAL_NO_MATCH");
-    }
-    if matches.len() != 1 {
-        return Err("PROPOSAL_AMBIGUOUS");
-    }
-    let at = matches[0];
-    let text = format!(
-        "{}{}{}",
-        &b[..at],
-        proposal.new_text,
-        &b[at + proposal.old_text.len()..]
-    );
-    if text == b {
-        return Err("PROPOSAL_NOOP");
-    }
-    if text.len() > 65536 {
-        return Err("BOUND");
-    }
-    let signature_preserved = text.lines().filter(|l| *l == RELAY_SIGNATURE).count() == 1
-        && b.lines().filter(|l| *l == RELAY_SIGNATURE).count() == 1;
-    if sample_signature && !signature_preserved {
-        return Err("SIGNATURE_CHANGED");
-    }
-    let diff = unified(b, &text, target);
-    Ok(Candidate {
-        candidate_sha256: hash(text.as_bytes()),
-        text,
-        diff_sha256: hash(diff.as_bytes()),
-        diff,
-        proposal_sha256: hash(raw),
-        signature_preserved,
-    })
-}
+pub(crate) use crate::execution_safety::candidate_text;
 /// JSON strings encode all untrusted sections: delimiters/newlines inside data cannot escape the envelope.
 pub fn prepare_review(p: &RelayPlan, base: &[u8], raw: &[u8]) -> Result<(Candidate, Vec<u8>)> {
     let c = candidate(p, base, raw)?;

@@ -1,7 +1,6 @@
 //! Dedicated Windows fixture only. Models never receive filesystem or process capabilities.
 //! State/HTTP admission belongs to Store and relay; this module owns bounded local facts/I/O.
 use super::{
-    api_adapter::SecretLease,
     contract::*,
     store::{Guard, Store},
     Result,
@@ -11,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufRead, Read, Seek, SeekFrom, Write},
+    io::{BufRead, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -29,135 +28,7 @@ fn sql<T>(r: rusqlite::Result<T>) -> Result<T> {
 }
 
 /// Pin every ancestor, not just the leaf. Guard checks reparse points and denies delete sharing.
-fn parents(path: &Path) -> Result<Vec<Guard>> {
-    let mut out = Vec::new();
-    for p in path.ancestors().skip(1) {
-        out.push(Guard::open(p, true)?);
-    }
-    Ok(out)
-}
-#[cfg(windows)]
-fn handle_identity(f: &File, expected: &Path) -> Result<String> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
-    };
-    let h = f.as_raw_handle() as _;
-    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    if unsafe { GetFileInformationByHandle(h, &mut info) } == 0
-        || info.dwFileAttributes & (0x400 | 0x10) != 0
-        || info.nNumberOfLinks != 1
-    {
-        return Err("TASK_IDENTITY_REJECTED");
-    }
-    let mut buffer = vec![0u16; 32768];
-    let n = unsafe { GetFinalPathNameByHandleW(h, buffer.as_mut_ptr(), 32768, 0) } as usize;
-    if n == 0 || n >= buffer.len() {
-        return Err("TASK_IDENTITY_REJECTED");
-    }
-    let final_path = String::from_utf16(&buffer[..n]).map_err(|_| "TASK_IDENTITY_REJECTED")?;
-    if Path::new(
-        final_path
-            .strip_prefix(r"\\?\")
-            .ok_or("TASK_IDENTITY_REJECTED")?,
-    ) != expected
-    {
-        return Err("TASK_PATH_CHANGED");
-    }
-    Ok(format!(
-        "{:08x}:{:08x}{:08x}",
-        info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
-    ))
-}
-#[cfg(not(windows))]
-fn handle_identity(_: &File, _: &Path) -> Result<String> {
-    Err("WINDOWS_REQUIRED")
-}
-
-struct ExclusiveTarget {
-    file: File,
-    path: PathBuf,
-    identity: String,
-    _parents: Vec<Guard>,
-}
-impl ExclusiveTarget {
-    fn open(path: &Path, identity: &str, before: &[u8]) -> Result<Self> {
-        let pg = parents(path)?;
-        // Resolve/reject aliases before opening; inspect again through the exclusive handle.
-        {
-            let g = Guard::open(path, false)?;
-            if g.identity != identity || g.path != path {
-                return Err("TASK_PATH_CHANGED");
-            }
-        }
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            opts.share_mode(0).custom_flags(0x00200000);
-        }
-        #[cfg(not(windows))]
-        return Err("WINDOWS_REQUIRED");
-        let file = opts.open(path).map_err(|_| "TASK_EXCLUSIVE_REJECTED")?;
-        if handle_identity(&file, path)? != identity {
-            return Err("TASK_IDENTITY_REJECTED");
-        }
-        let mut s = Self {
-            file,
-            path: path.into(),
-            identity: identity.into(),
-            _parents: pg,
-        };
-        if s.read()? != before {
-            return Err("TASK_PREIMAGE_CHANGED");
-        }
-        Ok(s)
-    }
-    fn verify(&self) -> Result<()> {
-        for p in &self._parents {
-            p.verify()?;
-        }
-        if handle_identity(&self.file, &self.path)? != self.identity {
-            return Err("TASK_IDENTITY_REJECTED");
-        }
-        Ok(())
-    }
-    fn read(&mut self) -> Result<Vec<u8>> {
-        self.verify()?;
-        io(self.file.seek(SeekFrom::Start(0)))?;
-        let mut b = Vec::new();
-        io((&mut self.file).take(65537).read_to_end(&mut b))?;
-        if b.len() > 65536 {
-            return Err("BOUND");
-        }
-        self.verify()?;
-        Ok(b)
-    }
-    // Faults are crate-test-only values, not CLI flags or a runtime recovery API.
-    fn write(&mut self, candidate: &[u8], fault: u8) -> Result<()> {
-        self.verify()?;
-        io(self.file.seek(SeekFrom::Start(0)))?;
-        if fault == 3 {
-            io(self.file.write_all(&candidate[..candidate.len() / 2]))?;
-            return Err("TASK_WRITE_UNKNOWN");
-        }
-        io(self.file.write_all(candidate))?;
-        if fault == 4 {
-            return Err("TASK_TRUNCATE_UNKNOWN");
-        }
-        io(self.file.set_len(candidate.len() as u64))?;
-        if fault == 5 {
-            return Err("TASK_FLUSH_UNKNOWN");
-        }
-        io(self.file.sync_all())?;
-        if self.read()? != candidate {
-            return Err("TASK_WRITE_UNKNOWN");
-        }
-        Ok(())
-    }
-}
-
+use crate::execution_safety::{parents,ExclusiveTarget};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskRequest {
@@ -344,7 +215,8 @@ impl Fixture {
             OpenFlags::SQLITE_OPEN_READ_ONLY,
         ))?;
         sql(db.execute_batch("PRAGMA query_only=ON; BEGIN;"))?;
-        if sql(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)))? != 12 {
+        // v13 only adds API-only receipt/config tables; the frozen v12 Task contract is unchanged.
+        if !matches!(sql(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)))?, 12 | 13) {
             return Err("TASK_DATABASE_REJECTED");
         }
         let identity = rg.identity.clone();

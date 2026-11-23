@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// Current schema version this build of Nova understands. Bump this and
 /// append a new [`Migration`] to [`MIGRATIONS`] whenever the schema changes
 /// — never edit an already-shipped migration's SQL in place.
-pub const CURRENT_SCHEMA_VERSION: i64 = 12;
+pub const CURRENT_SCHEMA_VERSION: i64 = 13;
 
 #[derive(Debug)]
 pub enum MigrationError {
@@ -1080,6 +1080,7 @@ const MIGRATIONS: &[Migration] = &[
         sql: V11_SQL,
     },
     Migration { version: 12, requires_backup: true, sql: V12_SQL },
+    Migration { version: 13, requires_backup: true, sql: include_str!("api_only_v13.sql") },
 ];
 
 #[cfg(test)]
@@ -2728,7 +2729,7 @@ mod tests {
             .map(|iter| iter.filter_map(|e| e.ok()).count())
             .unwrap_or(0);
         assert_eq!(
-            count, 11,
+            count, (CURRENT_SCHEMA_VERSION - 1) as usize,
             "reopening an already-fully-migrated database must not take any new backups"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -2753,8 +2754,8 @@ mod tests {
             .collect();
         assert_eq!(
             entries.len(),
-            11,
-            "expected exactly eleven backups (migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, and 12 each require one): {entries:?}"
+            (CURRENT_SCHEMA_VERSION - 1) as usize,
+            "expected one backup per non-baseline migration: {entries:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2779,13 +2780,13 @@ mod tests {
             .collect();
         assert_eq!(
             names.len(),
-            11,
-            "migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, and 12 each produce their own backup"
+            (CURRENT_SCHEMA_VERSION - 1) as usize,
+            "each non-baseline migration produces its own backup"
         );
         let unique: std::collections::HashSet<&String> = names.iter().collect();
         assert_eq!(
             unique.len(),
-            11,
+            (CURRENT_SCHEMA_VERSION - 1) as usize,
             "all backups from the same run must have distinct names, never collide"
         );
         for name in &names {
@@ -2914,8 +2915,8 @@ mod tests {
         let backups_dir = dir.join("backups");
         let count = fs::read_dir(&backups_dir).unwrap().count();
         assert_eq!(
-            count, 11,
-            "already-applied migrations must not be re-run, so no extra backups beyond the eleven produced by the first run"
+            count, (CURRENT_SCHEMA_VERSION - 1) as usize,
+            "already-applied migrations must not be re-run, so no extra backups beyond the schema migrations produced by the first run"
         );
         let _ = fs::remove_dir_all(&dir);
     }

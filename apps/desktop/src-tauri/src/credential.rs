@@ -117,8 +117,9 @@ mod windows_store {
 
         fn delete_api_key(&self, provider_id: &str) -> NovaResult<()> {
             let target = wide(&target_name(provider_id));
-            unsafe {
-                CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0);
+            let ok = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) };
+            if ok == 0 && unsafe { windows_sys::Win32::Foundation::GetLastError() } != 1168 {
+                return Err(NovaError::Credential("Windows Credential Manager 删除失败".into()));
             }
             Ok(())
         }

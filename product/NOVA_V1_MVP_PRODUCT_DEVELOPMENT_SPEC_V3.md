@@ -1,5 +1,7 @@
 # Nova V1 MVP 产品开发文档
 
+> **现行API-only修订（2026-11-23）：** 产品执行仅使用模型API；CLI/客户端接入、CLI角色互换及会话接力要求暂停。完整首版供应商为SDKMAX、OpenAI、Claude、Kimi、DeepSeek、Gemini及自定义OpenAI兼容；开发/自检默认同配置、独立上下文。当前分批范围、接入顺序及验收门槛以同目录NOVA_V0.1.0_MINIMUM_RELEASE_DEVELOPMENT_PLAN.md的“现行路线决定：API-only”为准；下文冲突的CLI段落保留为历史，不再作为当前实现前置。
+
 **版本：** V3.0  
 **文档性质：** 产品需求、用户体验、技术实现与验收基线  
 **产品形态：** 独立 Windows 桌面客户端  

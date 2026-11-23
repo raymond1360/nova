@@ -572,11 +572,14 @@ async function handleViewDocument(documentType: string) {
       <button class="link-button" @click="handleRefreshTask">手动刷新状态</button>
     </section>
 
+    </template>
+
     <section
       v-if="store.currentTask && ['preview_ready', 'awaiting_user_acceptance', 'failed', 'needs_user_action', 'cancelled', 'completed'].includes(store.currentTask.state)"
       class="block"
     >
-      <h3>6. 结果与验收</h3>
+      <h3>6. 历史结果与只读说明</h3>
+      <p class="hint">此处展示已保存的历史记录；当前API任务的执行与最终用户验收请使用上方受控任务面板。</p>
       <!-- v0.1.0 scope correction (Work Package 2): review records are an
            optional diagnostic — v0.1.0's result and completion never
            depend on them, so this section is framed around Nova's own
@@ -643,7 +646,7 @@ async function handleViewDocument(documentType: string) {
         </template>
       </details>
 
-      <div v-if="store.currentTask.state === 'awaiting_user_acceptance'" class="accept-block">
+      <div v-if="legacyCliControls && store.currentTask.state === 'awaiting_user_acceptance'" class="accept-block">
         <textarea v-model="acceptNote" placeholder="验收备注（可选）"></textarea>
         <div class="row">
           <button :disabled="!store.completionPrecheck?.can_submit_acceptance" @click="store.acceptResult(true, acceptNote)">通过验收</button>
@@ -668,8 +671,7 @@ async function handleViewDocument(documentType: string) {
          event for something that has not actually happened. Available for
          a task in any state, including terminal ones — viewing evidence
          never re-executes anything. -->
-    </template>
-    <section v-if="legacyCliControls && store.currentTask" class="block">
+    <section v-if="store.currentTask" class="block">
       <h3>7. 时间线与 Nova 验证</h3>
       <div v-if="store.evidenceOverview">
         <p>
@@ -733,7 +735,7 @@ async function handleViewDocument(documentType: string) {
     <!-- Phase 4: the seven result documents, listed by their real
          generation/existence status and shown only in their redacted form
          — no arbitrary file path is ever accepted from the UI. -->
-    <section v-if="legacyCliControls && store.currentTask" class="block">
+    <section v-if="store.currentTask" class="block">
       <h3>8. 任务文档</h3>
       <button :disabled="store.syncingDocuments || !!store.documentSyncDisabledReason" @click="store.resyncDocuments">{{ store.syncingDocuments ? '正在更新…' : '重新生成任务文档' }}</button>
       <p class="hint">根据已有执行证据更新报告，不会重新开发、运行测试或构建。</p>

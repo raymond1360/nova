@@ -14,6 +14,20 @@ import type { Project, Task, TaskEvidenceOverview, TestEvidenceEntry, BuildEvide
 import { all, button, click, input, renderComponent, settle, type TestNode } from './testSupport/interactionRenderer'
 
 const mockedInvoke = vi.mocked(invoke)
+// Explicit metadata/receipt reads only: never treat all api_only_* as read-only.
+const apiReads = ['api_only_configs', 'api_only_catalog', 'api_only_task_report', 'api_only_cleanup_status', 'api_pm_status']
+const legacyReads = ['get_last_active_project', 'list_tasks_for_project', 'detect_test_command',
+  'list_task_reviews', 'list_task_documents', 'list_task_self_checks', 'get_task_evidence_overview',
+  'get_completion_precheck', 'get_verify_only_eligibility', 'get_no_build_confirmation_needed', 'get_no_tests_confirmation_needed', 'get_pending_round', 'read_task_document']
+const navigationCommands = ['set_last_active_project']
+let unexpectedCommands: string[] = []
+const forbiddenExecution = ['api_only_approve', 'api_only_execute', 'api_pm_run', 'api_pm_approve',
+  'api_only_test_connection', 'verify_existing_changes', 'start_core_loop', 'get_core_loop_readiness',
+  'confirm_task_test_command', 'accept_task_result']
+function expectNoExecution() {
+  expect(mockedInvoke.mock.calls.map(c => c[0]).filter(c => forbiddenExecution.includes(c))).toEqual([])
+}
+
 let pinia: ReturnType<typeof createPinia>
 let mounted: ReturnType<typeof renderComponent> | undefined
 function deferred<T>() {
@@ -24,20 +38,30 @@ function deferred<T>() {
 }
 function route(extra: Record<string, (args: any) => any> = {}) {
   const handlers: Record<string, (args: any) => any> = {
+    api_only_catalog: () => [], api_only_configs: () => [], api_pm_status: () => null,
+    api_only_task_report: ({ taskId }) => ({
+      schema: 'nova.api.pm-report/1', pm_packet_id: null, task: task({ id: taskId }), task_goal: task().goal,
+      changes: null, actual_tests: null, self_check: null, blockers: { phase: null, error: null },
+      plans: [], runs: [], repair_count: 0,
+      roles: { developer: { config_id: null }, reviewer: { config_id: null, independent_context: true }, pm: null },
+      decision_required: 'USER_ACCEPTANCE_OR_PM_REMEDIATION',
+    }),
+    api_only_cleanup_status: () => ({ pending: 0, status: 'NO_RECORDED_FAILURE' }),
     initialize_app: () => undefined,
     get_provider: () => ({ id: 'sdkmax', name: 'Fixture', base_url: '', has_key: false, masked_key: null }),
     list_conversations: () => [], get_setting: () => null,
-    get_last_active_project: () => null,
+    get_last_active_project: () => null, get_pending_round: () => 1,
     list_tasks_for_project: () => [], detect_test_command: () => null,
     set_last_active_project: () => undefined,
     list_task_reviews: () => [], list_task_documents: () => [], list_task_self_checks: () => [],
     get_task_evidence_overview: () => overview(),
     get_completion_precheck: () => ({ ok: false, can_submit_acceptance: false }),
     get_verify_only_eligibility: () => null,
+    get_no_build_confirmation_needed: () => false, get_no_tests_confirmation_needed: () => false,
     list_messages: () => [], ...extra,
   }
   mockedInvoke.mockImplementation(async (command, args) => {
-    if (!(command in handlers)) throw new Error(`Unexpected IPC: ${command}`)
+    if (!(command in handlers)) { unexpectedCommands.push(command); throw new Error(`Unexpected IPC: ${command}`) }
     return handlers[command](args)
   })
 }
@@ -84,15 +108,14 @@ function requirements(root: TestNode) {
 }
 function expectNoWrites(allowCreate = false) {
   const calls = mockedInvoke.mock.calls.map(c => c[0])
-  const reads = ['get_last_active_project', 'list_tasks_for_project', 'detect_test_command',
-    'list_task_reviews', 'list_task_documents', 'list_task_self_checks',
-    'get_task_evidence_overview', 'get_completion_precheck', 'get_verify_only_eligibility']
+  const reads = [...legacyReads, ...apiReads]
   for (const command of calls) {
     expect([...reads, ...(allowCreate ? ['create_task'] : [])]).toContain(command)
   }
 }
 
 beforeEach(() => {
+  unexpectedCommands = []
   pinia = createPinia(); setActivePinia(pinia); mockedInvoke.mockReset()
   // Only needed by Vue's v-model focus checks; this renderer has no browser DOM.
   vi.stubGlobal('document', { activeElement: null })
@@ -100,7 +123,7 @@ beforeEach(() => {
   vi.stubGlobal('ShadowRoot', class {})
   route()
 })
-afterEach(() => { mounted?.unmount(); mounted = undefined; vi.unstubAllGlobals() })
+afterEach(() => { mounted?.unmount(); mounted = undefined; vi.unstubAllGlobals(); expectNoExecution(); expect(unexpectedCommands).toEqual([]) })
 
 describe('IA-01 actual chat component events and IPC acceptance', () => {
   it.each(['', '  keep this draft\nsecond line  '])('shows the missing-model error, retains exact draft %j and never invokes send_chat_message', async draft => {
@@ -204,7 +227,13 @@ describe('IA-03 existing requirements are independent read-only data', () => {
     const { root } = await core()
     const title = all(root, n => n.kind === 'input' && n.props.placeholder === '任务标题')[0]
     await input(title, 'Created')
-    const editors = all(root, n => n.kind === 'textarea')
+    const form = all(root, n => n.kind === 'section' && n.children.some(c => c.kind === 'h3' && c.textContent === '2. 新建任务（独立表单）'))[0]
+    expect(form).toBeDefined()
+    const editors = ['目标 / 需求描述', '本次范围内', '明确不包含', '完成标准'].map(placeholder => {
+      const field = all(form, n => n.kind === 'textarea' && n.props.placeholder === placeholder)
+      expect(field).toHaveLength(1)
+      return field[0]
+    })
     for (const [index, value] of [created.goal, created.in_scope, created.not_in_scope, created.done_criteria].entries()) {
       await input(editors[index], value!)
     }
@@ -312,24 +341,17 @@ describe('RAV-01 background failure notification', () => {
 
 describe('RAV-01 verify-only recovery', () => {
   const eligible = { result_generation: 0, round: 1, dev_attempt: 1, test_command: 'npm test' }
-  it('shows an entry for an already confirmed command and dispatches only verify-only once', async () => {
-    const pending = deferred<void>()
-    route({ get_verify_only_eligibility: () => eligible, verify_existing_changes: () => pending.promise,
-      list_tasks_for_project: () => [task({ state: 'verifying' })], get_pending_round: () => 1 })
+  it('keeps verify-only closed in API-only even when a saved command is eligible', async () => {
+    route({ get_verify_only_eligibility: () => eligible })
     const { root, store } = await core()
     store.currentTask = task({ state: 'needs_user_action', test_command_source: 'user', test_command_redacted: 'npm test' })
     await settle()
-    expect(root.textContent).toContain('沿用测试命令：npm test')
-    const action = button(root, '重新验证现有修改')
-    const request = click(action)
-    await settle()
-    expect(store.verifyingOnly).toBe(true)
-    await store.verifyExistingChanges()
-    expect(mockedInvoke.mock.calls.filter(c => c[0] === 'verify_existing_changes')).toHaveLength(1)
-    expect(mockedInvoke.mock.calls.find(c => c[0] === 'verify_existing_changes')?.[1]).toEqual({ projectId: 'project', taskId: 'task', expected: eligible })
-    pending.resolve(); await request
-    expect(store.currentTask.state).toBe('verifying')
-    expect(mockedInvoke.mock.calls.some(c => ['start_core_loop', 'get_core_loop_readiness', 'confirm_task_test_command'].includes(c[0]))).toBe(false)
+    expect(store.verifyOnlyEligibility).toEqual(eligible)
+    expect(root.textContent).not.toContain('沿用测试命令：npm test')
+    expect(all(root, n => n.kind === 'button' && n.textContent === '重新验证现有修改')).toHaveLength(0)
+    await click(button(root, '刷新时间线与证据'))
+    expectNoWrites()
+    expectNoExecution()
   })
   it('hides the entry when backend rejects eligibility and discards late foreign-task results', async () => {
     const pending = deferred<typeof eligible>()
@@ -343,15 +365,23 @@ describe('RAV-01 verify-only recovery', () => {
     await store.verifyExistingChanges()
     expect(mockedInvoke.mock.calls.some(c => c[0] === 'verify_existing_changes')).toBe(false)
   })
-  it('shows request errors and never falls back to ordinary development', async () => {
-    route({ get_verify_only_eligibility: () => eligible,
-      verify_existing_changes: () => { throw new Error('任务验证条件已变化') } })
+  it('keeps legacy execution and acceptance absent when eligibility lookup fails', async () => {
+    route({ get_verify_only_eligibility: () => { throw new Error('任务验证条件已变化') } })
     const { root, store } = await core()
     store.currentTask = task({ state: 'needs_user_action', test_command_source: 'user', test_command_redacted: 'npm test' })
-    await settle(); await click(button(root, '重新验证现有修改'))
+    await settle()
+    expect(mockedInvoke.mock.calls.some(c => c[0] === 'get_verify_only_eligibility')).toBe(true)
     expect(root.textContent).toContain('任务验证条件已变化')
+    expect(store.verifyOnlyEligibility).toBeNull()
+    store.currentTask = task({ state: 'awaiting_user_acceptance' })
+    await settle()
+    for (const label of ['重新验证现有修改', '开始任务', '检查 Codex / Claude CLI 就绪状态', '通过验收', '不通过']) {
+      expect(all(root, n => n.kind === 'button' && n.textContent.trim() === label)).toHaveLength(0)
+    }
+    await click(button(root, '刷新时间线与证据'))
     expect(store.verifyingOnly).toBe(false)
-    expect(mockedInvoke.mock.calls.some(c => c[0] === 'start_core_loop')).toBe(false)
+    expectNoWrites()
+    expectNoExecution()
   })
 })
 
@@ -401,7 +431,7 @@ describe('RAV01 document regeneration entry', () => {
     return result
   }
   function onlyDocumentWrites() {
-    const writes = mockedInvoke.mock.calls.map(c => c[0]).filter(c => !c.startsWith('get_') && !c.startsWith('list_') && c !== 'read_task_document' && c !== 'set_last_active_project')
+    const writes = mockedInvoke.mock.calls.map(c => c[0]).filter(c => ![...legacyReads, ...apiReads, ...navigationCommands].includes(c))
     expect(writes).toEqual(['resync_task_documents'])
   }
   it('is visible without pending, shares one in-flight request with retry, refreshes list and open content', async () => {

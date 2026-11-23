@@ -140,6 +140,11 @@ describe('CoreLoopView.vue single-AI copy', () => {
     )
     expect(evidenceSection).not.toBeNull()
     expect(documentSection).not.toBeNull()
+    expect(source).toContain('const legacyCliControls = ref(false)')
+    expect(source).toContain('<template v-if="legacyCliControls"><!-- paused CLI controls; API-only panel above owns execution -->')
+    expect(source).toContain('<div v-if="legacyCliControls && store.currentTask.state === \'awaiting_user_acceptance\'" class="accept-block">')
+    expect(source).toMatch(/<template v-if="legacyCliControls">\r?\n      <div v-if="store\.currentTask\.test_command_source">/)
+
   })
 })
 

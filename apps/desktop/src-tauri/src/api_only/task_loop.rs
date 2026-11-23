@@ -105,10 +105,14 @@ fn inherited_files(db: &Database, id: &str, p: &Plan) -> Result<Vec<(String, Str
         })
         .collect())
 }
-fn inherit_repair(db: &Database, vault: &dyn CredentialStore, id: &str, p: &Plan) -> Result<Plan> {
+pub(super) fn inherit_repair(
+    db: &Database,
+    vault: &dyn CredentialStore,
+    id: &str,
+    p: &Plan,
+) -> Result<Plan> {
     let (_, _, phase, _) = load_plan(db, id)?;
-    if !p.allow_repair || p.parent_run.is_some() || p.expires_utc <= chrono::Utc::now().timestamp()
-    {
+    if !p.allow_repair || p.parent_run.is_some() || p.expires_utc <= now_utc() {
         return Err("API_NEW_APPROVAL_REQUIRED");
     }
     if phase == "USER_REJECTED" {
@@ -123,13 +127,16 @@ fn inherit_repair(db: &Database, vault: &dyn CredentialStore, id: &str, p: &Plan
     }
     validate_root(db, p)?;
     let expected = inherited_files(db, id, p)?;
-    let next = repair(
+    let next = prepare_deadline(
         db,
         vault,
-        id,
+        &p.task_id,
+        &p.config.config.id,
         p.files.iter().map(|f| f.path.clone()).collect(),
         p.tests.iter().map(|t| t.specification.clone()).collect(),
-        &p.config.config.id,
+        false,
+        Some(id),
+        Some(p.expires_utc),
     )?;
     if next.files.len() != p.files.len()
         || next.files.iter().any(|f| {
@@ -140,7 +147,7 @@ fn inherit_repair(db: &Database, vault: &dyn CredentialStore, id: &str, p: &Plan
         || encode(&next.config)? != encode(&p.config)?
         || encode(&next.tests)? != encode(&p.tests)?
         || next.root_identity != p.root_identity
-        || p.expires_utc <= chrono::Utc::now().timestamp()
+        || p.expires_utc <= now_utc()
     {
         return Err("API_NEW_APPROVAL_REQUIRED");
     }
@@ -205,6 +212,9 @@ pub fn passing_evidence(db: &Database, task: &crate::models::Task) -> Result<boo
         .optional())?;
     let Some(id) = id else { return Ok(false) };
     let (p, _, phase, s) = load_plan(db, &id)?;
+    if p.approval_kind.is_empty() {
+        return Ok(false);
+    }
     validate_root(db, &p)?;
     if phase != "AWAITING_USER" || s["published_generation"] != task.result_generation {
         return Ok(false);
@@ -245,6 +255,10 @@ pub fn passing_evidence(db: &Database, task: &crate::models::Task) -> Result<boo
     )?;
     Ok(!tests.is_empty()
         && tests.len() == p.tests.len()
+        && tests
+            .iter()
+            .zip(&p.tests)
+            .all(|(e, t)| recipes::valid_evidence(t, e))
         && tests
             .iter()
             .all(|t| t.status == "PASS" && t.exit_code == Some(0))

@@ -91,6 +91,8 @@ pub struct FileSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct Plan {
     #[serde(default)]
+    pub approval_kind: String,
+    #[serde(default)]
     pub allow_repair: bool,
     #[serde(default)]
     pub parent_run: Option<String>,
@@ -210,6 +212,34 @@ pub fn prepare_scoped(
     allow_repair: bool,
     parent: Option<&str>,
 ) -> Result<Plan> {
+    prepare_deadline(
+        db,
+        vault,
+        task_id,
+        config_id,
+        paths,
+        tests,
+        allow_repair,
+        parent,
+        None,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn prepare_deadline(
+    db: &Database,
+    vault: &dyn CredentialStore,
+    task_id: &str,
+    config_id: &str,
+    paths: Vec<String>,
+    tests: Vec<FixedTest>,
+    allow_repair: bool,
+    parent: Option<&str>,
+    inherited: Option<i64>,
+) -> Result<Plan> {
+    let expires = inherited.unwrap_or_else(|| now_utc() + 3600);
+    if expires <= now_utc() {
+        return Err("API_APPROVAL_EXPIRED");
+    }
     let c = config::load_config(db, config_id)?;
     c.view.config.require_adapter()?;
     if !c.view.has_key {
@@ -261,7 +291,7 @@ pub fn prepare_scoped(
         &tests,
         allow_repair,
     )?;
-    let plan=Plan{allow_repair,parent_run:parent.map(str::to_string),prior_issues,schema:"nova.api.task/1".into(),id:uuid::Uuid::new_v4().to_string(),task_id:task_id.into(),project_id:project_id.clone(),root:root.path,root_identity:root.identity,task_digest:hash(encode(&task)?.as_bytes()),task,config:c.view.clone(),files,tests,expires_utc:chrono::Utc::now().timestamp()+3600,notice:"At most DEVELOP 1 + independent REVIEW 1, no automatic network retries. Approved files only; non-atomic in-place writes may be partial. Only the displayed fixed test recipe/argv/environment is approved; never model-generated shell. API requests expose this packet and incur provider charges. No automatic restore/completion/commit. A task-level one-repair grant permits at most 4 model requests total, same configuration/files/tests only; no additional tools or budget. Project unittest executes trusted project code and dependencies with user permissions, may write/spawn/access network; not a sandbox.".into()};
+    let plan=Plan{approval_kind:if inherited.is_some(){"INHERITED"}else{"EXPLICIT"}.into(),allow_repair,parent_run:parent.map(str::to_string),prior_issues,schema:"nova.api.task/1".into(),id:uuid::Uuid::new_v4().to_string(),task_id:task_id.into(),project_id:project_id.clone(),root:root.path,root_identity:root.identity,task_digest:hash(encode(&task)?.as_bytes()),task,config:c.view.clone(),files,tests,expires_utc:expires,notice:"At most DEVELOP 1 + independent REVIEW 1, no automatic network retries. Approved files only; non-atomic in-place writes may be partial. Only the displayed fixed test recipe/argv/environment is approved; never model-generated shell. API requests expose this packet and incur provider charges. No automatic restore/completion/commit. A task-level one-repair grant permits at most 4 model requests total, same configuration/files/tests only; no additional tools or budget. Project unittest executes trusted project code and dependencies with user permissions, may write/spawn/access network; not a sandbox.".into()};
     let raw = encode(&plan)?;
     config::acquire(&c, vault)?.scan_json(raw.as_bytes(), 65536)?;
     if raw.len() > 49152 {
@@ -298,11 +328,29 @@ fn validate_root(db: &Database, p: &Plan) -> Result<()> {
     Ok(())
 }
 fn validate_current(db: &Database, p: &Plan) -> Result<config::StoredConfig> {
+    if !matches!(p.approval_kind.as_str(), "EXPLICIT" | "INHERITED") {
+        return Err("API_LEGACY_PLAN_REQUIRES_NEW_APPROVAL");
+    }
+    if p.approval_kind == "INHERITED" {
+        let parent = p.parent_run.as_deref().ok_or("API_APPROVAL_MISMATCH")?;
+        let (original, _, _, _) = load_plan(db, parent)?;
+        if !original.allow_repair
+            || original.parent_run.is_some()
+            || p.expires_utc > original.expires_utc
+            || original.expires_utc <= now_utc()
+        {
+            return Err("API_APPROVAL_EXPIRED");
+        }
+    }
     validate_root(db, p)?;
-    if p.schema != "nova.api.task/1" || p.expires_utc <= chrono::Utc::now().timestamp() {
+    if p.schema != "nova.api.task/1" || p.expires_utc <= now_utc() {
         return Err("API_APPROVAL_EXPIRED");
     }
-    if p.tests.iter().any(|t| t.argv.is_empty()) {
+    if p.tests.iter().any(|t| {
+        t.argv.is_empty()
+            || (t.specification.recipe == "python_unittest"
+                && !t.argv.iter().any(|a| a == recipes::UNIT_WRAPPER))
+    }) {
         return Err("API_LEGACY_PLAN_REQUIRES_NEW_APPROVAL");
     }
     let c = config::load_config(db, &p.config.config.id)?;
@@ -373,6 +421,8 @@ struct Edits {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TestEvidence {
+    #[serde(default)]
+    pub counts: Option<recipes::Counts>,
     pub file: String,
     pub status: String,
     pub exit_code: Option<i32>,
@@ -419,7 +469,21 @@ impl TestPort for FixedTestRunner {
             } => "FAIL",
             _ => "UNKNOWN",
         };
+        let counts = if t.specification.recipe == "python_unittest" {
+            recipes::counts(&e.stdout)
+        } else {
+            None
+        };
+        let status = if status == "PASS"
+            && t.specification.recipe == "python_unittest"
+            && !counts.as_ref().is_some_and(|c| c.passed())
+        {
+            "UNKNOWN"
+        } else {
+            status
+        };
         Ok(TestEvidence {
+            counts,
             file: t.specification.file.clone(),
             status: status.into(),
             exit_code: e.exit_code,
@@ -454,6 +518,7 @@ pub fn execute<P: ApiPort, T: TestPort>(
         let input = json!({"task":p.task,"files":p.files,"fixed_tests":p.tests,"scope":p.notice,"prior_issues":p.prior_issues});
         summary["develop_attempts_reserved"] = json!(1);
         cas(db, id, stage, stage, &summary)?;
+        validate_current(db, &p)?;
         let proposed =
             transport::completion(api, &p.config.config, &key, "DEVELOP", &input, cancel)?;
         let edits: Edits = decode(
@@ -514,6 +579,7 @@ pub fn execute<P: ApiPort, T: TestPort>(
         }
         validate_current(db, &p)?;
         for (target, change) in targets.iter_mut().zip(&changes) {
+            validate_current(db, &p)?;
             target.write(change.candidate.text.as_bytes(), 0)?;
         }
         drop(targets);
@@ -604,6 +670,7 @@ pub fn execute<P: ApiPort, T: TestPort>(
         if cancel.is_cancelled() || started.elapsed() > Duration::from_secs(240) {
             return Err("API_CANCELLED_UNKNOWN");
         }
+        validate_current(db, &p)?;
         let raw =
             transport::completion(api, &p.config.config, &key, "REVIEW", &review_input, cancel)?;
         let claim: ReviewClaim = decode(
@@ -615,9 +682,14 @@ pub fn execute<P: ApiPort, T: TestPort>(
         verify_files(&p, Some(&changes))?;
         summary["review"] = serde_json::to_value(&claim).map_err(|_| "API_ENCODING")?;
         summary["review_response_validated"] = json!(true);
-        let passed = tests
+        let project_proof = tests
             .iter()
-            .all(|t| t.status == "PASS" && t.exit_code == Some(0))
+            .zip(&p.tests)
+            .all(|(e, t)| recipes::valid_evidence(t, e));
+        let passed = project_proof
+            && tests
+                .iter()
+                .all(|t| t.status == "PASS" && t.exit_code == Some(0))
             && claim.verdict == "PASS"
             && claim.issues.is_empty()
             && claim.unknowns.is_empty();
@@ -653,3 +725,15 @@ pub fn execute<P: ApiPort, T: TestPort>(
 }
 #[cfg(test)]
 mod tests;
+
+fn now_utc() -> i64 {
+    #[cfg(test)]
+    {
+        if let Some(t) = TEST_CLOCK.with(|v| v.get()) {
+            return t;
+        }
+    }
+    chrono::Utc::now().timestamp()
+}
+#[cfg(test)]
+thread_local! {static TEST_CLOCK:std::cell::Cell<Option<i64>>=const{std::cell::Cell::new(None)};}

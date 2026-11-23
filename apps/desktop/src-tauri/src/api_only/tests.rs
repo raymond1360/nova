@@ -178,6 +178,7 @@ impl TestPort for FakeTests {
     fn run(&mut self, t: &ApprovedTest, _: &Path, _: &CancellationToken) -> Result<TestEvidence> {
         self.calls += 1;
         Ok(TestEvidence {
+            counts: None,
             file: t.specification.file.clone(),
             status: self.state.into(),
             exit_code: if self.state == "PASS" {
@@ -1482,4 +1483,288 @@ fn disk_reopen_keeps_repair_limit_and_unknown_without_resending() {
             .execute("DELETE FROM api_task_runs", [])
             .is_err());
     }
+}
+#[test]
+fn p1_inherited_deadline_crossing_stops_before_write() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_CLOCK.with(|c| c.set(None));
+        }
+    }
+    let _reset = Reset;
+    TEST_CLOCK.with(|c| c.set(Some(10000)));
+    let f = Fixture::new();
+    let p = prepare_scoped(
+        &f.db,
+        &f.vault,
+        &f.task,
+        &f.config.id,
+        vec!["note.txt".into()],
+        vec![f.test()],
+        true,
+        None,
+    )
+    .unwrap();
+    approve(&f.db, &p.id, &hash(encode(&p).unwrap().as_bytes())).unwrap();
+    let mut a = LoopApi {
+        calls: 0,
+        reviews: 0,
+        fail_second: false,
+    };
+    let mut t = FakeTests {
+        state: "PASS",
+        calls: 0,
+    };
+    execute(
+        &f.db,
+        &p.id,
+        &f.vault,
+        &mut a,
+        &mut t,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    TEST_CLOCK.with(|c| c.set(Some(p.expires_utc - 1)));
+    let next = task_loop::inherit_repair(&f.db, &f.vault, &p.id, &p).unwrap();
+    assert_eq!(next.expires_utc, p.expires_utc);
+    struct Cross {
+        inner: LoopApi,
+        deadline: i64,
+    }
+    impl ApiPort for Cross {
+        fn send(
+            &mut self,
+            r: &transport::WireRequest,
+            k: &SecretLease,
+            c: &CancellationToken,
+        ) -> Result<Vec<u8>> {
+            let out = self.inner.send(r, k, c);
+            TEST_CLOCK.with(|v| v.set(Some(self.deadline)));
+            out
+        }
+    }
+    let before = std::fs::read(f.root.join("note.txt")).unwrap();
+    let mut crossing = Cross {
+        inner: LoopApi {
+            calls: 0,
+            reviews: 1,
+            fail_second: false,
+        },
+        deadline: p.expires_utc,
+    };
+    let mut tests = FakeTests {
+        state: "PASS",
+        calls: 0,
+    };
+    let r = execute(
+        &f.db,
+        &next.id,
+        &f.vault,
+        &mut crossing,
+        &mut tests,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_ne!(r["phase"], "AWAITING_USER");
+    assert_eq!(crossing.inner.calls, 1);
+    assert_eq!(tests.calls, 0);
+    assert_eq!(std::fs::read(f.root.join("note.txt")).unwrap(), before);
+    assert!(task_loop::inherit_repair(&f.db, &f.vault, &p.id, &p).is_err());
+}
+#[test]
+fn p1_manual_deadline_is_new_explicit_approval() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_CLOCK.with(|c| c.set(None));
+        }
+    }
+    let _reset = Reset;
+    TEST_CLOCK.with(|c| c.set(Some(20000)));
+    let f = Fixture::new();
+    let p = f.approved();
+    execute_case(&f, &p, "changes", "PASS");
+    TEST_CLOCK.with(|c| c.set(Some(p.expires_utc + 1)));
+    let child = task_loop::repair(
+        &f.db,
+        &f.vault,
+        &p.id,
+        vec!["note.txt".into()],
+        vec![f.test()],
+        &f.config.id,
+    )
+    .unwrap();
+    assert!(child.expires_utc > p.expires_utc);
+    assert_eq!(status(&f.db, &child.id).unwrap()["phase"], "PREPARED");
+}
+#[test]
+fn p1_runtime_suite_counts_empty_mismatch_skip_failure_success() {
+    let f = Fixture::new();
+    std::fs::create_dir(f.root.join("tests")).unwrap();
+    let spec = FixedTest {
+        recipe: "python_unittest".into(),
+        ..f.test()
+    };
+    let files = vec![FileSnapshot {
+        path: "note.txt".into(),
+        identity: "unused".into(),
+        before: "unused".into(),
+        sha256: "unused".into(),
+    }];
+    let t = tool_snapshot(&spec, &f.root, &files).unwrap();
+    for (name,source,pass) in [("other.py","import unittest\nclass T(unittest.TestCase):\n def test_a(self): pass\n",false),("test_a.py","import unittest\nclass T(unittest.TestCase):\n def test_a(self): pass\n",true),("test_a.py","import unittest\n@unittest.skip('synthetic')\nclass T(unittest.TestCase):\n def test_a(self): pass\n",false),("test_a.py","import unittest\nclass T(unittest.TestCase):\n def test_a(self): self.fail('synthetic')\n",false)]{std::fs::write(f.root.join("tests").join(name),source).unwrap();let e=FixedTestRunner.run(&t,&f.root,&CancellationToken::new()).unwrap();assert_eq!(e.status=="PASS",pass);assert!(e.counts.is_some());}
+    assert!(recipes::counts("OK").is_none());
+    assert!(recipes::counts("NOVA_UNIT_RESULT {}\n").is_none());
+}
+#[test]
+fn p1_empty_suite_never_publishes_or_completes() {
+    let f = Fixture::new();
+    std::fs::create_dir(f.root.join("tests")).unwrap();
+    let spec = FixedTest {
+        recipe: "python_unittest".into(),
+        ..f.test()
+    };
+    let p = prepare_scoped(
+        &f.db,
+        &f.vault,
+        &f.task,
+        &f.config.id,
+        vec!["note.txt".into()],
+        vec![spec],
+        false,
+        None,
+    )
+    .unwrap();
+    approve(&f.db, &p.id, &hash(encode(&p).unwrap().as_bytes())).unwrap();
+    let mut api = FakeApi {
+        root: f.root.clone(),
+        ..Default::default()
+    };
+    let r = task_loop::execute_loop(
+        &f.db,
+        &p.id,
+        &f.vault,
+        &mut api,
+        &mut FixedTestRunner,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_ne!(r["phase"], "AWAITING_USER");
+    assert!(task_loop::user_decision_with_vault(&f.db, &f.vault, &p.id, true, "accept").is_err());
+}
+#[test]
+fn p1_missing_or_invalid_counts_cannot_pass_tool_or_gate() {
+    let f = Fixture::new();
+    std::fs::create_dir(f.root.join("tests")).unwrap();
+    let spec = FixedTest {
+        recipe: "python_unittest".into(),
+        ..f.test()
+    };
+    let p = prepare_scoped(
+        &f.db,
+        &f.vault,
+        &f.task,
+        &f.config.id,
+        vec!["note.txt".into()],
+        vec![spec],
+        false,
+        None,
+    )
+    .unwrap();
+    approve(&f.db, &p.id, &hash(encode(&p).unwrap().as_bytes())).unwrap();
+    let mut api = FakeApi {
+        root: f.root.clone(),
+        ..Default::default()
+    };
+    let mut fake = FakeTests {
+        state: "PASS",
+        calls: 0,
+    };
+    let r = task_loop::execute_loop(
+        &f.db,
+        &p.id,
+        &f.vault,
+        &mut api,
+        &mut fake,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(r["phase"], "NEEDS_REMEDIATION");
+    assert!(task_loop::user_decision_with_vault(&f.db, &f.vault, &p.id, true, "no proof").is_err());
+    for raw in [
+        r#"{"schema":"nova.unittest/1","discovered":0,"executed":0,"skipped":0,"failures":0,"errors":0,"expected_failures":0,"unexpected_successes":0}"#,
+        r#"{"schema":"nova.unittest/1","discovered":2,"executed":2,"skipped":2,"failures":0,"errors":0,"expected_failures":0,"unexpected_successes":0}"#,
+    ] {
+        let c = recipes::counts(&format!("NOVA_UNIT_RESULT {raw}")).unwrap();
+        assert!(!c.passed());
+    }
+}
+#[test]
+fn p1_gate_rechecks_counts_and_legacy_plan_requires_new_approval() {
+    let f = Fixture::new();
+    std::fs::create_dir(f.root.join("tests")).unwrap();
+    std::fs::write(
+        f.root.join("tests/test_gate.py"),
+        "import unittest\nclass T(unittest.TestCase):\n def test_a(self): pass\n",
+    )
+    .unwrap();
+    let spec = FixedTest {
+        recipe: "python_unittest".into(),
+        ..f.test()
+    };
+    let p = prepare_scoped(
+        &f.db,
+        &f.vault,
+        &f.task,
+        &f.config.id,
+        vec!["note.txt".into()],
+        vec![spec],
+        false,
+        None,
+    )
+    .unwrap();
+    let mut legacy = p.clone();
+    legacy.approval_kind.clear();
+    assert_eq!(
+        validate_current(&f.db, &legacy).err(),
+        Some("API_LEGACY_PLAN_REQUIRES_NEW_APPROVAL")
+    );
+    approve(&f.db, &p.id, &hash(encode(&p).unwrap().as_bytes())).unwrap();
+    let mut a = FakeApi {
+        root: f.root.clone(),
+        ..Default::default()
+    };
+    let r = task_loop::execute_loop(
+        &f.db,
+        &p.id,
+        &f.vault,
+        &mut a,
+        &mut FixedTestRunner,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(r["phase"], "AWAITING_USER");
+    let (_, _, _, mut summary) = load_plan(&f.db, &p.id).unwrap();
+    summary["tests"][0]["counts"] = Value::Null;
+    f.db.conn()
+        .execute(
+            "UPDATE api_task_runs SET summary_json=?1 WHERE id=?2",
+            rusqlite::params![encode(&summary).unwrap(), p.id],
+        )
+        .unwrap();
+    assert!(f
+        .db
+        .evaluate_acceptance_submission(&f.db.task(&f.task).unwrap())
+        .unwrap()
+        .is_err());
+    assert!(task_loop::user_decision_with_vault(
+        &f.db,
+        &f.vault,
+        &p.id,
+        true,
+        "reject missing counts"
+    )
+    .is_err());
+    assert!(f.db.user_acceptance_for_task(&f.task).unwrap().is_none());
 }

@@ -427,7 +427,7 @@ fn actual_owned_store_guard_migrations_and_transition_side_effects() {
     let status = s.status(&f.e).unwrap();
     assert_eq!(status["task_state"], "queued");
     let backups = fs::read_dir(f.root.join("owned/backups")).unwrap().count();
-    assert_eq!(backups, 11);
+    assert_eq!(backups, (crate::storage::migrations::CURRENT_SCHEMA_VERSION - 1) as usize);
     for t in [ReportType::Review, ReportType::Ci, ReportType::Development] {
         f.import(&s, &report(t)).unwrap();
     }

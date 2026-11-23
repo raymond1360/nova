@@ -1768,3 +1768,257 @@ fn p1_gate_rechecks_counts_and_legacy_plan_requires_new_approval() {
     .is_err());
     assert!(f.db.user_acceptance_for_task(&f.task).unwrap().is_none());
 }
+#[test]
+fn legacy_grant_public_paths_reject_before_any_reservation() {
+    for node in [false, true] {
+        for awaiting in [false, true] {
+            let source = Fixture::new();
+            let mut p = source.plan();
+            let f = Fixture::new();
+            p.id = uuid::Uuid::new_v4().to_string();
+            p.task_id = f.task.clone();
+            p.task = task_snapshot(&f.db, &f.task).unwrap();
+            p.task_digest = hash(encode(&p.task).unwrap().as_bytes());
+            p.project_id = f.db.task(&f.task).unwrap().project_id;
+            p.root = f.root.clone();
+            p.root_identity = Guard::open(&f.root, true).unwrap().identity;
+            p.config = config::load_config(&f.db, &f.config.id).unwrap().view;
+            p.allow_repair = true;
+            p.files = vec![FileSnapshot {
+                path: "note.txt".into(),
+                identity: read_file(&f.root.join("note.txt"), 8192).unwrap().1,
+                before: std::fs::read_to_string(f.root.join("note.txt")).unwrap(),
+                sha256: hash(&std::fs::read(f.root.join("note.txt")).unwrap()),
+            }];
+            if node {
+                let dir = f.root.join("apps/desktop/node_modules/vitest");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("vitest.mjs"), "throw Error('must never run')").unwrap();
+                let program = std::env::var_os("PATH")
+                    .and_then(|v| {
+                        std::env::split_paths(&v)
+                            .map(|p| p.join("node.exe"))
+                            .find(|p| p.is_file())
+                    })
+                    .unwrap();
+                p.tests = vec![tool_snapshot(
+                    &FixedTest {
+                        recipe: "nova_vitest_api2".into(),
+                        program,
+                        ..f.test()
+                    },
+                    &f.root,
+                    &p.files,
+                )
+                .unwrap()];
+            } else {
+                p.tests = vec![tool_snapshot(&f.test(), &f.root, &p.files).unwrap()];
+            }
+            let mut old = serde_json::to_value(&p).unwrap();
+            old.as_object_mut().unwrap().remove("approval_kind");
+            let raw = encode(&old).unwrap();
+            let digest = hash(raw.as_bytes());
+            let proposal = json!({"schema":"nova.relay.proposal/1","target_path":"note.txt","old_text":"Alpha","new_text":"beta","rationale":"synthetic prior execution"});
+            let candidate = candidate_text(
+                "note.txt",
+                &p.files[0].sha256,
+                p.files[0].before.as_bytes(),
+                &serde_json::to_vec(&proposal).unwrap(),
+                false,
+            )
+            .unwrap();
+            std::fs::write(f.root.join("note.txt"), candidate.text.as_bytes()).unwrap();
+            let summary=encode(&json!({"approved_digest":digest,"changes":[{"path":"note.txt","candidate":candidate}],"tests":[{"file":"note.txt","status":"PASS","exit_code":0,"stdout":"synthetic","stderr":"","counts":null}],"review":{"verdict":"PASS"},"write_verified":true,"published_generation":1})).unwrap();
+            f.db.conn()
+                .execute(
+                    "INSERT INTO api_task_runs VALUES(?1,?2,?3,?4,?5,?6,4,?7)",
+                    rusqlite::params![
+                        p.id,
+                        p.task_id,
+                        p.project_id,
+                        raw,
+                        digest,
+                        if awaiting {
+                            "AWAITING_USER"
+                        } else {
+                            "USER_REJECTED"
+                        },
+                        summary
+                    ],
+                )
+                .unwrap();
+            f.db.conn()
+                .execute(
+                    "INSERT INTO api_task_scopes VALUES(?1,?2,NULL)",
+                    rusqlite::params![p.task_id, p.id],
+                )
+                .unwrap();
+            // Build the old post-result Task through existing legal transitions, not an admission override.
+            for state in [
+                TaskState::Queued,
+                TaskState::Running,
+                TaskState::Verifying,
+                TaskState::PreviewReady,
+                TaskState::AwaitingUserAcceptance,
+            ] {
+                f.db.transition_task(&f.task, state, Actor::Nova, None, None, false, None)
+                    .unwrap();
+            }
+            if awaiting {
+                task_loop::user_decision_with_vault(&f.db, &f.vault, &p.id, false, "decline only")
+                    .unwrap();
+            } else {
+                f.db.transition_task(
+                    &f.task,
+                    TaskState::NeedsUserAction,
+                    Actor::User,
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap();
+            }
+            let before = load_plan(&f.db, &p.id).unwrap();
+            let row_before: (String, String, String, i64, String) =
+                f.db.conn()
+                    .query_row(
+                        "SELECT plan_json,digest,phase,revision,summary_json FROM api_task_runs",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                    )
+                    .unwrap();
+            let bytes = std::fs::read(f.root.join("note.txt")).unwrap();
+            let mut api = FakeApi::default();
+            let mut tests = FakeTests {
+                state: "PASS",
+                calls: 0,
+            };
+            assert_eq!(
+                task_loop::execute_loop(
+                    &f.db,
+                    &p.id,
+                    &f.vault,
+                    &mut api,
+                    &mut tests,
+                    &CancellationToken::new()
+                )
+                .unwrap_err(),
+                "API_PARENT_GRANT_REJECTED"
+            );
+            assert!(api.calls.is_empty());
+            assert_eq!(tests.calls, 0);
+            assert_eq!(std::fs::read(f.root.join("note.txt")).unwrap(), bytes);
+            let after = load_plan(&f.db, &p.id).unwrap();
+            assert_eq!(before.1, after.1);
+            assert_eq!(before.2, after.2);
+            assert_eq!(before.3, after.3);
+            let row: (i64, Option<String>) = f
+                .db
+                .conn()
+                .query_row(
+                    "SELECT (SELECT count(*) FROM api_task_runs),repair_run FROM api_task_scopes",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(row, (1, None));
+            let stored: String =
+                f.db.conn()
+                    .query_row("SELECT plan_json FROM api_task_runs", [], |r| r.get(0))
+                    .unwrap();
+            assert_eq!(stored, raw);
+            let row_after: (String, String, String, i64, String) =
+                f.db.conn()
+                    .query_row(
+                        "SELECT plan_json,digest,phase,revision,summary_json FROM api_task_runs",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                    )
+                    .unwrap();
+            assert_eq!(row_before, row_after);
+            if awaiting && !node {
+                let manual = task_loop::repair(
+                    &f.db,
+                    &f.vault,
+                    &p.id,
+                    vec!["note.txt".into()],
+                    vec![f.test()],
+                    &f.config.id,
+                )
+                .unwrap();
+                assert_eq!(manual.approval_kind, "EXPLICIT");
+                assert_eq!(status(&f.db, &manual.id).unwrap()["phase"], "PREPARED");
+                assert!(task_loop::execute_loop(
+                    &f.db,
+                    &manual.id,
+                    &f.vault,
+                    &mut api,
+                    &mut tests,
+                    &CancellationToken::new()
+                )
+                .is_err());
+                assert!(api.calls.is_empty());
+                assert!(task_loop::repair(
+                    &f.db,
+                    &f.vault,
+                    &p.id,
+                    vec!["note.txt".into()],
+                    vec![f.test()],
+                    &f.config.id
+                )
+                .is_err());
+            }
+        }
+    }
+}
+#[test]
+fn child_rechecks_persisted_parent_grant_and_link() {
+    let f = Fixture::new();
+    let p = prepare_scoped(
+        &f.db,
+        &f.vault,
+        &f.task,
+        &f.config.id,
+        vec!["note.txt".into()],
+        vec![f.test()],
+        true,
+        None,
+    )
+    .unwrap();
+    approve(&f.db, &p.id, &hash(encode(&p).unwrap().as_bytes())).unwrap();
+    execute_case(&f, &p, "changes", "PASS");
+    let child = task_loop::inherit_repair(&f.db, &f.vault, &p.id, &p).unwrap();
+    assert!(validate_current(&f.db, &child).is_ok());
+    let mut wrong = child.clone();
+    wrong.parent_run = Some(child.id.clone());
+    assert!(validate_current(&f.db, &wrong).is_err());
+    wrong = child.clone();
+    wrong.id = uuid::Uuid::new_v4().to_string();
+    assert!(validate_current(&f.db, &wrong).is_err());
+    let (_, _, _, mut s) = load_plan(&f.db, &p.id).unwrap();
+    s["approved_digest"] = json!("wrong");
+    f.db.conn()
+        .execute(
+            "UPDATE api_task_runs SET summary_json=?1 WHERE id=?2",
+            rusqlite::params![encode(&s).unwrap(), p.id],
+        )
+        .unwrap();
+    assert!(validate_current(&f.db, &child).is_err());
+    let mut api = FakeApi::default();
+    let mut tests = FakeTests {
+        state: "PASS",
+        calls: 0,
+    };
+    assert!(task_loop::execute_loop(
+        &f.db,
+        &child.id,
+        &f.vault,
+        &mut api,
+        &mut tests,
+        &CancellationToken::new()
+    )
+    .is_err());
+    assert!(api.calls.is_empty());
+    assert_eq!(tests.calls, 0);
+}

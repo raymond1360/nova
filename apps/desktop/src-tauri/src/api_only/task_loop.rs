@@ -41,9 +41,68 @@ pub fn repair_context(
         Ok(Value::Null)
     }
 }
+/// Validate the persisted grant itself, independently of the Task's current state.
+pub(super) fn parent_grant(
+    db: &Database,
+    id: &str,
+    child: Option<&Plan>,
+    reserved: bool,
+) -> Result<Plan> {
+    let (p, d, phase, receipt) = load_plan(db, id)?;
+    if p.id != id
+        || p.schema != "nova.api.task/1"
+        || p.approval_kind != "EXPLICIT"
+        || p.parent_run.is_some()
+        || !p.allow_repair
+        || receipt["approved_digest"] != d
+        || !matches!(phase.as_str(), "NEEDS_REMEDIATION" | "USER_REJECTED")
+    {
+        return Err("API_PARENT_GRANT_REJECTED");
+    }
+    if p.expires_utc <= now_utc() {
+        return Err("API_NEW_APPROVAL_REQUIRED");
+    }
+    let (first, repair): (String, Option<String>) = sql(db.conn().query_row(
+        "SELECT first_run,repair_run FROM api_task_scopes WHERE task_id=?1",
+        [&p.task_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ))?;
+    if first != id
+        || if reserved {
+            repair.as_deref() != child.map(|c| c.id.as_str()) || repair.is_none()
+        } else {
+            repair.is_some()
+        }
+    {
+        return Err("API_PARENT_SCOPE_REJECTED");
+    }
+    if let Some(c) = child {
+        if c.parent_run.as_deref() != Some(id)
+            || c.task_id != p.task_id
+            || c.project_id != p.project_id
+            || c.root != p.root
+            || c.root_identity != p.root_identity
+            || encode(&c.config)? != encode(&p.config)?
+            || encode(&c.tests)? != encode(&p.tests)?
+            || c.files.len() != p.files.len()
+            || c.files.iter().any(|f| {
+                !p.files
+                    .iter()
+                    .any(|old| old.path == f.path && old.identity == f.identity)
+            })
+            || c.expires_utc > p.expires_utc
+        {
+            return Err("API_PARENT_SCOPE_REJECTED");
+        }
+    }
+    Ok(p)
+}
 pub fn insert_plan(db: &Database, p: &Plan, raw: &str, parent: Option<&str>) -> Result<()> {
     sql(db.conn().execute_batch("BEGIN IMMEDIATE"))?;
     let result = (|| {
+        if p.approval_kind == "INHERITED" {
+            parent_grant(db, parent.ok_or("API_APPROVAL_MISMATCH")?, Some(p), false)?;
+        }
         sql(db.conn().execute("INSERT INTO api_task_runs(id,task_id,project_id,plan_json,digest,phase,revision,summary_json) VALUES(?1,?2,?3,?4,?5,'PREPARED',0,'{}')",rusqlite::params![p.id,p.task_id,p.project_id,raw,hash(raw.as_bytes())]))?;
         if let Some(parent) = parent {
             if sql(db.conn().execute("UPDATE api_task_scopes SET repair_run=?1 WHERE task_id=?2 AND first_run=?3 AND repair_run IS NULL AND EXISTS(SELECT 1 FROM api_task_runs WHERE id=?3 AND phase IN ('NEEDS_REMEDIATION','USER_REJECTED'))",rusqlite::params![p.id,p.task_id,parent]))?!=1{return Err("API_REPAIR_LIMIT")}
@@ -111,6 +170,7 @@ pub(super) fn inherit_repair(
     id: &str,
     p: &Plan,
 ) -> Result<Plan> {
+    parent_grant(db, id, None, false)?;
     let (_, _, phase, _) = load_plan(db, id)?;
     if !p.allow_repair || p.parent_run.is_some() || p.expires_utc <= now_utc() {
         return Err("API_NEW_APPROVAL_REQUIRED");

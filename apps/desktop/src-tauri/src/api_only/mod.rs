@@ -236,6 +236,16 @@ fn prepare_deadline(
     parent: Option<&str>,
     inherited: Option<i64>,
 ) -> Result<Plan> {
+    if let Some(deadline) = inherited {
+        let original =
+            task_loop::parent_grant(db, parent.ok_or("API_APPROVAL_MISMATCH")?, None, false)?;
+        if original.task_id != task_id
+            || original.config.config.id != config_id
+            || deadline > original.expires_utc
+        {
+            return Err("API_PARENT_SCOPE_REJECTED");
+        }
+    }
     let expires = inherited.unwrap_or_else(|| now_utc() + 3600);
     if expires <= now_utc() {
         return Err("API_APPROVAL_EXPIRED");
@@ -333,14 +343,7 @@ fn validate_current(db: &Database, p: &Plan) -> Result<config::StoredConfig> {
     }
     if p.approval_kind == "INHERITED" {
         let parent = p.parent_run.as_deref().ok_or("API_APPROVAL_MISMATCH")?;
-        let (original, _, _, _) = load_plan(db, parent)?;
-        if !original.allow_repair
-            || original.parent_run.is_some()
-            || p.expires_utc > original.expires_utc
-            || original.expires_utc <= now_utc()
-        {
-            return Err("API_APPROVAL_EXPIRED");
-        }
+        task_loop::parent_grant(db, parent, Some(p), true)?;
     }
     validate_root(db, p)?;
     if p.schema != "nova.api.task/1" || p.expires_utc <= now_utc() {
@@ -560,7 +563,7 @@ pub fn execute<P: ApiPort, T: TestPort>(
         if cancel.is_cancelled() {
             return Err("API_CANCELLED_UNKNOWN");
         }
-        let intent = json!({"changes":changes,"backup":"original bytes retained in immutable plan.files.before","write_semantics":"NON_ATOMIC_IN_PLACE","tests":"NOT RUN","review":"NOT RUN","develop_attempts_reserved":1,"review_attempts_reserved":0});
+        let intent = json!({"changes":changes,"approved_digest":summary["approved_digest"],"backup":"original bytes retained in immutable plan.files.before","write_semantics":"NON_ATOMIC_IN_PLACE","tests":"NOT RUN","review":"NOT RUN","develop_attempts_reserved":1,"review_attempts_reserved":0});
         cas(db, id, stage, "WRITE_INTENT", &intent)?;
         stage = "WRITE_INTENT";
         summary = intent;

@@ -1387,12 +1387,37 @@ mod tests {
             "unknown"
         );
     }
+    // Test-only clock: no elapsed wall time in the write-fault matrix. For the
+    // boundary case, advance only after both API evidence receipts are COMPLETE,
+    // so the production write guard (not an earlier relay deadline) is exercised.
+    struct WriteFaultClock {
+        now: std::cell::Cell<u64>,
+        advance_after_receipts: Option<PathBuf>,
+    }
+    impl Clock for WriteFaultClock {
+        fn now_ms(&self) -> u64 {
+            if let Some(root) = &self.advance_after_receipts {
+                let store = Store::task_open(root).unwrap();
+                let attempts = store.api_attempts().unwrap();
+                if attempts.len() == 2 && attempts.iter().all(|a| {
+                    a.evidence.as_ref().is_some_and(|e| e["state"] == "COMPLETE")
+                }) {
+                    self.now.set(120000);
+                }
+            }
+            self.now.get()
+        }
+    }
     #[test]
     fn task_execution_backup_intent_and_write_faults_never_replay() {
         for fault in 1..=6 {
             let r = setup();
             let p = accept(&r);
-            let (mut http, mut keys, clock, stop) = ports();
+            let (mut http, mut keys, _, stop) = ports();
+            let clock = WriteFaultClock {
+                now: std::cell::Cell::new(0),
+                advance_after_receipts: None,
+            };
             let result = run_with_fault(
                 &r.fixture_root,
                 &r.task_id,
@@ -1425,6 +1450,36 @@ mod tests {
             assert_eq!(keys.reads, reads);
             assert_eq!(fs::read(p.target()).unwrap(), file);
         }
+    }
+    #[test]
+    fn task_execution_write_deadline_boundary_rejects_without_replay() {
+        let r = setup();
+        let p = accept(&r);
+        let (mut http, mut keys, _, stop) = ports();
+        let clock = WriteFaultClock {
+            now: std::cell::Cell::new(0),
+            advance_after_receipts: Some(p.store_root()),
+        };
+        assert_eq!(run_with(
+            &r.fixture_root, &r.task_id, true, &mut http, &mut keys, &clock, &stop,
+        ).unwrap_err(), "TASK_WRITE_NOT_AUTHORIZED");
+        assert_eq!(clock.now.get(), 120000);
+        assert_eq!((http.calls, keys.reads), (2, 2));
+        let store = Store::task_open(&p.store_root()).unwrap();
+        assert_eq!(store.api_attempts().unwrap().len(), 2);
+        assert!(store.task_write_state().unwrap().is_none());
+        let (_, _, evidence_root, _) = store.api_plan().unwrap();
+        assert!(!evidence_root.join("original-backup.json").exists());
+        assert_eq!(fs::read(p.target()).unwrap(), p.snapshot.as_bytes());
+        let calls = http.calls;
+        let reads = keys.reads;
+        run_with(
+            &r.fixture_root, &r.task_id, true, &mut http, &mut keys, &clock, &stop,
+        ).unwrap();
+        assert_eq!(http.calls - calls, 0, "reopen must not send again");
+        assert_eq!(keys.reads - reads, 0);
+        assert!(store.task_write_state().unwrap().is_none());
+        assert_eq!(fs::read(p.target()).unwrap(), p.snapshot.as_bytes());
     }
     #[test]
     fn task_execution_failure_cancel_secrets_and_usage_stop_without_review() {

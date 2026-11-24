@@ -125,11 +125,11 @@ try {
  $tests=Get-Content (Join-Path $EvidenceDirectory 'old-relay/default-names.json') -Raw|ConvertFrom-Json -AsHashtable
  $scheduler=Get-Content (Join-Path $EvidenceDirectory 'old-relay/scheduler-names.json') -Raw|ConvertFrom-Json -AsHashtable
  $explicit=Get-Content (Join-Path $EvidenceDirectory 'old-relay/explicit-names.json') -Raw|ConvertFrom-Json -AsHashtable
- if((SetHash $tests.listed) -cne 'fce100c3b3dd007fae5d1395d84eab37495bd2e8e5de4d48eb286f8e8729fa0c'){throw 'API_FROZEN_DEFAULT_LISTED'}
- if((SetHash $tests.passed) -cne '3d09f90c0aef612b2c629bc7f15f2334a1cb4dc4d81fbbe3f23039f72d4ac317'){throw 'API_FROZEN_DEFAULT_PASSED'}
+ if((SetHash $tests.listed) -cne '2c52c4423d66340add577cc0faf4a426dc7d18b1b415e5b0ed4e2d1418c73191'){throw 'API_FROZEN_DEFAULT_LISTED'}
+ if((SetHash $tests.passed) -cne '4e90f5f0e834e08979d9314acdf191f89e412f9c7d6e8a6cdec49b83ca60eb32'){throw 'API_FROZEN_DEFAULT_PASSED'}
  if((SetHash $tests.ignored) -cne 'a39bbead332b9d661508d9a4d3a81dbf78a7473b535e6e470c0d76e3738d9611'){throw 'API_FROZEN_DEFAULT_IGNORED'}
- if((SetHash $scheduler.listed) -cne 'fa1c48749681e147eac07824ce294040c7340f644ddf6f8a588a76b227fcc233'){throw 'API_FROZEN_SCHEDULER_LISTED'}
- if((SetHash $scheduler.passed) -cne 'a2c17b36bf6435a44534a701f67b7fff409f734c9f0b7b5ec01e7938f09b3eef'){throw 'API_FROZEN_SCHEDULER_PASSED'}
+ if((SetHash $scheduler.listed) -cne '9e8721788bad879371af9f5fa7090a60ffdcfe3761c00d6faa2c34d761c3ccd8'){throw 'API_FROZEN_SCHEDULER_LISTED'}
+ if((SetHash $scheduler.passed) -cne '0bf635a2bb2dd5328fced62eb64b75d4567fc2cd2f93f40c3416d3ac0a9b04a2'){throw 'API_FROZEN_SCHEDULER_PASSED'}
  if((SetHash $scheduler.ignored) -cne 'a39bbead332b9d661508d9a4d3a81dbf78a7473b535e6e470c0d76e3738d9611'){throw 'API_FROZEN_SCHEDULER_IGNORED'}
  Assert-Set $tests.listed $tests.passed $tests.ignored
  Assert-Set $scheduler.listed $scheduler.passed $scheduler.ignored

@@ -23,3 +23,34 @@ describe('API PM concrete panel',()=>{
  it('unknown/reopened running states never expose replay',async()=>{for(const s of ['UNKNOWN','RUNNING','PLANNING_STARTED']){phase=s;const root=await mount();expect(all(root,n=>n.kind==='button'&&/开始自动协调|允许产品经理形成派单/.test(n.textContent))).toHaveLength(0);mounted?.unmount()}expect(ipc.mock.calls.some(c=>c[0]==='api_pm_run')).toBe(false)})
  it('pending cancel is not a model call',async()=>{const root=await mount();await click(button(root,'取消协调'));expect(root.textContent).toContain('已取消');expect(ipc.mock.calls.some(c=>c[0]==='api_pm_run')).toBe(false)})
 })
+
+function readonlyFailureRoute(stored:any){ipc.mockImplementation(async(command)=>{switch(command){case 'api_only_configs':return [] as any;case 'api_only_catalog':return [] as any;case 'api_pm_status':return structuredClone(stored);default:throw Error('Unexpected '+command)}})}
+function errorPanel(root:TestNode){return all(root,n=>n.props['aria-label']==='持久错误说明')[0]!}
+describe('persisted timeout explanation',()=>{
+ it('legacy persisted error stays visible after refresh/reopen with zero new requests',async()=>{
+  const stored={...record(),phase:'UNKNOWN',error_code:'API_PM_EXECUTION_UNKNOWN',execution:{phase:'UNKNOWN',summary:{error_code:'API_TIMEOUT_UNKNOWN',stopped_phase:'DEVELOP_STARTED',tests:'NOT RUN',review:'NOT RUN'}},pm_requests_reserved:1,execution_requests_reserved:1,overall_requests_reserved:2}
+  readonlyFailureRoute(stored)
+  let root=await mount()
+  for(let i=0;i<2;i++){
+   const text=errorPanel(root).textContent
+   expect(text).toContain('60秒');expect(text).toContain('结果未知');expect(text).toContain('停止阶段：开发请求')
+   expect(text).toContain('测试：未运行');expect(text).toContain('审核：未运行');expect(text).toContain('不会自动重发')
+   expect(text).toContain('未记录');expect(text).not.toContain('文件未改')
+   await click(button(root,'刷新协调记录（只读）'));mounted?.unmount();root=await mount()
+  }
+  expect(root.textContent).toContain('请求预约数，不是实际计费次数')
+  expect(ipc.mock.calls.every(c=>['api_only_configs','api_only_catalog','api_pm_status'].includes(c[0]))).toBe(true)
+ })
+ it('renders only observed header/body boundaries, including completed response',async()=>{
+  for(const [facts,message]of [
+   [{headers_received:false,http_status:null,body_complete:false,body_bytes_read:0,elapsed_ms:60000},'尚未记录到响应头'],
+   [{headers_received:true,http_status:200,body_complete:false,body_bytes_read:17,elapsed_ms:60000},'已收到HTTP状态 200，响应体尚未完整读取'],
+   [{headers_received:true,http_status:200,body_complete:true,body_bytes_read:128,elapsed_ms:12},'响应体已完整收到'],
+  ] as const){
+   readonlyFailureRoute({...record(),phase:'UNKNOWN',execution:{phase:'UNKNOWN',summary:{error_code:'API_TIMEOUT_UNKNOWN',stopped_phase:'REVIEW_STARTED',review_transport:facts,tests:[{status:'PASS'}],review:'NOT RUN'}}})
+   const root=await mount();expect(errorPanel(root).textContent).toContain(message)
+   expect(errorPanel(root).textContent).toContain('独立审核请求');mounted?.unmount()
+  }
+  expect(ipc.mock.calls.every(c=>['api_only_configs','api_only_catalog','api_pm_status'].includes(c[0]))).toBe(true)
+ })
+})

@@ -5,6 +5,45 @@ pub struct WireRequest {
     pub method: String,
     pub body: Vec<u8>,
 }
+/// Tool facts only: no endpoint, headers, body, credentials or free exception text.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransportFacts {
+    pub attempt_started_utc: String,
+    pub headers_received: bool,
+    pub http_status: Option<u16>,
+    pub body_complete: bool,
+    pub body_bytes_read: u64,
+    pub elapsed_ms: u64,
+    pub error_category: TransportCategory,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TransportCategory {
+    InProgress, None, TimeoutUnknown, CancelledUnknown, ResponseUnknown,
+    HttpRejected, ResponseBound, TransportUnavailable, MethodInvalid, OtherRejected,
+}
+impl TransportFacts {
+    pub(crate) fn begin() -> Self {
+        Self { attempt_started_utc: chrono::Utc::now().to_rfc3339(),
+            headers_received: false, http_status: None, body_complete: false,
+            body_bytes_read: 0, elapsed_ms: 0, error_category: TransportCategory::InProgress }
+    }
+    pub(crate) fn finish(&mut self, result: &Result<Vec<u8>>, elapsed: Duration) {
+        self.elapsed_ms = elapsed.as_millis().try_into().unwrap_or(u64::MAX);
+        self.error_category = match result.as_ref().err().copied() {
+            None => TransportCategory::None,
+            Some("API_TIMEOUT_UNKNOWN") => TransportCategory::TimeoutUnknown,
+            Some("API_CANCELLED_UNKNOWN") => TransportCategory::CancelledUnknown,
+            Some("API_RESPONSE_UNKNOWN") => TransportCategory::ResponseUnknown,
+            Some("API_HTTP_REJECTED") => TransportCategory::HttpRejected,
+            Some("API_RESPONSE_BOUND") => TransportCategory::ResponseBound,
+            Some("API_TRANSPORT_UNAVAILABLE") => TransportCategory::TransportUnavailable,
+            Some("API_METHOD_INVALID") => TransportCategory::MethodInvalid,
+            Some(_) => TransportCategory::OtherRejected,
+        };
+    }
+}
 pub trait ApiPort {
     fn send(
         &mut self,
@@ -12,30 +51,58 @@ pub trait ApiPort {
         key: &SecretLease,
         cancel: &CancellationToken,
     ) -> Result<Vec<u8>>;
+    // Legacy injected ports make no claims about unobserved HTTP boundaries.
+    fn send_diagnosed(&mut self, request: &WireRequest, key: &SecretLease,
+        cancel: &CancellationToken, _observe: &mut dyn FnMut(&TransportFacts)) -> Result<Vec<u8>> {
+        self.send(request, key, cancel)
+    }
 }
 pub struct DeepSeekHttp;
 impl ApiPort for DeepSeekHttp {
-    fn send(
-        &mut self,
-        r: &WireRequest,
-        key: &SecretLease,
-        cancel: &CancellationToken,
-    ) -> Result<Vec<u8>> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| "API_TRANSPORT_UNAVAILABLE")?;
-        let out=runtime.block_on(async {
-   let client=reqwest::Client::builder().https_only(true).no_proxy().retry(reqwest::retry::never()).redirect(reqwest::redirect::Policy::none()).pool_max_idle_per_host(0).build().map_err(|_|"API_TRANSPORT_UNAVAILABLE")?;
-   let op=async {
-    let method=if r.method=="GET"{reqwest::Method::GET}else if r.method=="POST"{reqwest::Method::POST}else{return Err("API_METHOD_INVALID")};
-    let mut response=client.request(method,&r.endpoint).bearer_auth(key.bearer()?).header("Content-Type","application/json").body(r.body.clone()).send().await.map_err(|_|"API_RESPONSE_UNKNOWN")?;
-    if response.status()!=200{return Err("API_HTTP_REJECTED")}
-    let mut body=Vec::new();while let Some(chunk)=response.chunk().await.map_err(|_|"API_RESPONSE_UNKNOWN")? {if body.len()+chunk.len()>131072{return Err("API_RESPONSE_BOUND")};body.extend_from_slice(&chunk)};Ok(body)
-   };
-   tokio::select!{v=op=>v,_=cancel.cancelled()=>Err("API_CANCELLED_UNKNOWN"),_=tokio::time::sleep(Duration::from_secs(60))=>Err("API_TIMEOUT_UNKNOWN")}
-  });
-        runtime.shutdown_timeout(Duration::from_millis(100));
+    fn send(&mut self, r: &WireRequest, key: &SecretLease, cancel: &CancellationToken) -> Result<Vec<u8>> {
+        self.send_diagnosed(r, key, cancel, &mut |_| {})
+    }
+    fn send_diagnosed(&mut self, r: &WireRequest, key: &SecretLease,
+        cancel: &CancellationToken, observe: &mut dyn FnMut(&TransportFacts)) -> Result<Vec<u8>> {
+        let started = Instant::now();
+        let mut facts = TransportFacts::begin();
+        observe(&facts); // Local attempt only; not proof of upstream receipt.
+        let out = (|| {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()
+                .map_err(|_| "API_TRANSPORT_UNAVAILABLE")?;
+            let out = runtime.block_on(async {
+                let client = reqwest::Client::builder().https_only(true).no_proxy()
+                    .retry(reqwest::retry::never()).redirect(reqwest::redirect::Policy::none())
+                    .pool_max_idle_per_host(0).build().map_err(|_| "API_TRANSPORT_UNAVAILABLE")?;
+                let op = async {
+                    let method = if r.method == "GET" { reqwest::Method::GET }
+                        else if r.method == "POST" { reqwest::Method::POST }
+                        else { return Err("API_METHOD_INVALID") };
+                    let mut response = client.request(method, &r.endpoint).bearer_auth(key.bearer()?)
+                        .header("Content-Type", "application/json").body(r.body.clone()).send().await
+                        .map_err(|_| "API_RESPONSE_UNKNOWN")?;
+                    facts.headers_received = true;
+                    facts.http_status = Some(response.status().as_u16());
+                    facts.elapsed_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+                    observe(&facts);
+                    if response.status() != 200 { return Err("API_HTTP_REJECTED") }
+                    let mut body = Vec::new();
+                    while let Some(chunk) = response.chunk().await.map_err(|_| "API_RESPONSE_UNKNOWN")? {
+                        facts.body_bytes_read = facts.body_bytes_read.saturating_add(chunk.len() as u64);
+                        if body.len() + chunk.len() > 131072 { return Err("API_RESPONSE_BOUND") }
+                        body.extend_from_slice(&chunk);
+                    }
+                    facts.body_complete = true; // Only an observed end-of-body establishes this.
+                    Ok(body)
+                };
+                tokio::select! {v=op=>v, _=cancel.cancelled()=>Err("API_CANCELLED_UNKNOWN"),
+                    _=tokio::time::sleep(Duration::from_secs(60))=>Err("API_TIMEOUT_UNKNOWN")}
+            });
+            runtime.shutdown_timeout(Duration::from_millis(100));
+            out
+        })();
+        facts.finish(&out, started.elapsed());
+        observe(&facts);
         out
     }
 }
@@ -46,6 +113,7 @@ pub(crate) fn completion<P: ApiPort>(
     role: &str,
     input: &Value,
     cancel: &CancellationToken,
+    observe: &mut dyn FnMut(&TransportFacts),
 ) -> Result<Value> {
     c.require_adapter()?;
     if cancel.is_cancelled() {
@@ -70,7 +138,7 @@ pub(crate) fn completion<P: ApiPort>(
         return Err("API_CONTEXT_BOUND");
     };
     key.scan_text(&body)?;
-    let raw = port.send(
+    let raw = port.send_diagnosed(
         &WireRequest {
             endpoint: format!("{}/chat/completions", c.base_url),
             method: "POST".into(),
@@ -78,6 +146,7 @@ pub(crate) fn completion<P: ApiPort>(
         },
         key,
         cancel,
+        observe,
     )?;
     let value = key.scan_response(&raw)?;
     if value["model"] != c.model

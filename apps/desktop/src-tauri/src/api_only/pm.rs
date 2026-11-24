@@ -225,6 +225,8 @@ fn request<P: ApiPort>(
         sql(db.conn().execute("INSERT INTO api_pm_decisions(packet_id,ordinal,run_id,stage,input_json,input_hash,phase) VALUES(?1,?2,?3,?4,?5,?6,'STARTED')",rusqlite::params![p.id,count+1,run,stage,raw,hash(raw.as_bytes())]))?;
         Ok(count + 1)
     })?;
+    let mut observed_transport = None;
+    let mut diagnostic_incomplete = false;
     let result = (|| {
         current(db, p, stage == "PLAN")?;
         let c = config::load_config(db, &p.pm.config.id)?;
@@ -240,6 +242,15 @@ fn request<P: ApiPort>(
             },
             &input,
             cancel,
+            &mut |facts| {
+                observed_transport = Some(json!(facts));
+                let envelope = json!({"schema":"nova.api.pm-observation/1",
+                    "transport":observed_transport,"model_output":null});
+                let saved = encode(&envelope).and_then(|raw| sql(db.conn().execute(
+                    "UPDATE api_pm_decisions SET output_json=?1 WHERE packet_id=?2 AND ordinal=?3 AND phase='STARTED'",
+                    rusqlite::params![raw,p.id,ordinal])));
+                if !matches!(saved, Ok(1)) { diagnostic_incomplete = true; }
+            },
         )?;
         current(db, p, stage == "PLAN")?;
         if cancel.is_cancelled() {
@@ -248,12 +259,29 @@ fn request<P: ApiPort>(
         scan(db, vault, p, &v)?;
         Ok(v)
     })();
+    // Keep tool diagnostics separate from model conclusions; old output_json stays readable.
+    let envelope = |output: Option<&Value>| {
+        let mut v = json!({"schema":"nova.api.pm-observation/1",
+            "transport":observed_transport,"diagnostic_incomplete":diagnostic_incomplete,"model_output":output});
+        // Do not let diagnostic overhead make an otherwise readable error record
+        // exceed the existing 64 KiB record reader. Normal valid PM contracts fit.
+        if encode(&v).is_ok_and(|raw| raw.len() > 65536) {
+            v["model_output"] = Value::Null;
+            v["model_output_omitted"] = json!("RECORD_BOUND");
+        }
+        v
+    };
     match result {
         Ok(v) => {
-            sql(db.conn().execute("UPDATE api_pm_decisions SET phase='RECEIVED',output_json=?1 WHERE packet_id=?2 AND ordinal=?3",rusqlite::params![encode(&v)?,p.id,ordinal]))?;
+            sql(db.conn().execute("UPDATE api_pm_decisions SET phase='RECEIVED',output_json=?1 WHERE packet_id=?2 AND ordinal=?3",rusqlite::params![encode(&envelope(Some(&v)))?,p.id,ordinal]))?;
             Ok(v)
         }
         Err(e) => {
+            // Never turn a transport failure into a diagnostic-storage error or success.
+            if let Ok(raw) = encode(&envelope(None)) {
+                let _ = db.conn().execute("UPDATE api_pm_decisions SET output_json=?1 WHERE packet_id=?2 AND ordinal=?3",
+                    rusqlite::params![raw,p.id,ordinal]);
+            }
             stop(db, &p.id, e)?;
             Err(e)
         }
@@ -662,7 +690,13 @@ pub fn status(db: &Database, id: &str) -> Result<Value> {
     let mut decisions = vec![];
     for row in rows {
         let (n, run, stage, hash, phase, output, disposition, rejection_reason) = sql(row)?;
-        decisions.push(json!({"ordinal":n,"run_id":run,"stage":stage,"input_hash":hash,"phase":phase,"output":output.map(|s|decode::<Value>(s.as_bytes(),65536)).transpose()?,"disposition":disposition,"rejection_reason":rejection_reason}));
+        let stored = output.map(|s|decode::<Value>(s.as_bytes(),65536)).transpose()?;
+        let (model_output, transport, incomplete) = match stored {
+            Some(v) if v["schema"] == "nova.api.pm-observation/1" =>
+                (v["model_output"].clone(), v["transport"].clone(), v["diagnostic_incomplete"].clone()),
+            old => (old.unwrap_or(Value::Null), Value::Null, Value::Null),
+        };
+        decisions.push(json!({"ordinal":n,"run_id":run,"stage":stage,"input_hash":hash,"phase":phase,"output":model_output,"transport":transport,"diagnostic_incomplete":incomplete,"disposition":disposition,"rejection_reason":rejection_reason}));
     }
     let execution = run.as_deref().map(|r| super::status(db, r)).transpose()?;
     let plan = run

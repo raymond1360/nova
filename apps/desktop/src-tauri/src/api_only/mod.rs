@@ -510,6 +510,19 @@ pub fn execute<P: ApiPort, T: TestPort>(
 pub(super) trait ReviewPolicy {
     fn before_review(&mut self, plan: &Plan, evidence: &Value) -> Result<()>;
 }
+// Diagnostic persistence is best-effort and cannot replace the production result.
+fn recorded_completion<P: ApiPort>(db: &Database, id: &str, stage: &str, summary: &mut Value,
+    api: &mut P, config: &Config, key: &SecretLease, role: &str, input: &Value,
+    cancel: &CancellationToken) -> Result<Value> {
+    let field = if role == "DEVELOP" { "develop_transport" } else { "review_transport" };
+    let mut incomplete = false;
+    let result = transport::completion(api, config, key, role, input, cancel, &mut |facts| {
+        summary[field] = json!(facts);
+        if cas(db, id, stage, stage, summary).is_err() { incomplete = true; }
+    });
+    if incomplete { summary["transport_recording"] = json!("INCOMPLETE"); }
+    result
+}
 fn execute_staged<P: ApiPort, T: TestPort>(db: &Database, id: &str, vault: &dyn CredentialStore, api: &mut P, test: &mut T, cancel: &CancellationToken, mut policy: Option<&mut dyn ReviewPolicy>) -> Result<Value> {
     let (p, _, phase, mut summary) = load_plan(db, id)?;
     if pm::managed(db, &p.task_id)? && policy.is_none() { return Err("API_PM_COORDINATOR_REQUIRED"); }
@@ -532,7 +545,7 @@ fn execute_staged<P: ApiPort, T: TestPort>(db: &Database, id: &str, vault: &dyn 
         cas(db, id, stage, stage, &summary)?;
         validate_current(db, &p)?;
         let proposed =
-            transport::completion(api, &p.config.config, &key, "DEVELOP", &input, cancel)?;
+            recorded_completion(db, id, stage, &mut summary, api, &p.config.config, &key, "DEVELOP", &input, cancel)?;
         let edits: Edits = decode(
             &serde_json::to_vec(&proposed).map_err(|_| "API_ENCODING")?,
             65536,
@@ -572,7 +585,7 @@ fn execute_staged<P: ApiPort, T: TestPort>(db: &Database, id: &str, vault: &dyn 
         if cancel.is_cancelled() {
             return Err("API_CANCELLED_UNKNOWN");
         }
-        let intent = json!({"changes":changes,"approved_digest":summary["approved_digest"],"backup":"original bytes retained in immutable plan.files.before","write_semantics":"NON_ATOMIC_IN_PLACE","tests":"NOT RUN","review":"NOT RUN","develop_attempts_reserved":1,"review_attempts_reserved":0});
+        let intent = json!({"changes":changes,"approved_digest":summary["approved_digest"],"develop_transport":summary.get("develop_transport"),"transport_recording":summary.get("transport_recording"),"backup":"original bytes retained in immutable plan.files.before","write_semantics":"NON_ATOMIC_IN_PLACE","tests":"NOT RUN","review":"NOT RUN","develop_attempts_reserved":1,"review_attempts_reserved":0});
         cas(db, id, stage, "WRITE_INTENT", &intent)?;
         stage = "WRITE_INTENT";
         summary = intent;
@@ -685,7 +698,7 @@ fn execute_staged<P: ApiPort, T: TestPort>(db: &Database, id: &str, vault: &dyn 
         }
         validate_current(db, &p)?;
         let raw =
-            transport::completion(api, &p.config.config, &key, "REVIEW", &review_input, cancel)?;
+            recorded_completion(db, id, stage, &mut summary, api, &p.config.config, &key, "REVIEW", &review_input, cancel)?;
         let claim: ReviewClaim = decode(
             &serde_json::to_vec(&raw).map_err(|_| "API_ENCODING")?,
             65536,

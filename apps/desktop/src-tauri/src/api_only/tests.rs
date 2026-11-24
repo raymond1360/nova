@@ -191,6 +191,94 @@ impl TestPort for FakeTests {
         })
     }
 }
+// Offline scripted transport: real persistence/execute code, no sockets or real credentials.
+struct DiagnosedPort<P> { inner: P, timeout: u8, calls: usize }
+impl<P: ApiPort> ApiPort for DiagnosedPort<P> {
+    fn send(&mut self, r: &transport::WireRequest, key: &SecretLease, c: &CancellationToken) -> Result<Vec<u8>> {
+        self.inner.send(r, key, c)
+    }
+    fn send_diagnosed(&mut self, r: &transport::WireRequest, key: &SecretLease,
+        c: &CancellationToken, observe: &mut dyn FnMut(&transport::TransportFacts)) -> Result<Vec<u8>> {
+        self.calls += 1;
+        let mut f = transport::TransportFacts::begin();
+        observe(&f);
+        if self.timeout != 1 {
+            f.headers_received = true; f.http_status = Some(200); observe(&f);
+        }
+        let result = if self.timeout > 0 {
+            if self.timeout == 2 { f.body_bytes_read = 17; }
+            Err("API_TIMEOUT_UNKNOWN")
+        } else {
+            let out = self.inner.send(r, key, c);
+            if let Ok(b) = &out { f.body_bytes_read = b.len() as u64; f.body_complete = true; }
+            out
+        };
+        f.finish(&result, Duration::from_millis(if self.timeout > 0 { 60000 } else { 7 }));
+        observe(&f);
+        result
+    }
+}
+#[test]
+fn transport_observations_persist_preheader_and_partial_body_timeout() {
+    for timeout in [1, 2] {
+        let f = Fixture::new(); let p = f.approved();
+        let before = std::fs::read(f.root.join("note.txt")).unwrap();
+        let mut api = DiagnosedPort { inner: FakeApi::default(), timeout, calls: 0 };
+        let mut tests = FakeTests {state:"PASS",calls:0};
+        let out = execute(&f.db,&p.id,&f.vault,&mut api,&mut tests,&CancellationToken::new()).unwrap();
+        assert_eq!(out["phase"],"UNKNOWN");
+        assert_eq!(out["summary"]["error_code"],"API_TIMEOUT_UNKNOWN");
+        assert_eq!(out["summary"]["stopped_phase"],"DEVELOP_STARTED");
+        let facts=&out["summary"]["develop_transport"];
+        assert_eq!(facts["headers_received"],timeout==2);
+        assert_eq!(facts["http_status"],if timeout==2 {json!(200)} else {Value::Null});
+        assert_eq!(facts["body_complete"],false);
+        assert_eq!(facts["body_bytes_read"],if timeout==2 {17} else {0});
+        assert_eq!(facts["elapsed_ms"],60000);
+        assert_eq!(facts["error_category"],"TIMEOUT_UNKNOWN");
+        chrono::DateTime::parse_from_rfc3339(facts["attempt_started_utc"].as_str().unwrap()).unwrap();
+        assert!(out["summary"].get("changes").is_none());
+        assert_eq!((api.calls,tests.calls),(1,0));
+        assert_eq!(std::fs::read(f.root.join("note.txt")).unwrap(),before);
+        assert_eq!(status(&f.db,&p.id).unwrap(),out);
+        assert!(execute(&f.db,&p.id,&f.vault,&mut api,&mut tests,&CancellationToken::new()).is_err());
+        assert_eq!(api.calls,1);
+        assert_eq!(f.db.task(&f.task).unwrap().state,TaskState::Confirmed);
+        let text=encode(facts).unwrap();
+        assert!(!text.contains("SYNTHETIC_SECRET_VALUE_12345678"));
+        assert_eq!(facts.as_object().unwrap().len(),7);
+    }
+}
+#[test]
+fn transport_observations_complete_and_no_sensitive_diagnostics() {
+    let f=Fixture::new();let p=f.approved();
+    let mut api=DiagnosedPort {inner:FakeApi {root:f.root.clone(),..Default::default()},timeout:0,calls:0};
+    let mut tests=FakeTests {state:"PASS",calls:0};
+    let out=execute(&f.db,&p.id,&f.vault,&mut api,&mut tests,&CancellationToken::new()).unwrap();
+    assert_eq!(out["phase"],"AWAITING_USER");
+    for field in ["develop_transport","review_transport"] {
+        let facts=&out["summary"][field];
+        assert_eq!(facts["body_complete"],true);assert_eq!(facts["http_status"],200);
+        assert!(facts["body_bytes_read"].as_u64().unwrap()>0);assert_eq!(facts["error_category"],"NONE");
+        let text=encode(facts).unwrap();
+        for secret in ["SYNTHETIC_SECRET_VALUE_12345678","Approved word change","choices","Authorization"] {assert!(!text.contains(secret));}
+    }
+    assert_eq!((api.calls,tests.calls),(2,1));
+    let mut facts=transport::TransportFacts::begin();
+    facts.finish(&Err("SYNTHETIC_SECRET_VALUE_12345678 raw private error"),Duration::from_millis(1));
+    assert_eq!(serde_json::to_value(&facts).unwrap()["error_category"],"OTHER_REJECTED");
+    assert!(!encode(&facts).unwrap().contains("SYNTHETIC"));
+}
+#[test]
+fn transport_diagnostic_storage_failure_preserves_timeout() {
+    let f=Fixture::new();let p=f.approved();
+    f.db.conn().execute_batch("CREATE TEMP TRIGGER diagnostic_failure BEFORE UPDATE ON api_task_runs WHEN NEW.phase=OLD.phase AND NEW.summary_json LIKE '%develop_transport%' BEGIN SELECT RAISE(FAIL,'synthetic diagnostic storage failure'); END;").unwrap();
+    let mut api=DiagnosedPort {inner:FakeApi::default(),timeout:2,calls:0};
+    let mut tests=FakeTests {state:"PASS",calls:0};
+    let out=execute(&f.db,&p.id,&f.vault,&mut api,&mut tests,&CancellationToken::new()).unwrap();
+    assert_eq!(out["phase"],"UNKNOWN");assert_eq!(out["summary"]["error_code"],"API_TIMEOUT_UNKNOWN");
+    assert_eq!(out["summary"]["transport_recording"],"INCOMPLETE");assert_eq!((api.calls,tests.calls),(1,0));
+}
 fn execute_case(
     f: &Fixture,
     p: &Plan,
@@ -2071,6 +2159,9 @@ mod pm_cases {
                 };
                 json!({"schema":"nova.api.pm.decision/1","action":action,"reason":"Based only on actual tool receipts"})
             };
+            let output = if self.mode == "large_invalid" {
+                json!({"schema":"invalid","reason":"x".repeat(65400)})
+            } else { output };
             Ok(encode(&json!({"model":body["model"],"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":encode(&output)?}}]}))?.into_bytes())
         }
     }
@@ -2107,6 +2198,42 @@ mod pm_cases {
             s["execution_approval_digest"].as_str().unwrap(),
         )
         .unwrap()
+    }
+    #[test]
+    fn pm_transport_facts_legacy_output_and_unknown_do_not_replay() {
+        let f=Fixture::new();
+        let mut pm_api=DiagnosedPort {inner:PmApi {calls:vec![],mode:""},timeout:0,calls:0};
+        let s=pm::prepare(&f.db,&f.vault,request(&f,f.test())).unwrap();
+        let id=s["id"].as_str().unwrap();
+        let planned=pm::plan(&f.db,&f.vault,id,s["digest"].as_str().unwrap(),true,&mut pm_api,&CancellationToken::new()).unwrap();
+        assert_eq!(planned["decisions"][0]["output"]["action"],"ARRANGE_DEVELOP");
+        assert_eq!(planned["decisions"][0]["transport"]["body_complete"],true);
+        // A genuine old output_json shape has no tool envelope or transport fields.
+        let model=encode(&planned["decisions"][0]["output"]).unwrap();
+        f.db.conn().execute("UPDATE api_pm_decisions SET output_json=?1 WHERE packet_id=?2",rusqlite::params![model,id]).unwrap();
+        let legacy=pm::status(&f.db,id).unwrap();
+        assert_eq!(legacy["decisions"][0]["output"]["action"],"ARRANGE_DEVELOP");
+        assert!(legacy["decisions"][0]["transport"].is_null());
+        let ready=pm::confirm(&f.db,&f.vault,id).unwrap();
+        pm::approve(&f.db,id,ready["execution_approval_digest"].as_str().unwrap()).unwrap();
+        let mut api=DiagnosedPort {inner:FakeApi::default(),timeout:1,calls:0};
+        let mut tests=FakeTests {state:"PASS",calls:0};
+        assert_eq!(pm::execute(&f.db,&f.vault,id,&mut pm_api,&mut api,&mut tests,&CancellationToken::new()).unwrap_err(),"API_PM_EXECUTION_UNKNOWN");
+        let stopped=pm::status(&f.db,id).unwrap();
+        assert_eq!(stopped["execution"]["summary"]["error_code"],"API_TIMEOUT_UNKNOWN");
+        assert_eq!(stopped["overall_requests_reserved"],2);
+        for _ in 0..2 {assert_eq!(pm::status(&f.db,id).unwrap(),stopped);}
+        assert!(pm::execute(&f.db,&f.vault,id,&mut pm_api,&mut api,&mut tests,&CancellationToken::new()).is_err());
+        assert_eq!((pm_api.calls,api.calls,tests.calls),(1,1,0));
+        let f=Fixture::new();
+        let s=pm::prepare(&f.db,&f.vault,request(&f,f.test())).unwrap();
+        let mut large=DiagnosedPort {inner:PmApi {calls:vec![],mode:"large_invalid"},timeout:0,calls:0};
+        assert!(pm::plan(&f.db,&f.vault,s["id"].as_str().unwrap(),s["digest"].as_str().unwrap(),true,&mut large,&CancellationToken::new()).is_err());
+        let stopped=pm::status(&f.db,s["id"].as_str().unwrap()).unwrap();
+        assert_eq!(stopped["phase"],"STOPPED");
+        assert_eq!(stopped["decisions"][0]["transport"]["body_complete"],true);
+        assert!(stopped["decisions"][0]["output"].is_null());
+        assert_eq!(large.calls,1);
     }
     #[test]
     fn pm_planning_consent_and_refresh_are_read_only() {

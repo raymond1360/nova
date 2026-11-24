@@ -59,7 +59,24 @@ fn current_upgrade_only_adds_tables_without_modifying_v11_business_rows() {
     for old in &before {
         assert_eq!(Some(old), after.iter().find(|v| v.0 == old.0), "{}", old.0);
     }
-    assert_eq!(after.len(), before.len() + 12);
+    // Exact retained additions since v11, not CREATE statements (v14 rebuilds api_task_runs).
+    let expected_added: std::collections::BTreeSet<&str> = [
+        // v12: requirements workspace.
+        "requirement_conversations", "requirement_drafts", "requirement_revisions",
+        "requirement_messages", "planning_authorizations", "planning_requests",
+        "requirement_task_bindings", "requirement_mutation_receipts",
+        // v13: API configuration and immutable execution plans.
+        "api_model_configs", "api_task_runs",
+        // v14: persistent repair scope and credential cleanup receipts.
+        "api_task_scopes", "api_credential_cleanup",
+        // v15: bounded PM coordination and decision reservations.
+        "api_pm_packets", "api_pm_decisions",
+    ].into_iter().collect();
+    let before_names: std::collections::BTreeSet<&str> = before.iter().map(|v| v.0.as_str()).collect();
+    let after_names: std::collections::BTreeSet<&str> = after.iter().map(|v| v.0.as_str()).collect();
+    let actual_added = after_names.difference(&before_names).copied().collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(actual_added, expected_added, "exact retained table additions since v11");
+    assert_eq!(after.len(), before.len() + expected_added.len());
     assert_eq!(
         conn.query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
             .optional()
@@ -71,6 +88,8 @@ fn current_upgrade_only_adds_tables_without_modifying_v11_business_rows() {
             .unwrap(),
         CURRENT_SCHEMA_VERSION
     );
+    eprintln!("UPGRADE_CONTRACT_VERIFIED: old_tables={} added_tables={} foreign_keys=PASS schema={}",
+        before.len(), expected_added.len(), CURRENT_SCHEMA_VERSION);
 }
 #[test]
 fn v12_backup_failure_stops_before_ddl() {

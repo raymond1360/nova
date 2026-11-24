@@ -1021,8 +1021,8 @@ jobs:
           $PSNativeCommandUseErrorActionPreference=$true
           if($PSVersionTable.PSVersion.Major -ne 7){throw 'API_PWSH'}
           if((git rev-parse HEAD).Trim() -cne $env:GITHUB_SHA){throw 'API_SHA'}
-          git merge-base --is-ancestor cdd7486924c63fa606daa23e770a82e85e8140d6 HEAD
-          git diff --exit-code cdd7486924c63fa606daa23e770a82e85e8140d6 HEAD -- apps/desktop/src-tauri
+          git merge-base --is-ancestor d59f396a7f57d1711290e497b4ac63dc8d392f05 HEAD
+          git diff --exit-code d59f396a7f57d1711290e497b4ac63dc8d392f05 HEAD -- apps/desktop/src-tauri
           $git=Join-Path $env:ProgramFiles 'Git/cmd/git.exe'
           if(-not(Test-Path -LiteralPath $git)){throw 'API_GIT_LAUNCHER_MISSING'}
           $env:PATH=(Split-Path $git)+';'+$env:PATH

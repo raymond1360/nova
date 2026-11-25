@@ -11,7 +11,7 @@ $git=(Get-Command git -CommandType Application | Select-Object -First 1).Source
 if(-not $cargo -or -not $git){throw 'Tool missing'}
 # Bind the actual workspace, including staged/unstaged and buildable ignored files.
 function Assert-ReviewedSource([string]$GitExe,[string]$Root) {
- $baseline='d59f396a7f57d1711290e497b4ac63dc8d392f05'
+ $baseline='4188691ab40c6bdd21d2a54cc570c3b15f581ec5'
  & $GitExe -C $Root merge-base --is-ancestor $baseline HEAD
  $code=$LASTEXITCODE
  if($code -ne 0){throw "SOURCE_ANCESTRY_REJECTED:$code"}
@@ -125,8 +125,8 @@ try {
  $tests=Get-Content (Join-Path $EvidenceDirectory 'old-relay/default-names.json') -Raw|ConvertFrom-Json -AsHashtable
  $scheduler=Get-Content (Join-Path $EvidenceDirectory 'old-relay/scheduler-names.json') -Raw|ConvertFrom-Json -AsHashtable
  $explicit=Get-Content (Join-Path $EvidenceDirectory 'old-relay/explicit-names.json') -Raw|ConvertFrom-Json -AsHashtable
- if((SetHash $tests.listed) -cne '2c52c4423d66340add577cc0faf4a426dc7d18b1b415e5b0ed4e2d1418c73191'){throw 'API_FROZEN_DEFAULT_LISTED'}
- if((SetHash $tests.passed) -cne '4e90f5f0e834e08979d9314acdf191f89e412f9c7d6e8a6cdec49b83ca60eb32'){throw 'API_FROZEN_DEFAULT_PASSED'}
+ if((SetHash $tests.listed) -cne '4ae925f2d7fe59fb5413378804161cb5af2470e11572b5bf7c070fda15273499'){throw 'API_FROZEN_DEFAULT_LISTED'}
+ if((SetHash $tests.passed) -cne '65e7de8279fac5547153958c66a6ea0b27cab3ef3cfa8811ac40c69173d2eda3'){throw 'API_FROZEN_DEFAULT_PASSED'}
  if((SetHash $tests.ignored) -cne 'a39bbead332b9d661508d9a4d3a81dbf78a7473b535e6e470c0d76e3738d9611'){throw 'API_FROZEN_DEFAULT_IGNORED'}
  if((SetHash $scheduler.listed) -cne '9e8721788bad879371af9f5fa7090a60ffdcfe3761c00d6faa2c34d761c3ccd8'){throw 'API_FROZEN_SCHEDULER_LISTED'}
  if((SetHash $scheduler.passed) -cne '0bf635a2bb2dd5328fced62eb64b75d4567fc2cd2f93f40c3416d3ac0a9b04a2'){throw 'API_FROZEN_SCHEDULER_PASSED'}

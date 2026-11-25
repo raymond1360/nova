@@ -321,6 +321,13 @@ pub fn plan<P: ApiPort>(
     current(db, &p, true)?;
     advance(db, id, "PREPARED", "PLANNING_STARTED")?;
     let result = (|| {
+        let selected: Vec<_> = p.files.iter().map(|f| f.path.clone()).collect();
+        let recipes: Vec<_> = p.tests.iter().map(|t| t.specification.recipe.clone()).collect();
+        // Serialize the actual approved IDs/paths, not executable descriptions or a fixed sample.
+        let example = json!({"schema":"nova.api.pm.draft/1","action":"ARRANGE_DEVELOP",
+            "goal":p.request.goal,"requirements":"Describe the approved change only",
+            "acceptance":"Approved fixed tests and independent review must pass",
+            "files":selected,"test_recipes":recipes,"reason":"Within the user-selected scope"});
         let v = request(
             db,
             vault,
@@ -329,28 +336,26 @@ pub fn plan<P: ApiPort>(
             cancel,
             None,
             "PLAN",
-            json!({"goal":p.request.goal,"files":p.files,"fixed_tests":p.tests,"limit":"selected files/tests only, <=3 files; clarify/split otherwise"}),
+            json!({"goal":p.request.goal,"files":p.files,"fixed_tests":p.tests,
+                "selected_paths":selected,"allowed_test_recipe_ids":recipes,"output_example":example,
+                "limit":"Copy selected_paths and allowed_test_recipe_ids exactly; fixed_tests program/argv/trust_notice are execution metadata, not values for test_recipes; <=3 files; clarify/split otherwise"}),
         )?;
         let d: Draft = decode(encode(&v)?.as_bytes(), 32768)?;
         let mut paths = d.files.clone();
         paths.sort();
-        let selected: Vec<_> = p.files.iter().map(|f| f.path.clone()).collect();
-        let recipes: Vec<_> = p
-            .tests
-            .iter()
-            .map(|t| t.specification.recipe.clone())
-            .collect();
-        if d.schema != "nova.api.pm.draft/1"
-            || !matches!(d.action.as_str(), "ARRANGE_DEVELOP" | "CLARIFY" | "STOP")
-            || d.reason.len() > 2048
-            || d.goal.trim().is_empty()
-            || d.requirements.len() > 8192
-            || d.acceptance.len() > 8192
-            || paths != selected
-            || d.test_recipes != recipes
-        {
+        // Same strict predicates as before, with fixed field-specific reasons.
+        let rejection = if d.schema != "nova.api.pm.draft/1" { Some("API_PM_DRAFT_SCHEMA_REJECTED") }
+            else if !matches!(d.action.as_str(), "ARRANGE_DEVELOP" | "CLARIFY" | "STOP") { Some("API_PM_DRAFT_ACTION_REJECTED") }
+            else if d.reason.len() > 2048 { Some("API_PM_DRAFT_REASON_REJECTED") }
+            else if d.goal.trim().is_empty() { Some("API_PM_DRAFT_GOAL_REJECTED") }
+            else if d.requirements.len() > 8192 { Some("API_PM_DRAFT_REQUIREMENTS_REJECTED") }
+            else if d.acceptance.len() > 8192 { Some("API_PM_DRAFT_ACCEPTANCE_REJECTED") }
+            else if paths != selected { Some("API_PM_DRAFT_FILES_REJECTED") }
+            else if d.test_recipes != recipes { Some("API_PM_DRAFT_TEST_RECIPES_REJECTED") }
+            else { None };
+        if let Some(code) = rejection {
             disposition(db, &p, false)?;
-            return Err("API_PM_DRAFT_REJECTED");
+            return Err(code);
         }
         disposition(db, &p, true)?;
         let next = if d.action == "ARRANGE_DEVELOP"

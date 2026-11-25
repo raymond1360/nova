@@ -54,3 +54,16 @@ describe('persisted timeout explanation',()=>{
   expect(ipc.mock.calls.every(c=>['api_only_configs','api_only_catalog','api_pm_status'].includes(c[0]))).toBe(true)
  })
 })
+
+describe('draft recipe rejection explanation',()=>{
+ it('shows persisted approved recipe ID reason after refresh without executing commands or planning',async()=>{
+  const stored={...record(),phase:'STOPPED',packet:{...packet,tests:[{specification:{recipe:'python_unittest',program:'C:/tools/python.exe',argv:['-I','-S']}}]},error_code:'API_PM_DRAFT_TEST_RECIPES_REJECTED',execution:null,run_id:null,draft:null}
+  readonlyFailureRoute(stored);let root=await mount()
+  expect(errorPanel(root).textContent).toContain('测试配方须使用已批准的python_unittest编号')
+  expect(errorPanel(root).textContent).toContain('不能返回程序路径、命令或说明文本')
+  expect(errorPanel(root).textContent).not.toContain('C:/tools/python.exe')
+  await click(button(root,'刷新协调记录（只读）'));mounted?.unmount();root=await mount()
+  expect(errorPanel(root).textContent).toContain('python_unittest编号')
+  expect(ipc.mock.calls.every(c=>['api_only_configs','api_only_catalog','api_pm_status'].includes(c[0]))).toBe(true)
+ })
+})

@@ -30,7 +30,13 @@ const responseProgress=computed(()=>{
  if(f.headers_received===true)return `已收到HTTP状态 ${f.http_status??'未记录'}，响应体尚未完整读取`
  return '尚未记录到响应头；不能据此确认上游是否收到请求'
 })
+const draftReasons:Record<string,string>={API_PM_DRAFT_SCHEMA_REJECTED:'派单格式版本不符合要求。',API_PM_DRAFT_ACTION_REJECTED:'派单动作不在允许范围。',API_PM_DRAFT_REASON_REJECTED:'派单说明超过允许长度。',API_PM_DRAFT_GOAL_REJECTED:'派单目标不能为空。',API_PM_DRAFT_REQUIREMENTS_REJECTED:'派单需求超过允许长度。',API_PM_DRAFT_ACCEPTANCE_REJECTED:'验收标准超过允许长度。',API_PM_DRAFT_FILES_REJECTED:'派单文件必须与本次选定文件完全一致，不允许扩围。',API_PM_DRAFT_REJECTED:'派单未通过合同校验；旧记录未记录具体字段原因。'}
 const failureMessage=computed(()=>{
+ if(failureCode.value==='API_PM_DRAFT_TEST_RECIPES_REJECTED'){
+  const ids=(record.value?.packet?.tests??[]).map((t:any)=>t.specification?.recipe).filter((s:any)=>['python_unittest','content','nova_vitest_api2',''].includes(s)).map((s:string)=>s||'空字符串（兼容配方）')
+  return `测试配方须使用已批准的${ids.length?ids.join('、'):'测试配方'}编号，不能返回程序路径、命令或说明文本。`
+ }
+ if(draftReasons[failureCode.value])return draftReasons[failureCode.value]
  if(failureCode.value==='API_TIMEOUT_UNKNOWN')return '请求在60秒传输期限内未取得完整结果，结果未知。'
  if(String(failureCode.value).includes('UNKNOWN'))return '执行结果未知，需要人工核对。'
  return '本次操作已停止，需要人工处理。'

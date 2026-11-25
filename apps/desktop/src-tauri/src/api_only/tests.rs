@@ -2200,6 +2200,68 @@ mod pm_cases {
         .unwrap()
     }
     #[test]
+    fn pm_draft_recipe_ids_wire_example_and_strict_field_rejections() {
+        struct DraftApi { mode: &'static str, inner: PmApi }
+        impl ApiPort for DraftApi {
+            fn send(&mut self, r:&transport::WireRequest, key:&SecretLease, c:&CancellationToken)->Result<Vec<u8>> {
+                let mut response:Value=decode(&self.inner.send(r,key,c)?,131072)?;
+                let mut d:Value=decode(response["choices"][0]["message"]["content"].as_str().unwrap().as_bytes(),65536)?;
+                let wire:Value=decode(&r.body,131072)?;
+                let input:Value=decode(wire["messages"][1]["content"].as_str().unwrap().as_bytes(),131072)?;
+                d["files"]=input["selected_paths"].clone();
+                match self.mode {
+                    "command"=>d["test_recipes"]=json!(["Run Python unittest with python.exe -I -S -B and discover tests"]),
+                    "unknown"=>d["test_recipes"]=json!(["pytest"]),
+                    "extra"=>d["test_recipes"]=json!(["python_unittest","content"]),
+                    "files"=>d["files"]=json!(["../outside.py"]),
+                    "schema"=>d["schema"]=json!("wrong"),
+                    "action"=>d["action"]=json!("COMPLETE_TASK"),
+                    "reason"=>d["reason"]=json!("x".repeat(2049)),
+                    "goal"=>d["goal"]=json!(" "),
+                    "requirements"=>d["requirements"]=json!("x".repeat(8193)),
+                    "acceptance"=>d["acceptance"]=json!("x".repeat(8193)),
+                    _=>{},
+                }
+                response["choices"][0]["message"]["content"]=json!(encode(&d)?);
+                Ok(encode(&response)?.into_bytes())
+            }
+        }
+        for (mode,expected) in [
+            ("ok",None),("command",Some("API_PM_DRAFT_TEST_RECIPES_REJECTED")),
+            ("unknown",Some("API_PM_DRAFT_TEST_RECIPES_REJECTED")),("extra",Some("API_PM_DRAFT_TEST_RECIPES_REJECTED")),
+            ("files",Some("API_PM_DRAFT_FILES_REJECTED")),("schema",Some("API_PM_DRAFT_SCHEMA_REJECTED")),
+            ("action",Some("API_PM_DRAFT_ACTION_REJECTED")),("reason",Some("API_PM_DRAFT_REASON_REJECTED")),
+            ("goal",Some("API_PM_DRAFT_GOAL_REJECTED")),("requirements",Some("API_PM_DRAFT_REQUIREMENTS_REJECTED")),
+            ("acceptance",Some("API_PM_DRAFT_ACCEPTANCE_REJECTED")),
+        ] {
+            let f=Fixture::new();std::fs::rename(f.root.join("note.txt"),f.root.join("label.py")).unwrap();
+            std::fs::create_dir(f.root.join("tests")).unwrap();
+            let mut spec=f.test();spec.file="label.py".into();spec.recipe="python_unittest".into();
+            let mut req=request(&f,spec);req.paths=vec!["label.py".into()];req.goal="Fix \"quoted\" label\nPreserve Ä".into();
+            let prepared=pm::prepare(&f.db,&f.vault,req).unwrap();let id=prepared["id"].as_str().unwrap();
+            let mut api=DraftApi {mode,inner:PmApi {calls:vec![],mode:""}};
+            let before=std::fs::read(f.root.join("label.py")).unwrap();
+            let result=pm::plan(&f.db,&f.vault,id,prepared["digest"].as_str().unwrap(),true,&mut api,&CancellationToken::new());
+            if let Some(code)=expected {assert_eq!(result.unwrap_err(),code);}else{assert_eq!(result.unwrap()["phase"],"DRAFT");}
+            let wire=&api.inner.calls[0];let input:Value=decode(wire["messages"][1]["content"].as_str().unwrap().as_bytes(),131072).unwrap();
+            assert_eq!(input["allowed_test_recipe_ids"],json!(["python_unittest"]));
+            assert_eq!(input["selected_paths"],json!(["label.py"]));
+            assert_eq!(input["output_example"]["test_recipes"],json!(["python_unittest"]));
+            assert_eq!(input["output_example"]["files"],json!(["label.py"]));
+            assert_eq!(input["output_example"]["goal"],input["goal"]);
+            assert!(wire["messages"][0]["content"].as_str().unwrap().contains("never program paths, argv, shell commands"));
+            let status=pm::status(&f.db,id).unwrap();assert!(status["task_id"].is_null()&&status["run_id"].is_null());
+            assert_eq!(f.db.conn().query_row("SELECT count(*) FROM api_task_runs",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+            assert_eq!(std::fs::read(f.root.join("label.py")).unwrap(),before);
+            if let Some(code)=expected {
+                assert_eq!(status["phase"],"STOPPED");assert_eq!(status["error_code"],code);
+                assert_eq!(status["decisions"][0]["rejection_reason"],code);
+                assert!(pm::plan(&f.db,&f.vault,id,prepared["digest"].as_str().unwrap(),true,&mut api,&CancellationToken::new()).is_err());
+            }
+            assert_eq!(api.inner.calls.len(),1);
+        }
+    }
+    #[test]
     fn pm_transport_facts_legacy_output_and_unknown_do_not_replay() {
         let f=Fixture::new();
         let mut pm_api=DiagnosedPort {inner:PmApi {calls:vec![],mode:""},timeout:0,calls:0};

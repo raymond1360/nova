@@ -2148,6 +2148,9 @@ mod pm_cases {
                 json!({"schema":"nova.api.pm.draft/1","action":"ARRANGE_DEVELOP","goal":"Change Alpha to beta","requirements":"Change the approved word only","acceptance":"Expected exact beta text; fixed tests and independent review pass","files":if self.mode=="outside"{json!(["../secret"])}else{json!(["note.txt"])},"test_recipes":input["fixed_tests"].as_array().unwrap().iter().map(|v|v["specification"]["recipe"].clone()).collect::<Vec<_>>(),"reason":"Concrete bounded task"})
             } else {
                 let allowed = input["allowed_actions"].as_array().unwrap();
+                assert_eq!(input["output_example"]["schema"], "nova.api.pm.decision/1");
+                assert_eq!(input["output_example"]["action"], allowed[0]);
+                assert!(body["messages"][0]["content"].as_str().unwrap().contains("never omit schema"));
                 let action = if self.mode == "invalid" {
                     "COMPLETE_TASK"
                 } else if self.mode == "skip" {
@@ -2161,6 +2164,8 @@ mod pm_cases {
             };
             let output = if self.mode == "large_invalid" {
                 json!({"schema":"invalid","reason":"x".repeat(65400)})
+            } else if self.mode == "missing_decision_schema" && input.get("allowed_actions").is_some() {
+                json!({"action":"ARRANGE_REVIEW","reason":"Synthetic review required after tests"})
             } else { output };
             Ok(encode(&json!({"model":body["model"],"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":encode(&output)?}}]}))?.into_bytes())
         }
@@ -2388,6 +2393,21 @@ mod pm_cases {
         )
         .unwrap();
         assert_eq!(f.db.task(task).unwrap().state, TaskState::Completed);
+    }
+    #[test]
+    fn pm_missing_decision_schema_stops_before_review_and_never_replays() {
+        let f=Fixture::new();
+        let mut pm_api=PmApi {calls:vec![],mode:"missing_decision_schema"};
+        let s=ready(&f,f.test(),&mut pm_api);let id=s["id"].as_str().unwrap();
+        let mut api=FakeApi {root:f.root.clone(),..Default::default()};
+        let mut tests=FakeTests {state:"PASS",calls:0};
+        assert_eq!(pm::execute(&f.db,&f.vault,id,&mut pm_api,&mut api,&mut tests,&CancellationToken::new()).unwrap_err(),"API_PM_EXECUTION_STOPPED");
+        let stopped=pm::status(&f.db,id).unwrap();
+        assert_eq!(stopped["execution"]["summary"]["error_code"],"SCHEMA_REJECTED");
+        assert_eq!(stopped["execution"]["summary"]["review"],"NOT RUN");
+        assert_eq!(api.calls.len(),1);assert_eq!(tests.calls,1);
+        assert!(pm::execute(&f.db,&f.vault,id,&mut pm_api,&mut api,&mut tests,&CancellationToken::new()).is_err());
+        assert_eq!(api.calls.len(),1);assert_eq!(pm_api.calls.len(),2);assert_eq!(tests.calls,1);
     }
     #[test]
     fn pm_authorized_once_repair_preserves_shared_scope() {

@@ -554,7 +554,7 @@ fn decide<P: ApiPort>(
         cancel,
         Some(run),
         stage,
-        json!({"run_id":run,"stage":stage,"confirmed_task":plan.task,"approved_tests":plan.tests,"file_scope":p.request.paths,"actual_evidence":evidence,"allowed_actions":allowed,"no_user_acceptance":true}),
+        json!({"run_id":run,"stage":stage,"confirmed_task":plan.task,"approved_tests":plan.tests,"file_scope":p.request.paths,"actual_evidence":evidence,"allowed_actions":allowed,"output_example":{"schema":"nova.api.pm.decision/1","action":allowed[0],"reason":"Decision based on actual tool evidence"},"output_contract":"Exactly three required String fields: schema, action, reason. schema must be nova.api.pm.decision/1; action must be one of allowed_actions. No extra fields. Do not omit schema.","no_user_acceptance":true}),
     )?;
     let d: Decision = match decode(encode(&v)?.as_bytes(), 4096) {
         Ok(d) => d,
